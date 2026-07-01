@@ -514,6 +514,77 @@ app.post("/api/seller/test", async (req, res, next) => {
   }
 });
 
+app.get("/api/seller/dashboard", async (req, res, next) => {
+  try {
+    const today = (db ? await loadDbJobHistory(req.user) : await loadJobHistory()).today || {};
+    let products = { total: null, archived: null };
+    let orders = { total: null, awaiting: null };
+    let recentJobs = [];
+    try {
+      const data = await callOzonSellerAPI("/v3/product/list", { filter: { visibility: "ALL" }, limit: 1 });
+      const items = data?.result?.items || [];
+      const total = Number(data?.result?.total || 0);
+      const archived = items.filter((it) => it.archived).length;
+      products = { total, archived };
+    } catch (e) { products = { total: null, archived: null, error: e.message }; }
+    try {
+      const data = await callOzonSellerAPI("/v3/orders/list", { limit: 50 });
+      const items = data?.items || data?.result?.items || [];
+      orders = { total: items.length, awaiting: items.filter((it) => ["awaiting_packaging", "awaiting_deliver"].includes(it.status)).length };
+    } catch (e) { orders = { total: null, awaiting: null, error: e.message }; }
+    if (db) {
+      const rows = await db.query(
+        "SELECT id, kind, status, phase, processed, total, updated_at FROM app_jobs WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 8",
+        [req.user?.id || ""],
+      );
+      recentJobs = rows.rows.map((r) => ({ id: r.id, kind: r.kind, status: r.status, phase: r.phase, processed: r.processed, total: r.total, updatedAt: r.updated_at }));
+    }
+    res.json({ success: true, today, products, orders, recentJobs });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/products", async (req, res, next) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || req.body?.limit || 50)));
+    const archived = String(req.query.archived || req.body?.archived || "false") === "true";
+    const data = await callOzonSellerAPI("/v3/product/list", { filter: { visibility: "ALL" }, limit, archived });
+    res.json({ success: true, data });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.post("/api/seller/orders", async (req, res, next) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || req.body?.limit || 50)));
+    const status = req.query.status || req.body?.status || "";
+    const filter = status ? { status } : {};
+    const data = await callOzonSellerAPI("/v2/postings/list", { filter, limit });
+    res.json({ success: true, data });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.post("/api/seller/categories/tree", async (req, res, next) => {
+  try {
+    const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" });
+    res.json({ success: true, data });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.get("/api/seller/warehouses", async (_req, res, next) => {
+  try {
+    const data = await callOzonSellerAPI("/v1/cluster/list", {});
+    res.json({ success: true, data });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.post("/api/seller/products/stocks", async (req, res, next) => {
+  try {
+    const stocks = Array.isArray(req.body?.stocks) ? req.body.stocks : null;
+    if (!stocks) { res.status(400).json({ success: false, error: "请求体需要 stocks 数组" }); return; }
+    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks });
+    res.json({ success: true, data });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
 app.post("/api/seller/products/import", async (req, res, next) => {
   try {
     const item = req.body?.item;

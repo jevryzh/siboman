@@ -3,272 +3,84 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Ozon 1688 采集工具</title>
+    <title>Ozon 1688 ERP</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/app-shell.css" />
   </head>
   <body>
-    <main class="app-shell">
-      <section class="workspace">
-        <div class="toolbar">
-          <div>
-            <h1>Ozon → 1688 采集</h1>
-            <p>批量抓取 Ozon 商品信息，并用主图查找 1688 候选货源。</p>
-          </div>
-          <div class="toolbar-actions">
-            <span class="current-user" id="currentUser" hidden></span>
-            <button id="open1688Btn" class="button secondary" type="button">打开 1688 登录窗口</button>
-            <button id="closeBrowserBtn" class="button quiet" type="button">关闭浏览器</button>
-            <button id="logoutBtn" class="button quiet" type="button">退出登录</button>
-          </div>
+    <div class="shell">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-brand">
+          <div class="logo">O</div>
+          <div class="name">Ozon 1688 ERP<small id="sidebarStore">未连接店铺</small></div>
         </div>
 
-        <div class="mode-tabs">
-          <button class="mode-tab active" data-mode="single" type="button">单品找货</button>
-          <button class="mode-tab" data-mode="batch" type="button">批量采集模式</button>
-          <button class="mode-tab" data-mode="seller" type="button">上架到 Ozon</button>
+        <nav class="sidebar-nav" id="sidebarNav">
+          <a class="nav-item" data-route="dashboard">
+            <span class="icon">📊</span><span class="label">仪表盘</span>
+          </a>
+
+          <a class="nav-item" data-route="sourcing">
+            <span class="icon">🎯</span><span class="label">选品</span>
+          </a>
+          <div class="nav-subitems" data-parent="sourcing">
+            <a class="nav-subitem" data-route="sourcing/category">类目分析</a>
+            <a class="nav-subitem" data-route="sourcing/bestsellers">榜单选品</a>
+            <a class="nav-subitem" data-route="sourcing/single">单品找货</a>
+            <a class="nav-subitem" data-route="sourcing/batch">批量采集</a>
+          </div>
+
+          <a class="nav-item" data-route="products">
+            <span class="icon">📦</span><span class="label">商品</span>
+            <span class="badge" id="navProductsBadge">…</span>
+          </a>
+          <div class="nav-subitems" data-parent="products">
+            <a class="nav-subitem" data-route="products/list">商品列表</a>
+            <a class="nav-subitem" data-route="products/upload">上架</a>
+            <a class="nav-subitem" data-route="products/stock">同步库存</a>
+            <a class="nav-subitem" data-route="products/images">AI 商品套图</a>
+          </div>
+
+          <a class="nav-item" data-route="orders">
+            <span class="icon">🧾</span><span class="label">订单</span>
+            <span class="badge" id="navOrdersBadge">…</span>
+          </a>
+          <div class="nav-subitems" data-parent="orders">
+            <a class="nav-subitem" data-route="orders/list">订单列表</a>
+          </div>
+
+          <a class="nav-item" data-route="tools">
+            <span class="icon">🛠️</span><span class="label">工具</span>
+          </a>
+          <div class="nav-subitems" data-parent="tools">
+            <a class="nav-subitem" data-route="tools/browser">1688 浏览器</a>
+            <a class="nav-subitem" data-route="tools/history">历史与下载</a>
+            <a class="nav-subitem" data-route="tools/logs">运行日志</a>
+          </div>
+        </nav>
+
+        <div class="sidebar-footer">
+          <div class="who">
+            <div id="sidebarUser">未登录</div>
+            <small id="sidebarRole"></small>
+          </div>
+          <button id="logoutBtn" type="button">退出</button>
         </div>
-
-        <div id="singleModePanel" class="input-grid mode-panel">
-          <label class="field field-large">
-            <span>Ozon 链接</span>
-            <textarea id="urlsInput" spellcheck="false" placeholder="每行一个 Ozon 商品链接"></textarea>
-          </label>
-
-          <div class="settings">
-            <label class="field">
-              <span>每个商品返回候选数</span>
-              <input id="maxCandidatesInput" type="number" min="1" max="20" value="5" />
-            </label>
-            <label class="field">
-              <span>每个链接随机间隔（秒）</span>
-              <div class="range-inputs">
-                <input id="delayMinInput" type="number" min="1" max="120" step="1" value="8" />
-                <input id="delayMaxInput" type="number" min="1" max="120" step="1" value="20" />
-              </div>
-            </label>
-            <label class="field">
-              <span>从第几行开始</span>
-              <input id="startRowInput" type="number" min="1" step="1" value="1" />
-            </label>
-            <label class="field">
-              <span>连续异常自动停止</span>
-              <input id="maxConsecutiveFailuresInput" type="number" min="1" max="20" step="1" value="3" />
-            </label>
-            <label class="check-row">
-              <input id="enable1688Input" type="checkbox" checked />
-              <span>启用 1688 以图搜货</span>
-            </label>
-            <label class="check-row">
-              <input id="enableAiInput" type="checkbox" checked />
-              <span>启用 AI 严格审核</span>
-            </label>
-            <label class="check-row">
-              <input id="headlessInput" type="checkbox" />
-              <span>后台浏览器模式</span>
-            </label>
-            <div class="run-actions">
-              <button id="runBtn" class="button primary" type="button">开始采集</button>
-              <button id="cancelBtn" class="button danger" type="button" disabled>停止</button>
-            </div>
-          </div>
-        </div>
-
-        <div id="batchModePanel" class="input-grid mode-panel hidden">
-          <label class="field field-large">
-            <span>Ozon 店铺/商品链接</span>
-            <textarea id="batchSourceInput" spellcheck="false" placeholder="粘贴一个 Ozon 店铺链接或商品链接"></textarea>
-          </label>
-
-          <div class="settings">
-            <label class="field">
-              <span>最多采集商品数</span>
-              <input id="batchMaxProductsInput" type="number" min="1" max="500" step="1" value="50" />
-            </label>
-            <label class="field">
-              <span>黑标价 RMB 区间</span>
-              <div class="range-inputs">
-                <input id="batchMinPriceInput" type="number" min="0" step="0.01" placeholder="最低" />
-                <input id="batchMaxPriceInput" type="number" min="0" step="0.01" placeholder="最高" />
-              </div>
-            </label>
-            <label class="field">
-              <span>跟卖数量区间</span>
-              <div class="range-inputs">
-                <input id="batchMinSellerInput" type="number" min="0" step="1" placeholder="最低" />
-                <input id="batchMaxSellerInput" type="number" min="0" step="1" placeholder="最高" />
-              </div>
-            </label>
-            <label class="field">
-              <span>标题关键词</span>
-              <input id="batchKeywordInput" type="text" placeholder="可不填" />
-            </label>
-            <label class="field">
-              <span>每个商品随机间隔（秒）</span>
-              <div class="range-inputs">
-                <input id="batchDelayMinInput" type="number" min="1" max="120" step="1" value="8" />
-                <input id="batchDelayMaxInput" type="number" min="1" max="120" step="1" value="20" />
-              </div>
-            </label>
-            <label class="field">
-              <span>连续异常自动停止</span>
-              <input id="batchMaxConsecutiveFailuresInput" type="number" min="1" max="20" step="1" value="3" />
-            </label>
-            <label class="check-row">
-              <input id="batchHeadlessInput" type="checkbox" />
-              <span>后台浏览器模式</span>
-            </label>
-            <div class="run-actions">
-              <button id="batchRunBtn" class="button primary" type="button">开始批量采集</button>
-              <button id="batchCancelBtn" class="button danger" type="button" disabled>停止</button>
-            </div>
-          </div>
-        </div>
-
-        <div id="sellerModePanel" class="input-grid mode-panel hidden">
-          <div class="settings seller-settings">
-            <div class="seller-row">
-              <button id="sellerTestBtn" class="button secondary" type="button">测试连接</button>
-              <span id="sellerStatus" class="seller-status">未连接</span>
-            </div>
-
-            <label class="field">
-              <span>类目 ID <small>（在 Ozon 卖家后台查好后填，比如手机壳）</small></span>
-              <input id="sellerCategoryIdInput" type="text" inputmode="numeric" placeholder="例如 17032807" />
-            </label>
-
-            <label class="field">
-              <span>商品标题</span>
-              <input id="sellerNameInput" type="text" placeholder="例如 透明手机壳 适配 iPhone 15" />
-            </label>
-
-            <div class="range-inputs">
-              <label class="field">
-                <span>SKU（你自己店铺里的唯一编码）</span>
-                <input id="sellerSkuInput" type="text" placeholder="例如 OZ-IP15-CASE-001" />
-              </label>
-              <label class="field">
-                <span>Barcode（可选）</span>
-                <input id="sellerBarcodeInput" type="text" placeholder="例如 6901234567890" />
-              </label>
-            </div>
-
-            <div class="range-inputs">
-              <label class="field">
-                <span>售价（卖家后台币种）</span>
-                <input id="sellerPriceInput" type="text" placeholder="例如 999.00" />
-              </label>
-              <label class="field">
-                <span>重量（克，含包装）</span>
-                <input id="sellerWeightInput" type="text" placeholder="例如 80" />
-              </label>
-            </div>
-
-            <div class="range-inputs">
-              <label class="field">
-                <span>长 (cm)</span>
-                <input id="sellerDepthInput" type="text" placeholder="例如 18" />
-              </label>
-              <label class="field">
-                <span>宽 (cm)</span>
-                <input id="sellerWidthInput" type="text" placeholder="例如 9" />
-              </label>
-              <label class="field">
-                <span>高 (cm)</span>
-                <input id="sellerHeightInput" type="text" placeholder="例如 2" />
-              </label>
-            </div>
-
-            <label class="field">
-              <span>图片 URL <small>（一行一张，Ozon 会自己下载）</small></span>
-              <textarea id="sellerImagesInput" spellcheck="false" placeholder="https://cdn.example.com/img1.jpg&#10;https://cdn.example.com/img2.jpg"></textarea>
-            </label>
-
-            <label class="field">
-              <span>类目属性（JSON 数组） <small>（从 /v1/description-category/attribute 拿到 schema 后填入）</small></span>
-              <textarea id="sellerAttributesInput" class="code-area" spellcheck="false" placeholder='[{"id": 85, "values": [{"value": "Прозрачный"}]}]'></textarea>
-            </label>
-
-            <div class="run-actions">
-              <button id="sellerLoadSampleBtn" class="button quiet" type="button">载入手机壳样例</button>
-              <button id="sellerImportBtn" class="button primary" type="button">上架</button>
-              <button id="sellerClearBtn" class="button quiet" type="button">清空</button>
-            </div>
-
-            <label class="field">
-              <span>Ozon 返回（原文）</span>
-              <pre id="sellerResponse" class="response-area">点击"测试连接"或"上架"后这里会显示 Ozon 的响应。</pre>
-            </label>
-          </div>
-        </div>
-
-        
-          <div>
-            <span class="label">状态</span>
-            <strong id="statusText">待开始</strong>
-          </div>
-          <div>
-            <span class="label">进度</span>
-            <strong id="progressText">0 / 0</strong>
-          </div>
-          <a id="downloadLink" class="button secondary hidden" href="#">下载 Excel</a>
-        </section>
-
-        <section class="history-section">
-          <div class="section-head">
-            <h2>统计与历史</h2>
-            <button id="refreshHistoryBtn" class="button quiet small" type="button">刷新</button>
-          </div>
-          <div class="stats-grid">
-            <div>
-              <span class="label">今日处理</span>
-              <strong id="todayRowsText">0 条</strong>
-            </div>
-            <div>
-              <span class="label">今日任务</span>
-              <strong id="todayJobsText">0 批</strong>
-            </div>
-            <div>
-              <span class="label">历史文件</span>
-              <strong id="historyFilesText">0 份</strong>
-            </div>
-          </div>
-          <div id="historyList" class="history-list"></div>
-        </section>
-
-        <section class="results-section">
-          <div class="section-head">
-            <h2>结果</h2>
-            <span id="resultCount">0 条</span>
-          </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Ozon 商品</th>
-                  <th>主图</th>
-                  <th>采集结果</th>
-                  <th>状态</th>
-                </tr>
-              </thead>
-              <tbody id="resultsBody">
-                <tr>
-                  <td colspan="4" class="empty">还没有结果</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </section>
-      </section>
-
-      <aside class="log-panel">
-        <div class="section-head">
-          <h2>日志</h2>
-          <button id="clearLogBtn" class="button quiet small" type="button">清空</button>
-        </div>
-        <div id="logList" class="log-list"></div>
       </aside>
-    </main>
 
+      <main class="main">
+        <div class="topbar">
+          <h1 id="pageTitle">仪表盘</h1>
+          <span class="crumb" id="pageCrumb"></span>
+          <div class="actions" id="pageActions"></div>
+        </div>
+        <div class="content" id="content">
+          <div class="empty">加载中…</div>
+        </div>
+      </main>
+    </div>
+
+    <div class="toast" id="toast"></div>
     <script src="/app.js"></script>
   </body>
 </html>
