@@ -514,6 +514,24 @@ app.post("/api/seller/test", async (req, res, next) => {
   }
 });
 
+app.post("/api/seller/analytics/categories", async (req, res, next) => {
+  try {
+    const range = String(req.query.range || req.body?.range || "30");
+    const days = Math.min(365, Math.max(1, Number(range)));
+    const dimension = String(req.query.dimension || req.body?.dimension || "category1");
+    const now = new Date();
+    const since = new Date(now.getTime() - days * 24 * 3600 * 1000).toISOString();
+    const to = now.toISOString();
+    const data = await callOzonSellerAPI("/v1/analytics/data", {
+      date_from: since, date_to: to,
+      metrics: ["revenue", "ordered_units", "returns", "delivered_units", "cancellations"],
+      dimension: [dimension],
+      limit: 200,
+    });
+    res.json({ success: true, data, range: days, dimension });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
 app.get("/api/seller/dashboard", async (req, res, next) => {
   try {
     const today = (db ? await loadDbJobHistory(req.user) : await loadJobHistory()).today || {};
@@ -557,7 +575,10 @@ app.post("/api/seller/orders", async (req, res, next) => {
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || req.body?.limit || 50)));
     const status = req.query.status || req.body?.status || "";
     const filter = status ? { status } : {};
-    const data = await callOzonSellerAPI("/v2/postings/list", { filter, limit });
+    const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
+      filter: { since: req.query.since || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(), to: req.query.to || new Date().toISOString() },
+      limit,
+    });
     res.json({ success: true, data });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
@@ -570,9 +591,26 @@ app.post("/api/seller/categories/tree", async (req, res, next) => {
 });
 
 app.get("/api/seller/warehouses", async (_req, res, next) => {
+  // Ozon 的 cluster/list 和 /v1/warehouse/list 端点对该 Seller 不可用。
+  // 但 /v2/posting/fbo/list 和 /v3/posting/fbs/list 返回的 posting 里有 warehouse_id + warehouse 名称。
+  // 这里采用：先尝试拉一次最近订单，从结果里提取去重的 warehouse 列表。
   try {
-    const data = await callOzonSellerAPI("/v1/cluster/list", {});
-    res.json({ success: true, data });
+    const now = new Date();
+    const since = new Date(now.getTime() - 90 * 24 * 3600 * 1000).toISOString();
+    const to = now.toISOString();
+    let result = { result: [] };
+    try {
+      const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
+        filter: { since, to }, limit: 100,
+      });
+      const map = new Map();
+      for (const p of (data?.result?.postings || [])) {
+        const m = p?.delivery_method || {};
+        if (m.warehouse_id) map.set(m.warehouse_id, { warehouse_id: m.warehouse_id, name: m.warehouse || ("仓库 " + m.warehouse_id) });
+      }
+      result = { result: Array.from(map.values()) };
+    } catch (e) { /* posting 端点失败时返回空 */ }
+    res.json({ success: true, data: result, note: result.result.length ? "" : "未从订单中提取到 warehouse（最近 90 天无订单）" });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
 

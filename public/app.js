@@ -278,14 +278,20 @@ async function renderCategoryAnalysis(root) {
   $$("#catSubtabs .mode-tab").forEach((t) => t.addEventListener("click", () => {
     $$("#catSubtabs .mode-tab").forEach((x) => x.classList.remove("active"));
     t.classList.add("active");
+    loadCategoryAnalytics();
+  }));
+  $$("#catTimeRange .chip").forEach((t) => t.addEventListener("click", () => {
+    $$("#catTimeRange .chip").forEach((x) => x.classList.remove("active"));
+    t.classList.add("active");
+    loadCategoryAnalytics();
   }));
   await loadCategoryTree();
+  await loadCategoryAnalytics();
 }
 
 async function loadCategoryTree() {
   const meta = $("#catMeta");
   const tree = $("#catTree");
-  if (meta) meta.textContent = "加载中…";
   if (tree) tree.textContent = "加载中…";
   try {
     const data = await getJson("/api/seller/categories/tree");
@@ -309,6 +315,70 @@ async function loadCategoryTree() {
     });
   } catch (e) {
     if (tree) tree.innerHTML = `<div class="empty">加载失败：${escapeHtml(e.message)}</div>`;
+  }
+}
+
+async function loadCategoryAnalytics() {
+  const range = $$("#catTimeRange .chip").find((c) => c.classList.contains("active"))?.dataset.v || "30";
+  const dim = $$("#catSubtabs .mode-tab").find((c) => c.classList.contains("active"))?.dataset.sub || "all";
+  const dimension = dim === "all" ? "category1" : dim === "growth" ? "category1" : "category1";
+  const body = $("#catListBody");
+  const meta = $("#catListMeta");
+  if (body) body.innerHTML = `<tr><td colspan="9" class="empty"><span class="spinner"></span> 加载中…</td></tr>`;
+  try {
+    const data = await postJson("/api/seller/analytics/categories", { range, dimension });
+    const items = (data.data?.result?.data || []).map((row) => {
+      const dim = row.dimensions?.[0] || {};
+      const m = row.metrics || [];
+      const revenue = m[0] || 0;
+      const ordered = m[1] || 0;
+      const returns = m[2] || 0;
+      const delivered = m[3] || 0;
+      const cancels = m[4] || 0;
+      const returnRate = ordered > 0 ? (returns / ordered * 100) : 0;
+      const cancelRate = ordered > 0 ? (cancels / ordered * 100) : 0;
+      return { name: dim.name || "—", id: dim.id || "—", revenue, ordered, returns, delivered, cancels, returnRate, cancelRate };
+    });
+    items.sort((a, b) => b.revenue - a.revenue);
+    if (meta) meta.textContent = `共 ${items.length} 个类目（近 ${data.range} 天，按销售额降序）`;
+    if (!items.length) { body.innerHTML = `<tr><td colspan="9" class="empty">该时间范围内没有数据</td></tr>`; return; }
+    // 顶部 5 个统计卡
+    const totalRev = items.reduce((s, it) => s + it.revenue, 0);
+    const totalOrd = items.reduce((s, it) => s + it.ordered, 0);
+    const totalRet = items.reduce((s, it) => s + it.returns, 0);
+    const avgRetRate = totalOrd > 0 ? (totalRet / totalOrd * 100) : 0;
+    const topCat = items[0];
+    const cards = $$("#catStats .stat-card .value");
+    if (cards[0]) cards[0].textContent = String(items.length);
+    if (cards[1]) cards[1].textContent = totalOrd.toLocaleString();
+    if (cards[2]) cards[2].textContent = `₽ ${totalRev.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+    if (cards[3]) cards[3].textContent = `${avgRetRate.toFixed(2)}%`;
+    if (cards[4]) cards[4].textContent = topCat ? `${topCat.name} ₽${topCat.revenue.toFixed(0)}` : "—";
+
+    body.innerHTML = items.map((it, i) => `
+      <tr>
+        <td>${i + 1}</td>
+        <td><a href="#" data-cat="${escapeAttr(it.id)}" data-name="${escapeAttr(it.name)}">${escapeHtml(it.name)}</a><br><span class="muted">#${escapeHtml(it.id)}</span></td>
+        <td>${it.ordered}</td>
+        <td>₽ ${it.revenue.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
+        <td>${it.delivered}/${it.cancels}</td>
+        <td>${it.returnRate.toFixed(2)}%</td>
+        <td>${it.cancelRate.toFixed(2)}%</td>
+        <td>—</td>
+        <td>—</td>
+      </tr>`).join("");
+    $$("#catListBody [data-cat]").forEach((a) => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        const id = a.getAttribute("data-cat");
+        const name = a.getAttribute("data-name");
+        const input = $("#sellerCategoryIdInput");
+        if (input) input.value = id;
+        toast(`已填入类目 ${id}（${name}）。切换到「上架」页继续。`, "success");
+      });
+    });
+  } catch (e) {
+    if (body) body.innerHTML = `<tr><td colspan="9" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
   }
 }
 
