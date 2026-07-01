@@ -36,6 +36,10 @@ const LOW_PRICE_THRESHOLD_RMB = Number(process.env.LOW_PRICE_THRESHOLD_RMB || 1)
 const OZON_SELLER_BASE_URL = (process.env.OZON_SELLER_BASE_URL || "https://api-seller.ozon.ru").replace(/\/$/, "");
 const OZON_SELLER_CLIENT_ID = process.env.OZON_SELLER_CLIENT_ID || "";
 const OZON_SELLER_API_KEY = process.env.OZON_SELLER_API_KEY || "";
+const MINIMAX_IMAGE_MODEL = process.env.MINIMAX_IMAGE_MODEL || "image-01";
+const MINIMAX_IMAGE_INPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_INPUT_USD_PER_M || 0.30);
+const MINIMAX_IMAGE_OUTPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_OUTPUT_USD_PER_M || 1.20);
+const MINIMAX_IMAGE_PER_IMAGE_USD = Number(process.env.MINIMAX_IMAGE_PER_IMAGE_USD || 0.03);
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
 const DETAIL_DELAY_MIN_MS = Number(process.env.DETAIL_DELAY_MIN_MS || 2500);
@@ -536,19 +540,24 @@ app.get("/api/seller/dashboard", async (req, res, next) => {
   try {
     const today = (db ? await loadDbJobHistory(req.user) : await loadJobHistory()).today || {};
     let products = { total: null, archived: null };
-    let orders = { total: null, awaiting: null };
+    let orders = { total: null, awaiting: null, awaiting_packaging: null, awaiting_deliver: null, delivering: null, delivered: null, cancelled: null };
     let recentJobs = [];
     try {
       const data = await callOzonSellerAPI("/v3/product/list", { filter: { visibility: "ALL" }, limit: 1 });
       const items = data?.result?.items || [];
       const total = Number(data?.result?.total || 0);
       const archived = items.filter((it) => it.archived).length;
-      products = { total, archived };
-    } catch (e) { products = { total: null, archived: null, error: e.message }; }
+      products = { total, archived, toModify: 0, lowStock: 0 };
+    } catch (e) { products = { total: null, archived: null, toModify: null, lowStock: null, error: e.message }; }
     try {
-      const data = await callOzonSellerAPI("/v3/orders/list", { limit: 50 });
-      const items = data?.items || data?.result?.items || [];
-      orders = { total: items.length, awaiting: items.filter((it) => ["awaiting_packaging", "awaiting_deliver"].includes(it.status)).length };
+      const since = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
+      const to = new Date().toISOString();
+      const data = await callOzonSellerAPI("/v3/posting/fbs/list", { filter: { since, to }, limit: 100 });
+      const items = data?.result?.postings || [];
+      const byStatus = { awaiting_packaging: 0, awaiting_deliver: 0, delivering: 0, delivered: 0, cancelled: 0 };
+      for (const p of items) { if (p.status in byStatus) byStatus[p.status] += 1; }
+      const awaiting = byStatus.awaiting_packaging + byStatus.awaiting_deliver;
+      orders = { total: items.length, awaiting, ...byStatus };
     } catch (e) { orders = { total: null, awaiting: null, error: e.message }; }
     if (db) {
       const rows = await db.query(
@@ -621,6 +630,55 @@ app.post("/api/seller/products/stocks", async (req, res, next) => {
     const data = await callOzonSellerAPI("/v2/products/stocks", { stocks });
     res.json({ success: true, data });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.post("/api/seller/images/generate", async (req, res, next) => {
+  try {
+    const apiKey = process.env.MINIMAX_API_KEY;
+    if (!apiKey) {
+      res.status(503).json({ success: false, error: "未配置 MINIMAX_API_KEY（请在 .env 里填写）" });
+      return;
+    }
+    const { prompt, image: refImage, aspectRatio = "3:4", n = 1, model: reqModel } = req.body || {};
+    if (!prompt) {
+      res.status(400).json({ success: false, error: "需要 prompt 字段" });
+      return;
+    }
+    const body = {
+      model: reqModel || MINIMAX_IMAGE_MODEL,
+      prompt: String(prompt).slice(0, 2000),
+      n: Math.min(8, Math.max(1, Number(n) || 1)),
+      aspect_ratio: aspectRatio,
+    };
+    if (Array.isArray(refImage) && refImage.length) {
+      body.image = refImage.slice(0, 4).map((u) => String(u));
+    } else if (typeof refImage === "string" && refImage) {
+      body.image = [refImage];
+    }
+    const response = await fetch(`${MINIMAX_BASE_URL}/image_generation`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch { payload = { raw: text.slice(0, 4000) }; }
+    if (!response.ok) {
+      res.status(response.status || 502).json({ success: false, error: `MiniMax 图生 ${response.status}：${text.slice(0, 500)}`, payload });
+      return;
+    }
+    const urls = payload?.data?.image_urls || [];
+    const usage = {
+      model: payload?.model || body.model,
+      promptTokens: (payload?.usage?.prompt_tokens || 0),
+      totalTokens: (payload?.usage?.total_tokens || 0),
+      images: urls.length,
+      estimatedCostUsd: Number((urls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6)),
+    };
+    res.json({ success: true, data: { images: urls, prompt: body.prompt, aspectRatio, n: body.n, hasRefImage: Boolean(body.image) }, usage });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 app.post("/api/seller/products/import", async (req, res, next) => {

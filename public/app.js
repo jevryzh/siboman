@@ -1,5 +1,5 @@
 /* =========================================================
-   Ozon 1688 ERP - app shell + pages
+   逐梦 ERP - app shell + pages
    - 风格自定，参考 MYerp 的功能分类
    ========================================================= */
 
@@ -103,9 +103,13 @@ function applyRoute() {
   $$(".nav-item").forEach((el) => el.classList.remove("expanded"));
   const top = route.split("/")[0];
   const topNav = $(`.nav-item[data-route="${top}"]`);
-  if (topNav) topNav.classList.add("active");
+  if (topNav) {
+    topNav.classList.add("active");
+    // 顶级栏目且有子项 → 一直展开
+    const hasSub = document.querySelector(`.nav-subitem[data-parent="${top}"]`);
+    if (hasSub) topNav.classList.add("expanded");
+  }
   if (top !== route && topNav) {
-    topNav.classList.add("expanded");
     const sub = $(`.nav-subitem[data-route="${route}"]`);
     if (sub) sub.classList.add("active");
   }
@@ -185,7 +189,7 @@ async function renderDashboard(root) {
       <div class="card">
         <div class="card-head"><h2>最近任务</h2><a class="muted" href="#/tools/history">查看全部</a></div>
         <div class="table-wrap"><table>
-          <thead><tr><th>类型</th><th>状态</th><th>进度</th><th>时间</th><th>下载</th></tr></thead>
+          <thead><tr><th style="min-width:120px">类型</th><th>状态</th><th>进度</th><th>时间</th><th>下载</th></tr></thead>
           <tbody id="dashJobsBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
         </table></div>
       </div>
@@ -222,7 +226,7 @@ async function renderDashboard(root) {
     else {
       body.innerHTML = items.map((job) => `
         <tr>
-          <td>${escapeHtml(job.kind === "batch-ozon" ? "批量采集" : "单品找货")}<br><span class="muted">${escapeHtml((job.id || "").slice(0, 8))}</span></td>
+          <td class="wrap"><div>${escapeHtml(job.kind === "batch-ozon" ? "批量采集" : "单品找货")}</div><span class="muted">${escapeHtml((job.id || "").slice(0, 8))}</span></td>
           <td>${statusBadge(job.status)}</td>
           <td>${job.processed || 0} / ${job.total || 0}</td>
           <td><span class="muted">${escapeHtml(formatTime(job.updatedAt))}</span></td>
@@ -271,7 +275,7 @@ async function renderCategoryAnalysis(root) {
     <div class="card">
       <div class="card-head"><h2>类目市场列表</h2><span class="meta" id="catListMeta">类目分析详情需 Ozon 官方分析 API（本项目暂用类目树占位）</span></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>#</th><th>类目</th><th>月销量</th><th>月销售额</th><th>GMV 增长</th><th>平均价</th><th>卖家数</th><th>退货率</th><th>品牌占比</th></tr></thead>
+        <thead><tr><th>#</th><th style="min-width:160px">类目</th><th>月销量</th><th>月销售额</th><th>发货/取消</th><th>退货率</th><th>取消率</th><th>ID</th><th>—</th></tr></thead>
         <tbody id="catListBody"><tr><td colspan="9" class="empty">（暂未启用 — Ozon 不开放公开类目分析接口）</td></tr></tbody>
       </table></div>
     </div>`;
@@ -358,7 +362,7 @@ async function loadCategoryAnalytics() {
     body.innerHTML = items.map((it, i) => `
       <tr>
         <td>${i + 1}</td>
-        <td><a href="#" data-cat="${escapeAttr(it.id)}" data-name="${escapeAttr(it.name)}">${escapeHtml(it.name)}</a><br><span class="muted">#${escapeHtml(it.id)}</span></td>
+        <td class="wrap"><a href="#" data-cat="${escapeAttr(it.id)}" data-name="${escapeAttr(it.name)}">${escapeHtml(it.name)}</a><div class="muted">#${escapeHtml(it.id)}</div></td>
         <td>${it.ordered}</td>
         <td>₽ ${it.revenue.toLocaleString(undefined, { maximumFractionDigits: 2 })}</td>
         <td>${it.delivered}/${it.cancels}</td>
@@ -482,7 +486,7 @@ function renderSingleSourcing(root) {
     <div class="card">
       <div class="card-head"><h2>结果</h2><span class="meta" id="singleResultCount">0 条</span><a id="singleDownload" class="button small hidden" href="#">下载 Excel</a></div>
       <div class="table-wrap"><table>
-        <thead><tr><th>Ozon</th><th>主图</th><th>1688 候选</th><th>状态</th></tr></thead>
+        <thead><tr><th style="min-width:180px">Ozon</th><th>主图</th><th style="min-width:280px">1688 候选</th><th>状态</th></tr></thead>
         <tbody id="singleResultsBody"><tr><td colspan="4" class="empty">还没有结果</td></tr></tbody>
       </table></div>
     </div>`;
@@ -560,9 +564,9 @@ function renderPolledJob(job) {
       const ozon = r.ozon || {};
       const cands = (r.candidates || []).slice(0, 3);
       return `<tr>
-        <td><a href="${escapeAttr(r.url)}" target="_blank" rel="noreferrer">${escapeHtml(ozon.title || r.url)}</a><br><span class="muted">${escapeHtml(ozon.currentBlackPriceCny || "")}</span></td>
+        <td class="wrap"><a href="${escapeAttr(r.url)}" target="_blank" rel="noreferrer">${escapeHtml(ozon.title || r.url)}</a><div class="muted">${escapeHtml(ozon.currentBlackPriceCny || "")}</div></td>
         <td>${ozon.mainImage?.publicUrl ? `<img class="thumb" src="${escapeAttr(ozon.mainImage.publicUrl)}">` : ""}</td>
-        <td>${cands.length ? cands.map((c) => `<div>${escapeHtml(c.rank)}. ${escapeHtml(c.title || "")}<br><span class="muted">${escapeHtml(c.price || "")}</span></div>`).join("") : "<span class='muted'>无候选</span>"}</td>
+        <td class="wrap">${cands.length ? cands.map((c) => `<div>${escapeHtml(c.rank)}. ${escapeHtml(c.title || "")}<div class="muted">${escapeHtml(c.price || "")}</div></div>`).join("") : "<span class='muted'>无候选</span>"}</td>
         <td>${escapeHtml(r.aiReview?.decision || r.error || "已采集")}</td>
       </tr>`;
     }).join("");
@@ -675,7 +679,7 @@ async function renderProductList(root) {
         <button class="button" id="plGo">加载</button>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>商品</th><th>offer_id / SKU</th><th>价格</th><th>状态</th></tr></thead>
+        <thead><tr><th style="min-width:160px">商品</th><th style="min-width:140px">offer_id</th><th>价格</th><th>状态</th></tr></thead>
         <tbody id="plBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
       </table></div>
     </div>`;
@@ -707,7 +711,7 @@ async function loadProductList() {
     if (!items.length) { body.innerHTML = `<tr><td colspan="4" class="empty">无数据</td></tr>`; return; }
     body.innerHTML = items.map((it) => `
       <tr>
-        <td>${escapeHtml(it.name || it.offer_id || "—")}</td>
+        <td class="wrap">${escapeHtml(it.name || it.offer_id || "—")}</td>
         <td><span class="muted">${escapeHtml(it.offer_id || "—")}</span></td>
         <td>${escapeHtml(it.price || "—")}</td>
         <td>${it.archived ? '<span class="badge gray">已归档</span>' : '<span class="badge green">在售</span>'}</td>
@@ -720,6 +724,15 @@ async function loadProductList() {
 /* ============== 上架 ==================== */
 
 function renderProductUpload(root) {
+  // 如果有从 AI 套图传来的图片，自动填到图片 URL 框
+  setTimeout(() => {
+    if (state._pendingUploadImage) {
+      const imgs = $("#sellerImagesInput");
+      if (imgs) imgs.value = state._pendingUploadImage;
+      state._pendingUploadImage = null;
+      toast("已自动填入图片 URL（来自 AI 套图）", "success");
+    }
+  }, 50);
   root.innerHTML = `
     <div class="card">
       <div class="card-head">
@@ -828,6 +841,10 @@ function bindUploadHandlers() {
     try {
       const data = await postJson("/api/seller/products/import", { item });
       $("#sellerResponse").textContent = JSON.stringify(data, null, 2);
+      const productId = data?.data?.result?.product_id || data?.data?.product_id;
+      if (productId) {
+        $("#sellerResponse").innerHTML += `\n\n→ <a href="https://www.ozon.ru/product/${escapeAttr(item.sku)}" target="_blank" rel="noreferrer">在 Ozon 后台查看（按 SKU 搜）</a>`;
+      }
       toast("上架请求已提交", "success");
     } catch (error) {
       $("#sellerResponse").textContent = error.message;
@@ -841,57 +858,147 @@ function bindUploadHandlers() {
 function renderProductStock(root) {
   root.innerHTML = `
     <div class="card">
-      <div class="card-head"><h2>同步库存</h2><span class="meta">调 Ozon /v2/products/stocks 批量改库存</span></div>
-      <p class="muted">每条库存需要：<code>sku</code>、<code>warehouse_id</code>（从「仓库」接口查）、<code>present</code>（现有库存）。</p>
-      <label class="field"><span>仓库</span>
-        <select id="stockWarehouseId"><option value="">（加载中…）</option></select>
-      </label>
-      <label class="field"><span>库存更新（JSON 数组）</span>
-        <textarea id="stockPayload" class="code-area" placeholder='[{"sku":"OZ-001","present":50,"reserved":0}]'></textarea>
-      </label>
-      <div style="display:flex;gap:8px">
-        <button class="button" id="stockLoadSample">载入样例</button>
-        <button class="button primary" id="stockSubmit">同步</button>
+      <div class="card-head">
+        <h2>同步库存</h2>
+        <span class="meta">选商品 → 改库存 → 批量提交到 Ozon</span>
+      </div>
+      <div class="filter-bar">
+        <label class="field" style="margin: 0; flex: 1; min-width: 200px;"><span>仓库</span>
+          <select id="stockWarehouseId"><option value="">（加载中…）</option></select>
+        </label>
+        <label class="field" style="margin: 0; flex: 1; min-width: 200px;"><span>搜索 SKU / 名称</span>
+          <input type="search" id="stockSearch" placeholder="过滤商品" />
+        </label>
+        <button class="button" id="stockRefresh">刷新</button>
+        <button class="button" id="stockSelectAll">全选</button>
+        <button class="button" id="stockSelectNone">全不选</button>
+      </div>
+      <div class="table-wrap" style="max-height: 420px"><table>
+        <thead><tr>
+          <th style="width:30px"><input type="checkbox" id="stockAll" /></th>
+          <th style="min-width:160px">商品</th>
+          <th style="min-width:140px">offer_id / SKU</th>
+          <th style="width:120px">新库存 (present)</th>
+          <th style="width:120px">预占 (reserved)</th>
+        </tr></thead>
+        <tbody id="stockBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+      </table></div>
+      <div class="filter-bar" style="justify-content: space-between; margin-top: 10px">
+        <span class="muted" id="stockSelectedMeta">已选 0 / 0</span>
+        <div style="display:flex; gap:8px">
+          <button class="button primary" id="stockSubmit">⚡ 提交到 Ozon</button>
+        </div>
       </div>
     </div>
     <div class="card">
       <div class="card-head"><h2>Ozon 返回</h2></div>
-      <pre id="stockResponse" class="response-area">点击「同步」后这里会显示 Ozon 的响应。</pre>
+      <pre id="stockResponse" class="response-area">提交后这里会显示 Ozon 的返回。</pre>
     </div>`;
-  // 拉仓库列表
-  getJson("/api/seller/warehouses").then((data) => {
-    const items = data.data?.result || data.data || [];
-    const sel = $("#stockWarehouseId");
-    if (!sel) return;
-    if (!items.length) { sel.innerHTML = `<option value="">(Ozon 没有返回仓库)</option>`; return; }
-    sel.innerHTML = items.map((it) => `<option value="${escapeAttr(it.warehouse_id || it.id || "")}">${escapeHtml(it.name || ("仓库 " + (it.warehouse_id || it.id)))}</option>`).join("");
-  }).catch((e) => {
-    const sel = $("#stockWarehouseId"); if (sel) sel.innerHTML = `<option value="">${escapeHtml(e.message)}</option>`;
-  });
-  $("#stockLoadSample")?.addEventListener("click", () => {
-    const wh = $("#stockWarehouseId")?.value || "123456";
-    $("#stockPayload").value = JSON.stringify([
-      { sku: "OZON-DEMO-CASE-001", warehouse_id: Number(wh), present: 100, reserved: 0 },
-    ], null, 2);
-  });
-  $("#stockSubmit")?.addEventListener("click", async () => {
-    let stocks;
-    try { stocks = JSON.parse($("#stockPayload").value); } catch (error) {
-      $("#stockResponse").textContent = `JSON 解析失败：${error.message}`; return;
+  bindStockHandlers();
+  loadStockProducts();
+}
+
+function bindStockHandlers() {
+  $("#stockRefresh")?.addEventListener("click", () => loadStockProducts());
+  $("#stockSearch")?.addEventListener("input", () => filterStockRows());
+  $("#stockSelectAll")?.addEventListener("click", () => { $$("#stockBody input[type=checkbox]").forEach((c) => c.checked = true); updateStockSelectedMeta(); });
+  $("#stockSelectNone")?.addEventListener("click", () => { $$("#stockBody input[type=checkbox]").forEach((c) => c.checked = false); updateStockSelectedMeta(); });
+  $("#stockAll")?.addEventListener("change", (e) => { $$("#stockBody input[type=checkbox]").forEach((c) => c.checked = e.target.checked); updateStockSelectedMeta(); });
+  $("#stockSubmit")?.addEventListener("click", submitStock);
+  $$("#stockBody").forEach?.(() => {}); // noop
+  // 仓库下拉变化时自动提交时携带
+}
+
+async function loadStockProducts() {
+  const body = $("#stockBody");
+  if (body) body.innerHTML = `<tr><td colspan="5" class="empty"><span class="spinner"></span> 加载商品…</td></tr>`;
+  try {
+    const data = await getJson(`/api/seller/products?limit=100`);
+    const items = (data.data?.result?.items || []).filter((it) => !it.archived);
+    // 暂存到全局
+    state._stockItems = items;
+    // 拉仓库
+    const whData = await getJson("/api/seller/warehouses").catch(() => ({ data: { result: [] } }));
+    const whItems = whData.data?.result || [];
+    const whSel = $("#stockWarehouseId");
+    if (whSel) {
+      whSel.innerHTML = whItems.length
+        ? whItems.map((w) => `<option value="${escapeAttr(w.warehouse_id)}">${escapeHtml(w.name)} (#${escapeHtml(String(w.warehouse_id))})</option>`).join("")
+        : `<option value="">(未获取到 warehouse，请在 Ozon 后台确认)</option>`;
     }
-    // 补上默认 warehouse_id
-    const wh = $("#stockWarehouseId")?.value;
-    if (wh) stocks = stocks.map((s) => ({ ...s, warehouse_id: s.warehouse_id || Number(wh) }));
-    $("#stockResponse").textContent = "正在同步…";
-    try {
-      const data = await postJson("/api/seller/products/stocks", { stocks });
-      $("#stockResponse").textContent = JSON.stringify(data, null, 2);
-      toast("库存同步已提交", "success");
-    } catch (error) {
-      $("#stockResponse").textContent = error.message;
-      toast(error.message, "error");
-    }
+    renderStockRows(items, whItems);
+  } catch (e) {
+    if (body) body.innerHTML = `<tr><td colspan="5" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+function renderStockRows(items, whItems) {
+  const body = $("#stockBody");
+  if (!body) return;
+  if (!items.length) { body.innerHTML = `<tr><td colspan="5" class="empty">店铺里还没有商品</td></tr>`; return; }
+  body.innerHTML = items.map((it, i) => `
+    <tr data-sku="${escapeAttr(it.offer_id || '')}" data-name="${escapeAttr(it.name || '')}">
+      <td><input type="checkbox" data-row="${i}" /></td>
+      <td class="wrap">${escapeHtml(it.name || it.offer_id || "—")}</td>
+      <td><span class="muted">${escapeHtml(it.offer_id || "—")}</span></td>
+      <td><input type="number" min="0" value="0" data-field="present" data-row="${i}" style="width: 90px" /></td>
+      <td><input type="number" min="0" value="0" data-field="reserved" data-row="${i}" style="width: 90px" /></td>
+    </tr>`).join("");
+  // 复选框变化
+  $$("#stockBody input[type=checkbox]").forEach((c) => c.addEventListener("change", updateStockSelectedMeta));
+  $$("#stockBody input[type=number]").forEach((i) => i.addEventListener("input", updateStockSelectedMeta));
+  updateStockSelectedMeta();
+}
+
+function filterStockRows() {
+  const q = ($("#stockSearch")?.value || "").toLowerCase().trim();
+  $$("#stockBody tr").forEach((tr) => {
+    const sku = (tr.getAttribute("data-sku") || "").toLowerCase();
+    const name = (tr.getAttribute("data-name") || "").toLowerCase();
+    tr.style.display = (q && !sku.includes(q) && !name.includes(q)) ? "none" : "";
   });
+  updateStockSelectedMeta();
+}
+
+function updateStockSelectedMeta() {
+  const all = $$("#stockBody input[type=checkbox]");
+  const checked = all.filter((c) => c.checked);
+  const meta = $("#stockSelectedMeta");
+  if (meta) meta.textContent = `已选 ${checked.length} / ${all.length}（改过库存的行用蓝色边框）`;
+  // 给改过值的行加个视觉提示
+  $$("#stockBody tr").forEach((tr) => {
+    const present = tr.querySelector("input[data-field=present]");
+    const dirty = present && Number(present.value) > 0;
+    tr.style.background = dirty ? "#fff8e1" : "";
+  });
+}
+
+async function submitStock() {
+  const wh = Number($("#stockWarehouseId")?.value);
+  if (!wh) { toast("请先选择仓库", "error"); return; }
+  const rows = $$("#stockBody tr");
+  const stocks = [];
+  for (const tr of rows) {
+    const cb = tr.querySelector("input[type=checkbox]");
+    if (!cb || !cb.checked) continue;
+    const sku = tr.getAttribute("data-sku");
+    if (!sku) continue;
+    const present = Number(tr.querySelector("input[data-field=present]")?.value || 0);
+    const reserved = Number(tr.querySelector("input[data-field=reserved]")?.value || 0);
+    stocks.push({ sku, warehouse_id: wh, present, reserved });
+  }
+  if (!stocks.length) { toast("请至少勾选一行", "error"); return; }
+  if (!confirm(`即将提交 ${stocks.length} 条库存更新到 Ozon，确认？`)) return;
+  const out = $("#stockResponse");
+  out.textContent = "正在提交…";
+  try {
+    const data = await postJson("/api/seller/products/stocks", { stocks });
+    out.textContent = JSON.stringify(data, null, 2);
+    toast(`已提交 ${stocks.length} 条`, "success");
+  } catch (e) {
+    out.textContent = e.message;
+    toast(e.message, "error");
+  }
 }
 
 /* ============== AI 商品套图 ==================== */
@@ -900,53 +1007,220 @@ function renderProductImages(root) {
   root.innerHTML = `
     <div class="card">
       <div class="card-head">
-        <h2>AI 商品套图 <span class="badge blue">占位</span></h2>
-        <span class="meta">本项目暂未启用图像生成</span>
+        <h2>AI 商品套图 <span class="badge green">已接入 MiniMax</span></h2>
+        <span class="meta" id="imgModelLabel">模型：image-01</span>
+        <span class="meta" id="imgStatus">就绪</span>
       </div>
-      <p class="muted">功能描述：上传商品图，AI 立刻生成符合多电商平台规范的高转化率商品套图。</p>
-      <p class="muted">当前 MiniMax-M3 是文本模型，不支持图像生成。该功能等接入图像生成 API（Gemini Pro / 第三方服务）后启用。</p>
+      <p class="muted">上传商品原图 → MiniMax 图生图（i2i）生成 N 张不同场景的套图。也支持纯文字 → 图片（T2I）。</p>
     </div>
     <div class="two-col">
       <div class="card">
-        <div class="card-head"><h2>商品原图</h2><span class="meta">单张 ≤ 10MB · jpg / jpeg / png</span></div>
-        <div class="upload-area">
-          <div class="upload-icon">⬆</div>
-          <div>点击、拖拽、或 <kbd>Ctrl/⌘+V</kbd> 粘贴图片</div>
-          <div class="muted">推荐白底或纯净背景的主体清晰图</div>
+        <div class="card-head"><h2>商品原图</h2><span class="meta">支持 URL 或本地 → 上传后转 dataURL</span></div>
+        <label class="field"><span>原图 URL（可留空，走纯文字生成）</span>
+          <input id="imgRefUrl" type="text" placeholder="https://cdn.example.com/your-product.jpg" />
+        </label>
+        <div class="row" style="grid-template-columns: auto 1fr; gap: 8px; align-items: center">
+          <input type="file" id="imgFile" accept="image/*" />
+          <span class="muted" id="imgFileName">未选择</span>
         </div>
+        <div id="imgPreview" class="upload-area">点击上方选文件，或拖入 / 粘贴图片</div>
       </div>
       <div class="card">
-        <div class="card-head"><h2>套图预览</h2><button class="button small" disabled>↓ 下载全部</button></div>
-        <div class="empty">上传商品图后，这里会显示 AI 生成的 8 张场景图。</div>
+        <div class="card-head">
+        <h2>套图预览</h2>
+        <span class="meta" id="imgUsageMeta">未生成</span>
+      </div>
+        <div style="display:grid; grid-template-columns: 1fr 180px; gap: 12px">
+          <div id="imgResult" class="image-grid"><div class="empty">生成结果会显示在这里。</div></div>
+          <div>
+            <div class="muted" style="font-size:11.5px; margin-bottom: 4px">已选中：</div>
+            <div id="imgSelected" class="upload-area" style="min-height: 140px; padding: 8px; justify-content:flex-start"><span class="muted">未选中</span></div>
+            <button class="button small" id="imgFillUpload" style="margin-top: 6px; width: 100%">填到上架页图片</button>
+          </div>
+        </div>
       </div>
     </div>
     <div class="card">
       <div class="card-head"><h2>生成设置</h2></div>
-      <label class="field"><span>生成模型</span>
-        <div class="model-pick">
-          <div class="model-card disabled">
-            <div class="model-name">⚡ Gemini Pro · 高质量</div>
-            <div class="model-meta">100 套电商模板自动选场景 · 渲染本地化文案</div>
-            <button class="button small" disabled>切换</button>
-          </div>
-        </div>
-      </label>
-      <div class="row" style="grid-template-columns: 1fr 1fr 1fr; gap: 8px">
-        <label class="field"><span>平台</span><select disabled><option>OZON</option></select></label>
-        <label class="field"><span>语言</span><select disabled><option>俄语</option></select></label>
-        <label class="field"><span>比例</span><select disabled><option>3:4</option></select></label>
+      <div class="row" style="grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px">
+        <label class="field"><span>模型</span>
+          <select id="imgModel">
+            <option value="image-01">image-01（标准）</option>
+            <option value="image-01-live">image-01-live（更快）</option>
+          </select>
+        </label>
+        <label class="field"><span>比例</span>
+          <select id="imgRatio">
+            <option value="3:4" selected>3:4（OZON 主图）</option>
+            <option value="1:1">1:1（方形）</option>
+            <option value="4:3">4:3（横版）</option>
+            <option value="16:9">16:9（宽屏）</option>
+          </select>
+        </label>
+        <label class="field"><span>张数</span>
+          <input id="imgN" type="number" min="1" max="8" value="4" />
+        </label>
+        <label class="field"><span>场景</span>
+          <select id="imgScenePreset">
+            <option value="custom">自定义</option>
+            <option value="white">白底</option>
+            <option value="lifestyle">生活场景</option>
+            <option value="model">模特</option>
+            <option value="detail">细节</option>
+            <option value="bundle">搭配/组合</option>
+          </select>
+        </label>
       </div>
-      <label class="field"><span>商品卖点 & 要求</span>
-        <div class="row" style="grid-template-columns: 1fr auto; gap: 8px">
-          <textarea id="imgSellingPoints" placeholder="建议：1. 产品名称  2. 核心卖点  3. 适用人群  4. 期望场景" disabled></textarea>
-          <button class="button" disabled>⚡ AI 帮写</button>
-        </div>
+      <label class="field"><span>场景描述 / Prompt</span>
+        <textarea id="imgPrompt" placeholder="例如：transparent phone case on clean white background, soft shadow, product photography, 4k"></textarea>
       </label>
       <div class="filter-bar" style="justify-content: space-between; margin-top: 8px">
-        <span class="muted">⚡ 生成一套 8 张套图，消耗 400 MY币</span>
-        <button class="button primary" disabled>⚡ 一键生成爆款套图</button>
+        <span class="muted">💡 留空原图 = 纯文字出图；填原图 = 图生图（推荐）</span>
+        <button class="button primary" id="imgGenerateBtn">⚡ 一键生成</button>
       </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>原响应</h2></div>
+      <pre id="imgResponse" class="response-area">点击「一键生成」后这里会显示 MiniMax 的返回 JSON。</pre>
     </div>`;
+  bindImageHandlers();
+}
+
+function bindImageHandlers() {
+  const fileInput = $("#imgFile");
+  const fileName = $("#imgFileName");
+  const preview = $("#imgPreview");
+  const refUrl = $("#imgRefUrl");
+  const promptBox = $("#imgPrompt");
+  const sceneSel = $("#imgScenePreset");
+  const modelSel = $("#imgModel");
+  const modelLabel = $("#imgModelLabel");
+  const statusEl = $("#imgStatus");
+
+  // 模型切换更新顶部 label
+  modelSel?.addEventListener("change", () => {
+    modelLabel.textContent = `模型：${modelSel.value}`;
+  });
+  modelLabel.textContent = `模型：${modelSel.value}`;
+
+  // 场景预设 → 自动填 prompt
+  const scenePrompts = {
+    white: "clean white background, soft natural shadow, product photography, e-commerce listing, sharp focus, 4k",
+    lifestyle: "in a real lifestyle setting, on a wooden table, warm natural lighting, cozy atmosphere, 4k, photorealistic",
+    model: "held by a young woman, casual outfit, soft daylight, lifestyle photography, e-commerce hero shot, 4k",
+    detail: "macro close-up, shallow depth of field, fine texture detail, studio lighting, 4k",
+    bundle: "with complementary accessories, flat lay composition, clean white surface, 4k, e-commerce bundle shot",
+  };
+  sceneSel?.addEventListener("change", () => {
+    if (sceneSel.value !== "custom") {
+      promptBox.value = scenePrompts[sceneSel.value] || "";
+    }
+  });
+
+  // 文件 → 转 dataURL 预览 + 自动填
+  fileInput?.addEventListener("change", () => {
+    const f = fileInput.files?.[0];
+    if (!f) return;
+    fileName.textContent = `${f.name}（${Math.round(f.size / 1024)}KB）`;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = reader.result;
+      preview.innerHTML = `<img src="${dataUrl}" style="max-width:100%; max-height:200px; object-fit:contain;">`;
+      // 暂存 dataURL 到全局
+      state._imgDataUrl = dataUrl;
+    };
+    reader.readAsDataURL(f);
+  });
+
+  // 粘贴图片
+  preview?.addEventListener("paste", (e) => {
+    const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items || [];
+    for (const it of items) {
+      if (it.kind === "file" && it.type.startsWith("image/")) {
+        const f = it.getAsFile();
+        if (f) {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const dataUrl = reader.result;
+            preview.innerHTML = `<img src="${dataUrl}" style="max-width:100%; max-height:200px; object-fit:contain;">`;
+            state._imgDataUrl = dataUrl;
+          };
+          reader.readAsDataURL(f);
+        }
+      }
+    }
+  });
+
+  $("#imgFillUpload")?.addEventListener("click", () => {
+    if (!state._selectedGeneratedImage) { toast("请先在套图里点「用此图」选一张", "error"); return; }
+    const imgs = $("#sellerImagesInput");
+    if (imgs) { imgs.value = state._selectedGeneratedImage; }
+    navigate("products/upload");
+    setTimeout(() => {
+      const imgs2 = $("#sellerImagesInput");
+      if (imgs2) imgs2.value = state._selectedGeneratedImage;
+      toast("已填入图片 URL。点「上架」即可提交。", "success");
+    }, 100);
+  });
+
+  $("#imgGenerateBtn")?.addEventListener("click", async () => {
+    const prompt = promptBox.value.trim();
+    if (!prompt) { toast("请填写 prompt（或选场景预设）", "error"); return; }
+    const ratio = $("#imgRatio").value;
+    const n = Number($("#imgN").value || 4);
+    const model = modelSel.value;
+    const url = refUrl.value.trim();
+
+    // 优先 URL，否则用 dataURL
+    let refImage = null;
+    if (url) refImage = [url];
+    else if (state._imgDataUrl) refImage = [state._imgDataUrl];
+
+    statusEl.textContent = "生成中…";
+    statusEl.className = "meta";
+    $("#imgGenerateBtn").disabled = true;
+    const out = $("#imgResponse");
+    out.textContent = "正在调 MiniMax 图生图…";
+    try {
+      const data = await postJson("/api/seller/images/generate", {
+        prompt, image: refImage, aspectRatio: ratio, n, model,
+      });
+      const imgs = data.data?.images || [];
+      const usage = data.usage || {};
+      out.textContent = JSON.stringify(data, null, 2);
+      if (imgs.length) {
+        $("#imgResult").innerHTML = imgs.map((u, i) => `
+          <div class="image-cell" data-idx="${i}">
+            <a href="${escapeAttr(u)}" target="_blank" rel="noreferrer"><img src="${escapeAttr(u)}"></a>
+            <div class="image-actions">
+              <a class="button small" href="${escapeAttr(u)}" download="image-${Date.now()}-${i}.jpg" target="_blank" rel="noreferrer">下载</a>
+              <button class="button small" data-use="${i}">用此图</button>
+            </div>
+          </div>`).join("");
+        $$("#imgResult [data-use]").forEach((b) => b.addEventListener("click", () => {
+          const idx = Number(b.getAttribute("data-use"));
+          const url = imgs[idx];
+          state._selectedGeneratedImage = url;
+          $("#imgSelected").innerHTML = `<img src="${escapeAttr(url)}" style="max-width:140px; max-height:140px; object-fit:contain; border:1px solid var(--green); border-radius:6px;"><div class="muted" style="margin-top:4px; font-size:11px">已选中 #${idx + 1}</div>`;
+          toast("已选中此图。点下方「填到上架页图片」一键带入。", "success");
+        }));
+        $("#imgUsageMeta").textContent = `${imgs.length} 张 · 模型 ${usage.model} · $${(usage.estimatedCostUsd || 0).toFixed(4)}`;
+        statusEl.textContent = `完成 · ${imgs.length} 张`;
+        statusEl.className = "meta";
+        toast(`生成完成：${imgs.length} 张图`, "success");
+      } else {
+        $("#imgResult").innerHTML = `<div class="empty">${escapeHtml(out.textContent.slice(0, 200))}</div>`;
+        statusEl.textContent = "失败";
+        toast("生成失败：详见响应", "error");
+      }
+    } catch (error) {
+      out.textContent = error.message;
+      statusEl.textContent = "失败";
+      toast(error.message, "error");
+    } finally {
+      $("#imgGenerateBtn").disabled = false;
+    }
+  });
 }
 
 /* ============== 订单列表 ==================== */
@@ -995,7 +1269,7 @@ async function renderOrderList(root) {
     </div>
     <div class="card">
       <div class="table-wrap"><table>
-        <thead><tr><th>货件号</th><th>状态</th><th>店铺</th><th>商品</th><th>仓库 / 配送</th><th>金额</th><th>创建时间</th></tr></thead>
+        <thead><tr><th style="min-width:160px">货件号</th><th>状态</th><th class="wrap" style="min-width:200px">商品</th><th>仓库</th><th>配送</th><th>金额</th><th>时间</th><th></th></tr></thead>
         <tbody id="orderBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
       </table></div>
     </div>`;
@@ -1019,29 +1293,94 @@ async function loadOrders() {
   const search = ($("#orderSearch")?.value || "").toLowerCase();
   const body = $("#orderBody");
   const countEl = $("#orderCountValue");
-  if (body) body.innerHTML = `<tr><td colspan="7" class="empty"><span class="spinner"></span> 加载中…</td></tr>`;
+  if (body) body.innerHTML = `<tr><td colspan="8" class="empty"><span class="spinner"></span> 加载中…</td></tr>`;
   try {
     const data = await getJson(`/api/seller/orders?limit=${limit}&status=${encodeURIComponent(status)}`);
-    let items = data.data?.items || data.data?.result?.items || [];
+    let items = (data.data?.result?.postings || data.data?.items || data.data?.result?.items || []).slice();
     if (search) items = items.filter((it) => (it.order_number || it.posting_number || it.id || "").toLowerCase().includes(search));
     if (countEl) countEl.textContent = String(items.length);
-    if (!items.length) { body.innerHTML = `<tr><td colspan="7" class="empty">无订单数据（Ozon /v2/postings/list 接口暂未返回结果，请检查 Seller API 权限）</td></tr>`; return; }
-    body.innerHTML = items.slice(0, limit).map((it) => {
-      const products = (it.products || []).map((p) => p.name || p.sku || "").join("；");
-      const wh = it.warehouse_name || it.delivery_method || "—";
-      return `<tr>
-        <td><span class="muted">${escapeHtml(it.order_number || it.posting_number || it.id || "—")}</span></td>
+    state._orders = items;
+    if (!items.length) { body.innerHTML = `<tr><td colspan="8" class="empty">无订单数据（最近 90 天没有匹配的订单）</td></tr>`; return; }
+    body.innerHTML = items.slice(0, limit).map((it, idx) => {
+      const products = (it.products || []);
+      const productSummary = products.map((p) => `${escapeHtml(p.name || p.sku || "—")} ×${p.quantity || p.qty || 1}`).slice(0, 2).join("；");
+      const more = products.length > 2 ? `<span class="muted">（还有 ${products.length - 2} 个）</span>` : "";
+      const dm = it.delivery_method || {};
+      const dmName = dm.name || "—";
+      const wh = it.warehouse || it.warehouse_name || (dm.warehouse_id ? "仓库#" + dm.warehouse_id : "—");
+      const price = it.financial_data?.total_price || it.total_price || (it.financial_data?.posting_services?.total_price) || "—";
+      return `<tr data-idx="${idx}" class="order-row" style="cursor:pointer">
+        <td class="muted" style="min-width:160px">${escapeHtml(it.order_number || it.posting_number || it.id || "—")}</td>
         <td>${statusBadge(it.status)}</td>
-        <td>${escapeHtml(it.cluster_name || it.warehouse_name || "—")}</td>
-        <td>${escapeHtml(products.slice(0, 80))}</td>
+        <td class="wrap" style="min-width:200px; max-width:320px">${productSummary} ${more}</td>
         <td>${escapeHtml(wh)}</td>
-        <td>${escapeHtml(it.total_price || "—")}</td>
-        <td><span class="muted">${escapeHtml(formatTime(it.created_at))}</span></td>
+        <td class="muted" style="font-size:11px">${escapeHtml(dmName)}</td>
+        <td>${escapeHtml(String(price))}</td>
+        <td class="muted">${escapeHtml(formatTime(it.in_process_at || it.created_at || it.shipment_date))}</td>
+        <td><button class="button small" data-detail="${idx}">详情</button></td>
       </tr>`;
     }).join("");
+    $$("#orderBody [data-detail]").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.getAttribute("data-detail"));
+        showOrderDetail(state._orders?.[idx]);
+      });
+    });
   } catch (error) {
-    if (body) body.innerHTML = `<tr><td colspan="7" class="empty">加载失败：${escapeHtml(error.message)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="8" class="empty">加载失败：${escapeHtml(error.message)}</td></tr>`;
   }
+}
+
+function showOrderDetail(posting) {
+  if (!posting) return;
+  const dm = posting.delivery_method || {};
+  const prods = (posting.products || []).map((p) => `<tr><td>${escapeHtml(p.name || p.sku || "—")}</td><td>${escapeHtml(p.sku || p.offer_id || "—")}</td><td>${p.quantity || 1}</td><td>${escapeHtml(p.price || "—")}</td></tr>`).join("");
+  const addr = posting.addressee || {};
+  const f = posting.financial_data || {};
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>订单 ${escapeHtml(posting.posting_number || "")}</title>
+<style>
+body { font: 13px -apple-system, sans-serif; padding: 20px; max-width: 720px; margin: 0 auto; }
+h1 { font-size: 16px; margin: 0 0 12px; }
+.row { display: grid; grid-template-columns: 130px 1fr; gap: 6px 12px; margin-bottom: 8px; }
+.k { color: #666; }
+table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+th, td { padding: 6px 8px; border-bottom: 1px solid #e3e6e1; text-align: left; font-size: 12px; }
+th { background: #f6f7f5; }
+.section { background: #fff; border: 1px solid #e3e6e1; border-radius: 6px; padding: 12px; margin-bottom: 12px; }
+h2 { font-size: 13px; margin: 0 0 8px; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; background: #e6f1eb; color: #245744; }
+</style></head><body>
+<h1>订单详情 · ${escapeHtml(posting.posting_number || posting.order_number || "")}</h1>
+<div class="section">
+  <div class="row"><span class="k">状态</span><span>${escapeHtml(posting.status || "—")}</span></div>
+  <div class="row"><span class="k">店铺</span><span>${escapeHtml(posting.cluster_name || "—")}</span></div>
+  <div class="row"><span class="k">仓库</span><span>${escapeHtml(posting.warehouse || (dm.warehouse_id ? "仓库#" + dm.warehouse_id : "—"))}</span></div>
+  <div class="row"><span class="k">配送方式</span><span>${escapeHtml(dm.name || "—")} (tpl_provider: ${escapeHtml(dm.tpl_provider || "—")})</span></div>
+  <div class="row"><span class="k">追踪号</span><span class="muted">${escapeHtml(posting.tracking_number || "—")}</span></div>
+  <div class="row"><span class="k">进入处理</span><span>${escapeHtml(posting.in_process_at || "—")}</span></div>
+  <div class="row"><span class="k">应发货</span><span>${escapeHtml(posting.shipment_date || "—")}</span></div>
+  <div class="row"><span class="k">运输中</span><span>${escapeHtml(posting.delivering_date || "—")}</span></div>
+</div>
+<div class="section">
+  <h2>商品</h2>
+  <table><thead><tr><th>名称</th><th>SKU / offer_id</th><th>数量</th><th>价格</th></tr></thead><tbody>${prods || '<tr><td colspan="4" class="muted">无</td></tr>'}</tbody></table>
+</div>
+${addr.name ? `<div class="section"><h2>收件人</h2>
+  <div class="row"><span class="k">姓名</span><span>${escapeHtml(addr.name || "")}</span></div>
+  <div class="row"><span class="k">电话</span><span>${escapeHtml(addr.phone || "")}</span></div>
+  <div class="row"><span class="k">地址</span><span>${escapeHtml(addr.address || "")}</span></div>
+</div>` : ''}
+${Object.keys(f).length ? `<div class="section"><h2>财务</h2>
+  <div class="row"><span class="k">总价</span><span>${escapeHtml(f.total_price || "—")}</span></div>
+  <div class="row"><span class="k">佣金</span><span>${escapeHtml(f.commission_amount || "—")}</span></div>
+  <div class="row"><span class="k">服务费</span><span>${escapeHtml(f.services_amount || "—")}</span></div>
+  <div class="row"><span class="k">物流</span><span>${escapeHtml(f.delivery_price || "—")}</span></div>
+</div>` : ''}
+</body></html>`;
+  const w = window.open("", "_blank", "width=720,height=800");
+  if (w) { w.document.write(html); w.document.close(); }
+  else { toast("浏览器拦截了弹窗", "error"); }
 }
 
 /* ============== 工具页 ==================== */
@@ -1084,7 +1423,7 @@ async function renderToolsHistory(root) {
         <div class="stat-card"><div class="label">历史文件</div><div class="value">…</div></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th>任务</th><th>进度</th><th>更新时间</th><th>下载</th></tr></thead>
+        <thead><tr><th style="min-width:140px">任务</th><th>进度</th><th>时间</th><th>下载</th></tr></thead>
         <tbody id="historyBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
       </table></div>
     </div>`;
@@ -1106,7 +1445,7 @@ async function loadHistory() {
     if (!items.length) { body.innerHTML = `<tr><td colspan="4" class="empty">还没有历史 Excel</td></tr>`; return; }
     body.innerHTML = items.slice(0, 50).map((it) => `
       <tr>
-        <td>${escapeHtml(it.kind === "batch-ozon" ? "批量采集" : "单品找货")}<br><span class="muted">${escapeHtml((it.id || "").slice(0, 8))}</span></td>
+        <td class="wrap"><div>${escapeHtml(it.kind === "batch-ozon" ? "批量采集" : "单品找货")}</div><span class="muted">${escapeHtml((it.id || "").slice(0, 8))}</span></td>
         <td>${it.processed || 0} / ${it.total || 0}</td>
         <td><span class="muted">${escapeHtml(formatTime(it.updatedAt))}</span></td>
         <td>${it.downloadUrl ? `<a class="button small" href="${escapeAttr(it.downloadUrl)}">下载</a>` : ""}</td>
@@ -1158,7 +1497,16 @@ $$(".nav-item, .nav-subitem").forEach((el) => {
   el.addEventListener("click", (e) => {
     e.preventDefault();
     const route = el.getAttribute("data-route");
-    if (route) navigate(route);
+    if (!route) return;
+    // 顶级栏目且有子项 → 自动展开 + 跳到第一个子项
+    if (el.classList.contains("nav-item")) {
+      const firstSub = document.querySelector(`.nav-subitem[data-parent="${route}"]`);
+      if (firstSub) {
+        navigate(firstSub.getAttribute("data-route"));
+        return;
+      }
+    }
+    navigate(route);
   });
 });
 
