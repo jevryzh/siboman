@@ -15,14 +15,17 @@
             <p>批量抓取 Ozon 商品信息，并用主图查找 1688 候选货源。</p>
           </div>
           <div class="toolbar-actions">
+            <span class="current-user" id="currentUser" hidden></span>
             <button id="open1688Btn" class="button secondary" type="button">打开 1688 登录窗口</button>
             <button id="closeBrowserBtn" class="button quiet" type="button">关闭浏览器</button>
+            <button id="logoutBtn" class="button quiet" type="button">退出登录</button>
           </div>
         </div>
 
         <div class="mode-tabs">
           <button class="mode-tab active" data-mode="single" type="button">单品找货</button>
           <button class="mode-tab" data-mode="batch" type="button">批量采集模式</button>
+          <button class="mode-tab" data-mode="seller" type="button">上架到 Ozon</button>
         </div>
 
         <div id="singleModePanel" class="input-grid mode-panel">
@@ -121,7 +124,84 @@
           </div>
         </div>
 
-        <section class="status-band">
+        <div id="sellerModePanel" class="input-grid mode-panel hidden">
+          <div class="settings seller-settings">
+            <div class="seller-row">
+              <button id="sellerTestBtn" class="button secondary" type="button">测试连接</button>
+              <span id="sellerStatus" class="seller-status">未连接</span>
+            </div>
+
+            <label class="field">
+              <span>类目 ID <small>（在 Ozon 卖家后台查好后填，比如手机壳）</small></span>
+              <input id="sellerCategoryIdInput" type="text" inputmode="numeric" placeholder="例如 17032807" />
+            </label>
+
+            <label class="field">
+              <span>商品标题</span>
+              <input id="sellerNameInput" type="text" placeholder="例如 透明手机壳 适配 iPhone 15" />
+            </label>
+
+            <div class="range-inputs">
+              <label class="field">
+                <span>SKU（你自己店铺里的唯一编码）</span>
+                <input id="sellerSkuInput" type="text" placeholder="例如 OZ-IP15-CASE-001" />
+              </label>
+              <label class="field">
+                <span>Barcode（可选）</span>
+                <input id="sellerBarcodeInput" type="text" placeholder="例如 6901234567890" />
+              </label>
+            </div>
+
+            <div class="range-inputs">
+              <label class="field">
+                <span>售价（卖家后台币种）</span>
+                <input id="sellerPriceInput" type="text" placeholder="例如 999.00" />
+              </label>
+              <label class="field">
+                <span>重量（克，含包装）</span>
+                <input id="sellerWeightInput" type="text" placeholder="例如 80" />
+              </label>
+            </div>
+
+            <div class="range-inputs">
+              <label class="field">
+                <span>长 (cm)</span>
+                <input id="sellerDepthInput" type="text" placeholder="例如 18" />
+              </label>
+              <label class="field">
+                <span>宽 (cm)</span>
+                <input id="sellerWidthInput" type="text" placeholder="例如 9" />
+              </label>
+              <label class="field">
+                <span>高 (cm)</span>
+                <input id="sellerHeightInput" type="text" placeholder="例如 2" />
+              </label>
+            </div>
+
+            <label class="field">
+              <span>图片 URL <small>（一行一张，Ozon 会自己下载）</small></span>
+              <textarea id="sellerImagesInput" spellcheck="false" placeholder="https://cdn.example.com/img1.jpg&#10;https://cdn.example.com/img2.jpg"></textarea>
+            </label>
+
+            <label class="field">
+              <span>类目属性（JSON 数组） <small>（从 /v1/description-category/attribute 拿到 schema 后填入）</small></span>
+              <textarea id="sellerAttributesInput" class="code-area" spellcheck="false" placeholder='[{"id": 85, "values": [{"value": "Прозрачный"}]}]'></textarea>
+            </label>
+
+            <div class="run-actions">
+              <button id="sellerLoadSampleBtn" class="button quiet" type="button">载入手机壳样例</button>
+              <button id="sellerImportBtn" class="button primary" type="button">上架</button>
+              <button id="sellerClearBtn" class="button quiet" type="button">清空</button>
+            </div>
+
+            <label class="field">
+              <span>Ozon 返回（原文）</span>
+              <pre id="sellerResponse" class="response-area">点击"测试连接"或"上架"后这里会显示 Ozon 的响应。</pre>
+            </label>
+          </div>
+        </div>
+
+        
           <div>
             <span class="label">状态</span>
             <strong id="statusText">待开始</strong>

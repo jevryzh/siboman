@@ -33,6 +33,9 @@ const AI_CONFIDENCE_THRESHOLD = Number(process.env.AI_CONFIDENCE_THRESHOLD || 0.
 const MINIMAX_INPUT_USD_PER_M = Number(process.env.MINIMAX_INPUT_USD_PER_M || 0.30);
 const MINIMAX_OUTPUT_USD_PER_M = Number(process.env.MINIMAX_OUTPUT_USD_PER_M || 1.20);
 const LOW_PRICE_THRESHOLD_RMB = Number(process.env.LOW_PRICE_THRESHOLD_RMB || 1);
+const OZON_SELLER_BASE_URL = (process.env.OZON_SELLER_BASE_URL || "https://api-seller.ozon.ru").replace(/\/$/, "");
+const OZON_SELLER_CLIENT_ID = process.env.OZON_SELLER_CLIENT_ID || "";
+const OZON_SELLER_API_KEY = process.env.OZON_SELLER_API_KEY || "";
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
 const DETAIL_DELAY_MIN_MS = Number(process.env.DETAIL_DELAY_MIN_MS || 2500);
@@ -451,6 +454,81 @@ app.post("/api/browser/close", async (_req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+async function callOzonSellerAPI(path, body, { method = "POST" } = {}) {
+  if (!OZON_SELLER_CLIENT_ID || !OZON_SELLER_API_KEY) {
+    const error = new Error("服务端没有配置 OZON_SELLER_CLIENT_ID / OZON_SELLER_API_KEY，请到 .env 里填写。");
+    error.statusCode = 503;
+    throw error;
+  }
+  const response = await fetch(`${OZON_SELLER_BASE_URL}${path}`, {
+    method,
+    headers: {
+      "Client-Id": OZON_SELLER_CLIENT_ID,
+      "Api-Key": OZON_SELLER_API_KEY,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await response.text();
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text.slice(0, 4000) };
+    }
+  }
+  if (!response.ok) {
+    const detail = typeof payload === "object" && payload
+      ? JSON.stringify(payload).slice(0, 1500)
+      : String(text).slice(0, 1500);
+    const error = new Error(`Ozon Seller API ${response.status} ${response.statusText || ""}：${detail}`);
+    error.statusCode = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload;
+}
+
+function sellerConfiguredResponse(_req, res) {
+  res.json({
+    success: true,
+    configured: Boolean(OZON_SELLER_CLIENT_ID && OZON_SELLER_API_KEY),
+    baseUrl: OZON_SELLER_BASE_URL,
+  });
+}
+
+app.get("/api/seller/status", sellerConfiguredResponse);
+
+app.post("/api/seller/test", async (req, res, next) => {
+  try {
+    // 用最轻量的 list 接口验证鉴权
+    const data = await callOzonSellerAPI("/v3/product/list", { filter: { visibility: "ALL" }, limit: 1 });
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
+  }
+});
+
+app.post("/api/seller/products/import", async (req, res, next) => {
+  try {
+    const item = req.body?.item;
+    if (!item || typeof item !== "object") {
+      res.status(400).json({ success: false, error: "请求体需要包含 item 字段（单个商品对象）。" });
+      return;
+    }
+    if (!item.name || !item.sku || !item.category_id) {
+      res.status(400).json({ success: false, error: "item 至少需要 name / sku / category_id 三个字段。" });
+      return;
+    }
+    const data = await callOzonSellerAPI("/v3/products/import", { items: [item] });
+    res.json({ success: true, data });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
 });
 

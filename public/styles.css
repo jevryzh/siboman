@@ -97,6 +97,12 @@ p,
   font-size: 14px;
 }
 
+.current-user {
+  color: var(--muted);
+  font-size: 13px;
+  align-self: center;
+}
+
 .toolbar-actions,
 .run-actions {
   gap: 8px;
@@ -435,6 +441,54 @@ td img {
 
 .hidden {
   display: none;
+}
+
+.seller-settings {
+  grid-template-columns: 1fr;
+  gap: 12px;
+}
+
+.seller-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.seller-status {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.seller-status.configured {
+  color: var(--green);
+  font-weight: 650;
+}
+
+.code-area,
+.response-area {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  min-height: 130px;
+  resize: vertical;
+  padding: 10px 12px;
+  line-height: 1.5;
+  background: #fbfcfa;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+.response-area {
+  min-height: 160px;
+  max-height: 320px;
+  overflow: auto;
+}
+
+textarea.code-area {
+  width: 100%;
+  min-height: 130px;
 }
 
 @media (max-width: 1050px) {

@@ -13,6 +13,24 @@ const batchDelayMinInput = document.querySelector("#batchDelayMinInput");
 const batchDelayMaxInput = document.querySelector("#batchDelayMaxInput");
 const batchMaxConsecutiveFailuresInput = document.querySelector("#batchMaxConsecutiveFailuresInput");
 const batchHeadlessInput = document.querySelector("#batchHeadlessInput");
+const sellerModePanel = document.querySelector("#sellerModePanel");
+const sellerTestBtn = document.querySelector("#sellerTestBtn");
+const sellerStatus = document.querySelector("#sellerStatus");
+const sellerCategoryIdInput = document.querySelector("#sellerCategoryIdInput");
+const sellerNameInput = document.querySelector("#sellerNameInput");
+const sellerSkuInput = document.querySelector("#sellerSkuInput");
+const sellerBarcodeInput = document.querySelector("#sellerBarcodeInput");
+const sellerPriceInput = document.querySelector("#sellerPriceInput");
+const sellerWeightInput = document.querySelector("#sellerWeightInput");
+const sellerDepthInput = document.querySelector("#sellerDepthInput");
+const sellerWidthInput = document.querySelector("#sellerWidthInput");
+const sellerHeightInput = document.querySelector("#sellerHeightInput");
+const sellerImagesInput = document.querySelector("#sellerImagesInput");
+const sellerAttributesInput = document.querySelector("#sellerAttributesInput");
+const sellerImportBtn = document.querySelector("#sellerImportBtn");
+const sellerLoadSampleBtn = document.querySelector("#sellerLoadSampleBtn");
+const sellerClearBtn = document.querySelector("#sellerClearBtn");
+const sellerResponse = document.querySelector("#sellerResponse");
 const maxCandidatesInput = document.querySelector("#maxCandidatesInput");
 const delayMinInput = document.querySelector("#delayMinInput");
 const delayMaxInput = document.querySelector("#delayMaxInput");
@@ -27,6 +45,8 @@ const cancelBtn = document.querySelector("#cancelBtn");
 const batchCancelBtn = document.querySelector("#batchCancelBtn");
 const open1688Btn = document.querySelector("#open1688Btn");
 const closeBrowserBtn = document.querySelector("#closeBrowserBtn");
+const logoutBtn = document.querySelector("#logoutBtn");
+const currentUser = document.querySelector("#currentUser");
 const clearLogBtn = document.querySelector("#clearLogBtn");
 const refreshHistoryBtn = document.querySelector("#refreshHistoryBtn");
 const statusText = document.querySelector("#statusText");
@@ -195,6 +215,14 @@ async function initRuntimeMode() {
   try {
     const data = await fetchJson("/api/auth/status");
     collectorMode = Boolean(data.collectorMode);
+    if (data.user) {
+      const label = data.user.display_name || data.user.username || "";
+      const role = data.user.role && data.user.role !== "user" ? `（${data.user.role}）` : "";
+      if (label) {
+        currentUser.textContent = `当前账号：${label}${role}`;
+        currentUser.hidden = false;
+      }
+    }
     if (collectorMode) {
       open1688Btn.textContent = "本机采集端已接管";
       closeBrowserBtn.textContent = "本机采集端管理中";
@@ -207,13 +235,141 @@ async function initRuntimeMode() {
   }
 }
 
+sellerTestBtn.addEventListener("click", async () => {
+  sellerTestBtn.disabled = true;
+  sellerResponse.textContent = "正在测试连接 ...";
+  try {
+    const data = await postJson("/api/seller/test", {});
+    sellerStatus.textContent = "连接成功";
+    sellerStatus.classList.add("configured");
+    sellerResponse.textContent = JSON.stringify(data, null, 2);
+    appendLocalLog("Ozon Seller API 连接成功。");
+  } catch (error) {
+    sellerStatus.textContent = `连接失败：${error.message}`;
+    sellerStatus.classList.remove("configured");
+    sellerResponse.textContent = error.message;
+    appendLocalLog(`Ozon Seller API 测试连接失败：${error.message}`, "error");
+  } finally {
+    sellerTestBtn.disabled = false;
+  }
+});
+
+sellerLoadSampleBtn.addEventListener("click", () => {
+  sellerCategoryIdInput.value = "17032807";
+  sellerNameInput.value = "Прозрачный силиконовый чехол для iPhone 15 с защитой камеры";
+  sellerSkuInput.value = "OZON-DEMO-CASE-001";
+  sellerBarcodeInput.value = "6901234567890";
+  sellerPriceInput.value = "999.00";
+  sellerWeightInput.value = "80";
+  sellerDepthInput.value = "18";
+  sellerWidthInput.value = "9";
+  sellerHeightInput.value = "2";
+  sellerImagesInput.value = [
+    "https://cdn.example.com/sample-case-front.jpg",
+    "https://cdn.example.com/sample-case-side.jpg",
+  ].join("\n");
+  sellerAttributesInput.value = JSON.stringify([
+    { id: 85, complex_id: 0, values: [{ value: "Прозрачный" }] },
+    { id: 8229, complex_id: 0, values: [{ value: "Силикон" }] },
+    { id: 9163, complex_id: 0, values: [{ value: "iPhone 15" }] },
+  ], null, 2);
+  sellerResponse.textContent = "已载入样例（手机壳 / iPhone 15 透明硅胶），请改图片 URL 和类目 ID 后再上架。";
+  appendLocalLog("已载入上架样例。");
+});
+
+sellerClearBtn.addEventListener("click", () => {
+  [sellerCategoryIdInput, sellerNameInput, sellerSkuInput, sellerBarcodeInput,
+   sellerPriceInput, sellerWeightInput, sellerDepthInput, sellerWidthInput,
+   sellerHeightInput, sellerImagesInput, sellerAttributesInput].forEach((el) => { el.value = ""; });
+  sellerResponse.textContent = "已清空。";
+});
+
+sellerImportBtn.addEventListener("click", async () => {
+  const item = {
+    name: sellerNameInput.value.trim(),
+    sku: sellerSkuInput.value.trim(),
+    category_id: Number(sellerCategoryIdInput.value.trim()) || 0,
+  };
+  if (!item.name || !item.sku || !item.category_id) {
+    sellerResponse.textContent = "请至少填写：标题、SKU、类目 ID（数字）。";
+    return;
+  }
+  const barcode = sellerBarcodeInput.value.trim();
+  if (barcode) item.barcode = barcode;
+  const price = sellerPriceInput.value.trim();
+  if (price) item.price = price;
+  const weight = sellerWeightInput.value.trim();
+  if (weight) item.weight = Number(weight);
+  const depth = sellerDepthInput.value.trim();
+  const width = sellerWidthInput.value.trim();
+  const height = sellerHeightInput.value.trim();
+  if (depth || width || height) {
+    item.depth = Number(depth) || 0;
+    item.width = Number(width) || 0;
+    item.height = Number(height) || 0;
+  }
+  const images = sellerImagesInput.value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  if (images.length) item.images = images;
+  const attrsText = sellerAttributesInput.value.trim();
+  if (attrsText) {
+    try {
+      item.attributes = JSON.parse(attrsText);
+    } catch (error) {
+      sellerResponse.textContent = `类目属性 JSON 解析失败：${error.message}`;
+      return;
+    }
+  }
+
+  sellerImportBtn.disabled = true;
+  sellerResponse.textContent = "正在提交到 Ozon ...";
+  try {
+    const data = await postJson("/api/seller/products/import", { item });
+    sellerResponse.textContent = JSON.stringify(data, null, 2);
+    appendLocalLog("Ozon 上架请求已提交，详情见右栏响应。");
+  } catch (error) {
+    sellerResponse.textContent = error.message;
+    appendLocalLog(`Ozon 上架失败：${error.message}`, "error");
+  } finally {
+    sellerImportBtn.disabled = false;
+  }
+});
+
+logoutBtn.addEventListener("click", async () => {
+  logoutBtn.disabled = true;
+  try {
+    await postJson("/api/auth/logout", {});
+  } catch (error) {
+    appendLocalLog(`退出失败：${error.message}`, "error");
+    logoutBtn.disabled = false;
+    return;
+  }
+  location.href = "/login";
+});
+
 function setMode(mode) {
-  activeMode = mode === "batch" ? "batch" : "single";
+  activeMode = (mode === "batch" || mode === "seller") ? mode : "single";
   modeTabs.forEach((button) => {
     button.classList.toggle("active", button.dataset.mode === activeMode);
   });
   singleModePanel.classList.toggle("hidden", activeMode !== "single");
   batchModePanel.classList.toggle("hidden", activeMode !== "batch");
+  sellerModePanel.classList.toggle("hidden", activeMode !== "seller");
+  if (activeMode === "seller") {
+    fetchSellerStatus().catch(() => {});
+  }
+}
+
+async function fetchSellerStatus() {
+  try {
+    const data = await fetchJson("/api/seller/status");
+    sellerStatus.textContent = data.configured
+      ? `已配置 · base=${data.baseUrl}`
+      : "未配置（请在 .env 里加 OZON_SELLER_CLIENT_ID / OZON_SELLER_API_KEY）";
+    sellerStatus.classList.toggle("configured", data.configured);
+  } catch (error) {
+    sellerStatus.textContent = `状态查询失败：${error.message}`;
+    sellerStatus.classList.remove("configured");
+  }
 }
 
 function setRunningState(isRunning) {
