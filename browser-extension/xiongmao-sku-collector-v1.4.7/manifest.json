@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "熊猫 Ozon 数据采集器",
+  "version": "1.4.7",
+  "description": "一键采集熊猫、MY 和 Ozon Seller 后台订单页数据，按模板输出并保留 Ozon 原始货件字段。",
+  "permissions": [
+    "activeTab",
+    "clipboardWrite",
+    "downloads",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://system.xiongmaoshangjia.cn/*",
+    "https://my.jizhangerp.com/*",
+    "https://*.ozon.ru/*",
+    "https://*.ozonst.ru/*",
+    "https://cdn1.ozone.ru/*",
+    "https://ir-*.ozonusercontent.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "采集页面数据"
+  }
+}

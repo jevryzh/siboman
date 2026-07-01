@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Ozon SKU 数据采集器",
+  "version": "1.1.0",
+  "description": "一键采集熊猫上架和 MY 页面里的 SKU/商品编号及表格列数据，支持复制和下载 CSV/JSON。",
+  "permissions": [
+    "activeTab",
+    "clipboardWrite",
+    "downloads",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://system.xiongmaoshangjia.cn/*",
+    "https://my.jizhangerp.com/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "采集 SKU"
+  }
+}

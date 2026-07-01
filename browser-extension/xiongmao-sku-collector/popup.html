@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SKU 采集器</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <div>
+          <h1>Ozon SKU 采集器</h1>
+          <p id="pageHint">当前页面数据</p>
+        </div>
+        <span class="badge" id="countBadge">0 条</span>
+      </header>
+
+      <section class="options" aria-label="采集选项">
+        <label class="check">
+          <input type="checkbox" id="autoScroll" checked>
+          <span>自动向下采集当前列表</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="scanHorizontal" checked>
+          <span>同时读取右侧列</span>
+        </label>
+      </section>
+
+      <button class="primary" id="collectBtn" type="button">采集当前页</button>
+
+      <section class="actions" aria-label="导出操作">
+        <button id="copyCsvBtn" type="button" disabled>复制 CSV</button>
+        <button id="downloadCsvBtn" type="button" disabled>下载 CSV</button>
+        <button id="downloadJsonBtn" type="button" disabled>下载 JSON</button>
+      </section>
+
+      <p class="status" id="status">打开熊猫上架或 MY 列表页后点击采集。</p>
+
+      <section class="preview" aria-label="数据预览">
+        <div class="preview-head">
+          <strong>预览</strong>
+          <span id="columnBadge">0 列</span>
+        </div>
+        <pre id="previewText">还没有采集数据</pre>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

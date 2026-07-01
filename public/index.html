@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ozon 1688 采集工具</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="workspace">
+        <div class="toolbar">
+          <div>
+            <h1>Ozon → 1688 采集</h1>
+            <p>批量抓取 Ozon 商品信息，并用主图查找 1688 候选货源。</p>
+          </div>
+          <div class="toolbar-actions">
+            <button id="open1688Btn" class="button secondary" type="button">打开 1688 登录窗口</button>
+            <button id="closeBrowserBtn" class="button quiet" type="button">关闭浏览器</button>
+          </div>
+        </div>
+
+        <div class="mode-tabs">
+          <button class="mode-tab active" data-mode="single" type="button">单品找货</button>
+          <button class="mode-tab" data-mode="batch" type="button">批量采集模式</button>
+        </div>
+
+        <div id="singleModePanel" class="input-grid mode-panel">
+          <label class="field field-large">
+            <span>Ozon 链接</span>
+            <textarea id="urlsInput" spellcheck="false" placeholder="每行一个 Ozon 商品链接"></textarea>
+          </label>
+
+          <div class="settings">
+            <label class="field">
+              <span>每个商品返回候选数</span>
+              <input id="maxCandidatesInput" type="number" min="1" max="20" value="5" />
+            </label>
+            <label class="field">
+              <span>每个链接随机间隔（秒）</span>
+              <div class="range-inputs">
+                <input id="delayMinInput" type="number" min="1" max="120" step="1" value="8" />
+                <input id="delayMaxInput" type="number" min="1" max="120" step="1" value="20" />
+              </div>
+            </label>
+            <label class="field">
+              <span>从第几行开始</span>
+              <input id="startRowInput" type="number" min="1" step="1" value="1" />
+            </label>
+            <label class="field">
+              <span>连续异常自动停止</span>
+              <input id="maxConsecutiveFailuresInput" type="number" min="1" max="20" step="1" value="3" />
+            </label>
+            <label class="check-row">
+              <input id="enable1688Input" type="checkbox" checked />
+              <span>启用 1688 以图搜货</span>
+            </label>
+            <label class="check-row">
+              <input id="enableAiInput" type="checkbox" checked />
+              <span>启用 AI 严格审核</span>
+            </label>
+            <label class="check-row">
+              <input id="headlessInput" type="checkbox" />
+              <span>后台浏览器模式</span>
+            </label>
+            <div class="run-actions">
+              <button id="runBtn" class="button primary" type="button">开始采集</button>
+              <button id="cancelBtn" class="button danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+        </div>
+
+        <div id="batchModePanel" class="input-grid mode-panel hidden">
+          <label class="field field-large">
+            <span>Ozon 店铺/商品链接</span>
+            <textarea id="batchSourceInput" spellcheck="false" placeholder="粘贴一个 Ozon 店铺链接或商品链接"></textarea>
+          </label>
+
+          <div class="settings">
+            <label class="field">
+              <span>最多采集商品数</span>
+              <input id="batchMaxProductsInput" type="number" min="1" max="500" step="1" value="50" />
+            </label>
+            <label class="field">
+              <span>黑标价 RMB 区间</span>
+              <div class="range-inputs">
+                <input id="batchMinPriceInput" type="number" min="0" step="0.01" placeholder="最低" />
+                <input id="batchMaxPriceInput" type="number" min="0" step="0.01" placeholder="最高" />
+              </div>
+            </label>
+            <label class="field">
+              <span>跟卖数量区间</span>
+              <div class="range-inputs">
+                <input id="batchMinSellerInput" type="number" min="0" step="1" placeholder="最低" />
+                <input id="batchMaxSellerInput" type="number" min="0" step="1" placeholder="最高" />
+              </div>
+            </label>
+            <label class="field">
+              <span>标题关键词</span>
+              <input id="batchKeywordInput" type="text" placeholder="可不填" />
+            </label>
+            <label class="field">
+              <span>每个商品随机间隔（秒）</span>
+              <div class="range-inputs">
+                <input id="batchDelayMinInput" type="number" min="1" max="120" step="1" value="8" />
+                <input id="batchDelayMaxInput" type="number" min="1" max="120" step="1" value="20" />
+              </div>
+            </label>
+            <label class="field">
+              <span>连续异常自动停止</span>
+              <input id="batchMaxConsecutiveFailuresInput" type="number" min="1" max="20" step="1" value="3" />
+            </label>
+            <label class="check-row">
+              <input id="batchHeadlessInput" type="checkbox" />
+              <span>后台浏览器模式</span>
+            </label>
+            <div class="run-actions">
+              <button id="batchRunBtn" class="button primary" type="button">开始批量采集</button>
+              <button id="batchCancelBtn" class="button danger" type="button" disabled>停止</button>
+            </div>
+          </div>
+        </div>
+
+        <section class="status-band">
+          <div>
+            <span class="label">状态</span>
+            <strong id="statusText">待开始</strong>
+          </div>
+          <div>
+            <span class="label">进度</span>
+            <strong id="progressText">0 / 0</strong>
+          </div>
+          <a id="downloadLink" class="button secondary hidden" href="#">下载 Excel</a>
+        </section>
+
+        <section class="history-section">
+          <div class="section-head">
+            <h2>统计与历史</h2>
+            <button id="refreshHistoryBtn" class="button quiet small" type="button">刷新</button>
+          </div>
+          <div class="stats-grid">
+            <div>
+              <span class="label">今日处理</span>
+              <strong id="todayRowsText">0 条</strong>
+            </div>
+            <div>
+              <span class="label">今日任务</span>
+              <strong id="todayJobsText">0 批</strong>
+            </div>
+            <div>
+              <span class="label">历史文件</span>
+              <strong id="historyFilesText">0 份</strong>
+            </div>
+          </div>
+          <div id="historyList" class="history-list"></div>
+        </section>
+
+        <section class="results-section">
+          <div class="section-head">
+            <h2>结果</h2>
+            <span id="resultCount">0 条</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Ozon 商品</th>
+                  <th>主图</th>
+                  <th>采集结果</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="resultsBody">
+                <tr>
+                  <td colspan="4" class="empty">还没有结果</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <aside class="log-panel">
+        <div class="section-head">
+          <h2>日志</h2>
+          <button id="clearLogBtn" class="button quiet small" type="button">清空</button>
+        </div>
+        <div id="logList" class="log-list"></div>
+      </aside>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

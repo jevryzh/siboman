@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "熊猫 Ozon 数据采集器",
+  "version": "1.4.15",
+  "description": "一键采集熊猫、MY 和 Ozon Seller 后台数据，腾讯文档粘贴改为本地内嵌小图。",
+  "permissions": [
+    "activeTab",
+    "clipboardWrite",
+    "downloads",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://system.xiongmaoshangjia.cn/*",
+    "https://my.jizhangerp.com/*",
+    "https://*.ozon.ru/*",
+    "https://*.ozonst.ru/*",
+    "https://*.ozone.ru/*",
+    "https://cdn1.ozone.ru/*",
+    "https://*.ozonusercontent.com/*",
+    "https://*.ozonru.cn/*"
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "采集页面数据"
+  }
+}

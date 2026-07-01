@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>数据采集器</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <div>
+          <h1>熊猫 Ozon 数据采集器 <span class="version" id="versionBadge">v?</span></h1>
+          <p id="pageHint">当前页面数据</p>
+        </div>
+        <span class="badge" id="countBadge">0 条</span>
+      </header>
+
+      <section class="options" aria-label="采集选项">
+        <label class="check">
+          <input type="checkbox" id="autoScroll" checked>
+          <span>自动向下采集当前列表</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="scanHorizontal" checked>
+          <span>同时读取右侧列</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="imageFormula" checked>
+          <span>CSV 照片列使用 =IMAGE() 公式（能否显示取决于表格软件）</span>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="includeShop">
+          <span>添加"店铺"列（在"平台"和"订单号"之间，留空手动填）</span>
+        </label>
+      </section>
+
+      <button class="primary" id="collectBtn" type="button">采集当前页</button>
+
+      <section class="actions" aria-label="导出操作">
+        <button id="copyTencentBtn" type="button" disabled>复制到腾讯文档（内嵌小图）</button>
+        <button id="downloadXlsxBtn" type="button" disabled>下载 Excel（图+公式）</button>
+        <button id="downloadZipBtn" type="button" disabled>下载 ZIP（CSV + 图文件夹）</button>
+        <button id="downloadCsvBtn" type="button" disabled>下载 CSV（公式/链接）</button>
+        <button id="copyCsvBtn" type="button" disabled>复制 CSV</button>
+        <button id="downloadHtmlBtn" type="button" disabled>下载 HTML（内嵌图）</button>
+        <button id="downloadJsonBtn" type="button" disabled>下载 JSON</button>
+        <button id="copyDiagnosticBtn" type="button" disabled>复制诊断数据</button>
+      </section>
+
+<p class="status" id="status">打开"来自我的仓库的订单"页面后点击采集。<br>要带图文件，点"下载 Excel（图+公式）"。要直接粘到腾讯文档，点"复制到腾讯文档（内嵌小图）"。</p>
+
+      <section class="preview" aria-label="数据预览">
+        <div class="preview-head">
+          <strong>预览</strong>
+          <span id="columnBadge">0 列</span>
+        </div>
+        <pre id="previewText">还没有采集数据</pre>
+      </section>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>
