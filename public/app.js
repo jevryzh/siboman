@@ -298,7 +298,7 @@ async function loadCategoryTree() {
   const tree = $("#catTree");
   if (tree) tree.textContent = "加载中…";
   try {
-    const data = await getJson("/api/seller/categories/tree");
+    const data = await postJson("/api/seller/categories/tree", {});
     const items = data.data?.result || [];
     if (meta) meta.textContent = `共 ${items.length} 个一级类目`;
     if (!items.length) { tree.textContent = "（Ozon 没有返回类目）"; return; }
@@ -697,16 +697,35 @@ async function loadProductList() {
   const limit = Number($("#plLimit")?.value || 50);
   const search = ($("#plSearch")?.value || "").toLowerCase();
   const tab = $$("#plStatusTabs .mode-tab").find((t) => t.classList.contains("active"))?.dataset.v || "active";
-  const archived = tab === "archived" ? "true" : "false";
   const meta = $("#plMeta");
   const body = $("#plBody");
   if (meta) meta.textContent = "加载中…";
   if (body) body.innerHTML = `<tr><td colspan="4" class="empty"><span class="spinner"></span> 加载中…</td></tr>`;
   try {
-    const data = await getJson(`/api/seller/products?limit=${limit}&archived=${archived}`);
-    let items = data.data?.result?.items || data.data?.items || [];
+    const fetchItems = async (archived) => {
+      const data = await postJson("/api/seller/products", { limit, archived });
+      return data.data?.result?.items || data.data?.items || [];
+    };
+    let items = [];
+    if (tab === "all") {
+      const [activeItems, archivedItems] = await Promise.all([fetchItems(false), fetchItems(true)]);
+      items = [...activeItems.filter((it) => !it.archived), ...archivedItems.map((it) => ({ ...it, archived: true }))];
+      $("#plActiveCount").textContent = String(activeItems.length);
+      $("#plArchivedCount").textContent = String(archivedItems.length);
+      $("#plAllCount").textContent = String(items.length);
+    } else {
+      items = await fetchItems(tab === "archived");
+      if (tab === "active") items = items.filter((it) => !it.archived);
+      if (tab === "archived") items = items.map((it) => ({ ...it, archived: true }));
+      const activeCount = tab === "active" ? items.length : $("#plActiveCount").textContent;
+      const archivedCount = tab === "archived" ? items.length : $("#plArchivedCount").textContent;
+      $("#plActiveCount").textContent = activeCount;
+      $("#plArchivedCount").textContent = archivedCount;
+      $("#plAllCount").textContent = Number.isFinite(Number(activeCount)) && Number.isFinite(Number(archivedCount))
+        ? String(Number(activeCount) + Number(archivedCount))
+        : "—";
+    }
     if (search) items = items.filter((it) => (it.name || "").toLowerCase().includes(search) || (it.offer_id || "").toLowerCase().includes(search));
-    if (tab === "active") items = items.filter((it) => !it.archived);
     if (meta) meta.textContent = `共 ${items.length} 个`;
     if (!items.length) { body.innerHTML = `<tr><td colspan="4" class="empty">无数据</td></tr>`; return; }
     body.innerHTML = items.map((it) => `
@@ -843,7 +862,7 @@ function bindUploadHandlers() {
       $("#sellerResponse").textContent = JSON.stringify(data, null, 2);
       const productId = data?.data?.result?.product_id || data?.data?.product_id;
       if (productId) {
-        $("#sellerResponse").innerHTML += `\n\n→ <a href="https://www.ozon.ru/product/${escapeAttr(item.sku)}" target="_blank" rel="noreferrer">在 Ozon 后台查看（按 SKU 搜）</a>`;
+        $("#sellerResponse").innerHTML += `\n\n→ <a href="https://www.ozon.ru/product/${escapeAttr(productId)}" target="_blank" rel="noreferrer">在 Ozon 查看商品</a>`;
       }
       toast("上架请求已提交", "success");
     } catch (error) {
@@ -878,10 +897,9 @@ function renderProductStock(root) {
           <th style="width:30px"><input type="checkbox" id="stockAll" /></th>
           <th style="min-width:160px">商品</th>
           <th style="min-width:140px">offer_id / SKU</th>
-          <th style="width:120px">新库存 (present)</th>
-          <th style="width:120px">预占 (reserved)</th>
+          <th style="width:120px">新库存 (stock)</th>
         </tr></thead>
-        <tbody id="stockBody"><tr><td colspan="5" class="empty">加载中…</td></tr></tbody>
+        <tbody id="stockBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
       </table></div>
       <div class="filter-bar" style="justify-content: space-between; margin-top: 10px">
         <span class="muted" id="stockSelectedMeta">已选 0 / 0</span>
@@ -911,9 +929,9 @@ function bindStockHandlers() {
 
 async function loadStockProducts() {
   const body = $("#stockBody");
-  if (body) body.innerHTML = `<tr><td colspan="5" class="empty"><span class="spinner"></span> 加载商品…</td></tr>`;
+  if (body) body.innerHTML = `<tr><td colspan="4" class="empty"><span class="spinner"></span> 加载商品…</td></tr>`;
   try {
-    const data = await getJson(`/api/seller/products?limit=100`);
+    const data = await postJson("/api/seller/products", { limit: 100 });
     const items = (data.data?.result?.items || []).filter((it) => !it.archived);
     // 暂存到全局
     state._stockItems = items;
@@ -928,21 +946,20 @@ async function loadStockProducts() {
     }
     renderStockRows(items, whItems);
   } catch (e) {
-    if (body) body.innerHTML = `<tr><td colspan="5" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
+    if (body) body.innerHTML = `<tr><td colspan="4" class="empty">加载失败：${escapeHtml(e.message)}</td></tr>`;
   }
 }
 
 function renderStockRows(items, whItems) {
   const body = $("#stockBody");
   if (!body) return;
-  if (!items.length) { body.innerHTML = `<tr><td colspan="5" class="empty">店铺里还没有商品</td></tr>`; return; }
+  if (!items.length) { body.innerHTML = `<tr><td colspan="4" class="empty">店铺里还没有商品</td></tr>`; return; }
   body.innerHTML = items.map((it, i) => `
-    <tr data-sku="${escapeAttr(it.offer_id || '')}" data-name="${escapeAttr(it.name || '')}">
+    <tr data-offer-id="${escapeAttr(it.offer_id || '')}" data-product-id="${escapeAttr(it.product_id || '')}" data-name="${escapeAttr(it.name || '')}">
       <td><input type="checkbox" data-row="${i}" /></td>
       <td class="wrap">${escapeHtml(it.name || it.offer_id || "—")}</td>
       <td><span class="muted">${escapeHtml(it.offer_id || "—")}</span></td>
-      <td><input type="number" min="0" value="0" data-field="present" data-row="${i}" style="width: 90px" /></td>
-      <td><input type="number" min="0" value="0" data-field="reserved" data-row="${i}" style="width: 90px" /></td>
+      <td><input type="number" min="0" value="0" data-field="stock" data-row="${i}" style="width: 90px" /></td>
     </tr>`).join("");
   // 复选框变化
   $$("#stockBody input[type=checkbox]").forEach((c) => c.addEventListener("change", updateStockSelectedMeta));
@@ -953,7 +970,7 @@ function renderStockRows(items, whItems) {
 function filterStockRows() {
   const q = ($("#stockSearch")?.value || "").toLowerCase().trim();
   $$("#stockBody tr").forEach((tr) => {
-    const sku = (tr.getAttribute("data-sku") || "").toLowerCase();
+    const sku = (tr.getAttribute("data-offer-id") || "").toLowerCase();
     const name = (tr.getAttribute("data-name") || "").toLowerCase();
     tr.style.display = (q && !sku.includes(q) && !name.includes(q)) ? "none" : "";
   });
@@ -964,11 +981,11 @@ function updateStockSelectedMeta() {
   const all = $$("#stockBody input[type=checkbox]");
   const checked = all.filter((c) => c.checked);
   const meta = $("#stockSelectedMeta");
-  if (meta) meta.textContent = `已选 ${checked.length} / ${all.length}（改过库存的行用蓝色边框）`;
+  if (meta) meta.textContent = `已选 ${checked.length} / ${all.length}（改过库存的行会高亮）`;
   // 给改过值的行加个视觉提示
   $$("#stockBody tr").forEach((tr) => {
-    const present = tr.querySelector("input[data-field=present]");
-    const dirty = present && Number(present.value) > 0;
+    const stock = tr.querySelector("input[data-field=stock]");
+    const dirty = stock && Number(stock.value) > 0;
     tr.style.background = dirty ? "#fff8e1" : "";
   });
 }
@@ -981,11 +998,11 @@ async function submitStock() {
   for (const tr of rows) {
     const cb = tr.querySelector("input[type=checkbox]");
     if (!cb || !cb.checked) continue;
-    const sku = tr.getAttribute("data-sku");
-    if (!sku) continue;
-    const present = Number(tr.querySelector("input[data-field=present]")?.value || 0);
-    const reserved = Number(tr.querySelector("input[data-field=reserved]")?.value || 0);
-    stocks.push({ sku, warehouse_id: wh, present, reserved });
+    const offerId = tr.getAttribute("data-offer-id") || "";
+    const productId = Number(tr.getAttribute("data-product-id") || 0);
+    if (!offerId && !productId) continue;
+    const stock = Number(tr.querySelector("input[data-field=stock]")?.value || 0);
+    stocks.push({ offer_id: offerId, product_id: productId || undefined, warehouse_id: wh, stock });
   }
   if (!stocks.length) { toast("请至少勾选一行", "error"); return; }
   if (!confirm(`即将提交 ${stocks.length} 条库存更新到 Ozon，确认？`)) return;
@@ -1295,7 +1312,7 @@ async function loadOrders() {
   const countEl = $("#orderCountValue");
   if (body) body.innerHTML = `<tr><td colspan="8" class="empty"><span class="spinner"></span> 加载中…</td></tr>`;
   try {
-    const data = await getJson(`/api/seller/orders?limit=${limit}&status=${encodeURIComponent(status)}`);
+    const data = await postJson("/api/seller/orders", { limit, status });
     let items = (data.data?.result?.postings || data.data?.items || data.data?.result?.items || []).slice();
     if (search) items = items.filter((it) => (it.order_number || it.posting_number || it.id || "").toLowerCase().includes(search));
     if (countEl) countEl.textContent = String(items.length);
@@ -1467,6 +1484,7 @@ function renderToolsLogs(root) {
     const items = (d.items || []).slice(0, 30);
     if (!items.length) { picker.innerHTML = `<option>暂无任务</option>`; return; }
     picker.innerHTML = items.map((it) => `<option value="${escapeAttr(it.id)}">${escapeHtml(it.kind === "batch-ozon" ? "批量采集" : "单品找货")} · ${escapeHtml((it.id || "").slice(0, 8))} · ${escapeHtml(formatTime(it.updatedAt))}</option>`).join("");
+    if (items[0]?.id) loadLog(items[0].id);
   }).catch(() => {});
   picker?.addEventListener("change", () => loadLog(picker.value));
   $("#logRefresh")?.addEventListener("click", () => { if (picker.value) loadLog(picker.value); });

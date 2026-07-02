@@ -582,10 +582,14 @@ app.post("/api/seller/products", async (req, res, next) => {
 app.post("/api/seller/orders", async (req, res, next) => {
   try {
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || req.body?.limit || 50)));
-    const status = req.query.status || req.body?.status || "";
-    const filter = status ? { status } : {};
+    const status = String(req.query.status || req.body?.status || "").trim();
+    const filter = {
+      since: req.query.since || req.body?.since || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(),
+      to: req.query.to || req.body?.to || new Date().toISOString(),
+    };
+    if (status) filter.status = status;
     const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
-      filter: { since: req.query.since || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(), to: req.query.to || new Date().toISOString() },
+      filter,
       limit,
     });
     res.json({ success: true, data });
@@ -627,7 +631,27 @@ app.post("/api/seller/products/stocks", async (req, res, next) => {
   try {
     const stocks = Array.isArray(req.body?.stocks) ? req.body.stocks : null;
     if (!stocks) { res.status(400).json({ success: false, error: "请求体需要 stocks 数组" }); return; }
-    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks });
+    const errors = [];
+    const normalizedStocks = stocks.map((item, index) => {
+      const offerId = String(item?.offer_id || item?.sku || "").trim();
+      const productId = Number(item?.product_id || 0);
+      const stock = Number(item?.stock ?? item?.present ?? 0);
+      const warehouseId = Number(item?.warehouse_id || 0);
+      if (!offerId && !productId) errors.push(`第 ${index + 1} 行缺少 offer_id/product_id`);
+      if (!Number.isFinite(stock) || stock < 0) errors.push(`第 ${index + 1} 行库存不合法`);
+      if (!Number.isFinite(warehouseId) || warehouseId <= 0) errors.push(`第 ${index + 1} 行 warehouse_id 不合法`);
+      return {
+        ...(offerId ? { offer_id: offerId } : {}),
+        ...(Number.isFinite(productId) && productId > 0 ? { product_id: productId } : {}),
+        stock: Math.max(0, Math.floor(stock)),
+        warehouse_id: Math.floor(warehouseId),
+      };
+    });
+    if (errors.length) {
+      res.status(400).json({ success: false, error: errors.slice(0, 5).join("；") });
+      return;
+    }
+    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: normalizedStocks });
     res.json({ success: true, data });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
@@ -884,7 +908,12 @@ app.get("/api/jobs/:id", async (req, res, next) => {
     }
     const job = jobs.get(req.params.id);
     if (!job) {
-      res.status(404).json({ success: false, error: "任务不存在。" });
+      const storedJob = await loadStoredJob(req.params.id);
+      if (!storedJob) {
+        res.status(404).json({ success: false, error: "任务不存在。" });
+        return;
+      }
+      res.json({ success: true, job: storedJob });
       return;
     }
     res.json({ success: true, job: serializeJob(job) });
@@ -4902,6 +4931,28 @@ async function sendJobDownload(id, res) {
   await markJobDownloaded(id).catch(() => {});
   const shortId = id.length > 18 ? id.slice(0, 18) : id;
   res.download(filePath, `${downloadPrefix}-${shortId}.xlsx`);
+}
+
+async function loadStoredJob(id) {
+  if (!isSafeJobId(id)) return null;
+  const jsonPath = path.join(JOBS_DIR, id, "results.json");
+  if (!existsSync(jsonPath)) return null;
+  try {
+    const data = JSON.parse(await fs.readFile(jsonPath, "utf8"));
+    const kind = data.kind === "batch-ozon" ? "batch-ozon" : data.kind || "run";
+    const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
+    const excelPath = path.join(JOBS_DIR, id, excelName);
+    return {
+      ...data,
+      id,
+      kind,
+      logs: Array.isArray(data.logs) ? data.logs.slice(-300) : [],
+      results: Array.isArray(data.results) ? data.results.map(stripBuffers) : [],
+      downloadUrl: data.downloadUrl || (existsSync(excelPath) ? `/api/history/${encodeURIComponent(id)}/download` : ""),
+    };
+  } catch {
+    return null;
+  }
 }
 
 async function loadJobHistory() {
