@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>逐梦 ERP 采集端</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <div>
+          <h1>逐梦 ERP 采集端</h1>
+          <p id="versionText">浏览器插件版</p>
+        </div>
+        <span class="status-pill" id="onlinePill">离线</span>
+      </header>
+
+      <section class="card">
+        <label class="field">
+          <span>ERP 地址</span>
+          <input id="serverUrlInput" autocomplete="off" value="http://xm.renwz.cn">
+        </label>
+        <label class="field">
+          <span>账号</span>
+          <input id="usernameInput" autocomplete="username">
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="passwordInput" type="password" autocomplete="current-password">
+        </label>
+        <button class="primary" id="loginBtn" type="button">登录并保持在线</button>
+      </section>
+
+      <section class="card">
+        <div class="row">
+          <span>采集端</span>
+          <strong id="workerNameText">-</strong>
+        </div>
+        <div class="row">
+          <span>账号</span>
+          <strong id="accountText">未登录</strong>
+        </div>
+        <div class="row">
+          <span>队列</span>
+          <strong id="queueText">-</strong>
+        </div>
+        <div class="row">
+          <span>最后心跳</span>
+          <strong id="lastSeenText">-</strong>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="heartbeatBtn" type="button">立即同步状态</button>
+        <button id="startBtn" type="button">保持在线</button>
+        <button id="stopBtn" type="button">暂停</button>
+        <button id="logoutBtn" type="button">退出登录</button>
+      </section>
+
+      <p class="notice" id="noticeText">预览版先用于连接 ERP 和显示在线状态；自动领取 Ozon/1688 采集任务会在下一步开启。</p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -63,6 +63,24 @@ let browserContext = null;
 let browserOpening = null;
 let currentBrowserHeadless = false;
 
+app.use((req, res, next) => {
+  const origin = String(req.headers.origin || "");
+  const isExtensionOrigin = /^chrome-extension:\/\//.test(origin);
+  const isTrustedWebOrigin = /^https?:\/\/(xm|test)\.renwz\.cn$/i.test(origin) || /^https?:\/\/localhost:\d+$/i.test(origin);
+  if (isExtensionOrigin || isTrustedWebOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Worker-Name");
+    res.setHeader("Access-Control-Max-Age", "86400");
+    res.setHeader("Vary", "Origin");
+  }
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 class RowSkipError extends Error {
   constructor(message) {
     super(message);
@@ -101,7 +119,8 @@ function safeEqual(left, right) {
 }
 
 async function getAuthenticatedUser(req) {
-  const token = parseCookies(req)[AUTH_COOKIE] || "";
+  const bearerToken = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  const token = bearerToken || parseCookies(req)[AUTH_COOKIE] || "";
   const [userId, expiresAtText, signature] = token.split(".");
   const expiresAt = Number(expiresAtText);
   if (!userId || !Number.isFinite(expiresAt) || expiresAt < Date.now() || !signature) return null;
@@ -417,6 +436,48 @@ app.post("/api/auth/login", async (req, res, next) => {
     next(error);
   }
 });
+
+app.post("/api/extension/login", async (req, res, next) => {
+  try {
+    const password = String(req.body?.password || "");
+    if (db) {
+      const username = normalizeUsername(req.body?.username);
+      if (!username || !password) {
+        res.status(400).json({ success: false, error: "请输入账号和密码。" });
+        return;
+      }
+      const result = await db.query(
+        "SELECT id, username, display_name, role, password_hash FROM app_users WHERE username = $1 AND active = TRUE",
+        [username],
+      );
+      const user = result.rows[0] || null;
+      if (!user || !(await verifyPassword(password, user.password_hash))) {
+        res.status(401).json({ success: false, error: "账号或密码不正确。" });
+        return;
+      }
+      await db.query("UPDATE app_users SET last_login_at = now() WHERE id = $1", [user.id]);
+      res.json({
+        success: true,
+        token: createAuthToken(user.id),
+        user: { id: user.id, username: user.username, display_name: user.display_name, role: user.role },
+      });
+      return;
+    }
+
+    if (!APP_PASSWORD) {
+      res.status(500).json({ success: false, error: "服务端还没有设置 APP_PASSWORD，无法启用登录。" });
+      return;
+    }
+    if (!safeEqual(password, APP_PASSWORD)) {
+      res.status(401).json({ success: false, error: "密码不正确。" });
+      return;
+    }
+    res.json({ success: true, token: createAuthToken("legacy"), user: { id: "legacy", username: "admin", role: "admin" } });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/auth/logout", (req, res) => {
   clearAuthCookie(req, res);
   res.json({ success: true });
@@ -996,6 +1057,81 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
     }
     const job = await claimNextDbJob(req.user, req.body?.workerName || req.headers["x-worker-name"] || "");
     res.json({ success: true, job });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/worker/status", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
+      return;
+    }
+    const workersResult = await db.query(
+      `SELECT worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+       FROM app_worker_heartbeats
+       WHERE user_id = $1
+       ORDER BY last_seen_at DESC
+       LIMIT 10`,
+      [req.user?.id || ""],
+    );
+    const queueResult = await db.query(
+      `SELECT
+         count(*) FILTER (WHERE status = 'queued')::int AS queued,
+         count(*) FILTER (WHERE status IN ('claimed','running'))::int AS active
+       FROM app_jobs
+       WHERE user_id = $1`,
+      [req.user?.id || ""],
+    );
+    const now = Date.now();
+    const workers = workersResult.rows.map((row) => {
+      const lastSeenAt = row.last_seen_at ? new Date(row.last_seen_at).toISOString() : "";
+      const ageMs = lastSeenAt ? now - new Date(lastSeenAt).getTime() : Infinity;
+      return {
+        workerName: row.worker_name,
+        platform: row.platform || "",
+        hostname: row.hostname || "",
+        profileDir: row.profile_dir || "",
+        currentJobId: row.current_job_id || "",
+        currentPhase: row.current_phase || "",
+        lastSeenAt,
+        online: ageMs <= Math.max(30000, WORKER_ONLINE_WINDOW_MS),
+        ageSeconds: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null,
+      };
+    });
+    res.json({
+      success: true,
+      workers,
+      queue: queueResult.rows[0] || { queued: 0, active: 0 },
+      onlineWindowSeconds: Math.round(Math.max(30000, WORKER_ONLINE_WINDOW_MS) / 1000),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/worker/heartbeat", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
+      return;
+    }
+    await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentPhase: req.body?.currentPhase || "浏览器插件在线",
+    });
+    const queueResult = await db.query(
+      `SELECT
+         count(*) FILTER (WHERE status = 'queued')::int AS queued,
+         count(*) FILTER (WHERE status IN ('claimed','running'))::int AS active
+       FROM app_jobs
+       WHERE user_id = $1`,
+      [req.user?.id || ""],
+    );
+    res.json({ success: true, queue: queueResult.rows[0] || { queued: 0, active: 0 } });
   } catch (error) {
     next(error);
   }

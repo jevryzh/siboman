@@ -577,6 +577,56 @@ function renderPolledJob(job) {
   }
 }
 
+async function loadWorkerStatus(scope = "single") {
+  const metaEl = scope === "single" ? $("#singleCollectorMeta") : $("#collectorMeta");
+  const boxEl = scope === "single" ? $("#singleCollectorBox") : $("#collectorStatusBox");
+  if (!boxEl) return;
+  try {
+    const data = await getJson("/api/worker/status");
+    const workers = data.workers || [];
+    const onlineWorkers = workers.filter((worker) => worker.online);
+    const queue = data.queue || {};
+    if (metaEl) {
+      metaEl.textContent = `${onlineWorkers.length}/${workers.length} 在线 · 排队 ${queue.queued || 0} · 执行 ${queue.active || 0}`;
+    }
+    if (!workers.length) {
+      boxEl.innerHTML = `
+        <div class="empty" style="text-align:left">
+          当前账号还没有检测到浏览器采集插件。预览版先用于验证插件在线状态，正式采集领取会在采集逻辑迁移完成后开启。
+        </div>`;
+      return;
+    }
+    boxEl.innerHTML = workers.map((worker) => {
+      const platformLabel = formatWorkerPlatform(worker.platform);
+      const statusClass = worker.online ? "green" : "gray";
+      const statusText = worker.online ? "在线" : `离线 ${worker.ageSeconds ?? "?"} 秒`;
+      return `
+        <div style="border:1px solid #e0e5dc;border-radius:6px;padding:10px;margin:8px 0;background:#fff">
+          <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
+            <strong>${escapeHtml(worker.workerName || "本机采集端")}</strong>
+            <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
+          </div>
+          <div class="muted" style="margin-top:4px;font-size:12px">
+            ${escapeHtml(platformLabel)} · ${escapeHtml(worker.hostname || "未知电脑")}
+            ${worker.currentPhase ? ` · ${escapeHtml(worker.currentPhase)}` : ""}
+          </div>
+          ${worker.profileDir ? `<div class="muted" style="margin-top:4px;font-size:11px">浏览器配置：${escapeHtml(worker.profileDir)}</div>` : ""}
+          <div class="muted" style="margin-top:4px;font-size:11px">最后心跳：${escapeHtml(formatTime(worker.lastSeenAt) || "—")}</div>
+        </div>`;
+    }).join("");
+  } catch (error) {
+    if (metaEl) metaEl.textContent = "检测失败";
+    boxEl.innerHTML = `<div class="empty" style="text-align:left">采集端状态读取失败：${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function formatWorkerPlatform(platform = "") {
+  if (platform === "win32") return "Windows";
+  if (platform === "darwin") return "macOS";
+  if (platform === "linux") return "Linux";
+  return platform || "未知系统";
+}
+
 /* ============== 批量采集 ==================== */
 
 function renderBatchSourcing(root) {
@@ -1406,15 +1456,19 @@ function renderToolsBrowser(root) {
   root.innerHTML = `
     <div class="card">
       <div class="card-head"><h2>1688 浏览器</h2><span class="meta" id="browserStatus">未知</span></div>
-      <p class="muted">服务器队列模式下，浏览器由你 Mac 上的「本机采集端」管理。下面两个按钮仅在单机模式下生效。</p>
+      <p class="muted">服务器队列模式下，浏览器由当前登录账号对应电脑上的「浏览器采集插件」管理。下面两个按钮仅在单机模式下生效。</p>
       <div style="display:flex;gap:8px">
         <button class="button" id="open1688Btn">打开 1688 登录窗口</button>
         <button class="button quiet" id="closeBrowserBtn">关闭浏览器</button>
       </div>
     </div>
     <div class="card">
-      <div class="card-head"><h2>本机采集端</h2><span class="meta" id="collectorMeta">—</span></div>
-      <p class="muted">查看 collector 状态：<code>screen -ls</code> 或 <code>tail -f /Users/eason/Documents/OZON/data/collector.log</code></p>
+      <div class="card-head"><h2>浏览器采集插件</h2><span class="meta" id="collectorMeta">检测中...</span></div>
+      <div id="collectorStatusBox" class="muted">正在检测当前账号的浏览器采集插件...</div>
+      <p class="muted">正式客户安装 Chrome/Edge 插件后登录账号。插件在线后，本页面会显示电脑名、系统和任务状态；自动领取采集任务会在插件采集逻辑迁移完成后开启。</p>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <a class="button" href="/downloads/ozon-1688-collector-extension.zip" download>下载插件测试包</a>
+      </div>
     </div>`;
   $("#open1688Btn")?.addEventListener("click", async () => {
     try { const data = await postJson("/api/1688/open", {}); toast(data.message || "已请求打开 1688 浏览器", "success"); }
