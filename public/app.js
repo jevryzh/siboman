@@ -1466,8 +1466,9 @@ function renderToolsBrowser(root) {
       <div class="card-head"><h2>浏览器采集插件</h2><span class="meta" id="collectorMeta">检测中...</span></div>
       <div id="collectorStatusBox" class="muted">正在检测当前账号的浏览器采集插件...</div>
       <p class="muted">正式客户安装 Chrome/Edge 插件后登录账号。插件在线后，本页面会显示电脑名、系统和任务状态；自动领取采集任务会在插件采集逻辑迁移完成后开启。</p>
+      <p class="muted">测试安装：下载 zip 后先解压，不要直接拖 zip 到 Chrome。打开 <code>chrome://extensions/</code>，开启开发者模式，点击“加载已解压的扩展程序”，选择解压后包含 <code>manifest.json</code> 的文件夹。</p>
       <div style="display:flex;gap:8px;margin-top:8px">
-        <a class="button" href="/downloads/ozon-1688-collector-extension.zip" download>下载插件测试包</a>
+        <a class="button" href="/downloads/ozon-1688-collector-extension.zip" download>下载插件测试包（先解压）</a>
       </div>
     </div>`;
   $("#open1688Btn")?.addEventListener("click", async () => {

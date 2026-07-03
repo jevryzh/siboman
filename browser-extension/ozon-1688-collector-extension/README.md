@@ -16,11 +16,11 @@
 1. 打开 Chrome 或 Edge。
 2. 地址栏输入 `chrome://extensions/`。
 3. 打开开发者模式。
-4. 点击“加载已解压的扩展程序”。
-5. 选择本目录：`browser-extension/ozon-1688-collector-extension`。
-6. 点击插件图标，输入 ERP 地址、账号和密码。
+4. 如果下载的是 zip，请先解压，不要直接把 zip 拖进 Chrome。
+5. 点击“加载已解压的扩展程序”。
+6. 选择解压后包含 `manifest.json` 的文件夹。
+7. 点击插件图标，输入 ERP 地址、账号和密码。
 
 ## 下一步
 
 将现有 Node collector 的 Ozon 页面采集、1688 以图搜货、AI 审核和结果回传逻辑拆分迁移到插件中。
-
