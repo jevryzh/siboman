@@ -97,7 +97,6 @@ async function heartbeat() {
     headers: {
       "Authorization": `Bearer ${state.token}`,
       "Content-Type": "application/json",
-      "X-Worker-Name": body.workerName,
     },
     body: JSON.stringify(body),
   });
@@ -168,7 +167,7 @@ function normalizeServerUrl(value) {
 
 function defaultWorkerName() {
   const browser = navigator.userAgent.includes("Edg/") ? "Edge" : "Chrome";
-  return `${browser}-插件-${chrome.runtime.id.slice(0, 6)}`;
+  return `${browser}-extension-${chrome.runtime.id.slice(0, 6)}`;
 }
 
 function platformLabel() {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "逐梦 ERP 采集端",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "连接逐梦 ERP，使用本机浏览器辅助 Ozon/1688 采集任务。",
   "permissions": [
     "alarms",
