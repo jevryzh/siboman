@@ -1191,6 +1191,7 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};
     const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon" ? "batch-ozon" : "run";
+    await processWorkerCompletionResults(job, existing);
     const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, job, req.body?.excelBase64 || "");
     const updates = normalizeWorkerJobUpdate({ ...job, downloadUrl }, existing);
     updates.status = normalizeWorkerStatus(job.status) || "done";
@@ -4791,6 +4792,30 @@ function normalizeWorkerJobUpdate(input = {}, existing = {}) {
   if (input.error !== undefined) updates.error = String(input.error || "").slice(0, 2000);
   if (input.downloadUrl !== undefined) updates.downloadUrl = String(input.downloadUrl || "");
   return updates;
+}
+
+async function processWorkerCompletionResults(job, existing = {}) {
+  if (!job || existing.kind === "batch-ozon" || job.kind === "batch-ozon") return;
+  if (!Array.isArray(job.results) || !job.results.length) return;
+  const options = existing.payload?.options || {};
+  if (options.enableAI === false) return;
+  for (const result of job.results) {
+    if (!result?.ozon || !Array.isArray(result.candidates) || !result.candidates.length || result.aiReview) continue;
+    try {
+      result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
+      applyAiReview(result);
+      result.logs = Array.isArray(result.logs) ? result.logs : [];
+    } catch (error) {
+      result.aiReview = {
+        decision: "none",
+        selected_rank: null,
+        confidence: 0,
+        reason: `服务器 AI 审核失败：${error.message}`,
+        candidate_reviews: buildAiFailureCandidateReviews(result.candidates, "服务器 AI 审核失败"),
+        thinkingMode: MINIMAX_THINKING_TYPE,
+      };
+    }
+  }
 }
 
 function normalizeLogEntryForDb(entry) {
