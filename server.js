@@ -3958,9 +3958,16 @@ function applyAiQuantityToSelectedCandidate(result) {
 
 async function imageFileToDataUrl(filePath) {
   if (!filePath || !existsSync(filePath)) return "";
-  const converted = await convertImageForUse(filePath, "ai", { maxSide: 768, format: "JPEG", quality: 82 });
+  let converted = filePath;
+  try {
+    converted = await convertImageForUse(filePath, "ai", { maxSide: 768, format: "JPEG", quality: 82 });
+  } catch (error) {
+    console.warn(`[ai-image] image conversion failed, using original: ${error.message}`);
+  }
   const buffer = await fs.readFile(converted);
-  return `data:image/jpeg;base64,${buffer.toString("base64")}`;
+  const ext = path.extname(converted).toLowerCase();
+  const contentType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : "image/jpeg";
+  return `data:${contentType};base64,${buffer.toString("base64")}`;
 }
 
 async function prepare1688Page(context, job = null) {
@@ -4805,6 +4812,7 @@ function normalizeWorkerJobUpdate(input = {}, existing = {}) {
 async function processWorkerCompletionResults(job, existing = {}) {
   if (!job || existing.kind === "batch-ozon" || job.kind === "batch-ozon") return;
   if (!Array.isArray(job.results) || !job.results.length) return;
+  await hydrateWorkerResultImages(job);
   const options = existing.payload?.options || {};
   if (options.enableAI === false) return;
   for (const result of job.results) {
@@ -4813,6 +4821,8 @@ async function processWorkerCompletionResults(job, existing = {}) {
       result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
       applyAiReview(result);
       result.logs = Array.isArray(result.logs) ? result.logs : [];
+      job.logs = Array.isArray(job.logs) ? job.logs : [];
+      job.logs.push(makeLogEntry(`AI 已审核第 ${result.sourceRow || job.results.indexOf(result) + 1} 条，结果：${result.aiReview.decision || "none"}。`));
     } catch (error) {
       result.aiReview = {
         decision: "none",
@@ -4822,8 +4832,71 @@ async function processWorkerCompletionResults(job, existing = {}) {
         candidate_reviews: buildAiFailureCandidateReviews(result.candidates, "服务器 AI 审核失败"),
         thinkingMode: MINIMAX_THINKING_TYPE,
       };
+      job.logs = Array.isArray(job.logs) ? job.logs : [];
+      job.logs.push(makeLogEntry(`AI 审核第 ${result.sourceRow || job.results.indexOf(result) + 1} 条失败：${error.message}`, "warn"));
     }
   }
+}
+
+async function hydrateWorkerResultImages(job) {
+  if (!isSafeJobId(job.id) || !Array.isArray(job.results)) return;
+  await ensureDir(path.join(JOBS_DIR, job.id, "images"));
+  for (const [resultIndex, result] of job.results.entries()) {
+    const productIndex = result.sourceRow || resultIndex + 1;
+    const ozon = result.ozon || {};
+    if (!ozon.mainImage?.filePath && ozon.mainImageUrl) {
+      try {
+        ozon.mainImage = await downloadRemoteImageFile({
+          jobId: job.id,
+          index: productIndex,
+          prefix: "ozon",
+          url: ozon.mainImageUrl,
+          referer: result.url || ozon.sourceUrl || "https://www.ozon.ru/",
+        });
+        result.ozon = ozon;
+      } catch (error) {
+        ozon.imageDownloadError = error.message;
+      }
+    }
+    for (const [candidateIndex, candidate] of (result.candidates || []).entries()) {
+      if (!candidate.localImage?.filePath && candidate.image) {
+        try {
+          candidate.localImage = await downloadRemoteImageFile({
+            jobId: job.id,
+            index: `${String(productIndex).padStart(3, "0")}_${candidateIndex + 1}`,
+            prefix: "1688",
+            url: candidate.image,
+            referer: candidate.link || "https://www.1688.com/",
+          });
+        } catch (error) {
+          candidate.imageDownloadError = error.message;
+        }
+      }
+    }
+  }
+}
+
+async function downloadRemoteImageFile({ jobId, index, prefix, url, referer }) {
+  const response = await fetch(url, {
+    headers: {
+      Referer: referer || "",
+      "User-Agent": USER_AGENT,
+    },
+  });
+  if (!response.ok) throw new Error(`图片下载失败 ${response.status}：${url}`);
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const ext = extensionFromContentType(contentType, url);
+  const filename = `${prefix}_${String(index).replace(/[^0-9A-Za-z_-]/g, "_")}.${ext}`;
+  const filePath = path.join(JOBS_DIR, jobId, "images", filename);
+  await fs.writeFile(filePath, buffer);
+  return {
+    url,
+    filePath,
+    publicUrl: `/artifacts/jobs/${jobId}/images/${filename}`,
+    contentType,
+  };
 }
 
 function normalizeLogEntryForDb(entry) {
@@ -4932,6 +5005,7 @@ async function loadDbJobHistory(user) {
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
       processed: job.processed,
+      total: job.total || job.sourceTotal || job.results.length || 0,
       resultCount: job.results.length || job.processed || job.total || 0,
       sourceStartRow: job.sourceStartRow,
       sourceTotal: job.sourceTotal,
@@ -5763,7 +5837,7 @@ function buildContentTypesXml(hasImages) {
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
-  ${hasImages ? '<Default Extension="png" ContentType="image/png"/>' : ""}
+  ${hasImages ? '<Default Extension="png" ContentType="image/png"/><Default Extension="jpg" ContentType="image/jpeg"/><Default Extension="jpeg" ContentType="image/jpeg"/>' : ""}
   <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
   <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
   <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
@@ -5917,6 +5991,8 @@ if (process.argv[1] === __filename) {
 export {
   applyAiReview,
   getBrowserContext,
+  hydrateWorkerResultImages,
+  processWorkerCompletionResults,
   registerRuntimeJob,
   reviewCandidatesWithMiniMax,
   runBatchOzonJob,
