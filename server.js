@@ -1167,6 +1167,10 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
+    if (existing.status === "canceled") {
+      res.json({ success: true, job: existing });
+      return;
+    }
     const updates = normalizeWorkerJobUpdate(req.body || {}, existing);
     if (existing.status === "canceled" && updates.status && !["canceled", "done", "error"].includes(updates.status)) {
       delete updates.status;
@@ -1187,6 +1191,10 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     const existing = await getDbJobForUser(req.params.id, req.user);
     if (!existing) {
       res.status(404).json({ success: false, error: "任务不存在。" });
+      return;
+    }
+    if (existing.status === "canceled") {
+      res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl || "" });
       return;
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};

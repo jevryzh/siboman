@@ -82,6 +82,7 @@ async function runJob(job, state) {
       await updateProgress(job.id, "正在逐个采集 Ozon 商品", 0, total, state, "running", logs);
 
       for (let index = 0; index < productUrls.length; index += 1) {
+        await ensureJobNotCanceled(job.id, state);
         const url = productUrls[index];
         const sourceRow = index + 1;
         const result = await collectOzonResult(url, sourceRow, options, "batch");
@@ -100,6 +101,7 @@ async function runJob(job, state) {
       await updateProgress(job.id, "正在逐个采集 Ozon 商品", 0, total, state, "running", logs);
 
       for (let index = 0; index < urlRows.length; index += 1) {
+        await ensureJobNotCanceled(job.id, state);
         const row = typeof urlRows[index] === "string" ? { url: urlRows[index], sourceRow: index + 1 } : urlRows[index];
         const sourceRow = row.sourceRow || index + 1;
         const result = await collectOzonResult(row.url, sourceRow, options, "single");
@@ -124,6 +126,12 @@ async function runJob(job, state) {
     await completeJob(job.id, completed, state);
     await heartbeat();
   } catch (error) {
+    if (error?.canceled) {
+      logs.push(makeLog("检测到网页端停止任务，插件已停止领取后续链接。", "warn"));
+      await updateProgress(job.id, "已停止", results.length, total || job.total || 0, state, "canceled", logs, results).catch(() => {});
+      await heartbeat();
+      return;
+    }
     logs.push(makeLog(`任务失败：${error.message}`, "error"));
     await updateProgress(job.id, `任务失败：${error.message}`, results.length, total || job.total || 0, state, "error", logs, results);
     await completeJob(job.id, {
@@ -181,14 +189,18 @@ async function search1688ByImageUrl(imageUrl, maxCandidates, productIndex, ozon)
         error: "没有拿到 1688 搜图 token。请先在当前 Chrome 登录 1688，再回到插件开启领取任务。",
       };
     }
+    await reportLocalPhase(`1688 搜图 ${productIndex}：正在下载 Ozon 主图`);
     const base64Image = await imageUrlToCompressedBase64(imageUrl);
+    await reportLocalPhase(`1688 搜图 ${productIndex}：正在上传图片`);
     const imageId = await uploadImageTo1688(base64Image, cookieState);
     await sleep(900 + Math.floor(Math.random() * 1600));
+    await reportLocalPhase(`1688 搜图 ${productIndex}：正在获取候选货源`);
     const basicCandidates = (await searchOffersByImageId(imageId, cookieState)).slice(0, clampNumber(maxCandidates, 1, 20, 5));
     const candidates = [];
     for (let index = 0; index < basicCandidates.length; index += 1) {
       const candidate = basicCandidates[index];
       if (index > 0) await sleep(1200 + Math.floor(Math.random() * 2600));
+      await reportLocalPhase(`1688 候选详情 ${productIndex}-${index + 1}`);
       const details = await scrape1688CandidateDetails(candidate);
       candidates.push(annotateCandidateQuantity(addTrafficBaitAssessment(merge1688CandidateDetails(candidate, details)), ozon));
     }
@@ -945,7 +957,7 @@ function md5(input) {
 }
 
 async function updateProgress(jobId, phase, processed, total, state, status = "running", logs = [], results = undefined) {
-  await fetch(`${state.serverUrl}/api/worker/jobs/${jobId}/progress`, {
+  const response = await fetch(`${state.serverUrl}/api/worker/jobs/${jobId}/progress`, {
     method: "POST",
     headers: authHeaders(state),
     body: JSON.stringify({
@@ -958,6 +970,10 @@ async function updateProgress(jobId, phase, processed, total, state, status = "r
       ...(Array.isArray(results) ? { results } : {}),
     }),
   });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.success) throw new Error(data.error || `更新任务进度失败：HTTP ${response.status}`);
+  if (data.job?.status === "canceled") throwCanceled();
+  return data.job;
 }
 
 async function completeJob(jobId, job, state) {
@@ -972,6 +988,25 @@ async function completeJob(jobId, job, state) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.success) throw new Error(data.error || `回传任务失败：HTTP ${response.status}`);
   return data;
+}
+
+async function ensureJobNotCanceled(jobId, state) {
+  const response = await fetch(`${state.serverUrl}/api/jobs/${jobId}`, {
+    method: "GET",
+    headers: { "Authorization": `Bearer ${state.token}` },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (data.job?.status === "canceled") throwCanceled();
+}
+
+function throwCanceled() {
+  const error = new Error("任务已停止");
+  error.canceled = true;
+  throw error;
+}
+
+async function reportLocalPhase(phase) {
+  await chrome.storage.local.set({ currentPhase: phase }).catch(() => {});
 }
 
 async function login({ serverUrl, username, password }) {

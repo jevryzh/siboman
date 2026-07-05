@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "逐梦 ERP 采集端",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "连接逐梦 ERP，使用本机浏览器辅助 Ozon/1688 采集任务。",
   "permissions": [
     "alarms",
@@ -16,6 +16,7 @@
     "http://test.renwz.cn/*",
     "https://test.renwz.cn/*",
     "https://*.ozon.ru/*",
+    "https://*.ozone.ru/*",
     "https://*.1688.com/*",
     "https://h5api.m.1688.com/*",
     "https://*.alibaba.com/*"
