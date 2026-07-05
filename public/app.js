@@ -497,6 +497,7 @@ function bindSingleSourcingHandlers() {
   $("#runBtn")?.addEventListener("click", async () => {
     const urls = $("#urlsInput").value.trim();
     if (!urls) { toast("请粘贴 Ozon 链接", "error"); return; }
+    if (state.collectorMode && !(await ensureRunnableCollector("single"))) return;
     $("#runBtn").disabled = true; $("#cancelBtn").disabled = false;
     $("#singleLogs").textContent = "任务启动中…";
     try {
@@ -547,11 +548,12 @@ async function pollCurrentJob() {
 }
 
 function renderPolledJob(job) {
-  const statusLabel = $("#singleStatus");
-  const logBox = $("#singleLogs");
-  const resultCount = $("#singleResultCount");
-  const resultsBody = $("#singleResultsBody");
-  const downloadLink = $("#singleDownload");
+  const isBatchPage = Boolean($("#batchStatus"));
+  const statusLabel = isBatchPage ? $("#batchStatus") : $("#singleStatus");
+  const logBox = isBatchPage ? $("#batchLogs") : $("#singleLogs");
+  const resultCount = isBatchPage ? $("#batchResultCount") : $("#singleResultCount");
+  const resultsBody = isBatchPage ? $("#batchResultsBody") : $("#singleResultsBody");
+  const downloadLink = isBatchPage ? $("#batchDownload") : $("#singleDownload");
   if (statusLabel) statusLabel.textContent = `${job.status} · ${job.phase || ""} · ${job.processed || 0}/${job.total || 0}`;
   if (logBox && job.logs) {
     logBox.textContent = job.logs.slice(-100).map((l) => `[${(l.level || "info").toUpperCase()}] ${l.message}`).join("\n") || "（暂无日志）";
@@ -559,22 +561,40 @@ function renderPolledJob(job) {
   if (resultCount) resultCount.textContent = `${job.results?.length || 0} 条`;
   if (resultsBody) {
     const rows = job.results || [];
-    if (!rows.length) { resultsBody.innerHTML = `<tr><td colspan="4" class="empty">还没有结果</td></tr>`; return; }
-    resultsBody.innerHTML = rows.map((r) => {
-      const ozon = r.ozon || {};
-      const cands = (r.candidates || []).slice(0, 3);
-      return `<tr>
-        <td class="wrap"><a href="${escapeAttr(r.url)}" target="_blank" rel="noreferrer">${escapeHtml(ozon.title || r.url)}</a><div class="muted">${escapeHtml(ozon.currentBlackPriceCny || "")}</div></td>
-        <td>${ozon.mainImage?.publicUrl ? `<img class="thumb" src="${escapeAttr(ozon.mainImage.publicUrl)}">` : ""}</td>
-        <td class="wrap">${cands.length ? cands.map((c) => `<div>${escapeHtml(c.rank)}. ${escapeHtml(c.title || "")}<div class="muted">${escapeHtml(c.price || "")}</div></div>`).join("") : "<span class='muted'>无候选</span>"}</td>
-        <td>${escapeHtml(r.aiReview?.decision || r.error || "已采集")}</td>
-      </tr>`;
-    }).join("");
+    if (!rows.length) {
+      resultsBody.innerHTML = `<tr><td colspan="4" class="empty">还没有结果</td></tr>`;
+      return;
+    }
+    resultsBody.innerHTML = rows.map((r) => isBatchPage ? renderBatchResultRow(r) : renderSingleResultRow(r)).join("");
   }
   if (downloadLink && job.downloadUrl) {
     downloadLink.href = job.downloadUrl;
     downloadLink.classList.remove("hidden");
   }
+}
+
+function renderSingleResultRow(r) {
+  const ozon = r.ozon || {};
+  const cands = (r.candidates || []).slice(0, 3);
+  const image = ozon.mainImage?.publicUrl || ozon.mainImageUrl || "";
+  return `<tr>
+    <td class="wrap"><a href="${escapeAttr(r.url)}" target="_blank" rel="noreferrer">${escapeHtml(ozon.title || r.url)}</a><div class="muted">${escapeHtml(ozon.currentBlackPriceCny || ozon.finalBlackPriceCny || "")}</div></td>
+    <td>${image ? `<img class="thumb" src="${escapeAttr(image)}">` : ""}</td>
+    <td class="wrap">${cands.length ? cands.map((c) => `<div>${escapeHtml(c.rank)}. ${escapeHtml(c.title || "")}<div class="muted">${escapeHtml(c.price || "")}</div></div>`).join("") : `<span class='muted'>${escapeHtml(r.searchError || "无候选")}</span>`}</td>
+    <td>${escapeHtml(r.aiReview?.decision || r.error || "已采集")}</td>
+  </tr>`;
+}
+
+function renderBatchResultRow(r) {
+  const ozon = r.ozon || {};
+  const image = ozon.mainImage?.publicUrl || ozon.mainImageUrl || "";
+  const filterText = r.passedFilters ? "通过" : "未通过";
+  return `<tr>
+    <td class="wrap"><a href="${escapeAttr(r.url)}" target="_blank" rel="noreferrer">${escapeHtml(ozon.title || r.url)}</a><div class="muted">${escapeHtml(ozon.finalBlackPriceCny || ozon.currentBlackPriceCny || "")}</div></td>
+    <td>${image ? `<img class="thumb" src="${escapeAttr(image)}">` : ""}</td>
+    <td class="wrap">${escapeHtml(filterText)}${r.filterReasons?.length ? `<div class="muted">${escapeHtml(r.filterReasons.join("；"))}</div>` : ""}</td>
+    <td>${escapeHtml(r.error || "已采集")}</td>
+  </tr>`;
 }
 
 async function loadWorkerStatus(scope = "single") {
@@ -585,14 +605,17 @@ async function loadWorkerStatus(scope = "single") {
     const data = await getJson("/api/worker/status");
     const workers = data.workers || [];
     const onlineWorkers = workers.filter((worker) => worker.online);
+    const runnableWorkers = onlineWorkers.filter((worker) => worker.canClaimJobs);
     const queue = data.queue || {};
+    state.workerCanClaim = runnableWorkers.length > 0;
+    state.workerStatusLoadedAt = Date.now();
     if (metaEl) {
-      metaEl.textContent = `${onlineWorkers.length}/${workers.length} 在线 · 排队 ${queue.queued || 0} · 执行 ${queue.active || 0}`;
+      metaEl.textContent = `${runnableWorkers.length} 可执行 · ${onlineWorkers.length}/${workers.length} 在线 · 排队 ${queue.queued || 0} · 执行 ${queue.active || 0}`;
     }
     if (!workers.length) {
       boxEl.innerHTML = `
         <div class="empty" style="text-align:left">
-          当前账号还没有检测到浏览器采集插件。预览版先用于验证插件在线状态，正式采集领取会在采集逻辑迁移完成后开启。
+          当前账号还没有检测到可用采集端。请在需要采集的电脑上启动本机采集端，保持登录后再开始单品找货或批量采集。
         </div>`;
       return;
     }
@@ -600,11 +623,14 @@ async function loadWorkerStatus(scope = "single") {
       const platformLabel = formatWorkerPlatform(worker.platform);
       const statusClass = worker.online ? "green" : "gray";
       const statusText = worker.online ? "在线" : `离线 ${worker.ageSeconds ?? "?"} 秒`;
+      const runnableBadge = worker.online && worker.canClaimJobs
+        ? `<span class="badge green">可领取任务</span>`
+        : `<span class="badge amber">不可领取</span>`;
       return `
         <div style="border:1px solid #e0e5dc;border-radius:6px;padding:10px;margin:8px 0;background:#fff">
           <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
             <strong>${escapeHtml(worker.workerName || "本机采集端")}</strong>
-            <span class="badge ${statusClass}">${escapeHtml(statusText)}</span>
+            <span style="display:flex;gap:6px">${runnableBadge}<span class="badge ${statusClass}">${escapeHtml(statusText)}</span></span>
           </div>
           <div class="muted" style="margin-top:4px;font-size:12px">
             ${escapeHtml(platformLabel)} · ${escapeHtml(worker.hostname || "未知电脑")}
@@ -615,9 +641,20 @@ async function loadWorkerStatus(scope = "single") {
         </div>`;
     }).join("");
   } catch (error) {
+    state.workerCanClaim = false;
     if (metaEl) metaEl.textContent = "检测失败";
     boxEl.innerHTML = `<div class="empty" style="text-align:left">采集端状态读取失败：${escapeHtml(error.message)}</div>`;
   }
+}
+
+async function ensureRunnableCollector(scope = "single") {
+  await loadWorkerStatus(scope);
+  if (state.workerCanClaim) return true;
+  const message = "当前没有可领取任务的本机采集端在线。请先启动本机采集端，否则任务只会排队不会执行。";
+  toast(message, "error");
+  const logEl = scope === "single" ? $("#singleLogs") : $("#batchLogs");
+  if (logEl) logEl.textContent = message;
+  return false;
 }
 
 function formatWorkerPlatform(platform = "") {
@@ -658,6 +695,10 @@ function renderBatchSourcing(root) {
       </div>
     </div>
     <div class="card">
+      <div class="card-head"><h2>采集端状态</h2><span class="meta" id="collectorMeta">检测中...</span></div>
+      <div id="collectorStatusBox" class="muted">正在检测当前账号的本机采集端...</div>
+    </div>
+    <div class="card">
       <div class="card-head"><h2>实时进度</h2><span class="meta" id="batchStatus">待开始</span></div>
       <div id="batchLogs" class="code-area" style="min-height:200px"></div>
     </div>
@@ -669,12 +710,14 @@ function renderBatchSourcing(root) {
       </table></div>
     </div>`;
   bindBatchHandlers();
+  loadWorkerStatus("batch").catch(() => {});
 }
 
 function bindBatchHandlers() {
   $("#batchRunBtn")?.addEventListener("click", async () => {
     const url = $("#batchSourceInput").value.trim();
     if (!url) { toast("请粘贴 Ozon 店铺/商品链接", "error"); return; }
+    if (state.collectorMode && !(await ensureRunnableCollector("batch"))) return;
     $("#batchRunBtn").disabled = true; $("#batchCancelBtn").disabled = false;
     $("#batchLogs").textContent = "任务启动中…";
     try {

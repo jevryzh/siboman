@@ -13,6 +13,7 @@ const queueText = document.getElementById("queueText");
 const lastSeenText = document.getElementById("lastSeenText");
 const noticeText = document.getElementById("noticeText");
 const versionText = document.getElementById("versionText");
+const claimToggle = document.getElementById("claimToggle");
 
 init();
 
@@ -30,6 +31,10 @@ heartbeatBtn.addEventListener("click", () => runAction("正在同步状态...", 
 startBtn.addEventListener("click", () => runAction("正在保持在线...", () => sendMessage({ type: "start" })));
 stopBtn.addEventListener("click", () => runAction("正在暂停...", () => sendMessage({ type: "stop" })));
 logoutBtn.addEventListener("click", () => runAction("正在退出...", () => sendMessage({ type: "logout" })));
+claimToggle.addEventListener("change", () => {
+  const enabled = claimToggle.checked;
+  runAction(enabled ? "正在开启任务领取..." : "正在关闭任务领取...", () => sendMessage({ type: "set-claiming", enabled }));
+});
 
 async function init() {
   try {
@@ -66,6 +71,7 @@ async function sendMessage(message) {
 function renderState(state = {}) {
   serverUrlInput.value = state.serverUrl || "http://xm.renwz.cn";
   usernameInput.value = state.username || "";
+  claimToggle.checked = Boolean(state.enableJobClaiming);
   onlinePill.textContent = state.online && state.running ? "在线" : state.running ? "连接中" : "离线";
   onlinePill.classList.toggle("online", Boolean(state.online && state.running));
   workerNameText.textContent = state.workerName || "-";
@@ -73,10 +79,12 @@ function renderState(state = {}) {
   queueText.textContent = state.queue ? `排队 ${state.queue.queued || 0} / 执行 ${state.queue.active || 0}` : "-";
   lastSeenText.textContent = state.lastSeenAt ? formatTime(state.lastSeenAt) : "-";
   if (state.lastError) setNotice(state.lastError, "bad");
+  if (!state.lastError && state.online && state.enableJobClaiming) setNotice("已开启任务领取，网页端创建任务后会由本机插件执行。", "good");
+  if (!state.lastError && state.online && !state.enableJobClaiming) setNotice("插件在线，但未开启任务领取。需要采集时请打开上方开关。", "warn");
 }
 
 function setBusy(busy) {
-  [loginBtn, heartbeatBtn, startBtn, stopBtn, logoutBtn].forEach((button) => {
+  [loginBtn, heartbeatBtn, startBtn, stopBtn, logoutBtn, claimToggle].forEach((button) => {
     button.disabled = busy;
   });
 }

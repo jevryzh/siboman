@@ -1055,7 +1055,23 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
       return;
     }
-    const job = await claimNextDbJob(req.user, req.body?.workerName || req.headers["x-worker-name"] || "");
+    const workerName = req.body?.workerName || req.headers["x-worker-name"] || "";
+    await upsertWorkerHeartbeat(req.user, workerName, {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentPhase: req.body?.currentPhase || "本机采集端在线，可领取任务",
+    });
+    const job = await claimNextDbJob(req.user, workerName);
+    if (job) {
+      await upsertWorkerHeartbeat(req.user, workerName, {
+        platform: req.body?.platform,
+        hostname: req.body?.hostname,
+        profileDir: req.body?.profileDir,
+        currentJobId: job.id,
+        currentPhase: job.phase || "已领取任务",
+      });
+    }
     res.json({ success: true, job });
   } catch (error) {
     next(error);
@@ -1088,13 +1104,16 @@ app.get("/api/worker/status", async (req, res, next) => {
     const workers = workersResult.rows.map((row) => {
       const lastSeenAt = row.last_seen_at ? new Date(row.last_seen_at).toISOString() : "";
       const ageMs = lastSeenAt ? now - new Date(lastSeenAt).getTime() : Infinity;
+      const currentPhase = row.current_phase || "";
+      const canClaimJobs = !/预览版|暂不领取|不领取任务|未开启领取任务/i.test(currentPhase);
       return {
         workerName: row.worker_name,
         platform: row.platform || "",
         hostname: row.hostname || "",
         profileDir: row.profile_dir || "",
         currentJobId: row.current_job_id || "",
-        currentPhase: row.current_phase || "",
+        currentPhase,
+        canClaimJobs,
         lastSeenAt,
         online: ageMs <= Math.max(30000, WORKER_ONLINE_WINDOW_MS),
         ageSeconds: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null,
@@ -4787,19 +4806,28 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
   if (!isSafeJobId(id)) throw new Error("任务 ID 不合法");
   const dir = path.join(JOBS_DIR, id);
   await ensureDir(dir);
-  const downloadUrl = excelBase64 ? `/api/history/${id}/download` : "";
+  let downloadUrl = excelBase64 ? `/api/history/${id}/download` : "";
   const jobJson = {
     ...job,
     id,
     kind,
     downloadUrl,
+    logs: Array.isArray(job.logs) ? job.logs : [],
+    results: Array.isArray(job.results) ? job.results : [],
     updatedAt: new Date().toISOString(),
   };
-  await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
   if (excelBase64) {
     const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
     await fs.writeFile(path.join(dir, excelName), Buffer.from(String(excelBase64), "base64"));
+    await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
+    return downloadUrl;
   }
+  if (jobJson.results.length) {
+    await writeJobArtifacts(jobJson);
+    downloadUrl = jobJson.downloadUrl || `/api/history/${id}/download`;
+    jobJson.downloadUrl = downloadUrl;
+  }
+  await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
   return downloadUrl;
 }
 

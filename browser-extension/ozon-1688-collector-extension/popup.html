@@ -33,6 +33,13 @@
       </section>
 
       <section class="card">
+        <label class="toggle-row">
+          <input id="claimToggle" type="checkbox">
+          <span>
+            <strong>领取 ERP 采集任务</strong>
+            <small>开启后插件会使用当前浏览器执行单品找货和批量采集。</small>
+          </span>
+        </label>
         <div class="row">
           <span>采集端</span>
           <strong id="workerNameText">-</strong>
@@ -58,7 +65,7 @@
         <button id="logoutBtn" type="button">退出登录</button>
       </section>
 
-      <p class="notice" id="noticeText">预览版先用于连接 ERP 和显示在线状态；自动领取 Ozon/1688 采集任务会在下一步开启。</p>
+      <p class="notice" id="noticeText">登录后打开“领取 ERP 采集任务”，网页端创建的单品/批量任务就会由本机插件执行。</p>
     </main>
     <script src="popup.js"></script>
   </body>
