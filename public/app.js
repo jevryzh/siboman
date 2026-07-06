@@ -118,7 +118,7 @@ function formatTime(v) {
   return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 function statusBadge(status) {
-  const map = { running:["green","运行中"], done:["green","完成"], claimed:["blue","已领取"], queued:["gray","排队中"], error:["red","失败"], canceled:["gray","已停止"] };
+  const map = { running:["green","运行中"], paused:["amber","已暂停"], done:["green","完成"], claimed:["blue","已领取"], queued:["gray","排队中"], error:["red","失败"], canceled:["gray","已停止"] };
   const [cls, label] = map[status] || ["gray", status || "—"];
   return `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
 }
@@ -842,6 +842,9 @@ function renderSingleSourcing(root) {
           </label>
           <div style="display:flex;gap:8px;margin-top:8px">
             <button id="runBtn" class="button primary">开始采集</button>
+            <button id="pauseBtn" class="button" disabled>暂停</button>
+            <button id="resumeBtn" class="button" disabled>继续</button>
+            <button id="finishBtn" class="button" disabled>结束并导出</button>
             <button id="cancelBtn" class="button danger" disabled>停止</button>
           </div>
         </div>
@@ -864,6 +867,7 @@ function renderSingleSourcing(root) {
     </div>`;
   bindSingleSourcingHandlers();
   loadWorkerStatus("single").catch(() => {});
+  restoreActiveJob("single").catch(() => {});
 }
 
 function bindSingleSourcingHandlers() {
@@ -886,6 +890,7 @@ function bindSingleSourcingHandlers() {
         headless: $("#headlessInput").checked,
       });
       state.currentJobId = data.jobId;
+      localStorage.setItem("currentJobId", data.jobId);
       $("#singleLogs").textContent = `任务已创建：${data.jobId}\n`;
       $("#singleStatus").textContent = "排队中";
       loadWorkerStatus("single").catch(() => {});
@@ -896,10 +901,11 @@ function bindSingleSourcingHandlers() {
     }
   });
   $("#cancelBtn")?.addEventListener("click", async () => {
-    if (!state.currentJobId) return;
-    $("#cancelBtn").disabled = true;
-    try { await postJson(`/api/jobs/${state.currentJobId}/cancel`, {}); } catch (e) { /* ignore */ }
+    await actOnCurrentJob("cancel");
   });
+  $("#pauseBtn")?.addEventListener("click", () => actOnCurrentJob("pause"));
+  $("#resumeBtn")?.addEventListener("click", () => actOnCurrentJob("resume"));
+  $("#finishBtn")?.addEventListener("click", () => actOnCurrentJob("finish"));
 }
 
 function startJobPolling() {
@@ -914,12 +920,85 @@ async function pollCurrentJob() {
     const data = await getJson(`/api/jobs/${state.currentJobId}`);
     if (!data || !data.job) return;
     renderPolledJob(data.job);
-    if (["done", "error", "canceled"].includes(data.job.status)) {
+    if (["done", "error", "canceled", "paused"].includes(data.job.status)) {
       clearInterval(state.pollTimer);
       const r = $("#runBtn"); if (r) r.disabled = false;
-      const c = $("#cancelBtn"); if (c) c.disabled = true;
+      updateJobControlButtons(data.job.status);
+      if (["done", "error", "canceled"].includes(data.job.status)) localStorage.removeItem("currentJobId");
     }
   } catch (e) { /* ignore */ }
+}
+
+async function restoreActiveJob(scope = "single") {
+  let job = null;
+  const savedId = localStorage.getItem("currentJobId") || "";
+  if (savedId) {
+    try {
+      const data = await getJson(`/api/jobs/${savedId}`);
+      job = data.job || null;
+    } catch {}
+  }
+  if (!job || ["done", "error", "canceled"].includes(job.status)) {
+    const history = await getJson("/api/history").catch(() => null);
+    const wantedKind = scope === "batch" ? "batch-ozon" : "run";
+    const activeStatuses = new Set(["queued", "claimed", "running", "paused"]);
+    const item = (history?.items || []).find((it) => it.kind === wantedKind && activeStatuses.has(it.status));
+    if (item?.id) {
+      const data = await getJson(`/api/jobs/${item.id}`);
+      job = data.job || null;
+    }
+  }
+  if (!job || ["done", "error", "canceled"].includes(job.status)) return;
+  state.currentJobId = job.id;
+  localStorage.setItem("currentJobId", job.id);
+  renderPolledJob(job);
+  updateJobControlButtons(job.status);
+  if (job.status !== "paused") startJobPolling();
+}
+
+async function actOnCurrentJob(action, jobId = state.currentJobId) {
+  if (!jobId) return;
+  const labels = { pause: "暂停", resume: "继续", finish: "结束并导出", cancel: "停止" };
+  if (action === "finish" && !confirm("确定结束当前任务并按已采集结果生成 Excel？")) return;
+  if (action === "cancel" && !confirm("确定停止并取消当前任务？取消后不会继续。")) return;
+  try {
+    const data = await postJson(`/api/jobs/${jobId}/${action}`, {});
+    if (data.job) renderPolledJob(data.job);
+    if (data.downloadUrl) toast("Excel 已生成，可以下载。", "success");
+    else toast(`${labels[action] || "操作"}成功`, "success");
+    if (action === "resume") {
+      state.currentJobId = jobId;
+      localStorage.setItem("currentJobId", jobId);
+      startJobPolling();
+    }
+    if (action === "finish" || action === "cancel") {
+      clearInterval(state.pollTimer);
+      localStorage.removeItem("currentJobId");
+    }
+    await loadHistoryIfVisible();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function loadHistoryIfVisible() {
+  if ($("#historyBody")) await loadHistory();
+}
+
+function updateJobControlButtons(status) {
+  const active = ["queued", "claimed", "running"].includes(status);
+  const paused = status === "paused";
+  const terminal = ["done", "error", "canceled"].includes(status);
+  const run = $("#runBtn") || $("#batchRunBtn");
+  const pause = $("#pauseBtn") || $("#batchPauseBtn");
+  const resume = $("#resumeBtn") || $("#batchResumeBtn");
+  const finish = $("#finishBtn") || $("#batchFinishBtn");
+  const cancel = $("#cancelBtn") || $("#batchCancelBtn");
+  if (run) run.disabled = active;
+  if (pause) pause.disabled = !active;
+  if (resume) resume.disabled = !paused;
+  if (finish) finish.disabled = terminal || (!active && !paused);
+  if (cancel) cancel.disabled = terminal;
 }
 
 function renderPolledJob(job) {
@@ -930,6 +1009,7 @@ function renderPolledJob(job) {
   const resultsBody = isBatchPage ? $("#batchResultsBody") : $("#singleResultsBody");
   const downloadLink = isBatchPage ? $("#batchDownload") : $("#singleDownload");
   if (statusLabel) statusLabel.textContent = `${job.status} · ${job.phase || ""} · ${job.processed || 0}/${job.total || 0}`;
+  updateJobControlButtons(job.status);
   if (logBox && job.logs) {
     logBox.textContent = job.logs.slice(-100).map((l) => `[${(l.level || "info").toUpperCase()}] ${l.message}`).join("\n") || "（暂无日志）";
   }
@@ -1066,6 +1146,9 @@ function renderBatchSourcing(root) {
       <label><input type="checkbox" id="batchHeadlessInput" /> 后台浏览器模式</label>
       <div style="display:flex;gap:8px;margin-top:8px">
         <button id="batchRunBtn" class="button primary">开始批量采集</button>
+        <button id="batchPauseBtn" class="button" disabled>暂停</button>
+        <button id="batchResumeBtn" class="button" disabled>继续</button>
+        <button id="batchFinishBtn" class="button" disabled>结束并导出</button>
         <button id="batchCancelBtn" class="button danger" disabled>停止</button>
       </div>
     </div>
@@ -1086,6 +1169,7 @@ function renderBatchSourcing(root) {
     </div>`;
   bindBatchHandlers();
   loadWorkerStatus("batch").catch(() => {});
+  restoreActiveJob("batch").catch(() => {});
 }
 
 function bindBatchHandlers() {
@@ -1112,6 +1196,7 @@ function bindBatchHandlers() {
         },
       });
       state.currentJobId = data.jobId;
+      localStorage.setItem("currentJobId", data.jobId);
       $("#batchStatus").textContent = "排队中";
       startJobPolling();
     } catch (error) {
@@ -1120,10 +1205,11 @@ function bindBatchHandlers() {
     }
   });
   $("#batchCancelBtn")?.addEventListener("click", async () => {
-    if (!state.currentJobId) return;
-    $("#batchCancelBtn").disabled = true;
-    try { await postJson(`/api/jobs/${state.currentJobId}/cancel`, {}); } catch (e) { /* ignore */ }
+    await actOnCurrentJob("cancel");
   });
+  $("#batchPauseBtn")?.addEventListener("click", () => actOnCurrentJob("pause"));
+  $("#batchResumeBtn")?.addEventListener("click", () => actOnCurrentJob("resume"));
+  $("#batchFinishBtn")?.addEventListener("click", () => actOnCurrentJob("finish"));
 }
 
 /* ============== 商品列表 ==================== */
@@ -3206,8 +3292,8 @@ async function renderToolsHistory(root) {
         <div class="stat-card"><div class="label">历史文件</div><div class="value">…</div></div>
       </div>
       <div class="table-wrap"><table>
-        <thead><tr><th style="min-width:140px">任务</th><th>进度</th><th>时间</th><th>下载</th></tr></thead>
-        <tbody id="historyBody"><tr><td colspan="4" class="empty">加载中…</td></tr></tbody>
+        <thead><tr><th style="min-width:140px">任务</th><th>状态</th><th>进度</th><th>时间</th><th>操作</th><th>下载</th></tr></thead>
+        <tbody id="historyBody"><tr><td colspan="6" class="empty">加载中…</td></tr></tbody>
       </table></div>
     </div>`;
   $("#historyRefresh")?.addEventListener("click", () => loadHistory());
@@ -3225,15 +3311,38 @@ async function loadHistory() {
     `;
     const items = data.items || [];
     const body = $("#historyBody");
-    if (!items.length) { body.innerHTML = `<tr><td colspan="4" class="empty">还没有历史 Excel</td></tr>`; return; }
+    if (!items.length) { body.innerHTML = `<tr><td colspan="6" class="empty">还没有历史任务</td></tr>`; return; }
     body.innerHTML = items.slice(0, 50).map((it) => `
       <tr>
         <td class="wrap"><div>${escapeHtml(it.kind === "batch-ozon" ? "批量采集" : "单品找货")}</div><span class="muted">${escapeHtml((it.id || "").slice(0, 8))}</span></td>
+        <td>${statusBadge(it.status)}${it.phase ? `<div class="muted">${escapeHtml(it.phase)}</div>` : ""}</td>
         <td>${it.processed || 0} / ${it.total || 0}</td>
         <td><span class="muted">${escapeHtml(formatTime(it.updatedAt))}</span></td>
-        <td>${it.downloadUrl ? `<a class="button small" href="${escapeAttr(it.downloadUrl)}">下载</a>` : ""}</td>
+        <td>${renderHistoryActions(it)}</td>
+        <td>${it.downloadUrl ? `<a class="button small" href="${escapeAttr(it.downloadUrl)}">下载 Excel</a>` : ""}</td>
       </tr>`).join("");
+    body.querySelectorAll("[data-job-action]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const action = btn.dataset.jobAction;
+        const id = btn.dataset.jobId;
+        btn.disabled = true;
+        await actOnCurrentJob(action, id);
+      });
+    });
   } catch (e) { toast(e.message, "error"); }
+}
+
+function renderHistoryActions(it) {
+  const active = ["queued", "claimed", "running"].includes(it.status);
+  const paused = it.status === "paused";
+  const terminal = ["done", "error", "canceled"].includes(it.status);
+  const id = escapeAttr(it.id || "");
+  const parts = [];
+  if (active) parts.push(`<button class="button small" data-job-action="pause" data-job-id="${id}">暂停</button>`);
+  if (paused) parts.push(`<button class="button small" data-job-action="resume" data-job-id="${id}">继续</button>`);
+  if (!terminal) parts.push(`<button class="button small" data-job-action="finish" data-job-id="${id}">结束并导出</button>`);
+  if (active || paused) parts.push(`<button class="button small danger" data-job-action="cancel" data-job-id="${id}">停止</button>`);
+  return parts.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap">${parts.join("")}</div>` : "";
 }
 
 function renderToolsLogs(root) {

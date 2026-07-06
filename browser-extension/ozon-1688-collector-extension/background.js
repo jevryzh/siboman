@@ -63,11 +63,11 @@ async function pollJob() {
 }
 
 async function runJob(job, state) {
-  const logs = [makeLog("插件已领取任务。")];
+  const logs = Array.isArray(job.logs) ? [...job.logs, makeLog("插件已领取任务。")] : [makeLog("插件已领取任务。")];
   const kind = job.kind === "batch-ozon" ? "batch-ozon" : "run";
   const payload = job.payload || {};
   const options = payload.options || {};
-  let results = [];
+  let results = Array.isArray(job.results) ? [...job.results] : [];
   let total = 0;
 
   try {
@@ -81,10 +81,12 @@ async function runJob(job, state) {
       logs.push(makeLog(`已发现 ${total} 个商品链接。`));
       await updateProgress(job.id, "正在逐个采集 Ozon 商品", 0, total, state, "running", logs);
 
+      const doneRows = new Set(results.map((item) => Number(item?.sourceRow || 0)).filter(Boolean));
       for (let index = 0; index < productUrls.length; index += 1) {
-        await ensureJobNotCanceled(job.id, state);
+        await ensureJobRunnable(job.id, state);
         const url = productUrls[index];
         const sourceRow = index + 1;
+        if (doneRows.has(sourceRow)) continue;
         const result = await collectOzonResult(url, sourceRow, options, "batch");
         applyBatchFilters(result, options.filters || {});
         results.push(result);
@@ -100,10 +102,12 @@ async function runJob(job, state) {
       total = urlRows.length;
       await updateProgress(job.id, "正在逐个采集 Ozon 商品", 0, total, state, "running", logs);
 
+      const doneKeys = new Set(results.map((item) => `${Number(item?.sourceRow || 0)}:${item?.url || ""}`));
       for (let index = 0; index < urlRows.length; index += 1) {
-        await ensureJobNotCanceled(job.id, state);
+        await ensureJobRunnable(job.id, state);
         const row = typeof urlRows[index] === "string" ? { url: urlRows[index], sourceRow: index + 1 } : urlRows[index];
         const sourceRow = row.sourceRow || index + 1;
+        if (doneKeys.has(`${Number(sourceRow)}:${row.url || ""}`)) continue;
         const result = await collectOzonResult(row.url, sourceRow, options, "single");
         results.push(result);
         logs.push(makeLog(`第 ${index + 1}/${total} 条完成：${result.ozon?.title || row.url}`));
@@ -129,6 +133,11 @@ async function runJob(job, state) {
     if (error?.canceled) {
       logs.push(makeLog("检测到网页端停止任务，插件已停止领取后续链接。", "warn"));
       await updateProgress(job.id, "已停止", results.length, total || job.total || 0, state, "canceled", logs, results).catch(() => {});
+      await heartbeat();
+      return;
+    }
+    if (error?.paused) {
+      logs.push(makeLog("检测到网页端暂停任务，插件已暂停当前任务。", "warn"));
       await heartbeat();
       return;
     }
@@ -973,6 +982,7 @@ async function updateProgress(jobId, phase, processed, total, state, status = "r
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.success) throw new Error(data.error || `更新任务进度失败：HTTP ${response.status}`);
   if (data.job?.status === "canceled") throwCanceled();
+  if (data.job?.status === "paused") throwPaused();
   return data.job;
 }
 
@@ -990,18 +1000,26 @@ async function completeJob(jobId, job, state) {
   return data;
 }
 
-async function ensureJobNotCanceled(jobId, state) {
+async function ensureJobRunnable(jobId, state) {
   const response = await fetch(`${state.serverUrl}/api/jobs/${jobId}`, {
     method: "GET",
     headers: { "Authorization": `Bearer ${state.token}` },
   });
   const data = await response.json().catch(() => ({}));
   if (data.job?.status === "canceled") throwCanceled();
+  if (data.job?.status === "paused") throwPaused();
+  if (data.job?.status === "done") throwCanceled();
 }
 
 function throwCanceled() {
   const error = new Error("任务已停止");
   error.canceled = true;
+  throw error;
+}
+
+function throwPaused() {
+  const error = new Error("任务已暂停");
+  error.paused = true;
   throw error;
 }
 

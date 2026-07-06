@@ -2537,6 +2537,119 @@ app.post("/api/jobs/:id/cancel", async (req, res, next) => {
   }
 });
 
+app.post("/api/jobs/:id/pause", async (req, res, next) => {
+  try {
+    if (db) {
+      const job = await getDbJobForUser(req.params.id, req.user);
+      if (!job) {
+        res.status(404).json({ success: false, error: "任务不存在。" });
+        return;
+      }
+      if (["done", "error", "canceled"].includes(job.status)) {
+        res.json({ success: true, job });
+        return;
+      }
+      const updated = await updateDbJob(req.params.id, {
+        status: "paused",
+        phase: "已暂停，等待继续",
+        logs: [...(job.logs || []), makeLogEntry("已暂停任务，可在历史与下载中继续。", "warn")],
+      });
+      res.json({ success: true, job: updated });
+      return;
+    }
+    const job = jobs.get(req.params.id);
+    if (!job) {
+      res.status(404).json({ success: false, error: "任务不存在。" });
+      return;
+    }
+    job.status = "paused";
+    job.cancelRequested = true;
+    log(job, "已暂停任务。", "warn");
+    res.json({ success: true, job: serializeJob(job) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/jobs/:id/resume", async (req, res, next) => {
+  try {
+    if (db) {
+      const job = await getDbJobForUser(req.params.id, req.user);
+      if (!job) {
+        res.status(404).json({ success: false, error: "任务不存在。" });
+        return;
+      }
+      if (job.status !== "paused") {
+        res.status(409).json({ success: false, error: "只有暂停中的任务可以继续。" });
+        return;
+      }
+      const updated = await updateDbJob(req.params.id, {
+        status: "queued",
+        phase: "已继续，等待采集插件领取",
+        logs: [...(job.logs || []), makeLogEntry("已继续任务，等待采集插件领取。")],
+      });
+      res.json({ success: true, job: updated });
+      return;
+    }
+    res.status(409).json({ success: false, error: "当前模式暂不支持继续任务。" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/jobs/:id/finish", async (req, res, next) => {
+  try {
+    if (db) {
+      const existing = await getDbJobForUser(req.params.id, req.user);
+      if (!existing) {
+        res.status(404).json({ success: false, error: "任务不存在。" });
+        return;
+      }
+      if (existing.downloadUrl && existing.status === "done") {
+        res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl });
+        return;
+      }
+      const job = {
+        ...existing,
+        id: existing.id,
+        kind: existing.kind,
+        status: "done",
+        phase: "已结束并生成 Excel",
+        logs: [...(existing.logs || []), makeLogEntry("已手动结束任务，并按当前已采集结果生成 Excel。", "warn")],
+        results: Array.isArray(existing.results) ? existing.results : [],
+      };
+      await processWorkerCompletionResults(job, existing);
+      const kind = existing.kind === "batch-ozon" ? "batch-ozon" : "run";
+      const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, job, "");
+      const updated = await updateDbJob(req.params.id, {
+        status: "done",
+        phase: "已结束并生成 Excel",
+        processed: job.results.length || existing.processed || 0,
+        total: existing.total || existing.sourceTotal || job.results.length || 0,
+        logs: job.logs,
+        results: job.results,
+        error: "",
+        downloadUrl,
+      });
+      res.json({ success: true, job: updated, downloadUrl });
+      return;
+    }
+    const job = jobs.get(req.params.id) || await loadStoredJob(req.params.id);
+    if (!job) {
+      res.status(404).json({ success: false, error: "任务不存在。" });
+      return;
+    }
+    job.cancelRequested = true;
+    job.status = "done";
+    job.phase = "已结束并生成 Excel";
+    log(job, "已手动结束任务，并按当前已采集结果生成 Excel。", "warn");
+    await writeJobArtifacts(job);
+    res.json({ success: true, job: serializeJob(job), downloadUrl: job.downloadUrl || "" });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get("/api/jobs/:id/download", async (req, res, next) => {
   try {
     if (db && !(await getDbJobForUser(req.params.id, req.user))) {
@@ -2695,12 +2808,12 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
-    if (existing.status === "canceled") {
+    if (["paused", "canceled", "done"].includes(existing.status)) {
       res.json({ success: true, job: existing });
       return;
     }
     const updates = normalizeWorkerJobUpdate(req.body || {}, existing);
-    if (existing.status === "canceled" && updates.status && !["canceled", "done", "error"].includes(updates.status)) {
+    if (["paused", "canceled", "done"].includes(existing.status) && updates.status && ![existing.status, "done", "error"].includes(updates.status)) {
       delete updates.status;
     }
     const job = Object.keys(updates).length ? await updateDbJob(req.params.id, updates) : existing;
@@ -2728,7 +2841,7 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
-    if (existing.status === "canceled") {
+    if (["paused", "canceled", "done"].includes(existing.status)) {
       res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl || "" });
       return;
     }
@@ -6351,7 +6464,7 @@ async function claimNextDbJob(user, workerName = "") {
 
 function normalizeWorkerStatus(status) {
   const value = String(status || "").trim();
-  return ["queued", "claimed", "running", "done", "error", "canceled"].includes(value) ? value : "";
+  return ["queued", "claimed", "running", "paused", "done", "error", "canceled"].includes(value) ? value : "";
 }
 
 function normalizeWorkerJobUpdate(input = {}, existing = {}) {
