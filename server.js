@@ -45,6 +45,7 @@ const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
 const DETAIL_DELAY_MIN_MS = Number(process.env.DETAIL_DELAY_MIN_MS || 2500);
 const DETAIL_DELAY_MAX_MS = Number(process.env.DETAIL_DELAY_MAX_MS || 6500);
 const DETAIL_BROWSE_MODE = process.env.DETAIL_BROWSE_MODE || "balanced";
+const WORKER_ONLINE_WINDOW_MS = Number(process.env.WORKER_ONLINE_WINDOW_MS || 60000);
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = Number(process.env.DEFAULT_MAX_CONSECUTIVE_FAILURES || 3);
 const DISABLE_SERVER_SCRAPER = /^(1|true|yes)$/i.test(process.env.DISABLE_SERVER_SCRAPER || "");
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -66,7 +67,7 @@ let currentBrowserHeadless = false;
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || "");
   const isExtensionOrigin = /^chrome-extension:\/\//.test(origin);
-  const isTrustedWebOrigin = /^https?:\/\/(xm|test)\.renwz\.cn$/i.test(origin) || /^https?:\/\/localhost:\d+$/i.test(origin);
+  const isTrustedWebOrigin = /^https?:\/\/xm\.renwz\.cn$/i.test(origin) || /^https?:\/\/localhost:\d+$/i.test(origin);
   if (isExtensionOrigin || isTrustedWebOrigin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -348,6 +349,21 @@ async function initDatabase() {
 
     CREATE INDEX IF NOT EXISTS idx_app_jobs_user_updated ON app_jobs(user_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_app_jobs_status_updated ON app_jobs(status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS app_worker_heartbeats (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      worker_name TEXT NOT NULL,
+      platform TEXT NOT NULL DEFAULT '',
+      hostname TEXT NOT NULL DEFAULT '',
+      profile_dir TEXT NOT NULL DEFAULT '',
+      current_job_id UUID NULL,
+      current_phase TEXT NOT NULL DEFAULT '',
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(user_id, worker_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_app_worker_heartbeats_user_seen ON app_worker_heartbeats(user_id, last_seen_at DESC);
   `);
   await seedInitialUsers();
 }
@@ -4788,6 +4804,30 @@ async function claimNextDbJob(user, workerName = "") {
   } finally {
     client.release();
   }
+}
+
+async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
+  if (!db || !user?.id) return;
+  const workerLabel = String(workerName || "").trim().slice(0, 80) || "浏览器采集插件";
+  const platform = String(meta.platform || "").trim().slice(0, 40);
+  const hostname = String(meta.hostname || "").trim().slice(0, 120);
+  const profileDir = String(meta.profileDir || "").trim().slice(0, 240);
+  const currentPhase = String(meta.currentPhase || "").trim().slice(0, 200);
+  const currentJobId = isSafeJobId(meta.currentJobId) ? meta.currentJobId : null;
+  await db.query(
+    `INSERT INTO app_worker_heartbeats (
+       user_id, worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     ON CONFLICT (user_id, worker_name)
+     DO UPDATE SET
+       platform = EXCLUDED.platform,
+       hostname = EXCLUDED.hostname,
+       profile_dir = EXCLUDED.profile_dir,
+       current_job_id = COALESCE(EXCLUDED.current_job_id, app_worker_heartbeats.current_job_id),
+       current_phase = COALESCE(NULLIF(EXCLUDED.current_phase, ''), app_worker_heartbeats.current_phase),
+       last_seen_at = now()`,
+    [user.id, workerLabel, platform, hostname, profileDir, currentJobId, currentPhase],
+  );
 }
 
 function normalizeWorkerStatus(status) {
