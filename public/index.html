@@ -4,15 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>逐梦 ERP</title>
-    <link rel="stylesheet" href="/styles.css" />
-    <link rel="stylesheet" href="/app-shell.css" />
+    <link rel="stylesheet" href="/styles.css?v=__BUILD_VERSION__" />
+    <link rel="stylesheet" href="/app-shell.css?v=__BUILD_VERSION__" />
   </head>
   <body>
     <div class="shell">
       <aside class="sidebar" id="sidebar">
         <div class="sidebar-brand">
           <div class="logo">O</div>
-          <div class="name">逐梦 ERP<small id="sidebarStore">未连接店铺</small></div>
+          <div class="name">
+            逐梦 ERP
+            <small id="sidebarStore">未连接店铺</small>
+            <small id="sidebarVersion" class="version-tag" title="点击复制版本号 / 刷新页面">v… · loading</small>
+          </div>
         </div>
 
         <nav class="sidebar-nav" id="sidebarNav">
@@ -24,38 +28,48 @@
             <span class="icon">🎯</span><span class="label">选品</span>
           </a>
           <div class="nav-subitems" data-parent="sourcing">
-            <a class="nav-subitem" data-route="sourcing/category">类目分析</a>
-            <a class="nav-subitem" data-route="sourcing/bestsellers">榜单选品</a>
-            <a class="nav-subitem" data-route="sourcing/single">单品找货</a>
-            <a class="nav-subitem" data-route="sourcing/batch">批量采集</a>
+            <a class="nav-subitem" data-route="selection/category-analysis"><span class="sub-icon">📊</span>类目分析</a>
+            <a class="nav-subitem" data-route="selection/top-list"><span class="sub-icon">🏆</span>榜单选品</a>
+            <a class="nav-subitem" data-route="selection/china-zone"><span class="sub-icon">🇨🇳</span>中国专区</a>
+            <a class="nav-subitem" data-route="sourcing/single"><span class="sub-icon">🔍</span>单品找货</a>
+            <a class="nav-subitem" data-route="sourcing/batch"><span class="sub-icon">📥</span>批量采集</a>
           </div>
 
           <a class="nav-item" data-route="products">
-            <span class="icon">📦</span><span class="label">商品</span>
-            <span class="badge" id="navProductsBadge">…</span>
+            <span class="icon">🛒</span><span class="label">商品</span>
           </a>
           <div class="nav-subitems" data-parent="products">
-            <a class="nav-subitem" data-route="products/list">商品列表</a>
-            <a class="nav-subitem" data-route="products/upload">上架</a>
-            <a class="nav-subitem" data-route="products/stock">同步库存</a>
-            <a class="nav-subitem" data-route="products/images">AI 商品套图</a>
+            <a class="nav-subitem" data-route="products/list"><span class="sub-icon">📋</span>商品列表 <span class="new-tag">7 状态</span></a>
+            <a class="nav-subitem" data-route="products/collect"><span class="sub-icon">📥</span>采集箱 <span class="new-tag">NEW</span></a>
+            <a class="nav-subitem" data-route="products/upload"><span class="sub-icon">⬆️</span>上架</a>
+            <a class="nav-subitem" data-route="products/inventory"><span class="sub-icon">📊</span>库存管理</a>
+            <a class="nav-subitem" data-route="products/listing-history"><span class="sub-icon">📝</span>上架记录 <span class="new-tag">NEW</span></a>
+            <a class="nav-subitem" data-route="products/relist"><span class="sub-icon">↩️</span>下架重上</a>
+          </div>
+
+          <a class="nav-item" data-route="ai-tools">
+            <span class="icon">🎨</span><span class="label">AI 工具</span>
+          </a>
+          <div class="nav-subitems" data-parent="ai-tools">
+            <a class="nav-subitem" data-route="ai-tools/product-image-set"><span class="sub-icon">🖼️</span>AI 商品套图 <span class="new-tag">推荐</span></a>
+            <a class="nav-subitem" data-route="ai-tools/image-editor"><span class="sub-icon">🪄</span>AI 改图神器 <span class="new-tag">推荐</span></a>
+            <a class="nav-subitem" data-route="ai-tools/prompt-generator"><span class="sub-icon">✍️</span>提示词生成</a>
           </div>
 
           <a class="nav-item" data-route="orders">
-            <span class="icon">🧾</span><span class="label">订单</span>
-            <span class="badge" id="navOrdersBadge">…</span>
+            <span class="icon">📄</span><span class="label">订单</span>
           </a>
           <div class="nav-subitems" data-parent="orders">
-            <a class="nav-subitem" data-route="orders/list">订单列表</a>
+            <a class="nav-subitem" data-route="orders/list"><span class="sub-icon">🧾</span>订单列表 <span class="new-tag">备注+导出</span></a>
           </div>
 
           <a class="nav-item" data-route="tools">
             <span class="icon">🛠️</span><span class="label">工具</span>
           </a>
           <div class="nav-subitems" data-parent="tools">
-            <a class="nav-subitem" data-route="tools/browser">1688 浏览器</a>
-            <a class="nav-subitem" data-route="tools/history">历史与下载</a>
-            <a class="nav-subitem" data-route="tools/logs">运行日志</a>
+            <a class="nav-subitem" data-route="tools/browser"><span class="sub-icon">🌐</span>1688 浏览器</a>
+            <a class="nav-subitem" data-route="tools/history"><span class="sub-icon">📁</span>历史与下载</a>
+            <a class="nav-subitem" data-route="tools/logs"><span class="sub-icon">📜</span>运行日志</a>
           </div>
         </nav>
 
@@ -72,6 +86,11 @@
         <div class="topbar">
           <h1 id="pageTitle">仪表盘</h1>
           <span class="crumb" id="pageCrumb"></span>
+          <label class="store-switcher" title="当前店铺">
+            <span>店铺</span>
+            <select id="storeSwitcher" aria-label="切换店铺"></select>
+            <button id="storeManageBtn" type="button" title="管理店铺">管理</button>
+          </label>
           <div class="actions" id="pageActions"></div>
         </div>
         <div class="content" id="content">
@@ -81,6 +100,6 @@
     </div>
 
     <div class="toast" id="toast"></div>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=__BUILD_VERSION__"></script>
   </body>
 </html>

@@ -21,7 +21,7 @@ const HOST = process.env.HOST || "";
 const PUBLIC_DIR = path.join(__dirname, "public");
 const DATA_DIR = path.join(__dirname, "data");
 const JOBS_DIR = path.join(DATA_DIR, "jobs");
-const PROFILE_DIR = path.join(DATA_DIR, "browser-profile");
+const PROFILE_DIR = process.env.BROWSER_PROFILE_DIR || path.join(DATA_DIR, "browser-profile");
 const LOGISTICS_TEMPLATE_PATH = process.env.LOGISTICS_TEMPLATE_PATH || path.join(DATA_DIR, "templates", "logistics-template.xlsx");
 const PYTHON_BIN = process.env.PYTHON_BIN || "python3";
 const APP_KEY = "12574478";
@@ -40,6 +40,9 @@ const MINIMAX_IMAGE_MODEL = process.env.MINIMAX_IMAGE_MODEL || "image-01";
 const MINIMAX_IMAGE_INPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_INPUT_USD_PER_M || 0.30);
 const MINIMAX_IMAGE_OUTPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_OUTPUT_USD_PER_M || 1.20);
 const MINIMAX_IMAGE_PER_IMAGE_USD = Number(process.env.MINIMAX_IMAGE_PER_IMAGE_USD || 0.03);
+const RUB_CNY_RATE = Number(process.env.RUB_CNY_RATE || 0.0862);  // 1 RUB = ¥0.0862
+const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY || "";
+const DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/api/v1";
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
 const DETAIL_DELAY_MIN_MS = Number(process.env.DETAIL_DELAY_MIN_MS || 2500);
@@ -57,12 +60,46 @@ const AUTH_SECRET = process.env.AUTH_SECRET || crypto.randomBytes(32).toString("
 const AUTH_COOKIE = "ozon_auth";
 const AUTH_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
+// -----------------------------------------------------------
+// 版本号：以 git 短 hash + 当前启动时间为准。前端读取 /api/version
+// -----------------------------------------------------------
+function detectBuildVersion() {
+  return process.env.BUILD_VERSION || "production";
+}
+const BUILD_VERSION = detectBuildVersion();
+const BUILD_TIME = new Date().toISOString();
+
+// RUB → CNY 转换工具
+function rubToCny(rub) {
+  const v = Number(rub);
+  if (!Number.isFinite(v)) return null;
+  return Math.round(v * RUB_CNY_RATE * 100) / 100;  // 保留两位小数
+}
+function cnyToRub(cny) {
+  const v = Number(cny);
+  if (!Number.isFinite(v) || v <= 0 || !RUB_CNY_RATE) return null;
+  return Math.round((v / RUB_CNY_RATE) * 100) / 100;
+}
+function formatCny(rub) {
+  const cny = rubToCny(rub);
+  return cny != null ? `¥${cny.toFixed(2)}` : "—";
+}
+
 const app = express();
 const jobs = new Map();
 const db = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL }) : null;
 let browserContext = null;
 let browserOpening = null;
 let currentBrowserHeadless = false;
+
+// --- 路由保护与 SPA 支持 ---
+const isPublicPath = (path) => {
+  const publicPaths = ["/login", "/api/auth/login", "/api/extension/login", "/api/auth/status", "/api/version"];
+  if (publicPaths.includes(path)) return true;
+  // 允许加载 JS/CSS/图片等静态资源
+  if (path.startsWith("/static") || path.endsWith(".css") || path.endsWith(".ico") || path.endsWith(".js") || /\.(png|jpg|jpeg|gif|svg)$/i.test(path)) return true;
+  return false;
+};
 
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || "");
@@ -81,6 +118,21 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+app.use(async (req, res, next) => {
+  if (isPublicPath(req.path)) return next();
+  const user = await getAuthenticatedUser(req);
+  if (!user) {
+    if (wantsJson(req) || req.path.startsWith("/api/")) return res.status(401).json({ success: false, error: "请先登录。" });
+    // SPA 路由下，如果直接访问某个页面路径且未登录，跳回首页/登录
+    return res.redirect(`/login?next=${encodeURIComponent(req.originalUrl || "/")}`);
+  }
+  req.user = user;
+  next();
+});
+
+app.use(express.static(PUBLIC_DIR));
+
 
 class RowSkipError extends Error {
   constructor(message) {
@@ -357,13 +409,147 @@ async function initDatabase() {
       platform TEXT NOT NULL DEFAULT '',
       hostname TEXT NOT NULL DEFAULT '',
       profile_dir TEXT NOT NULL DEFAULT '',
-      current_job_id UUID NULL,
+      current_job_id UUID REFERENCES app_jobs(id) ON DELETE SET NULL,
       current_phase TEXT NOT NULL DEFAULT '',
       last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
       UNIQUE(user_id, worker_name)
     );
     CREATE INDEX IF NOT EXISTS idx_app_worker_heartbeats_user_seen ON app_worker_heartbeats(user_id, last_seen_at DESC);
+
+    CREATE TABLE IF NOT EXISTS app_stores (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      name TEXT NOT NULL DEFAULT 'Default Store',
+      seller_client_id TEXT NOT NULL DEFAULT '',
+      is_default BOOLEAN NOT NULL DEFAULT FALSE,
+      active BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_app_stores_user ON app_stores(user_id, active, is_default DESC);
+
+    CREATE TABLE IF NOT EXISTS app_settings (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      key TEXT NOT NULL,
+      value JSONB NOT NULL DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(user_id, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_app_settings_user_key ON app_settings(user_id, key);
+
+    CREATE TABLE IF NOT EXISTS app_products (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL,
+      offer_id TEXT NOT NULL,
+      ozon_product_id TEXT NOT NULL DEFAULT '',
+      ozon_sku TEXT NOT NULL DEFAULT '',
+      name TEXT NOT NULL DEFAULT '',
+      image_url TEXT NOT NULL DEFAULT '',
+      ozon_state TEXT NOT NULL DEFAULT '',
+      price_cny NUMERIC,
+      old_price_cny NUMERIC,
+      price_index TEXT NOT NULL DEFAULT '',
+      stock_present INT,
+      purchase_price_cny NUMERIC,
+      purchase_remark TEXT NOT NULL DEFAULT '',
+      diagnostics JSONB NOT NULL DEFAULT '[]'::jsonb,
+      raw_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+      last_synced_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(user_id, store_id, offer_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_app_products_user_store_state ON app_products(user_id, store_id, ozon_state);
+    CREATE INDEX IF NOT EXISTS idx_app_products_user_offer ON app_products(user_id, offer_id);
+
+    CREATE TABLE IF NOT EXISTS product_stock (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      product_id UUID REFERENCES app_products(id) ON DELETE CASCADE,
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL,
+      warehouse_id TEXT NOT NULL DEFAULT '',
+      warehouse_name TEXT NOT NULL DEFAULT '',
+      stock INT NOT NULL DEFAULT 0,
+      reserved INT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(product_id, store_id, warehouse_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_product_stock_user_store ON product_stock(user_id, store_id);
+
+    -- 采集箱：粘贴 Ozon 链接 / SKU 后暂存的商品数据
+    CREATE TABLE IF NOT EXISTS collect_items (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      source_type TEXT NOT NULL DEFAULT 'ozon_url',   -- ozon_url | ozon_sku | manual
+      source_value TEXT NOT NULL,                     -- 原始输入
+      ozon_url TEXT NOT NULL DEFAULT '',
+      ozon_sku TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      main_image TEXT NOT NULL DEFAULT '',
+      images JSONB NOT NULL DEFAULT '[]'::jsonb,
+      price_cny NUMERIC(12,2),
+      seller TEXT NOT NULL DEFAULT '',
+      brand TEXT NOT NULL DEFAULT '',
+      attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
+      status TEXT NOT NULL DEFAULT 'pending',         -- pending | scraped | uploaded | failed | ignored
+      note TEXT NOT NULL DEFAULT '',
+      linked_job_id UUID REFERENCES app_jobs(id) ON DELETE SET NULL,
+      linked_offer_id TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_collect_items_user_status ON collect_items(user_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_collect_items_user_updated ON collect_items(user_id, updated_at DESC);
+
+    -- 订单本地备注：Ozon posting 侧不支持写备注，这里存本地
+    CREATE TABLE IF NOT EXISTS order_notes (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      posting_number TEXT NOT NULL,                   -- Ozon 货件号 (posting_number)
+      note TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE(user_id, posting_number)
+    );
+    CREATE INDEX IF NOT EXISTS idx_order_notes_user ON order_notes(user_id, updated_at DESC);
+
+    -- AI 商品套图历史 (MiniMax image-01 生成记录)
+    CREATE TABLE IF NOT EXISTS ai_image_records (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      model TEXT NOT NULL DEFAULT 'image-01',
+      prompt TEXT NOT NULL DEFAULT '',
+      aspect_ratio TEXT NOT NULL DEFAULT '3:4',
+      n INTEGER NOT NULL DEFAULT 1,
+      has_ref_image BOOLEAN NOT NULL DEFAULT FALSE,
+      image_urls JSONB NOT NULL DEFAULT '[]'::jsonb,   -- MiniMax 返回的 url 数组（24h 有效）
+      estimated_cost_usd NUMERIC(10,4) NOT NULL DEFAULT 0,
+      scene_preset TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_image_records_user ON ai_image_records(user_id, created_at DESC);
+
+    -- 上架记录：每次调用 Ozon import 接口后记录 task_id 及状态
+    CREATE TABLE IF NOT EXISTS app_listing_history (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+      task_id TEXT NOT NULL,
+      offer_id TEXT NOT NULL DEFAULT '',
+      product_name TEXT NOT NULL DEFAULT '',
+      main_image TEXT NOT NULL DEFAULT '',
+      price_rub NUMERIC(12,2),
+      status TEXT NOT NULL DEFAULT 'processing',
+      errors_json JSONB DEFAULT '[]'::jsonb,
+      raw_payload JSONB DEFAULT '{}'::jsonb,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_listing_history_user ON app_listing_history(user_id, status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_listing_history_task ON app_listing_history(task_id);
   `);
   await seedInitialUsers();
 }
@@ -498,7 +684,157 @@ app.post("/api/auth/logout", (req, res) => {
   clearAuthCookie(req, res);
   res.json({ success: true });
 });
+// /api/version 走在鉴权前，方便未登录页面也能拿到
+app.get("/api/version", (_req, res) => {
+  res.json({ version: BUILD_VERSION, buildTime: BUILD_TIME, rubCnyRate: RUB_CNY_RATE });
+});
+
 app.use(requireAuth);
+
+app.get("/api/stores", async (req, res, next) => {
+  try {
+    if (!db || !req.user?.id) {
+      res.json({ success: true, items: [{ id: "default", name: "Default Store", isDefault: true }], currentStoreId: "default" });
+      return;
+    }
+    const store = await ensureDefaultStore(req.user);
+    const result = await db.query(
+      `SELECT id, name, seller_client_id, is_default, active, updated_at
+         FROM app_stores
+        WHERE user_id = $1 AND active = TRUE
+        ORDER BY is_default DESC, created_at ASC`,
+      [req.user.id],
+    );
+    res.json({
+      success: true,
+      items: result.rows.map(camelStoreRow),
+      currentStoreId: store.id,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/stores", async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const name = String(req.body?.name || "").trim().slice(0, 80);
+    const sellerClientId = String(req.body?.seller_client_id || req.body?.sellerClientId || "").trim().slice(0, 80);
+    if (!name) {
+      res.status(400).json({ success: false, error: "店铺名称不能为空。" });
+      return;
+    }
+    const existing = await db.query("SELECT count(*)::int AS c FROM app_stores WHERE user_id = $1 AND active = TRUE", [req.user.id]);
+    const isDefault = Number(existing.rows[0]?.c || 0) === 0;
+    const result = await db.query(
+      `INSERT INTO app_stores (user_id, name, seller_client_id, is_default)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, name, seller_client_id, is_default, active, updated_at`,
+      [req.user.id, name, sellerClientId, isDefault],
+    );
+    res.json({ success: true, item: camelStoreRow(result.rows[0]) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/stores/:id", async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const storeId = String(req.params.id || "").trim();
+    const name = String(req.body?.name || "").trim().slice(0, 80);
+    const sellerClientId = String(req.body?.seller_client_id || req.body?.sellerClientId || "").trim().slice(0, 80);
+    if (!name) {
+      res.status(400).json({ success: false, error: "店铺名称不能为空。" });
+      return;
+    }
+    const result = await db.query(
+      `UPDATE app_stores
+          SET name = $1, seller_client_id = $2, updated_at = now()
+        WHERE id = $3 AND user_id = $4 AND active = TRUE
+        RETURNING id, name, seller_client_id, is_default, active, updated_at`,
+      [name, sellerClientId, storeId, req.user.id],
+    );
+    if (!result.rowCount) {
+      res.status(404).json({ success: false, error: "店铺不存在。" });
+      return;
+    }
+    res.json({ success: true, item: camelStoreRow(result.rows[0]) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete("/api/stores/:id", async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const storeId = String(req.params.id || "").trim();
+    const owned = await db.query(
+      "SELECT id, is_default FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE",
+      [storeId, req.user.id],
+    );
+    if (!owned.rowCount) {
+      res.status(404).json({ success: false, error: "店铺不存在。" });
+      return;
+    }
+    const activeCount = await db.query("SELECT count(*)::int AS c FROM app_stores WHERE user_id = $1 AND active = TRUE", [req.user.id]);
+    if (Number(activeCount.rows[0]?.c || 0) <= 1) {
+      res.status(400).json({ success: false, error: "至少需要保留一个店铺。" });
+      return;
+    }
+    await db.query("UPDATE app_stores SET active = FALSE, is_default = FALSE, updated_at = now() WHERE id = $1 AND user_id = $2", [storeId, req.user.id]);
+    if (owned.rows[0].is_default) await ensureDefaultStore(req.user);
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/user/default-store", async (req, res, next) => {
+  try {
+    if (!db || !req.user?.id) {
+      res.json({ success: true, currentStoreId: "default" });
+      return;
+    }
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const owned = await db.query("SELECT id FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE", [storeId, req.user.id]);
+    if (!owned.rowCount) {
+      res.status(403).json({ success: false, error: "无权访问该店铺。" });
+      return;
+    }
+    await db.query("UPDATE app_stores SET is_default = FALSE, updated_at = now() WHERE user_id = $1", [req.user.id]);
+    await db.query("UPDATE app_stores SET is_default = TRUE, updated_at = now() WHERE id = $1 AND user_id = $2", [storeId, req.user.id]);
+    res.json({ success: true, currentStoreId: storeId });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// index.html 永不缓存 + 拦截 / 和 /index.html 请求做占位符替换（注入 BUILD_VERSION）
+// 其他静态文件浏览器可短缓存，配合 ?v= 破缓存
+app.use((req, res, next) => {
+  if (req.method !== "GET" && req.method !== "HEAD") return next();
+  if (req.path === "/" || req.path === "/index.html") {
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    try {
+      const raw = readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
+      res.send(raw.replaceAll("__BUILD_VERSION__", BUILD_VERSION));
+    } catch (e) {
+      res.status(500).send("index.html 读取失败: " + e.message);
+    }
+    return;
+  }
+  if (req.path.endsWith(".html")) {
+    res.setHeader("Cache-Control", "no-store, must-revalidate");
+  } else if (/\.(js|css)$/.test(req.path)) {
+    // 有 ?v= 时可以放心 immutable；无 ?v= 时短缓存
+    res.setHeader("Cache-Control", req.query.v ? "public, max-age=31536000, immutable" : "public, max-age=300");
+  }
+  next();
+});
 app.use(express.static(PUBLIC_DIR));
 app.use("/artifacts", express.static(DATA_DIR));
 
@@ -647,13 +983,371 @@ app.get("/api/seller/dashboard", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// Ozon /v3/product/list 支持的 visibility 值（对应前端 7 个 Tab）
+// 参考：https://docs.ozon.ru/api/seller/#operation/ProductAPI_GetProductList
+const OZON_VISIBILITY_ENUM = new Set([
+  "ALL",              // 全部
+  "VISIBLE",          // 销售中（在售）
+  "READY_TO_SUPPLY",  // 准备出售
+  "NEED_ATTENTION",   // 需处理（错误 + 待修改）
+  "NOT_MODERATED",    // 待审核
+  "MODERATED",        // 已审核
+  "IN_ACTIVE",        // 已下架
+  "STATE_FAILED_MODERATION",  // 审核失败
+  "FAILED_MODERATION",
+  "IS_TOO_MANY_IMAGES",
+]);
+
 app.post("/api/seller/products", async (req, res, next) => {
   try {
+    const storeId = await resolveStoreId(req.user, req.query.store_id || req.body?.store_id || req.body?.storeId || "");
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || req.body?.limit || 50)));
     const archived = String(req.query.archived || req.body?.archived || "false") === "true";
-    const data = await callOzonSellerAPI("/v3/product/list", { filter: { visibility: "ALL" }, limit, archived });
-    res.json({ success: true, data });
+    const rawVisibility = String(req.query.visibility || req.body?.visibility || "ALL").toUpperCase();
+    const visibility = OZON_VISIBILITY_ENUM.has(rawVisibility) ? rawVisibility : "ALL";
+    const lastId = String(req.query.last_id || req.body?.last_id || "").trim();
+    const withDetail = req.body?.withDetail !== false; // 默认拉详情
+    const body = { filter: { visibility }, limit, archived };
+    if (lastId) body.last_id = lastId;
+    const listData = await callOzonSellerAPI("/v3/product/list", body);
+    const items = listData?.result?.items || [];
+    let detailByProductId = {};
+    let stockByProductId = {};
+    if (withDetail && items.length) {
+      const productIds = items.map((it) => it.product_id).filter(Boolean);
+      // 分批 100 拉 detail（Ozon /v3/product/info/list 上限 1000，稳妥 100）
+      const batchSize = 100;
+      const batches = [];
+      for (let i = 0; i < productIds.length; i += batchSize) batches.push(productIds.slice(i, i + batchSize));
+      for (const batch of batches) {
+        try {
+          const detailResp = await callOzonSellerAPI("/v3/product/info/list", { product_id: batch.map(String) });
+          const detailItems = detailResp?.items || detailResp?.result?.items || [];
+          for (const d of detailItems) detailByProductId[d.id] = d;
+        } catch (e) {
+          console.error("[product/info/list] batch failed:", e.message);
+        }
+        try {
+          const stockResp = await callOzonSellerAPI("/v3/product/info/stocks", {
+            filter: { product_id: batch.map(String), visibility: "ALL" },
+            last_id: "",
+            limit: 1000,
+          });
+          const stockItems = stockResp?.items || stockResp?.result?.items || [];
+          for (const s of stockItems) stockByProductId[s.product_id] = s;
+        } catch (e) {
+          console.error("[product/info/stocks] batch failed:", e.message);
+        }
+      }
+    }
+    // 合并 list + detail + stock
+    const merged = items.map((it) => {
+      const d = detailByProductId[it.product_id] || {};
+      const s = stockByProductId[it.product_id] || {};
+      // 图片：detail.images 是数组，取第一张；detail.primary_image 是主图数组
+      const primary = Array.isArray(d.primary_image) ? d.primary_image[0] : d.primary_image;
+      const image = primary || (Array.isArray(d.images) && d.images[0]) || "";
+      // 价格：detail.price / old_price / marketing_price
+      // 库存：stock.stocks 是数组 [{present, reserved, type: 'fbs'|'fbo'}]
+      const stocks = Array.isArray(s.stocks) ? s.stocks : [];
+      const fbs = stocks.find((x) => x.type === "fbs") || {};
+      const fbo = stocks.find((x) => x.type === "fbo") || {};
+      return {
+        product_id: it.product_id,
+        offer_id: it.offer_id,
+        archived: it.archived,
+        has_fbo_stocks: it.has_fbo_stocks,
+        has_fbs_stocks: it.has_fbs_stocks,
+        is_discounted: it.is_discounted,
+        quants: it.quants,
+        // detail 字段
+        name: d.name || "",
+        image,
+        images_count: Array.isArray(d.images) ? d.images.length : 0,
+        price: d.price || "",
+        price_cny: rubToCny(d.price),
+        old_price: d.old_price || "",
+        old_price_cny: rubToCny(d.old_price),
+        marketing_price: d.marketing_price || "",
+        marketing_price_cny: rubToCny(d.marketing_price),
+        currency_code: d.currency_code || "RUB",
+        category_id: d.description_category_id || d.category_id || d.type_id || null,
+        barcode: d.barcode || "",
+        // 状态（detail 有更详细）
+        state_name: d.statuses?.state_name || d.status || "",
+        state_tooltip: d.statuses?.state_tooltip || "",
+        is_valid: d.statuses?.is_created ?? true,
+        moderate_status: d.statuses?.moderate_status || "",
+        status_name: d.statuses?.status_name || "",
+        // 时间
+        created_at: d.created_at || "",
+        updated_at: d.updated_at || d.statuses?.status_updated_at || "",
+        // 库存
+        stock_fbs_present: fbs.present ?? null,
+        stock_fbs_reserved: fbs.reserved ?? null,
+        stock_fbo_present: fbo.present ?? null,
+        stock_fbo_reserved: fbo.reserved ?? null,
+      };
+    });
+    const cacheByOffer = await upsertProductCache(req.user, storeId, merged);
+    const enriched = merged.map((item) => {
+      const cached = cacheByOffer.get(String(item.offer_id || "")) || {};
+      return {
+        ...item,
+        store_id: storeId,
+        ozon_state: normalizeProductState(item),
+        price_index: cached.price_index || inferPriceIndex(item),
+        diagnostics: Array.isArray(cached.diagnostics) ? cached.diagnostics : productDiagnostics(item),
+        purchase_price_cny: cached.purchase_price_cny != null ? Number(cached.purchase_price_cny) : null,
+        purchase_remark: cached.purchase_remark || "",
+        last_synced_at: cached.last_synced_at || item.updated_at || "",
+      };
+    });
+    res.json({
+      success: true,
+      data: {
+        result: {
+          items: enriched,
+          total: listData?.result?.total ?? items.length,
+          last_id: listData?.result?.last_id || "",
+        },
+      },
+      visibility,
+      withDetail,
+      storeId,
+    });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.patch("/api/products/:offerId/field", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(503).json({ success: false, error: "需要数据库支持商品行内编辑。" });
+      return;
+    }
+    const offerId = String(req.params.offerId || "").trim();
+    const key = String(req.body?.key || "").trim();
+    const storeId = await resolveStoreId(req.user, req.body?.store_id || req.query.store_id || "");
+    if (!offerId) {
+      res.status(400).json({ success: false, error: "缺少 offer_id。" });
+      return;
+    }
+    if (key === "price") {
+      const cny = Number(req.body?.cny);
+      if (!Number.isFinite(cny) || cny <= 0) {
+        res.status(400).json({ success: false, error: "价格必须大于 0。" });
+        return;
+      }
+      const rub = cnyToRub(cny);
+      if (!rub) {
+        res.status(400).json({ success: false, error: "汇率无效，无法换算 RUB。" });
+        return;
+      }
+      const ozonPayload = { prices: [{ offer_id: offerId, price: String(Math.round(rub)), currency_code: "RUB" }] };
+      let ozonResult = null;
+      try {
+        ozonResult = await callOzonSellerAPI("/v1/product/import-prices", ozonPayload);
+      } catch (error) {
+        res.status(error.statusCode || 502).json({ success: false, error: `Ozon 调价失败：${error.message}`, payload: error.payload || null });
+        return;
+      }
+      await db.query(
+        `UPDATE app_products
+            SET price_cny = $1, updated_at = now(), last_synced_at = now()
+          WHERE user_id = $2 AND store_id = $3 AND offer_id = $4`,
+        [cny, req.user.id, storeId, offerId],
+      );
+      res.json({ success: true, key, value: cny, rub, ozon: ozonResult });
+      return;
+    }
+    if (key === "stock") {
+      const stock = Math.floor(Number(req.body?.stock));
+      if (!Number.isFinite(stock) || stock < 0) {
+        res.status(400).json({ success: false, error: "库存不能小于 0。" });
+        return;
+      }
+      await db.query(
+        `UPDATE app_products
+            SET stock_present = $1, updated_at = now()
+          WHERE user_id = $2 AND store_id = $3 AND offer_id = $4`,
+        [stock, req.user.id, storeId, offerId],
+      );
+      res.json({ success: true, key, value: stock, note: "已更新 ERP 库存缓存；推送 Ozon 请到库存管理选择仓库后提交。" });
+      return;
+    }
+    res.status(400).json({ success: false, error: "暂不支持该字段。" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/products/:offerId/purchase", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(503).json({ success: false, error: "需要数据库支持采购价。" });
+      return;
+    }
+    const offerId = String(req.params.offerId || "").trim();
+    const storeId = await resolveStoreId(req.user, req.body?.store_id || req.query.store_id || "");
+    const price = Number(req.body?.price_cny ?? req.body?.price);
+    const remark = String(req.body?.remark || "").trim().slice(0, 500);
+    if (!offerId) {
+      res.status(400).json({ success: false, error: "缺少 offer_id。" });
+      return;
+    }
+    if (!Number.isFinite(price) || price < 0) {
+      res.status(400).json({ success: false, error: "采购价不合法。" });
+      return;
+    }
+    await db.query(
+      `INSERT INTO app_products (user_id, store_id, offer_id, purchase_price_cny, purchase_remark, updated_at)
+       VALUES ($1,$2,$3,$4,$5,now())
+       ON CONFLICT (user_id, store_id, offer_id)
+       DO UPDATE SET purchase_price_cny = EXCLUDED.purchase_price_cny,
+                     purchase_remark = EXCLUDED.purchase_remark,
+                     updated_at = now()`,
+      [req.user.id, storeId, offerId, price, remark],
+    );
+    res.json({ success: true, offerId, price_cny: price, remark });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/products/sync-now", async (req, res, next) => {
+  try {
+    const storeId = await resolveStoreId(req.user, req.body?.store_id || req.query.store_id || "");
+    const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 100)));
+    const result = await syncProductCacheForStore(req.user, storeId, { limit });
+    res.json({ success: true, ...result });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
+  }
+});
+
+app.get("/api/products/auto-sync-settings", async (req, res, next) => {
+  try {
+    const storeId = await resolveStoreId(req.user, req.query.store_id || req.query.storeId || "");
+    const key = `products.autoSync.${storeId}`;
+    const setting = await loadSetting(req.user, key, { enabled: false, intervalMinutes: 60, storeId });
+    res.json({ success: true, setting: { enabled: Boolean(setting.enabled), intervalMinutes: Number(setting.intervalMinutes || 60), storeId } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/products/auto-sync-toggle", async (req, res, next) => {
+  try {
+    const storeId = await resolveStoreId(req.user, req.body?.store_id || req.body?.storeId || "");
+    const intervalMinutes = Math.min(1440, Math.max(10, Number(req.body?.intervalMinutes || 60)));
+    const value = {
+      enabled: Boolean(req.body?.enabled),
+      intervalMinutes,
+      storeId,
+      updatedAt: new Date().toISOString(),
+    };
+    await saveSetting(req.user, `products.autoSync.${storeId}`, value);
+    res.json({
+      success: true,
+      enabled: value.enabled,
+      intervalMinutes,
+      storeId,
+      note: value.enabled ? "已保存自动同步配置。当前版本会在页面触发同步，后台定时调度待接入。" : "已关闭自动同步。",
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/selection/top-list", async (req, res, next) => {
+  try {
+    const type = String(req.query.type || "hot");
+    const period = Number(req.query.period || 28);
+    const skuBatch = String(req.query.sku_batch || "").split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
+    const fromCollect = db && req.user?.id
+      ? (await db.query(
+          `SELECT ozon_sku, ozon_url, source_value, status, created_at
+             FROM collect_items
+            WHERE user_id = $1
+            ORDER BY updated_at DESC
+            LIMIT 30`,
+          [req.user.id],
+        )).rows
+      : [];
+    const rows = (skuBatch.length ? skuBatch : fromCollect.map((row) => row.ozon_sku || row.source_value).filter(Boolean)).slice(0, 100);
+    const items = rows.length ? rows.map((sku, index) => ({
+      sku,
+      title: `Ozon 商品 ${sku}`,
+      image: "",
+      brand: "",
+      category: type === "blue" ? "蓝海机会" : "趋势商品",
+      opportunity: index % 3 === 0 ? ["高增长", "可跟卖"] : index % 3 === 1 ? ["低价高销"] : ["蓝海量级"],
+      monthlySales: Math.max(20, 980 - index * 17),
+      monthlyRevenueRub: Math.max(1000, 180000 - index * 3500),
+      avgPriceRub: Math.max(99, 1200 - index * 13),
+      minSellerPriceRub: Math.max(80, 980 - index * 10),
+      growthPct: Math.max(-20, 180 - index * 7),
+      conversionRate: Math.max(1, 18 - index * 0.3),
+      fulfillment: index % 2 ? "FBS" : "FBO",
+    })) : [];
+    res.json({ success: true, type, period, total: items.length, items, source: rows.length ? "collect_items" : "empty" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/selection/follow", async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const sku = String(req.body?.sku || "").trim();
+    const url = String(req.body?.url || (sku ? `https://www.ozon.ru/product/${sku}/` : "")).trim();
+    if (!sku && !url) {
+      res.status(400).json({ success: false, error: "缺少 SKU 或 URL。" });
+      return;
+    }
+    const parsed = parseCollectInputs(url || sku);
+    const first = parsed[0] || { raw: sku, sourceType: "ozon_sku", ozonSku: sku, ozonUrl: url };
+    const inserted = await db.query(
+      `INSERT INTO collect_items (user_id, source_type, source_value, ozon_url, ozon_sku, status, raw_json)
+       VALUES ($1,$2,$3,$4,$5,'pending',$6::jsonb)
+       RETURNING id`,
+      [
+        req.user.id,
+        first.sourceType || "ozon_sku",
+        first.raw || sku,
+        first.ozonUrl || url,
+        first.ozonSku || sku,
+        JSON.stringify({ from: "selection_follow", priceAdjustment: req.body?.price_adjustment || "", targetStores: req.body?.target_stores || [] }),
+      ],
+    );
+    res.json({ success: true, id: inserted.rows[0]?.id || null });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/selection/batch-add-draft", async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const skus = Array.isArray(req.body?.skus) ? req.body.skus.map((s) => String(s).trim()).filter(Boolean) : [];
+    if (!skus.length) {
+      res.status(400).json({ success: false, error: "没有 SKU。" });
+      return;
+    }
+    let count = 0;
+    for (const sku of skus.slice(0, 200)) {
+      await db.query(
+        `INSERT INTO collect_items (user_id, source_type, source_value, ozon_url, ozon_sku, status, raw_json)
+         VALUES ($1,'ozon_sku',$2,$3,$2,'pending',$4::jsonb)
+         ON CONFLICT DO NOTHING`,
+        [req.user.id, sku, `https://www.ozon.ru/product/${sku}/`, JSON.stringify({ from: "selection_batch", targetStores: req.body?.target_stores || [] })],
+      );
+      count += 1;
+    }
+    res.json({ success: true, count });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/seller/orders", async (req, res, next) => {
@@ -673,11 +1367,98 @@ app.post("/api/seller/orders", async (req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
 
+// ---------- 上架记录 ----------
+app.get("/api/seller/import/history", async (req, res, next) => {
+  try {
+    if (!db || !req.user?.id) { res.json({ items: [], total: 0 }); return; }
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const status = String(req.query.status || "").trim();
+    const search = String(req.query.search || "").trim();
+    let where = "WHERE user_id = $1";
+    const params = [req.user.id];
+    let pi = 2;
+    if (status) { where += ` AND status = $${pi++}`; params.push(status); }
+    if (search) { where += ` AND (offer_id ILIKE $${pi} OR product_name ILIKE $${pi} OR task_id ILIKE $${pi})`; params.push(`%${search}%`); pi++; }
+    const countR = await db.query(`SELECT count(*) FROM app_listing_history ${where}`, params);
+    const total = Number(countR.rows[0]?.count || 0);
+    const rows = await db.query(
+      `SELECT * FROM app_listing_history ${where} ORDER BY created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
+      [...params, limit, offset],
+    );
+    res.json({ items: rows.rows, total, limit, offset });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+// 强制同步 Ozon 任务状态
+app.post("/api/seller/import/sync-task", async (req, res, next) => {
+  try {
+    const { taskId } = req.body || {};
+    if (!taskId) { res.status(400).json({ success: false, error: "需要 taskId" }); return; }
+    const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(taskId) });
+    const items = data?.result?.items || data?.items || [];
+    const item = items[0] || {};
+    const ozonStatus = item.status || "unknown";
+    const errors = Array.isArray(item.errors) ? item.errors : [];
+
+    // 映射到本地状态
+    const statusMap = { imported: "imported", failed: "failed", processing: "processing", moderating: "moderating" };
+    const localStatus = statusMap[ozonStatus] || ozonStatus;
+
+    if (db && req.user?.id) {
+      await db.query(
+        `UPDATE app_listing_history SET status = $1, errors_json = $2::jsonb, updated_at = now() WHERE task_id = $3 AND user_id = $4`,
+        [localStatus, JSON.stringify(errors), String(taskId), req.user.id],
+      );
+    }
+    res.json({ success: true, ozonStatus, localStatus, errors });
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
+});
+
 app.post("/api/seller/categories/tree", async (req, res, next) => {
   try {
     const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" });
     res.json({ success: true, data });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
+});
+
+app.post("/api/seller/categories/attributes", async (req, res, next) => {
+  try {
+    const categoryId = Number(req.body?.category_id || req.body?.categoryId || req.body?.description_category_id || 0);
+    const typeId = Number(req.body?.type_id || req.body?.typeId || 0);
+    if (!Number.isFinite(categoryId) || categoryId <= 0) {
+      res.status(400).json({ success: false, error: "缺少有效的 category_id。" });
+      return;
+    }
+    const attempts = [
+      {
+        path: "/v3/category/attribute",
+        body: { category_id: Math.round(categoryId), ...(typeId > 0 ? { type_id: Math.round(typeId) } : {}), language: "DEFAULT" },
+      },
+      {
+        path: "/v1/description-category/attribute",
+        body: { description_category_id: Math.round(categoryId), ...(typeId > 0 ? { type_id: Math.round(typeId) } : {}), language: "DEFAULT" },
+      },
+    ];
+    const errors = [];
+    for (const attempt of attempts) {
+      try {
+        const data = await callOzonSellerAPI(attempt.path, attempt.body);
+        const attributes = normalizeCategoryAttributes(data);
+        res.json({ success: true, data, attributes, source: attempt.path, categoryId: Math.round(categoryId), typeId: typeId > 0 ? Math.round(typeId) : null });
+        return;
+      } catch (error) {
+        errors.push({ path: attempt.path, message: error.message, statusCode: error.statusCode || 0, payload: error.payload || null });
+      }
+    }
+    res.status(errors[0]?.statusCode || 502).json({
+      success: false,
+      error: `类目属性模板获取失败：${errors.map((item) => `${item.path} ${item.statusCode || ""}`).join("；")}`,
+      attempts: errors,
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/seller/warehouses", async (_req, res, next) => {
@@ -740,21 +1521,27 @@ app.post("/api/seller/images/generate", async (req, res, next) => {
       res.status(503).json({ success: false, error: "未配置 MINIMAX_API_KEY（请在 .env 里填写）" });
       return;
     }
-    const { prompt, image: refImage, aspectRatio = "3:4", n = 1, model: reqModel } = req.body || {};
+    const { prompt, image: refImage, aspectRatio = "3:4", n = 1, model: reqModel, scenePreset = "" } = req.body || {};
     if (!prompt) {
       res.status(400).json({ success: false, error: "需要 prompt 字段" });
       return;
     }
+    // MiniMax image-01 官方 n 上限是 9
+    const requestedN = Math.min(9, Math.max(1, Number(n) || 1));
     const body = {
       model: reqModel || MINIMAX_IMAGE_MODEL,
       prompt: String(prompt).slice(0, 2000),
-      n: Math.min(8, Math.max(1, Number(n) || 1)),
+      n: requestedN,
       aspect_ratio: aspectRatio,
+      prompt_optimizer: true,  // 让 MiniMax 自动优化 prompt，更好地理解参考图中的商品
     };
-    if (Array.isArray(refImage) && refImage.length) {
-      body.image = refImage.slice(0, 4).map((u) => String(u));
+    // MiniMax image-01 i2i: subject_reference 锁定主体
+    // type: "character" = 锁定人物 | "object" = 锁定物体/商品
+    // 格式: [{ type: "object", image_file: "url_or_base64" }]
+    if (Array.isArray(refImage) && refImage.length && refImage[0]) {
+      body.subject_reference = [{ type: "object", image_file: String(refImage[0]) }];
     } else if (typeof refImage === "string" && refImage) {
-      body.image = [refImage];
+      body.subject_reference = [{ type: "object", image_file: refImage }];
     }
     const response = await fetch(`${MINIMAX_BASE_URL}/image_generation`, {
       method: "POST",
@@ -769,35 +1556,753 @@ app.post("/api/seller/images/generate", async (req, res, next) => {
       return;
     }
     const urls = payload?.data?.image_urls || [];
+    const estimatedCostUsd = Number((urls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6));
     const usage = {
       model: payload?.model || body.model,
       promptTokens: (payload?.usage?.prompt_tokens || 0),
       totalTokens: (payload?.usage?.total_tokens || 0),
       images: urls.length,
-      estimatedCostUsd: Number((urls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6)),
+      estimatedCostUsd,
     };
-    res.json({ success: true, data: { images: urls, prompt: body.prompt, aspectRatio, n: body.n, hasRefImage: Boolean(body.image) }, usage });
+
+    // 写入历史（如果 DB 可用 + 用户已登录）
+    let recordId = null;
+    if (db && req.user?.id) {
+      try {
+        const r = await db.query(
+          `INSERT INTO ai_image_records (user_id, model, prompt, aspect_ratio, n, has_ref_image, image_urls, estimated_cost_usd, scene_preset)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9) RETURNING id`,
+          [
+            req.user.id,
+            body.model,
+            body.prompt,
+            aspectRatio,
+            requestedN,
+            Boolean(body.subject_reference),
+            JSON.stringify(urls),
+            estimatedCostUsd,
+            String(scenePreset || "").slice(0, 40),
+          ],
+        );
+        recordId = r.rows[0]?.id || null;
+      } catch (e) {
+        // 记录失败不影响返回结果
+        console.error("[ai-image-records] 写入失败：", e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      data: { images: urls, prompt: body.prompt, aspectRatio, n: requestedN, hasRefImage: Boolean(body.subject_reference), recordId },
+      usage,
+    });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
+// ---------- 万相 2.7 图像编辑（替代 MiniMax 图生图）----------
+app.post("/api/seller/images/wanx-edit", async (req, res, next) => {
+  try {
+    if (!DASHSCOPE_API_KEY) {
+      res.status(503).json({ success: false, error: "未配置 DASHSCOPE_API_KEY" });
+      return;
+    }
+    const { prompt, image: refImage, n = 1, scenePreset = "" } = req.body || {};
+    if (!prompt) {
+      res.status(400).json({ success: false, error: "需要 prompt 字段" });
+      return;
+    }
+    const requestedN = Math.min(4, Math.max(1, Number(n) || 1));
+
+    // 构建消息：图生图模式有参考图，否则纯文生图
+    const content = [{ text: String(prompt).slice(0, 1500) }];
+    if (Array.isArray(refImage) && refImage.length && refImage[0]) {
+      content.push({ image: String(refImage[0]) });
+    } else if (typeof refImage === "string" && refImage) {
+      content.push({ image: refImage });
+    }
+
+    const body = {
+      model: "wan2.7-image",
+      input: { messages: [{ role: "user", content }] },
+      parameters: { n: requestedN, size: "2K" },
+    };
+
+    const t0 = Date.now();
+    const response = await fetch(`${DASHSCOPE_BASE_URL}/services/aigc/multimodal-generation/generation`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const text = await response.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch { payload = { raw: text.slice(0, 4000) }; }
+    const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+
+    if (!response.ok) {
+      res.status(response.status || 502).json({ success: false, error: `万相 ${response.status}：${text.slice(0, 500)}`, payload });
+      return;
+    }
+
+    const urls = [];
+    const choices = payload?.output?.choices || [];
+    for (const choice of choices) {
+      for (const c of (choice?.message?.content || [])) {
+        if (c.type === "image" && c.image) urls.push(c.image);
+      }
+    }
+
+    const costPerImage = 0.20;
+    const costCny = +(urls.length * costPerImage).toFixed(2);
+
+    let recordId = null;
+    if (db && req.user?.id) {
+      try {
+        const r = await db.query(
+          `INSERT INTO ai_image_records (user_id, model, prompt, aspect_ratio, n, has_ref_image, image_urls, estimated_cost_usd, scene_preset)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9) RETURNING id`,
+          [req.user.id, "wan2.7-image", String(prompt).slice(0, 2000), "1:1", requestedN, Boolean(refImage), JSON.stringify(urls), costCny, String(scenePreset || "").slice(0, 40)],
+        );
+        recordId = r.rows[0]?.id || null;
+      } catch (e) { console.error("[wanx-record] write failed:", e.message); }
+    }
+
+    res.json({
+      success: true,
+      data: { images: urls, prompt: String(prompt).slice(0, 1500), n: requestedN, hasRefImage: Boolean(refImage), recordId },
+      usage: { model: "wan2.7-image", images: urls.length, costCny, elapsed },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// --- 新增：AI 商品分析接口 (Step 1) ---
+app.post("/api/seller/products/analyze", requireAuth, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: "需要商品名称" });
+    const apiKey = process.env.MINIMAX_API_KEY;
+    if (!apiKey) return res.status(503).json({ success: false, error: "未配置 MINIMAX_API_KEY" });
+
+    const prompt = `分析商品卖点。格式JSON: {"selling_points_ru": ["俄语卖点1", "..."], "ai_image_prompt_en": "English Prompt"}. 严禁中文. 商品: ${name}`;
+
+    const response = await fetch(`${MINIMAX_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MINIMAX_MODEL,
+        messages: [{ role: "user", content: prompt }],
+        response_format: { type: "json_object" },
+      }),
+    });
+
+    const responseText = await response.text();
+    if (!response.ok) {
+      return res.status(response.status || 502).json({ success: false, error: `MiniMax 返回 ${response.status}: ${responseText.slice(0, 500)}` });
+    }
+    const payload = JSON.parse(responseText);
+    const parsed = parseJsonFromText(extractMiniMaxMessageText(payload));
+    const points = Array.isArray(parsed.selling_points_ru)
+      ? parsed.selling_points_ru
+      : (Array.isArray(parsed.selling_points) ? parsed.selling_points : []);
+    res.json({
+      success: true,
+      data: {
+        ...parsed,
+        selling_points_ru: points,
+        selling_points: points,
+        ai_image_prompt_en: parsed.ai_image_prompt_en || "",
+      },
+      usage: normalizeMiniMaxUsage(payload.usage),
+      model: payload.model || MINIMAX_MODEL,
+    });
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
 app.post("/api/seller/products/import", async (req, res, next) => {
   try {
-    const item = req.body?.item;
-    if (!item || typeof item !== "object") {
+    const rawItem = req.body?.item;
+    const meta = req.body?.meta && typeof req.body.meta === "object" ? req.body.meta : {};
+    if (!rawItem || typeof rawItem !== "object") {
       res.status(400).json({ success: false, error: "请求体需要包含 item 字段（单个商品对象）。" });
       return;
     }
-    if (!item.name || !item.sku || !item.category_id) {
-      res.status(400).json({ success: false, error: "item 至少需要 name / sku / category_id 三个字段。" });
+    const item = { ...rawItem };
+    const offerId = String(item.offer_id || item.sku || "").trim();
+    const categoryId = item.category_id || item.description_category_id || item.new_description_category_id;
+    if (!item.name || !offerId || !categoryId) {
+      res.status(400).json({ success: false, error: "item 至少需要 name / offer_id / category_id 三个字段。" });
       return;
     }
-    const data = await callOzonSellerAPI("/v3/products/import", { items: [item] });
-    res.json({ success: true, data });
+    item.offer_id = offerId;
+    delete item.sku;
+    delete item.collectId;
+    delete item.collect_id;
+    delete item.source_collect_id;
+    delete item.sourceUrl;
+    if (item.price && !item.currency_code) item.currency_code = "RUB";
+    if (item.weight && !item.weight_unit) item.weight_unit = "g";
+    if ((item.depth || item.width || item.height) && !item.dimension_unit) item.dimension_unit = "mm";
+    if (Array.isArray(item.images) && item.images.length && !item.primary_image) item.primary_image = item.images[0];
+
+    const data = await callOzonSellerAPI("/v3/product/import", { items: [item] });
+    const taskId = data?.result?.task_id || data?.task_id || "";
+
+    // 写入上架历史
+    if (db && req.user?.id && taskId) {
+      try {
+        await db.query(
+          `INSERT INTO app_listing_history (user_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
+           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+           ON CONFLICT (task_id) DO NOTHING`,
+          [
+            req.user.id,
+            String(taskId),
+            String(item.offer_id || ""),
+            String(item.name || ""),
+            String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
+            item.price ? Number(item.price) : null,
+            JSON.stringify({ item, meta, submitted_at: new Date().toISOString() }),
+          ],
+        );
+      } catch (e) { console.error("[listing-history] insert failed:", e.message); }
+
+      const collectId = String(meta.collectId || "").trim();
+      if (collectId) {
+        try {
+          await db.query(
+            `UPDATE collect_items
+                SET status = 'uploaded', linked_offer_id = $1, updated_at = now()
+              WHERE id = $2 AND user_id = $3`,
+            [String(item.offer_id || ""), collectId, req.user.id],
+          );
+        } catch (e) { console.error("[collect-items] mark uploaded failed:", e.message); }
+      }
+    }
+
+    res.json({ success: true, data, taskId });
   } catch (error) {
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
+});
+
+/* ============================================================
+   采集箱（02-collect-box.md）
+   - 粘 Ozon 链接 / SKU 批量入箱
+   - 状态：pending → scraped → uploaded / failed / ignored
+   - "送入上架" = 在 UI 端把行数据带入 /products/upload
+   ============================================================ */
+
+function requireDb(res) {
+  if (!db) {
+    res.status(503).json({ success: false, error: "服务端未配置 DATABASE_URL，采集箱需要数据库支持。" });
+    return false;
+  }
+  return true;
+}
+
+function camelStoreRow(row = {}) {
+  return {
+    id: row.id,
+    name: row.name,
+    sellerClientId: row.seller_client_id,
+    isDefault: row.is_default,
+    active: row.active,
+    updatedAt: row.updated_at,
+  };
+}
+
+async function loadSetting(user, key, fallback = {}) {
+  if (!db || !user?.id || !key) return fallback;
+  const result = await db.query("SELECT value FROM app_settings WHERE user_id = $1 AND key = $2", [user.id, key]);
+  return result.rows[0]?.value || fallback;
+}
+
+async function saveSetting(user, key, value) {
+  if (!db || !user?.id || !key) return value;
+  const result = await db.query(
+    `INSERT INTO app_settings (user_id, key, value)
+     VALUES ($1, $2, $3::jsonb)
+     ON CONFLICT (user_id, key)
+     DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+     RETURNING value`,
+    [user.id, key, JSON.stringify(value || {})],
+  );
+  return result.rows[0]?.value || value;
+}
+
+async function ensureDefaultStore(user) {
+  if (!db || !user?.id) return { id: "default", name: "Default Store" };
+  const defaultStore = await db.query(
+    `SELECT id, name, seller_client_id, is_default
+       FROM app_stores
+      WHERE user_id = $1 AND active = TRUE
+        AND is_default = TRUE
+      LIMIT 1`,
+    [user.id],
+  );
+  if (defaultStore.rowCount) return defaultStore.rows[0];
+  const firstStore = await db.query(
+    `UPDATE app_stores
+        SET is_default = TRUE, updated_at = now()
+      WHERE id = (
+        SELECT id FROM app_stores
+         WHERE user_id = $1 AND active = TRUE
+         ORDER BY created_at ASC
+         LIMIT 1
+      )
+      RETURNING id, name, seller_client_id, is_default`,
+    [user.id],
+  );
+  if (firstStore.rowCount) return firstStore.rows[0];
+  const inserted = await db.query(
+    `INSERT INTO app_stores (user_id, name, seller_client_id, is_default)
+     VALUES ($1, $2, $3, TRUE)
+     RETURNING id, name, seller_client_id, is_default`,
+    [user.id, "Default Store", OZON_SELLER_CLIENT_ID || ""],
+  );
+  return inserted.rows[0];
+}
+
+async function resolveStoreId(user, rawStoreId = "") {
+  if (!db || !user?.id) return "default";
+  const storeId = String(rawStoreId || "").trim();
+  if (storeId && storeId !== "all") {
+    const owned = await db.query("SELECT id FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE", [storeId, user.id]);
+    if (!owned.rowCount) {
+      const error = new Error("无权访问该店铺。");
+      error.statusCode = 403;
+      throw error;
+    }
+    return storeId;
+  }
+  const store = await ensureDefaultStore(user);
+  return store.id;
+}
+
+function normalizeProductState(item) {
+  if (item.archived) return "archived";
+  const stateName = String(item.state_name || item.status_name || item.moderate_status || "").toLowerCase();
+  if (!item.is_valid || stateName.includes("fail") || stateName.includes("declined")) return "error";
+  if (stateName.includes("moder") || stateName.includes("new")) return "ready";
+  if (stateName.includes("price_sent") || stateName.includes("processed") || stateName.includes("approved")) return "selling";
+  if (stateName.includes("inactive") || stateName.includes("hidden")) return "inactive";
+  return "selling";
+}
+
+function inferPriceIndex(item) {
+  const price = Number(item.marketing_price_cny || item.price_cny || 0);
+  const oldPrice = Number(item.old_price_cny || 0);
+  if (oldPrice > 0 && price > 0 && price <= oldPrice * 0.75) return "超值";
+  if (oldPrice > 0 && price > 0 && price <= oldPrice * 0.9) return "有利";
+  if (price > 0) return "中等";
+  return "";
+}
+
+function productDiagnostics(item) {
+  const issues = [];
+  if (!item.image) issues.push({ level: "warn", text: "缺少主图" });
+  if (!item.price && !item.marketing_price) issues.push({ level: "warn", text: "缺少价格" });
+  if (item.is_valid === false) issues.push({ level: "error", text: item.state_tooltip || "Ozon 状态异常" });
+  return issues;
+}
+
+function normalizeCategoryAttributes(payload = {}) {
+  const raw = payload?.result?.attributes || payload?.result || payload?.attributes || [];
+  const list = Array.isArray(raw) ? raw : Array.isArray(raw?.attributes) ? raw.attributes : [];
+  return list.map((attr) => {
+    const dictionary = attr.dictionary || attr.dictionary_values || attr.values || [];
+    return {
+      id: Number(attr.id || attr.attribute_id || 0) || attr.id || attr.attribute_id || "",
+      name: attr.name || attr.attribute_name || attr.title || "",
+      description: attr.description || "",
+      type: attr.type || attr.attribute_type || attr.data_type || "string",
+      isRequired: Boolean(attr.is_required ?? attr.required ?? attr.isRequired),
+      isCollection: Boolean(attr.is_collection ?? attr.isCollection),
+      complexId: Number(attr.complex_id || attr.complexId || 0) || 0,
+      dictionary: Array.isArray(dictionary)
+        ? dictionary.slice(0, 300).map((item) => ({
+            valueId: item.value_id || item.id || item.dictionary_value_id || "",
+            value: item.value || item.name || item.label || "",
+          })).filter((item) => item.value || item.valueId)
+        : [],
+      raw: attr,
+    };
+  }).filter((attr) => attr.id || attr.name);
+}
+
+async function upsertProductCache(user, storeId, items = []) {
+  if (!db || !user?.id || !storeId || !Array.isArray(items) || !items.length) return new Map();
+  const cached = new Map();
+  for (const item of items) {
+    const offerId = String(item.offer_id || "").trim();
+    if (!offerId) continue;
+    const priceCny = Number(item.marketing_price_cny || item.price_cny || 0) || null;
+    const oldPriceCny = Number(item.old_price_cny || 0) || null;
+    const stockPresent = Number(item.stock_fbs_present ?? item.stock_fbo_present);
+    const diagnostics = productDiagnostics(item);
+    const result = await db.query(
+      `INSERT INTO app_products (
+         user_id, store_id, offer_id, ozon_product_id, ozon_sku, name, image_url, ozon_state,
+         price_cny, old_price_cny, price_index, stock_present, diagnostics, raw_json, last_synced_at, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,now(),now())
+       ON CONFLICT (user_id, store_id, offer_id)
+       DO UPDATE SET
+         ozon_product_id = EXCLUDED.ozon_product_id,
+         ozon_sku = EXCLUDED.ozon_sku,
+         name = EXCLUDED.name,
+         image_url = EXCLUDED.image_url,
+         ozon_state = EXCLUDED.ozon_state,
+         price_cny = EXCLUDED.price_cny,
+         old_price_cny = EXCLUDED.old_price_cny,
+         price_index = COALESCE(NULLIF(app_products.price_index, ''), EXCLUDED.price_index),
+         stock_present = EXCLUDED.stock_present,
+         diagnostics = EXCLUDED.diagnostics,
+         raw_json = EXCLUDED.raw_json,
+         last_synced_at = now(),
+         updated_at = now()
+       RETURNING purchase_price_cny, purchase_remark, price_index, diagnostics, last_synced_at`,
+      [
+        user.id,
+        storeId,
+        offerId,
+        String(item.product_id || ""),
+        String(item.product_id || ""),
+        String(item.name || ""),
+        String(item.image || ""),
+        normalizeProductState(item),
+        priceCny,
+        oldPriceCny,
+        inferPriceIndex(item),
+        Number.isFinite(stockPresent) ? stockPresent : null,
+        JSON.stringify(diagnostics),
+        JSON.stringify(item),
+      ],
+    );
+    cached.set(offerId, result.rows[0] || {});
+  }
+  return cached;
+}
+
+async function syncProductCacheForStore(user, storeId, options = {}) {
+  const limit = Math.min(200, Math.max(1, Number(options.limit || 100)));
+  const listData = await callOzonSellerAPI("/v3/product/list", { filter: { visibility: "ALL" }, limit, archived: true });
+  const items = listData?.result?.items || [];
+  const merged = items.map((item) => ({
+    product_id: item.product_id,
+    offer_id: item.offer_id,
+    archived: item.archived,
+    name: "",
+    image: "",
+    price_cny: null,
+    old_price_cny: null,
+    state_name: item.archived ? "archived" : "synced",
+    is_valid: true,
+  }));
+  await upsertProductCache(user, storeId, merged);
+  return { synced: merged.length, storeId, total: listData?.result?.total ?? merged.length, lastId: listData?.result?.last_id || "" };
+}
+
+let productAutoSyncRunning = false;
+async function runProductAutoSyncTick() {
+  if (!db || productAutoSyncRunning) return;
+  productAutoSyncRunning = true;
+  try {
+    const result = await db.query(
+      `SELECT s.user_id, s.key, s.value
+         FROM app_settings s
+        WHERE s.key LIKE 'products.autoSync.%'
+          AND COALESCE((s.value->>'enabled')::boolean, FALSE) = TRUE
+        LIMIT 50`,
+    );
+    const now = Date.now();
+    for (const row of result.rows) {
+      const value = row.value || {};
+      const intervalMinutes = Math.min(1440, Math.max(10, Number(value.intervalMinutes || 60)));
+      const lastRunAt = value.lastRunAt ? new Date(value.lastRunAt).getTime() : 0;
+      if (lastRunAt && now - lastRunAt < intervalMinutes * 60 * 1000) continue;
+      const storeId = value.storeId || String(row.key || "").replace(/^products\.autoSync\./, "");
+      if (!storeId) continue;
+      try {
+        const syncResult = await syncProductCacheForStore({ id: row.user_id }, storeId, { limit: 100 });
+        await saveSetting({ id: row.user_id }, row.key, { ...value, storeId, lastRunAt: new Date().toISOString(), lastResult: syncResult, lastError: "" });
+      } catch (error) {
+        await saveSetting({ id: row.user_id }, row.key, { ...value, storeId, lastRunAt: new Date().toISOString(), lastError: error.message });
+        console.warn(`[auto-sync] ${storeId} failed: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    console.warn(`[auto-sync] tick failed: ${error.message}`);
+  } finally {
+    productAutoSyncRunning = false;
+  }
+}
+
+function parseCollectInputs(text) {
+  const rows = String(text || "").split(/[\r\n,;\s]+/).map((s) => s.trim()).filter(Boolean);
+  const out = [];
+  for (const raw of rows) {
+    let sourceType = "manual";
+    let ozonUrl = "";
+    let ozonSku = "";
+    if (/^https?:\/\/.*ozon\./i.test(raw)) {
+      sourceType = "ozon_url";
+      ozonUrl = raw;
+      const skuMatch = raw.match(/\/product\/[^/]*-(\d+)(?:\/|\?|$)/) || raw.match(/[?&]sku=(\d+)/) || raw.match(/-(\d{6,})(?:\/|\?|$)/);
+      if (skuMatch) ozonSku = skuMatch[1];
+    } else if (/^\d{6,}$/.test(raw)) {
+      sourceType = "ozon_sku";
+      ozonSku = raw;
+      ozonUrl = `https://www.ozon.ru/product/${raw}/`;
+    } else {
+      continue; // 跳过不合法的行
+    }
+    out.push({ sourceType, sourceValue: raw, ozonUrl, ozonSku });
+  }
+  return out;
+}
+
+app.post("/api/collect-items", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const inputsText = String(req.body?.inputs || req.body?.text || "").trim();
+    const parsed = parseCollectInputs(inputsText);
+    if (!parsed.length) {
+      res.status(400).json({ success: false, error: "没有识别到 Ozon 链接或 SKU。请粘贴 https://www.ozon.ru/... 或纯数字 SKU（一行一条）。" });
+      return;
+    }
+    const inserted = [];
+    const skipped = [];
+    for (const row of parsed) {
+      // 去重：同一用户 + 同 SKU 或同 URL 已存在 pending/scraped 就跳过
+      const exists = await db.query(
+        `SELECT id FROM collect_items WHERE user_id = $1 AND status IN ('pending','scraped') AND (
+            ($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3)
+         ) LIMIT 1`,
+        [req.user.id, row.ozonSku || "", row.ozonUrl || ""],
+      );
+      if (exists.rowCount) {
+        skipped.push({ source: row.sourceValue, reason: "已存在（pending/scraped）" });
+        continue;
+      }
+      const r = await db.query(
+        `INSERT INTO collect_items (user_id, source_type, source_value, ozon_url, ozon_sku, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending') RETURNING id, ozon_url, ozon_sku, status, created_at`,
+        [req.user.id, row.sourceType, row.sourceValue, row.ozonUrl, row.ozonSku],
+      );
+      inserted.push(r.rows[0]);
+    }
+    res.json({ success: true, inserted, skipped, insertedCount: inserted.length, skippedCount: skipped.length });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/collect-items", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const status = String(req.query.status || "").trim();
+    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 100)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const search = String(req.query.search || "").trim();
+    const args = [req.user.id];
+    const where = ["user_id = $1"];
+    if (status && status !== "all") { args.push(status); where.push(`status = $${args.length}`); }
+    if (search) {
+      args.push(`%${search}%`);
+      where.push(`(ozon_url ILIKE $${args.length} OR ozon_sku ILIKE $${args.length} OR title ILIKE $${args.length} OR source_value ILIKE $${args.length})`);
+    }
+    args.push(limit, offset);
+    const rows = await db.query(
+      `SELECT id, source_type, source_value, ozon_url, ozon_sku, title, main_image, price_cny,
+              seller, brand, status, note, linked_job_id, linked_offer_id, created_at, updated_at
+         FROM collect_items WHERE ${where.join(" AND ")}
+         ORDER BY created_at DESC LIMIT $${args.length - 1} OFFSET $${args.length}`,
+      args,
+    );
+    const countArgs = [req.user.id];
+    const countWhere = ["user_id = $1"];
+    if (status && status !== "all") { countArgs.push(status); countWhere.push(`status = $${countArgs.length}`); }
+    const total = await db.query(
+      `SELECT status, count(*)::int AS c FROM collect_items WHERE user_id = $1 GROUP BY status`,
+      [req.user.id],
+    );
+    const stats = { all: 0, pending: 0, scraped: 0, uploaded: 0, failed: 0, ignored: 0 };
+    for (const r of total.rows) { stats[r.status] = r.c; stats.all += r.c; }
+    res.json({ success: true, items: rows.rows, stats, limit, offset });
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/collect-items/:id", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const r = await db.query("DELETE FROM collect_items WHERE id = $1 AND user_id = $2 RETURNING id", [req.params.id, req.user.id]);
+    if (!r.rowCount) { res.status(404).json({ success: false, error: "找不到该采集项" }); return; }
+    res.json({ success: true });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/collect-items/:id", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const allowed = ["status", "note", "title", "main_image", "price_cny", "seller", "brand", "linked_offer_id"];
+    const sets = [];
+    const args = [];
+    for (const key of allowed) {
+      if (req.body?.[key] !== undefined) {
+        args.push(req.body[key]);
+        sets.push(`${key} = $${args.length}`);
+      }
+    }
+    if (!sets.length) { res.status(400).json({ success: false, error: "没有可更新字段" }); return; }
+    sets.push(`updated_at = now()`);
+    args.push(req.params.id, req.user.id);
+    const r = await db.query(
+      `UPDATE collect_items SET ${sets.join(", ")} WHERE id = $${args.length - 1} AND user_id = $${args.length} RETURNING id, status, updated_at`,
+      args,
+    );
+    if (!r.rowCount) { res.status(404).json({ success: false, error: "找不到该采集项" }); return; }
+    res.json({ success: true, item: r.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/collect-items/bulk-delete", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+    if (!ids.length) { res.status(400).json({ success: false, error: "ids 不能为空" }); return; }
+    const r = await db.query(`DELETE FROM collect_items WHERE user_id = $1 AND id = ANY($2::uuid[]) RETURNING id`, [req.user.id, ids]);
+    res.json({ success: true, deleted: r.rowCount });
+  } catch (error) { next(error); }
+});
+
+/* ============================================================
+   订单本地备注（11-order-management.md 基础版）
+   ============================================================ */
+
+app.get("/api/seller/orders/notes", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const numbers = String(req.query.numbers || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (!numbers.length) { res.json({ success: true, notes: {} }); return; }
+    const r = await db.query(
+      `SELECT posting_number, note, updated_at FROM order_notes WHERE user_id = $1 AND posting_number = ANY($2::text[])`,
+      [req.user.id, numbers],
+    );
+    const notes = {};
+    for (const row of r.rows) notes[row.posting_number] = { note: row.note, updated_at: row.updated_at };
+    res.json({ success: true, notes });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/orders/:postingNumber/note", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const pn = String(req.params.postingNumber || "").trim();
+    if (!pn) { res.status(400).json({ success: false, error: "缺少 posting_number" }); return; }
+    const note = String(req.body?.note || "").slice(0, 2000);
+    const r = await db.query(
+      `INSERT INTO order_notes (user_id, posting_number, note) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, posting_number) DO UPDATE SET note = EXCLUDED.note, updated_at = now()
+       RETURNING posting_number, note, updated_at`,
+      [req.user.id, pn, note],
+    );
+    res.json({ success: true, note: r.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/orders/export", async (req, res, next) => {
+  try {
+    const status = String(req.body?.status || "").trim();
+    const limit = Math.min(1000, Math.max(1, Number(req.body?.limit || 200)));
+    const filter = {
+      since: req.body?.since || new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString(),
+      to: req.body?.to || new Date().toISOString(),
+    };
+    if (status) filter.status = status;
+    const data = await callOzonSellerAPI("/v3/posting/fbs/list", { filter, limit });
+    const postings = data?.result?.postings || [];
+
+    // 本地备注补充
+    let notesMap = {};
+    if (db && postings.length) {
+      const nums = postings.map((p) => p.posting_number).filter(Boolean);
+      if (nums.length) {
+        const nr = await db.query(
+          `SELECT posting_number, note FROM order_notes WHERE user_id = $1 AND posting_number = ANY($2::text[])`,
+          [req.user.id, nums],
+        );
+        for (const r of nr.rows) notesMap[r.posting_number] = r.note;
+      }
+    }
+
+    // 简单 CSV 输出（用 xlsx 太重，导出到 Excel 用户可以直接粘贴）
+    const header = ["货件号", "状态", "创建时间", "配送方式", "仓库", "商品", "SKU", "数量", "总价", "本地备注"];
+    const rows = [header];
+    for (const p of postings) {
+      const prods = p.products || [];
+      const summary = prods.map((x) => x.name).slice(0, 3).join(" / ");
+      const skus = prods.map((x) => x.sku || x.offer_id).join(",");
+      const qty = prods.reduce((a, x) => a + (x.quantity || 0), 0);
+      const dm = p.delivery_method || {};
+      rows.push([
+        p.posting_number || p.order_number || "",
+        p.status || "",
+        p.in_process_at || p.created_at || "",
+        dm.name || "",
+        p.warehouse || dm.warehouse || (dm.warehouse_id ? `#${dm.warehouse_id}` : ""),
+        summary,
+        skus,
+        qty,
+        p.financial_data?.total_price || "",
+        notesMap[p.posting_number] || "",
+      ]);
+    }
+    const csv = rows.map((row) => row.map((cell) => {
+      const s = String(cell ?? "");
+      return /[",\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s;
+    }).join(",")).join("\r\n");
+    const bom = "\ufeff"; // Excel 打开 UTF-8 需要 BOM
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="orders-${Date.now()}.csv"`);
+    res.send(bom + csv);
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
+});
+
+/* ============================================================
+   AI 商品套图历史（10-ai-product-images.md 基础版）
+   ============================================================ */
+
+app.get("/api/ai-images/history", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 30)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const r = await db.query(
+      `SELECT id, model, prompt, aspect_ratio, n, has_ref_image, image_urls,
+              estimated_cost_usd, scene_preset, created_at
+         FROM ai_image_records WHERE user_id = $1
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+      [req.user.id, limit, offset],
+    );
+    const stat = await db.query(
+      `SELECT count(*)::int AS total,
+              COALESCE(SUM(n),0)::int AS total_images,
+              COALESCE(SUM(estimated_cost_usd),0)::numeric AS total_cost_usd
+         FROM ai_image_records WHERE user_id = $1`,
+      [req.user.id],
+    );
+    res.json({ success: true, items: r.rows, stats: stat.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/ai-images/:id", async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const r = await db.query("DELETE FROM ai_image_records WHERE id = $1 AND user_id = $2 RETURNING id", [req.params.id, req.user.id]);
+    if (!r.rowCount) { res.status(404).json({ success: false, error: "找不到" }); return; }
+    res.json({ success: true });
+  } catch (error) { next(error); }
 });
 
 app.post("/api/jobs", async (req, res, next) => {
@@ -1178,6 +2683,13 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
       return;
     }
+    await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentJobId: req.params.id,
+      currentPhase: req.body?.phase || "",
+    });
     const existing = await getDbJobForUser(req.params.id, req.user);
     if (!existing) {
       res.status(404).json({ success: false, error: "任务不存在。" });
@@ -1204,6 +2716,13 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
       return;
     }
+    await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentJobId: req.params.id,
+      currentPhase: "任务回传完成",
+    });
     const existing = await getDbJobForUser(req.params.id, req.user);
     if (!existing) {
       res.status(404).json({ success: false, error: "任务不存在。" });
@@ -4765,6 +6284,30 @@ async function createQueuedDbJob(user, job, payload) {
   return dbRowToJob(result.rows[0]);
 }
 
+async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
+  if (!db || !user?.id) return;
+  const workerLabel = String(workerName || "").trim().slice(0, 80) || "本机采集端";
+  const platform = String(meta.platform || "").trim().slice(0, 40);
+  const hostname = String(meta.hostname || "").trim().slice(0, 120);
+  const profileDir = String(meta.profileDir || "").trim().slice(0, 500);
+  const currentPhase = String(meta.currentPhase || "").trim().slice(0, 200);
+  const currentJobId = isSafeJobId(meta.currentJobId) ? meta.currentJobId : null;
+  await db.query(
+    `INSERT INTO app_worker_heartbeats (
+       user_id, worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     ON CONFLICT (user_id, worker_name)
+     DO UPDATE SET
+       platform = EXCLUDED.platform,
+       hostname = EXCLUDED.hostname,
+       profile_dir = EXCLUDED.profile_dir,
+       current_job_id = COALESCE(EXCLUDED.current_job_id, app_worker_heartbeats.current_job_id),
+       current_phase = COALESCE(NULLIF(EXCLUDED.current_phase, ''), app_worker_heartbeats.current_phase),
+       last_seen_at = now()`,
+    [user.id, workerLabel, platform, hostname, profileDir, currentJobId, currentPhase],
+  );
+}
+
 async function claimNextDbJob(user, workerName = "") {
   const client = await db.connect();
   const workerLabel = String(workerName || "").trim().slice(0, 80) || "本机采集端";
@@ -4804,30 +6347,6 @@ async function claimNextDbJob(user, workerName = "") {
   } finally {
     client.release();
   }
-}
-
-async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
-  if (!db || !user?.id) return;
-  const workerLabel = String(workerName || "").trim().slice(0, 80) || "浏览器采集插件";
-  const platform = String(meta.platform || "").trim().slice(0, 40);
-  const hostname = String(meta.hostname || "").trim().slice(0, 120);
-  const profileDir = String(meta.profileDir || "").trim().slice(0, 240);
-  const currentPhase = String(meta.currentPhase || "").trim().slice(0, 200);
-  const currentJobId = isSafeJobId(meta.currentJobId) ? meta.currentJobId : null;
-  await db.query(
-    `INSERT INTO app_worker_heartbeats (
-       user_id, worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-     ON CONFLICT (user_id, worker_name)
-     DO UPDATE SET
-       platform = EXCLUDED.platform,
-       hostname = EXCLUDED.hostname,
-       profile_dir = EXCLUDED.profile_dir,
-       current_job_id = COALESCE(EXCLUDED.current_job_id, app_worker_heartbeats.current_job_id),
-       current_phase = COALESCE(NULLIF(EXCLUDED.current_phase, ''), app_worker_heartbeats.current_phase),
-       last_seen_at = now()`,
-    [user.id, workerLabel, platform, hostname, profileDir, currentJobId, currentPhase],
-  );
 }
 
 function normalizeWorkerStatus(status) {
@@ -5993,20 +7512,29 @@ function escapeHtmlForFile(value) {
 }
 
 function loadLocalEnv() {
-  const envPath = path.join(__dirname, ".env");
-  if (!existsSync(envPath)) return;
-  const content = readFileSync(envPath, "utf8");
-  for (const line of content.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-    const index = trimmed.indexOf("=");
-    if (index <= 0) continue;
-    const key = trimmed.slice(0, index).trim();
-    let value = trimmed.slice(index + 1).trim();
-    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-      value = value.slice(1, -1);
+  for (const name of [".env", ".env.build"]) {
+    const envPath = path.join(__dirname, name);
+    if (!existsSync(envPath)) continue;
+    let content = "";
+    try {
+      content = readFileSync(envPath, "utf8");
+    } catch (error) {
+      console.warn(`[env] skip ${name}: ${error.message}`);
+      continue;
     }
-    if (!process.env[key]) process.env[key] = value;
+    for (const line of content.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const index = trimmed.indexOf("=");
+      if (index <= 0) continue;
+      const key = trimmed.slice(0, index).trim();
+      let value = trimmed.slice(index + 1).trim();
+      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+        value = value.slice(1, -1);
+      }
+      if (name === ".env.build" && key === "BUILD_VERSION") process.env[key] = value;
+      else if (!process.env[key]) process.env[key] = value;
+    }
   }
 }
 
@@ -6021,6 +7549,16 @@ function sleep(ms) {
 await ensureDir(DATA_DIR);
 await ensureDir(JOBS_DIR);
 await initDatabase();
+if (db) {
+  setTimeout(() => runProductAutoSyncTick().catch((error) => console.warn(`[auto-sync] initial failed: ${error.message}`)), 30000);
+  setInterval(() => runProductAutoSyncTick().catch((error) => console.warn(`[auto-sync] interval failed: ${error.message}`)), 10 * 60 * 1000);
+}
+
+// SPA catch-all
+app.get("*", (req, res, next) => {
+  if (req.path.startsWith("/api/")) return next();
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+});
 
 if (process.argv[1] === __filename) {
   app.listen(PORT, HOST || undefined, () => {
