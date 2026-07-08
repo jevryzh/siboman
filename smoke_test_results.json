@@ -1,0 +1,8 @@
+{
+  "cascadeSelector": "FAIL (Cascader not found)",
+  "pdfMerge": "FAIL (Not enough orders)",
+  "imageScrape": "PASS",
+  "storeIsolation": "FAIL (Store trigger not found)",
+  "uiErrors": [],
+  "apiExceptions": []
+}

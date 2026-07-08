@@ -1,0 +1,7 @@
+{
+  "ping_sent": true,
+  "response_received": true,
+  "ok": true,
+  "version": "1.0.1",
+  "kind": "ping.response"
+}

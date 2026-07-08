@@ -1,0 +1,25 @@
+{
+  "zhumeng_loaded_type": "undefined",
+  "location": "http://test.renwz.cn/#/upload",
+  "origin": "http://test.renwz.cn",
+  "messages_received": [
+    {
+      "kind": "ping.request",
+      "keys": [
+        "__zhumeng_proto",
+        "kind",
+        "reqId"
+      ]
+    },
+    {
+      "kind": "ping.response",
+      "keys": [
+        "__zhumeng_proto",
+        "kind",
+        "reqId",
+        "ok",
+        "version"
+      ]
+    }
+  ]
+}

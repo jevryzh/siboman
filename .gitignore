@@ -1,0 +1,29 @@
+# 敏感配置文件 (不入库, 单独交付)
+.env
+env/
+*.env
+**/.env
+deploy-test.sh
+deploy-prod.sh
+
+# 运行时产物
+node_modules/
+**/node_modules/
+*.log
+__pycache__/
+.DS_Store
+**/.DS_Store
+
+# 上传目录 (运行时生成)
+siboman/public/uploads/
+siboman/public/extension/zhumeng-collector/icons/*.bak
+
+# 数据库备份
+*.sql.bak
+*.dump
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

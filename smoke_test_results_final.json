@@ -1,0 +1,10 @@
+{
+  "cascadeSelector": "FAIL (Category selector text not found)",
+  "pdfMerge": "FAIL (Not enough orders to select)",
+  "imageScrape": "PASS",
+  "storeIsolation": "FAIL (No stores found in branding or profile)",
+  "uiErrors": [
+    "仪表盘加载失败: Cannot set properties of null (setting 'innerHTML')"
+  ],
+  "apiExceptions": []
+}

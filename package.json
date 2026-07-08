@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "multer": "^2.2.0",
+    "pdf-lib": "^1.17.1",
+    "playwright": "^1.61.1"
+  }
+}
