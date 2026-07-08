@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <style>
+    body { width: 320px; font-family: -apple-system, sans-serif; margin: 0; padding: 0; }
+    .header { background: linear-gradient(135deg, #667eea, #764ba2); color: #fff; padding: 16px; text-align: center; }
+    .header h1 { margin: 0; font-size: 16px; }
+    .header .ver { font-size: 11px; opacity: 0.8; }
+    .body { padding: 16px; }
+    .status { padding: 10px 14px; border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
+    .status-ok { background: #f0f9eb; color: #67c23a; }
+    .status-err { background: #fef0f0; color: #f56c6c; }
+    .status-warn { background: #fdf6ec; color: #e6a23c; }
+    .btn { display: block; width: 100%; padding: 10px; border: none; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; margin-bottom: 8px; }
+    .btn-primary { background: #409eff; color: #fff; }
+    .btn-warning { background: #e6a23c; color: #fff; }
+    .tip { font-size: 11px; color: #909399; line-height: 1.5; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>逐梦 Ozon 采集器</h1>
+    <div class="ver">v2.1.0</div>
+  </div>
+  <div class="body">
+    <div id="status" class="status status-warn">检测中...</div>
+    <button class="btn btn-primary" id="openSeller">打开 seller.ozon.ru</button>
+    <button class="btn btn-warning" id="openErp">打开逐梦 ERP</button>
+    <div class="tip">
+      使用说明:<br>
+      1. 先打开 seller.ozon.ru 并登录<br>
+      2. 打开 ERP 批量跟卖页面<br>
+      3. 粘贴 SKU + 价格 → 点采集<br>
+      4. 插件自动从 Ozon 抓取商品信息
+    </div>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

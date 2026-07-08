@@ -1,8 +1,12 @@
-# 逐梦 ERP 移交文档 (v0.8.0-final)
+# 逐梦 ERP 移交文档 (v2.1.10)
 
+> **当前版本**: v2.1.10（BatchUpload 通信层 5 bug 全修 + type_id 历史反查兜底）
+> **历史移交版本**: v0.8.0-final (commit `28af7a7`)
 > **移交日期**: 2026-07-08
 > **分支**: `handover-v0.8.0-final`
 > **测试环境**: `test.renwz.cn` (Port 5178, `root@47.104.86.62`)
+>
+> **新文档**: [`CHANGELOG.md`](./CHANGELOG.md) · [`HANDOVER_v2.1.10.md`](./HANDOVER_v2.1.10.md)（v2.1.x 30 轮调试增量交接）
 
 ---
 
@@ -151,7 +155,7 @@ const priceCny = currency === "CNY" ? priceNative
 | 商品管理 | ProductList.js | v0.3.5 | 15 字段编辑抽屉 + 主图预览 + 类目 Cascader + 归档/上架 + AI 填充/核价 |
 | 订单管理 | OrderList.js | v0.3.5 | CNY 金额 + 商品图 + 详情抽屉 + 发货对话框 + 日期选择器 |
 | 库存管理 | InventoryManagement.js | v0.3.5 | 分仓 hover popover + 4 仓库修改弹窗 + 60px 图片预览 |
-| 批量跟卖 | BatchUpload.js | v0.8.3 | 10 格式解析 + 插件中继采集 + V3 payload + 多店扇出 + 实时日志 |
+| 批量跟卖 | BatchUpload.js | **v2.1.10** | 10 格式解析 + 插件中继采集 + V3 payload + 多店扇出 + 实时日志 + type_id 历史反查兜底 |
 | AI 套图 | AIImageGenerator.js | v0.3.8 | 三栏布局 + MiniMax 分析 + 万相 2.7 生图 (6 角色 3:4) |
 | 店铺管理 | StoreManagement.js | v0.7.5 | 店铺 CRUD + 插件下载 (v1.0.3) |
 | 采集插件 | zhumeng-collector/ | v1.0.3 | postMessage 协议 + Cookie 探测 + SKU 采集 |
@@ -197,12 +201,44 @@ scp -i ~/.ssh/ozon_deploy_ed25519 siboman/public/extension/zhumeng-collector.zip
 
 ---
 
-## 待办事项
+## 待办事项 (更新于 2026-07-08 16:25)
 
-1. **UI 最终验收**: 用户反馈 Dashboard 排版仍需微调 (KPI 卡片间距、表格列宽)
-2. **采集器实测**: 用户需实测 `4425674396,103` 的完整中继采集流程 (依赖 seller.ozon.ru 登录态)
-3. **AI 套图完善**: 万相 2.7 生图的俄语文字标注质量不稳定, 需调优 prompt
-4. **变体合并**: BatchUpload 的变体合并 (attr 9048 型号名) 逻辑尚未实装
-5. **历史记录**: BatchUpload 的上架历史记录入口未接后端
-6. **使用说明**: BatchUpload 右侧抽屉的使用说明未编写
+### 紧急 (P1)
+1. **上架历史 + 异步轮询** — 当前 ERP 上架按钮点了就"成功"，Ozon 真实状态（imported/failed）完全没查。PRD 写得很细（[`siboman/docs/requirements/03-listing-history.md`](./siboman/docs/requirements/03-listing-history.md)）但代码没实现。**端点 `/api/seller/import/sync-task` 已写好**（siboman/server.js:2948）但没人调用。1-1.5 人日。
+
+### 一般 (P2)
+2. **采集器实测** — 端到端第一次实测：task_id `5027892960` 提交后 8 分钟仍 `pending`（Ozon 队列），需等 Ozon 处理完验证 `imported` 路径
+3. **使用说明** — BatchUpload 右侧抽屉文案未写
+4. **变体合并** — BatchUpload 的 `attr 9048` 型号名合并逻辑未实装
+
+### 低优 (P3)
+5. **UI 最终验收** — Dashboard 排版微调 (KPI 卡片间距、表格列宽)
+6. **AI 套图** — 万相 2.7 生图的俄语文字标注质量不稳定, 需调优 prompt
+
+---
+
+## v2.1.x 增量改动 (2026-07-08)
+
+**通信层修了 4 个根因 bug + 1 个数据兜底**，详见 [`HANDOVER_v2.1.10.md`](./HANDOVER_v2.1.10.md) §2/§3:
+
+1. **v2.1.4** — 移除 `content-bridge-main` 转发层（addEventListener 拦截没真绑）
+2. **v2.1.5** — `JSON.parse(JSON.stringify(msg))` 剥 Vue 3 reactive Proxy
+3. **v2.1.7** — `content-bridge-main` 过滤自己 window 的 `.request` 消息
+4. **v2.1.9** — `refreshStatus` 不再覆盖 `extensionConnected.value`
+5. **v2.1.10** — `POST /api/seller/type-id-suggestion` 反查同店铺同 cat 历史 type_id 兜底
+
+**端到端第一次实测通过**：测试 SKU `4425674396` → Three Latte 店 → task_id `5027892960` → Ozon `pending`（Ozon 队列处理中）。
+
+---
+
+## 配置文件位置 (单独交付, 不入库)
+
+| 文件 | 本机绝对路径 | 内容 |
+|---|---|---|
+| 后端配置 | `/Users/eason/Documents/逐梦 ERP/env/server.env` | PORT / DATABASE_URL / OZON_SELLER_* / INITIAL_USERS / MINIMAX_* |
+| 本地开发 | `/Users/eason/Documents/逐梦 ERP/env/local.env` | COLLECTOR_* / OZON 默认凭证 |
+| 交付用 | `/Users/eason/Documents/逐梦 ERP/handover-config-private/.env` | 服务器端生产凭证（不放在 env/，单独加密交付） |
+| 部署脚本 | `/Users/eason/Documents/逐梦 ERP/deploy-test.sh`（已加 .gitignore） | rsync + scp + systemctl restart |
+
+**全部已通过 `.gitignore` 排除**（`env/`、`*.env`、`**/.env`、`handover-config-private/`），不会进 git 仓库。
 ```

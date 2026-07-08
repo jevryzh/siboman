@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>逐梦 ERP 专业版</title>
+    <link rel="stylesheet" href="https://unpkg.com/element-plus/dist/index.css" />
+    <style>
+      body { margin: 0; background: #f5f7fa; font-family: sans-serif; }
+      #app { height: 100vh; }
+      .layout-container { height: 100vh; }
+      .el-aside { background: #001529; color: #fff; }
+      .logo { height: 60px; line-height: 60px; text-align: center; font-size: 18px; font-weight: bold; background: #002140; color: #409eff; }
+      .text-ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+       <div style="display:flex; justify-content:center; align-items:center; height:100vh; color:#409eff;">系统全量重构中，请稍候...</div>
+    </div>
+
+    <!-- 基础依赖 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://unpkg.com/element-plus"></script>
+    <script src="https://unpkg.com/@element-plus/icons-vue"></script>
+    <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/echarts/dist/echarts.min.js"></script>
+    
+    <!-- 基座组件 -->
+    <script src="/js/components/InlineEditCell.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/components/ShopSwitcher.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/components/CollectionEditDrawer.js?v=083_AUTO_COLLECT"></script>
+
+    <!-- 业务视图 -->
+    <script src="/js/views/Dashboard.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/SourcingModule.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/CollectionBox.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/ProductList.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/InventoryManagement.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/OrderList.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/BatchUpload.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/AIImageGenerator.js?v=083_AUTO_COLLECT"></script>
+    <script src="/js/views/StoreManagement.js?v=083_AUTO_COLLECT"></script>
+
+    <!-- 主逻辑 -->
+    <script src="/js/main.js?v=083_AUTO_COLLECT" type="module"></script>
+  </body>
+</html>

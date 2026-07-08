@@ -1,0 +1,11 @@
+node_modules/
+data/*
+!data/templates/
+!data/templates/logistics-template.xlsx
+.env
+.env.*
+docs/handoff/
+.venv/
+.DS_Store
+npm-debug.log*
+*.log
