@@ -154,7 +154,7 @@ const initApp = () => {
         <el-aside width="200px">
           <div class="logo" style="display:flex; align-items:center; gap:8px">
             <img src="/extension/zhumeng-collector/icons/icon48.png" style="width:28px; height:28px; border-radius:6px" />
-            ZM ERP
+            逐梦 ERP
           </div>
           <el-menu :default-active="currentPath" background-color="#001529" text-color="#fff">
             <el-menu-item index="#/dashboard" @click="goTo('#/dashboard')">
@@ -189,7 +189,7 @@ const initApp = () => {
         <el-container>
           <el-header style="background:#fff; border-bottom:1px solid #eee; display:flex; align-items:center; justify-content:space-between">
             <el-breadcrumb separator="/">
-              <el-breadcrumb-item>ZM ERP</el-breadcrumb-item>
+              <el-breadcrumb-item>逐梦 ERP</el-breadcrumb-item>
               <el-breadcrumb-item>{{ routeName }}</el-breadcrumb-item>
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">

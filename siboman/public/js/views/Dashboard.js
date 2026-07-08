@@ -16,6 +16,7 @@ window.DashboardView = {
     const storeComparison = Vue.ref([]);
     const trends = Vue.ref([]);
     const recentJobs = Vue.ref([]);
+    const trendRange = Vue.ref(7);  // 7 日 / 30 日 趋势切换
 
     const fmtMoney = (v) => '¥' + (Number(v || 0)).toFixed(2);
     const fmtPct = (v) => {
@@ -24,12 +25,24 @@ window.DashboardView = {
       return sign + n.toFixed(2) + '%';
     };
     const fmtRate = (v) => (Number(v || 0)).toFixed(2) + '%';
+    // 0 数据友好处理: 0 / undefined / null 都显示 '—' (提示去同步)
+    const fmtNum0 = (v) => (Number(v || 0) > 0 ? String(Math.round(Number(v))) : '—');
+    const fmtMoney0 = (v) => (Number(v || 0) > 0 ? '¥' + Number(v).toFixed(2) : '—');
+    const fmtPct0 = (v) => {
+      const n = Number(v || 0);
+      if (n === 0) return '持平';
+      return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
+    };
+    const setTrendRange = (n) => { trendRange.value = n; fetchDashboard(); };
 
     const fetchDashboard = async () => {
       loading.value = true;
       try {
         const res = await axios.get('/api/seller/dashboard', {
-          params: { store_id: (window.getCurrentStoreId ? window.getCurrentStoreId() : '') },
+          params: {
+            store_id: (window.getCurrentStoreId ? window.getCurrentStoreId() : ''),
+            range: trendRange.value,
+          },
         });
         if (res.data.success) {
           const s = res.data.summary || {};
@@ -132,8 +145,8 @@ window.DashboardView = {
 
     return {
       summary, storeComparison, trends, recentJobs, loading,
-      syncLoading, syncingStore,
-      fmtMoney, fmtPct, fmtRate,
+      syncLoading, syncingStore, trendRange, setTrendRange,
+      fmtMoney, fmtPct, fmtRate, fmtNum0, fmtMoney0, fmtPct0,
       goToStores, goToCollection, goToOrders, goToProducts, goToAIImage, goToInventory,
       syncAllStores, syncOneStore,
     };
@@ -141,8 +154,8 @@ window.DashboardView = {
   template: `
     <div class="dashboard-v056" v-loading="loading" style="padding: 0; background: #f0f2f5; min-height: 100vh">
 
-      <!-- ========== 顶部标题行 ========== -->
-      <div style="background: #fff; padding: 14px 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); display: flex; justify-content: space-between; align-items: center; position: sticky; top: 0; z-index: 100">
+      <!-- ========== 顶部标题行 (不悬浮) ========== -->
+      <div style="background: #fff; padding: 14px 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); display: flex; justify-content: space-between; align-items: center">
         <div style="display: flex; align-items: center; gap: 12px">
           <span style="font-size: 20px; font-weight: 800; color: #303133">📊 经营仪表盘</span>
           <el-tag size="small" type="info" effect="plain">实时数据</el-tag>
@@ -166,11 +179,11 @@ window.DashboardView = {
         <div style="background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); padding: 20px; position: relative; overflow: hidden">
           <div style="position: absolute; top: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, #409eff, #67c23a)"></div>
           <div style="font-size: 13px; color: #909399; margin-bottom: 8px">今日订单</div>
-          <div style="font-size: 32px; font-weight: 800; color: #303133; line-height: 1">{{ summary.today_orders }}</div>
+          <div style="font-size: 32px; font-weight: 800; color: #303133; line-height: 1">{{ fmtNum0(summary.today_orders) }}</div>
           <div style="margin-top: 10px; display: flex; align-items: center; gap: 6px">
             <span style="font-size: 12px; color: #909399">昨日 {{ summary.yesterday_orders }}</span>
             <span :style="{ fontSize: '12px', fontWeight: 700, color: summary.order_growth > 0 ? '#f56c6c' : summary.order_growth < 0 ? '#67c23a' : '#909399' }">
-              {{ summary.order_growth > 0 ? '▲' : summary.order_growth < 0 ? '▼' : '—' }} {{ Math.abs(summary.order_growth) }}%
+              {{ summary.order_growth > 0 ? '▲' : summary.order_growth < 0 ? '▼' : '—' }} {{ fmtPct0(summary.order_growth) }}
             </span>
           </div>
         </div>
@@ -179,11 +192,11 @@ window.DashboardView = {
         <div style="background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); padding: 20px; position: relative; overflow: hidden">
           <div style="position: absolute; top: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, #e6a23c, #f56c6c)"></div>
           <div style="font-size: 13px; color: #909399; margin-bottom: 8px">今日 GMV</div>
-          <div style="font-size: 32px; font-weight: 800; color: #e6a23c; line-height: 1">{{ fmtMoney(summary.today_gmv) }}</div>
+          <div style="font-size: 32px; font-weight: 800; color: #e6a23c; line-height: 1">{{ fmtMoney0(summary.today_gmv) }}</div>
           <div style="margin-top: 10px; display: flex; align-items: center; gap: 6px">
             <span style="font-size: 12px; color: #909399">昨日 {{ fmtMoney(summary.yesterday_gmv) }}</span>
             <span :style="{ fontSize: '12px', fontWeight: 700, color: summary.gmv_growth > 0 ? '#f56c6c' : summary.gmv_growth < 0 ? '#67c23a' : '#909399' }">
-              {{ summary.gmv_growth > 0 ? '▲' : summary.gmv_growth < 0 ? '▼' : '—' }} {{ Math.abs(summary.gmv_growth) }}%
+              {{ summary.gmv_growth > 0 ? '▲' : summary.gmv_growth < 0 ? '▼' : '—' }} {{ fmtPct0(summary.gmv_growth) }}
             </span>
           </div>
         </div>
@@ -192,7 +205,7 @@ window.DashboardView = {
         <div style="background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); padding: 20px; position: relative; overflow: hidden">
           <div style="position: absolute; top: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, #f56c6c, #e6a23c)"></div>
           <div style="font-size: 13px; color: #909399; margin-bottom: 8px">待处理 (打包+发货)</div>
-          <div :style="{ fontSize: '32px', fontWeight: 800, lineHeight: 1, color: summary.awaiting_treatment > 0 ? '#f56c6c' : '#303133' }">{{ summary.awaiting_treatment }}</div>
+          <div :style="{ fontSize: '32px', fontWeight: 800, lineHeight: 1, color: summary.awaiting_treatment > 0 ? '#f56c6c' : '#303133' }">{{ fmtNum0(summary.awaiting_treatment) }}</div>
           <div style="margin-top: 10px; font-size: 12px; color: #909399">
             打包 <b style="color: #e6a23c">{{ summary.awaiting_packaging }}</b> · 发货 <b style="color: #e6a23c">{{ summary.awaiting_deliver }}</b>
           </div>
@@ -202,7 +215,7 @@ window.DashboardView = {
         <div style="background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); padding: 20px; position: relative; overflow: hidden">
           <div style="position: absolute; top: 0; left: 0; right: 0; height: 4px; background: linear-gradient(90deg, #67c23a, #409eff)"></div>
           <div style="font-size: 13px; color: #909399; margin-bottom: 8px">本周累计 GMV</div>
-          <div style="font-size: 32px; font-weight: 800; color: #67c23a; line-height: 1">{{ fmtMoney(summary.weekly_gmv) }}</div>
+          <div style="font-size: 32px; font-weight: 800; color: #67c23a; line-height: 1">{{ fmtMoney0(summary.weekly_gmv) }}</div>
           <div style="margin-top: 10px; font-size: 12px; color: #909399">
             7日 {{ summary.weekly_orders }} 单 · 利润 {{ fmtMoney(summary.weekly_profit) }}
           </div>
@@ -312,10 +325,14 @@ window.DashboardView = {
       <!-- ========== 7 日趋势 + 功能入口 (两列) ========== -->
       <div style="display: grid; grid-template-columns: 1fr 360px; gap: 16px; padding: 16px 20px 20px">
 
-        <!-- 7 日趋势 -->
+        <!-- 7 / 30 日趋势 -->
         <div style="background: #fff; border-radius: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: hidden">
-          <div style="padding: 16px 20px; border-bottom: 1px solid #f0f0f0">
-            <span style="font-size: 16px; font-weight: 700; color: #303133">📈 7 日订单趋势</span>
+          <div style="padding: 16px 20px; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; align-items: center">
+            <span style="font-size: 16px; font-weight: 700; color: #303133">📈 订单趋势</span>
+            <el-radio-group v-model="trendRange" size="small" @change="setTrendRange">
+              <el-radio-button :value="7">近 7 日</el-radio-button>
+              <el-radio-button :value="30">近 30 日</el-radio-button>
+            </el-radio-group>
           </div>
           <div style="padding: 20px">
             <div v-if="!trends.length" style="text-align: center; padding: 40px; color: #c0c4cc">暂无趋势数据</div>

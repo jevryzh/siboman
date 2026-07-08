@@ -113,7 +113,7 @@ let currentBrowserHeadless = false;
 
 // --- 路由保护与 SPA 支持 ---
 const isPublicPath = (path) => {
-  const publicPaths = ["/login", "/api/auth/login", "/api/auth/status", "/api/version", "/api/collect-items"];
+  const publicPaths = ["/login", "/api/auth/login", "/api/auth/status", "/api/version"];
   if (publicPaths.includes(path)) return true;
   // 允许加载 JS/CSS/图片等静态资源 + 扩展下载 + 上传目录
   if (path.startsWith("/static") || path.startsWith("/extension/") || path.startsWith("/uploads/") ||
@@ -204,7 +204,7 @@ app.get("/api/extension/seller-credentials", requireAuth, async (req, res, next)
    采集与找货 - 增强生产环境对齐逻辑
    ============================================================ */
 
-app.post("/api/collect-items", async (req, res, next) => {
+app.post("/api/collect-items", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const inputsText = String(req.body?.inputs || req.body?.text || "").trim();
@@ -797,7 +797,7 @@ app.post("/api/auth/logout", (req, res) => {
 /* ============================================================
    物理上传接口 - 解决 AI 上传 404
    ============================================================ */
-app.post("/api/upload",
+app.post("/api/upload", requireAuth,
   (req, res, next) => {
     upload.single("file")(req, res, (err) => {
       if (err) {
@@ -821,7 +821,7 @@ app.get("/api/version", (_req, res) => {
 /* ============================================================
    商品管理增强 - 行内编辑 API (修正版)
    ============================================================ */
-app.patch("/api/seller/products/:offer_id/field", async (req, res, next) => {
+app.patch("/api/seller/products/:offer_id/field", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const { offer_id } = req.params;
@@ -1774,7 +1774,7 @@ app.patch("/api/products/:offer_id/field", async (req, res, next) => {
   }
 });
 
-app.post("/api/seller/analytics/categories", async (req, res, next) => {
+app.post("/api/seller/analytics/categories", requireAuth, async (req, res, next) => {
   try {
     const { range = "28", dimension = "category1" } = req.body;
     const storeId = req.body?.store_id || req.body?.storeId;
@@ -1792,7 +1792,7 @@ app.post("/api/seller/analytics/categories", async (req, res, next) => {
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-app.post("/api/seller/analytics/bestsellers", async (req, res, next) => {
+app.post("/api/seller/analytics/bestsellers", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     const data = await callOzonSellerAPI("/v1/analytics/item_stock_forecast", {
@@ -1815,6 +1815,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const userId = req.user.id;
+    const range = Math.min(30, Math.max(7, Number(req.query.range) || 7));
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const weekAgo = new Date(now.getTime() - 7 * 86400e3);
@@ -1924,9 +1925,9 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       // 本周 GMV + Payout + 采购成本
       let weeklyGmv = 0, weeklyPayout = 0;
       const weekOfferIds = new Set();
-      // 按天分桶 (精确趋势)
+      // 按天分桶 (精确趋势, 准备 30 天, weekOrders 只填前 7 天)
       const dailyBuckets = {};
-      for (let i = 0; i < 7; i++) {
+      for (let i = 0; i < 30; i++) {
         const d = new Date(now.getTime() - i * 86400e3);
         const key = `${d.getMonth() + 1}/${d.getDate()}`;
         dailyBuckets[key] = { orders: 0, gmv: 0 };
@@ -2082,9 +2083,9 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       weekly_profit: Math.round(storeData.reduce((s, x) => s + x.weekly_profit, 0) * 100) / 100,
     };
 
-    // 6. 7 日趋势 (v0.5.0 精确按天聚合, 不再用日均估算)
+    // 6. 趋势 (v0.5.0 精确按天聚合, 不再用日均估算). range=7 / range=30
     const trends = [];
-    for (let i = 6; i >= 0; i--) {
+    for (let i = range - 1; i >= 0; i--) {
       const d = new Date(now.getTime() - i * 86400e3);
       const dayLabel = `${d.getMonth() + 1}/${d.getDate()}`;
       let dayOrders = 0;
@@ -2984,7 +2985,7 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
-app.post("/api/seller/categories/tree", async (req, res, next) => {
+app.post("/api/seller/categories/tree", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" }, { storeId, userId: req.user.id });
@@ -2992,7 +2993,7 @@ app.post("/api/seller/categories/tree", async (req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
-app.post("/api/seller/categories/attributes", async (req, res, next) => {
+app.post("/api/seller/categories/attributes", requireAuth, async (req, res, next) => {
   try {
     const { category_id, type_id } = req.body;
     const storeId = req.body?.store_id || req.body?.storeId;
@@ -3005,7 +3006,7 @@ app.post("/api/seller/categories/attributes", async (req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
-app.post("/api/seller/categories/attribute-values", async (req, res, next) => {
+app.post("/api/seller/categories/attribute-values", requireAuth, async (req, res, next) => {
   try {
     const { category_id, attribute_id, query, limit = 100 } = req.body;
     const storeId = req.body?.store_id || req.body?.storeId;
@@ -3021,7 +3022,7 @@ app.post("/api/seller/categories/attribute-values", async (req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
-app.get("/api/seller/warehouses", async (_req, res, next) => {
+app.get("/api/seller/warehouses", requireAuth, async (_req, res, next) => {
   // Ozon 的 cluster/list 和 /v1/warehouse/list 端点对该 Seller 不可用。
   // 但 /v2/posting/fbo/list 和 /v3/posting/fbs/list 返回的 posting 里有 warehouse_id + warehouse 名称。
   // 这里采用：先尝试拉一次最近订单，从结果里提取去重的 warehouse 列表。
@@ -3273,7 +3274,7 @@ app.post("/api/seller/products/analyze", requireAuth, async (req, res) => {
 //   解决 Ozon 公开 API + SW 公开页都无法直接拿 type_id 的问题.
 //   app_products 表里 sync-all 已存了所有商品的 (description_category_id, type_id,
 //   category_name). 这个端点返回所有去重的 (type_id, category_name) 让前端做下拉.
-app.post("/api/seller/type-id-suggestion", async (req, res, next) => {
+app.post("/api/seller/type-id-suggestion", requireAuth, async (req, res, next) => {
   try {
     const { description_category_id, category_id } = req.body || {};
     const storeId = req.body?.store_id || req.body?.storeId;
@@ -3430,7 +3431,7 @@ function parseCollectInputs(text) {
   return out;
 }
 
-app.post("/api/collect-items", async (req, res, next) => {
+app.post("/api/collect-items", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const inputsText = String(req.body?.inputs || req.body?.text || "").trim();
@@ -3483,7 +3484,7 @@ app.post("/api/collect-items", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.get("/api/collect-items", async (req, res, next) => {
+app.get("/api/collect-items", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const status = String(req.query.status || "").trim();
@@ -3587,7 +3588,7 @@ app.post("/api/collect-items/bulk-delete", async (req, res, next) => {
    订单本地备注（11-order-management.md 基础版）
    ============================================================ */
 
-app.get("/api/seller/orders/notes", async (req, res, next) => {
+app.get("/api/seller/orders/notes", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const numbers = String(req.query.numbers || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -3602,7 +3603,7 @@ app.get("/api/seller/orders/notes", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post("/api/seller/orders/:postingNumber/note", async (req, res, next) => {
+app.post("/api/seller/orders/:postingNumber/note", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const pn = String(req.params.postingNumber || "").trim();
@@ -3618,7 +3619,7 @@ app.post("/api/seller/orders/:postingNumber/note", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post("/api/seller/orders/export", async (req, res, next) => {
+app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
   try {
     const status = String(req.body?.status || "").trim();
     const limit = Math.min(1000, Math.max(1, Number(req.body?.limit || 200)));

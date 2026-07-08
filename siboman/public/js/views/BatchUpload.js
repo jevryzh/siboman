@@ -676,6 +676,9 @@ window.BatchUploadView = {
 1234567890,99.9,150,200,180,80
 1234567890,99.9,JZ-001,200,300,250,120
 1234567890,99.9,~75" style="width:100%; min-height:160px; padding:12px; border:1px solid #e2e8f0; border-radius:8px; font-family:'SF Mono',Monaco,monospace; font-size:13px; resize:vertical; outline:none"></textarea>
+              <div style="font-size:11px; color:#94a3b8; margin-top:6px; line-height:1.5">
+                粘贴 SKU + 价格 → 解析 → 采集 → 上架 · 支持 10 种格式, 每行一条
+              </div>
               <div style="background:#f8fafc; border-radius:8px; padding:12px; border:1px solid #e2e8f0">
                 <div style="font-size:12px; font-weight:700; color:#475569; margin-bottom:8px">📐 10 种格式</div>
                 <ol style="list-style:none; padding:0; margin:0; font-size:11px; color:#334155; line-height:1.6">
@@ -754,12 +757,6 @@ window.BatchUploadView = {
             </div>
           </section>
 
-          <!-- 空态 -->
-          <div v-if="!items.length" style="text-align:center; padding:60px 20px; color:#94a3b8; background:#fff; border-radius:10px; border:2px dashed #cbd5e1">
-            <div style="font-size:48px; margin-bottom:12px">📋</div>
-            <div style="font-size:14px; color:#64748b">粘贴 SKU + 价格 → 解析 → 采集 → 上架</div>
-            <div style="font-size:12px; color:#94a3b8; margin-top:8px">支持 10 种格式, 每行一条</div>
-          </div>
         </div>
 
         <!-- ========== 右栏配置 ========== -->
