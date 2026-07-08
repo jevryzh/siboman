@@ -73,6 +73,9 @@ window.StoreManagementView = {
     };
 
     Vue.onMounted(fetchShops);
+    const onShopChanged = () => fetchShops();
+    window.addEventListener('shop-changed', onShopChanged);
+    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return { shops, loading, dialogVisible, submitLoading, form, handleAdd, submitForm, handleDelete, maskClientId, downloadExtension };
   },

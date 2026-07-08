@@ -131,6 +131,17 @@ window.AIImageGeneratorView = {
       }
     };
 
+    const onShopChanged = () => {
+      // 切店后清空 resultImages (避免展示其他店的图) + 同步 form 里 material_images
+      resultImages.value = [];
+      previewVisible.value = false;
+      form.material_images = [];
+      form.title_zh = '';
+      form.title_ru = '';
+    };
+    window.addEventListener('shop-changed', onShopChanged);
+    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
+
     return {
       form, analyzing, generating, uploading, resultImages,
       previewVisible, previewUrl, previewIndex,
