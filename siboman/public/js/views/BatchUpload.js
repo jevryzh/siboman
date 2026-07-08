@@ -670,14 +670,16 @@ window.BatchUploadView = {
               <button @click="clearAll" style="background:transparent; border:none; color:#64748b; cursor:pointer; font-size:12px">🗑️ 清空</button>
             </div>
             <div style="padding:16px 20px; display:grid; grid-template-columns:1fr 280px; gap:16px">
-              <textarea v-model="pasteText" class="bu-paste-area" spellcheck="false" placeholder="每行一条，格式如下：
+              <div style="display:flex; flex-direction:column; gap:6px; min-width:0">
+                <textarea v-model="pasteText" class="bu-paste-area" spellcheck="false" placeholder="每行一条，格式如下：
 1234567890,99.9
 1234567890,99.9,JZ-001
 1234567890,99.9,150,200,180,80
 1234567890,99.9,JZ-001,200,300,250,120
 1234567890,99.9,~75" style="width:100%; min-height:160px; padding:12px; border:1px solid #e2e8f0; border-radius:8px; font-family:'SF Mono',Monaco,monospace; font-size:13px; resize:vertical; outline:none"></textarea>
-              <div style="font-size:11px; color:#94a3b8; margin-top:6px; line-height:1.5">
-                粘贴 SKU + 价格 → 解析 → 采集 → 上架 · 支持 10 种格式, 每行一条
+                <div style="font-size:11px; color:#94a3b8; line-height:1.5">
+                  粘贴 SKU + 价格 → 解析 → 采集 → 上架 · 支持 10 种格式, 每行一条
+                </div>
               </div>
               <div style="background:#f8fafc; border-radius:8px; padding:12px; border:1px solid #e2e8f0">
                 <div style="font-size:12px; font-weight:700; color:#475569; margin-bottom:8px">📐 10 种格式</div>
