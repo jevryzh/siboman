@@ -141,7 +141,7 @@ app.use(express.static(PUBLIC_DIR));
    多店铺管理 API
    ============================================================ */
 
-app.get("/api/seller/shops", async (req, res, next) => {
+app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const result = await db.query(
@@ -152,7 +152,7 @@ app.get("/api/seller/shops", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post("/api/seller/shops", async (req, res, next) => {
+app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const { name, client_id, api_key } = req.body;
@@ -170,7 +170,7 @@ app.post("/api/seller/shops", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.delete("/api/seller/shops/:id", async (req, res, next) => {
+app.delete("/api/seller/shops/:id", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     await db.query("DELETE FROM app_stores WHERE id = $1 AND user_id = $2", [req.params.id, req.user.id]);
@@ -1811,7 +1811,7 @@ app.post("/api/seller/analytics/bestsellers", async (req, res, next) => {
  *   - app_stores 多店对比
  * 金额: 严格按 v0.3.5c 币种感知 (CNY 直读, RUB × 0.0862)
  */
-app.get("/api/seller/dashboard", async (req, res, next) => {
+app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const userId = req.user.id;
@@ -3045,7 +3045,7 @@ app.get("/api/seller/warehouses", async (_req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
 
-app.post("/api/seller/products/stocks", async (req, res, next) => {
+app.post("/api/seller/products/stocks", requireAuth, async (req, res, next) => {
   try {
     const stocks = Array.isArray(req.body?.stocks) ? req.body.stocks : null;
     if (!stocks) { res.status(400).json({ success: false, error: "请求体需要 stocks 数组" }); return; }
@@ -3074,7 +3074,7 @@ app.post("/api/seller/products/stocks", async (req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
 
-app.post("/api/seller/images/generate", async (req, res, next) => {
+app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
   try {
     const apiKey = process.env.MINIMAX_API_KEY;
     if (!apiKey) {
@@ -3162,7 +3162,7 @@ app.post("/api/seller/images/generate", async (req, res, next) => {
 });
 
 // ---------- 万相 2.7 图像编辑（替代 MiniMax 图生图）----------
-app.post("/api/seller/images/wanx-edit", async (req, res, next) => {
+app.post("/api/seller/images/wanx-edit", requireAuth, async (req, res, next) => {
   try {
     if (!DASHSCOPE_API_KEY) {
       res.status(503).json({ success: false, error: "未配置 DASHSCOPE_API_KEY" });
