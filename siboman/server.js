@@ -655,6 +655,11 @@ async function initDatabase() {
         main_image TEXT NOT NULL DEFAULT '',
         price_rub NUMERIC(12,2),
         status TEXT NOT NULL DEFAULT 'processing',
+        raw_payload JSONB,
+        errors_json JSONB,
+        variants_count INT NOT NULL DEFAULT 0,
+        failed_variants_count INT NOT NULL DEFAULT 0,
+        partial_success BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
@@ -665,6 +670,11 @@ async function initDatabase() {
       ALTER TABLE order_notes ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
+      ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS raw_payload JSONB;
+      ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS errors_json JSONB;
+      ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS variants_count INT NOT NULL DEFAULT 0;
+      ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS failed_variants_count INT NOT NULL DEFAULT 0;
+      ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS partial_success BOOLEAN NOT NULL DEFAULT FALSE;
     `);
 
     // 5. 索引与约束 (依赖前面字段已上线)
@@ -680,6 +690,11 @@ async function initDatabase() {
       DO $$ BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'order_notes_store_posting_unique') THEN
           ALTER TABLE order_notes ADD CONSTRAINT order_notes_store_posting_unique UNIQUE(store_id, posting_number);
+        END IF;
+      END $$;
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'app_listing_history_task_id_unique') THEN
+          ALTER TABLE app_listing_history ADD CONSTRAINT app_listing_history_task_id_unique UNIQUE(task_id);
         END IF;
       END $$;
     `);
@@ -2922,7 +2937,7 @@ app.post("/api/seller/orders/ship", requireAuth, async (req, res) => {
 });
 
 // ---------- 上架记录 ----------
-app.get("/api/seller/import/history", async (req, res, next) => {
+app.get("/api/seller/import/history", requireAuth, async (req, res, next) => {
   try {
     if (!db || !req.user?.id) { res.json({ items: [], total: 0 }); return; }
     const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
@@ -2945,7 +2960,7 @@ app.get("/api/seller/import/history", async (req, res, next) => {
 });
 
 // 强制同步 Ozon 任务状态
-app.post("/api/seller/import/sync-task", async (req, res, next) => {
+app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => {
   try {
     const { taskId } = req.body || {};
     if (!taskId) { res.status(400).json({ success: false, error: "需要 taskId" }); return; }
@@ -3307,7 +3322,7 @@ app.post("/api/seller/type-id-suggestion", async (req, res, next) => {
   }
 });
 
-app.post("/api/seller/products/import", async (req, res, next) => {
+app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
   try {
     const { item: rawItem } = req.body;
     const storeId = req.body?.store_id || req.body?.storeId;

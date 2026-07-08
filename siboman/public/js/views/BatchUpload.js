@@ -305,27 +305,10 @@ window.BatchUploadView = {
       if(invalid.length) appendLog(`无效行: ${invalid.map(r=>`#${r.index} ${r.reason}`).join('; ')}`, 'warn');
       notify.success(`解析 ${valid.length} 行有效数据`);
 
-      // v2.1.1: 解析前等扩展 ready, 避免用户在 pingExtension await 还没 resolve 时
-      //   点解析按钮导致 extensionConnected=false → 误走 else 分支不打采集合.
-      //   ready handler 一旦触发就能 resolve 这里 (避免用户看 5 秒假死).
-      if(valid.length) {
-        if (!extensionConnected.value) {
-          const ready = await new Promise((resolve) => {
-            const t0 = Date.now();
-            const tick = () => {
-              if (extensionConnected.value) return resolve(true);
-              if (Date.now() - t0 > 5000) return resolve(false);
-              setTimeout(tick, 100);
-            };
-            tick();
-          });
-          if (!ready) {
-            appendLog('插件未连接, 请先安装插件并登录 seller.ozon.ru 后点「采集」', 'warn');
-            return;
-          }
-        }
-        appendLog('自动启动采集...', 'info');
-        await collectSkus();
+      // 解析只做格式, 不自动采集. 用户看完预览后主动点「采集」或「开始批采+上架」.
+      // 修复 v2.1.1 副作用: 之前解析完会 await collectSkus(), 让「采集」按钮变冗余.
+      if(valid.length && !extensionConnected.value) {
+        appendLog('提示: 插件未连接, 下一步点「采集」前请先安装插件并登录 seller.ozon.ru', 'warn');
       }
     };
 
