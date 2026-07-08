@@ -2044,6 +2044,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         awaiting_deliver: awaitingDel.length,
         today_returns: todayReturns,
         arbitration: arbitration.length,
+        _returns7d: returnCount,                      // 7 日 (cancelled + arbitration), 仅用于汇总 return_rate
         weekly_payout: Math.round(weeklyPayout * 100) / 100,
         weekly_profit: Math.round(weeklyProfit * 100) / 100,
         weekly_orders: weekOrders.length,
@@ -2074,13 +2075,20 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         : (totalTodayOrders > 0 ? 100 : 0),
       awaiting_packaging: storeData.reduce((s, x) => s + x.awaiting_packaging, 0),
       awaiting_deliver: storeData.reduce((s, x) => s + x.awaiting_deliver, 0),
+      awaiting_treatment: storeData.reduce((s, x) => s + x.awaiting_treatment, 0),
       active_products: storeData.reduce((s, x) => s + x.active_products, 0),
       stock_warning: storeData.reduce((s, x) => s + x.stock_warning, 0),
       today_returns: storeData.reduce((s, x) => s + x.today_returns, 0),
       arbitration: storeData.reduce((s, x) => s + x.arbitration, 0),      // v0.5.1 真实争议单
+      weekly_orders: storeData.reduce((s, x) => s + x.weekly_orders, 0),
       weekly_gmv: Math.round(storeData.reduce((s, x) => s + x.weekly_gmv, 0) * 100) / 100,
       weekly_payout: Math.round(storeData.reduce((s, x) => s + x.weekly_payout, 0) * 100) / 100,
       weekly_profit: Math.round(storeData.reduce((s, x) => s + x.weekly_profit, 0) * 100) / 100,
+      return_rate: (() => {
+        const totalReturns = storeData.reduce((s, x) => s + x.arbitration + (x._returns7d || 0), 0);
+        const totalWeek = storeData.reduce((s, x) => s + x.weekly_orders, 0);
+        return totalWeek > 0 ? Math.round((totalReturns / totalWeek) * 10000) / 100 : 0;
+      })(),
     };
 
     // 6. 趋势 (v0.5.0 精确按天聚合, 不再用日均估算). range=7 / range=30
