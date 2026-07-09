@@ -3846,6 +3846,36 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
   }
 });
 
+/**
+ * v2.2.6: 批量写库存到指定仓库 — 用 Ozon /v2/products/stocks (新版本, /v1/product/import-stocks 已 404)
+ *   入参: { store_id, stocks: [{ offer_id, stock, warehouse_id }] }
+ *   Ozon /v2/products/stocks 入参:
+ *     { stocks: [{ offer_id, stock, warehouse_id? }] }
+ *   注意: 字段是 stock 不是 stocks
+ */
+app.post("/api/seller/products/import-stocks", requireAuth, async (req, res) => {
+  try {
+    const { store_id: storeId, stocks } = req.body || {};
+    if (!storeId) return res.status(400).json({ success: false, error: "缺少 store_id" });
+    if (!Array.isArray(stocks) || !stocks.length) return res.status(400).json({ success: false, error: "缺少 stocks 数组" });
+    // 规范化: 过滤无效, 转 int, warehouse_id 字符串
+    const norm = stocks
+      .filter(s => s && s.offer_id && (Number(s.stock ?? s.stocks) >= 0))
+      .map(s => ({
+        offer_id: String(s.offer_id),
+        stock: parseInt(s.stock ?? s.stocks, 10),
+        ...(s.warehouse_id ? { warehouse_id: String(s.warehouse_id) } : {}),
+      }));
+    if (!norm.length) return res.status(400).json({ success: false, error: "stocks 全无效" });
+
+    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: norm }, { storeId, userId: req.user.id });
+    const taskId = data?.result?.task_id || data?.task_id || "";
+    res.json({ success: true, data, taskId, count: norm.length });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
+  }
+});
+
 /* ============================================================
    采集箱（02-collect-box.md）
    - 粘 Ozon 链接 / SKU 批量入箱

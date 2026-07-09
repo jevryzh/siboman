@@ -659,6 +659,8 @@ window.BatchUploadView = {
       for(const storeId of selectedStores.value){
         const storeName = allStores.value.find(s=>s.id===storeId)?.name || storeId;
         appendLog(`\n--- [${storeName}] 开始 ---`, 'info');
+        // v2.2.6: 收集本店铺本轮成功提交的商品, 用于上架成功后批量调 import-stocks 设仓库库存
+        const acceptedInThisStore = [];
         for(const row of rows){
           // v2.2.4: 拦截 confidence='none' 且 to=0 的行 (URL 面包屑 ID 不是 Seller API 的)
           //   Ozon 必拒 levels_category_not_found, 前端必须拦住不让提交
@@ -686,6 +688,7 @@ window.BatchUploadView = {
             appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}`, 'info');
             // 后台 polling 每 60s 同步 Ozon 真实状态
             totalOk++;
+            acceptedInThisStore.push({ offer_id: built.item.offer_id, stock: config.defaultStock || 0 });
           } catch(e) {
             // v2.2.0: 只有本地校验失败 (商品字段缺失) 才会报错
             // 类目等问题让 Ozon 处理, 不再前端拦截
@@ -694,6 +697,29 @@ window.BatchUploadView = {
             totalFail++;
           }
         }
+
+        // v2.2.6: 上架成功后, 把库存写入本店铺所选仓库 (Ozon /v1/product/import-stocks + warehouse_id)
+        //   Ozon 异步审核商品任务期间, import-stocks 会被队列等任务完成才生效, 但不需要商品已 imported — 通常 5-30 分钟内生效
+        const whId = selectedWarehousesByStore.value[storeId];
+        if (acceptedInThisStore.length && whId) {
+          try {
+            const res = await axios.post('/api/seller/products/import-stocks', {
+              store_id: storeId,
+              stocks: acceptedInThisStore.map(s => ({
+                offer_id: s.offer_id,
+                stocks: s.stock,
+                warehouse_id: whId,
+              })),
+            }, { timeout: 60000 });
+            appendLog(`  📦 已分配 ${acceptedInThisStore.length} 个商品到 warehouse_id=${whId} (库存=${config.defaultStock||0})`, 'success');
+          } catch (e) {
+            const errMsg = e.response?.data?.error || e.message;
+            appendLog(`  ⚠ 库存分配失败 (商品仍上架了): ${errMsg}`, 'warn');
+          }
+        } else if (acceptedInThisStore.length && !whId) {
+          appendLog(`  ⚠ [${storeName}] 未选仓库, 库存会进默认仓 (用户可去 Ozon 后台手动调)`, 'warn');
+        }
+
         appendLog(`--- [${storeName}] 完成 ---`, 'info');
       }
       appendLog(`\n========== 全部完成: ${totalOk} 提交 Ozon, ${totalFail} 本地校验失败, ${totalSkipped} 未选类目跳过 ==========`, (totalFail||totalSkipped)?'warn':'success');
@@ -738,11 +764,48 @@ window.BatchUploadView = {
     const fetchStores = async () => {
       try { const res = await axios.get('/api/seller/shops'); allStores.value = res.data.shops||[]; } catch {}
     };
+
+    // v2.2.6: 仓库选择 — 选店铺后自动拉这家店的 FBS 仓库, 每店选一个
+    const warehousesByStore = Vue.ref({});  // {storeId: [{warehouse_id, name, status}]}
+    const selectedWarehousesByStore = Vue.ref({});  // {storeId: warehouse_id}
+    const fetchingWarehouses = Vue.ref({});  // {storeId: true/false}
+    const fetchWarehousesForStore = async (storeId) => {
+      if (!storeId || warehousesByStore.value[storeId]) return;  // 已有缓存
+      fetchingWarehouses.value = { ...fetchingWarehouses.value, [storeId]: true };
+      try {
+        const res = await axios.get(`/api/seller/warehouses?storeId=${encodeURIComponent(storeId)}`);
+        const list = (res.data?.warehouses || []).filter(w => w.status === 'created' && w.is_rfbs);
+        warehousesByStore.value = { ...warehousesByStore.value, [storeId]: list };
+        // 默认选第一个
+        if (!selectedWarehousesByStore.value[storeId] && list.length) {
+          selectedWarehousesByStore.value = { ...selectedWarehousesByStore.value, [storeId]: list[0].warehouse_id };
+        }
+      } catch (e) {
+        appendLog(`  ⚠ 拉仓库失败 (${storeId.slice(0,8)}…): ${e.message}`, 'warn');
+      } finally {
+        fetchingWarehouses.value = { ...fetchingWarehouses.value, [storeId]: false };
+      }
+    };
+    // 选店铺变化时, 自动 fetch 没拉过的仓库
+    Vue.watch(selectedStores, async (newStores, oldStores) => {
+      const added = (newStores || []).filter(s => !(oldStores || []).includes(s));
+      for (const sid of added) await fetchWarehousesForStore(sid);
+    }, { deep: true });
+
     const saveConfig = () => {
-      localStorage.setItem('batch_config', JSON.stringify({selectedStores: selectedStores.value, ...config}));
+      localStorage.setItem('batch_config', JSON.stringify({
+        selectedStores: selectedStores.value,
+        selectedWarehousesByStore: selectedWarehousesByStore.value,
+        ...config,
+      }));
     };
     const loadConfig = () => {
-      try { const s = JSON.parse(localStorage.getItem('batch_config')||'{}'); Object.assign(config, s); if(s.selectedStores) selectedStores.value = s.selectedStores; } catch {}
+      try {
+        const s = JSON.parse(localStorage.getItem('batch_config')||'{}');
+        Object.assign(config, s);
+        if (s.selectedStores) selectedStores.value = s.selectedStores;
+        if (s.selectedWarehousesByStore) selectedWarehousesByStore.value = s.selectedWarehousesByStore;
+      } catch {}
     };
 
     const fmtMoney = (v) => '¥'+Number(v||0).toFixed(2);
@@ -806,6 +869,7 @@ window.BatchUploadView = {
       categoryPickerOpen, pickingRow, openCategoryPicker, closeCategoryPicker, applyCategoryChoice,
       candidateSearch, filteredCandidates, categoryStats, applyCategoryHistory,
       pickerFocusIdx, onPickerKeydown,
+      warehousesByStore, selectedWarehousesByStore, fetchingWarehouses, fetchWarehousesForStore,
     };
   },
   template: `
@@ -1021,6 +1085,31 @@ window.BatchUploadView = {
                 <el-select v-model="selectedStores" multiple filterable size="small" style="width:100%" placeholder="选择要上架的店铺" @change="saveConfig">
                   <el-option v-for="s in allStores" :key="s.id" :label="s.name" :value="s.id" />
                 </el-select>
+              </div>
+              <!-- v2.2.6: 选店铺后自动拉仓库, 每店一个仓库 (像 MY ERP) -->
+              <div v-if="selectedStores.length" style="background:#f0f9ff; border:1px solid #bae6fd; border-radius:8px; padding:10px 12px; margin-top:-4px">
+                <div style="font-size:12px; color:#0c4a6e; font-weight:600; margin-bottom:6px; display:flex; align-items:center; gap:6px">
+                  📦 目标仓库
+                  <span style="font-size:10px; font-weight:400; color:#64748b">(每店一个, 自动拉取 FBS)</span>
+                </div>
+                <div v-for="storeId in selectedStores" :key="storeId" style="display:flex; align-items:center; gap:6px; margin-bottom:4px; font-size:11px">
+                  <span style="min-width:80px; color:#475569; font-weight:600">{{ allStores.find(s=>s.id===storeId)?.name || storeId.slice(0,8) }}</span>
+                  <el-select
+                    v-model="selectedWarehousesByStore[storeId]"
+                    size="small"
+                    style="flex:1"
+                    :loading="fetchingWarehouses[storeId]"
+                    :no-data-text="fetchingWarehouses[storeId] ? '拉取中…' : '该店无可用 FBS 仓库'"
+                    placeholder="选仓库"
+                    @change="saveConfig">
+                    <el-option
+                      v-for="w in (warehousesByStore[storeId] || [])"
+                      :key="w.warehouse_id"
+                      :label="w.name"
+                      :value="w.warehouse_id" />
+                  </el-select>
+                  <span v-if="!(warehousesByStore[storeId] || []).length && !fetchingWarehouses[storeId]" style="color:#dc2626; font-size:10px">⚠ 无</span>
+                </div>
               </div>
               <div>
                 <div style="font-size:12px; color:#64748b; margin-bottom:4px; font-weight:600"><span style="color:#dc2626">*</span> 品牌</div>
