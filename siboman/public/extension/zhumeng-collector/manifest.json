@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "逐梦 Ozon 采集器",
-  "version": "2.2.2",
+  "version": "2.2.4",
   "description": "配合逐梦 ERP 批量跟卖使用。在 seller.ozon.ru 登录后,自动采集竞品 SKU 的完整商品信息(图片/属性/类目/尺寸)并回传给 ERP。",
   "permissions": [
     "storage",
