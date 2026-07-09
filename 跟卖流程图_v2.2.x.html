@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>逐梦 ERP · v2.2.x 跟卖流程图 · 庄国超团队运营手册</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Serif+Display&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg: #f7f5f0;
+  --card: #ffffff;
+  --line: #e9e3d6;
+  --line-soft: #f0ead9;
+  --text: #14171e;
+  --muted: #7c7a72;
+  --primary: #2f6f5e;
+  --accent: #c97b3f;
+  --danger: #b06367;
+  --info: #3a6c8c;
+  --warn: #c97b3f;
+  --success: #2f6f5e;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Outfit', -apple-system, sans-serif;
+  font-size: 14.5px;
+  line-height: 1.62;
+  padding: 60px 24px 80px;
+}
+body::before, body::after {
+  content: ""; position: fixed; pointer-events: none; border-radius: 50%;
+  z-index: 0;
+}
+body::before { top: -200px; right: -200px; width: 500px; height: 500px; background: radial-gradient(circle, rgba(47,111,94,0.05), transparent 70%); }
+body::after { bottom: -300px; left: -200px; width: 600px; height: 600px; background: radial-gradient(circle, rgba(201,123,63,0.04), transparent 70%); }
+.wrap { max-width: 920px; margin: 0 auto; position: relative; z-index: 1; }
+
+/* HEADER */
+.hero { margin-bottom: 56px; }
+.kicker { font-size: 11px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--primary); font-weight: 600; margin-bottom: 14px; }
+h1 { font-family: 'DM Serif Display', serif; font-weight: 400; font-size: 38px; line-height: 1.15; letter-spacing: -0.01em; margin-bottom: 16px; }
+.hero p { color: var(--muted); font-size: 15px; max-width: 620px; }
+.hero-meta { display: flex; gap: 24px; margin-top: 24px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+.hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
+.hero-meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--primary); display: inline-block; }
+
+/* SECTIONS */
+section { margin-bottom: 56px; }
+h2 { font-family: 'DM Serif Display', serif; font-weight: 400; font-size: 26px; line-height: 1.2; margin-bottom: 24px; letter-spacing: -0.005em; }
+h2 .num { color: var(--accent); margin-right: 12px; font-family: 'Outfit', sans-serif; font-weight: 700; font-size: 14px; vertical-align: middle; padding: 4px 10px; background: rgba(201,123,63,0.1); border-radius: 6px; }
+h3 { font-family: 'Outfit', sans-serif; font-weight: 700; font-size: 16px; margin: 24px 0 10px; color: var(--text); }
+p { margin-bottom: 14px; color: var(--text); }
+ul, ol { margin: 0 0 14px 22px; }
+li { margin-bottom: 6px; }
+code { font-family: 'JetBrains Mono', monospace; background: var(--line-soft); padding: 1px 6px; border-radius: 4px; font-size: 12.5px; color: var(--accent); }
+.muted { color: var(--muted); }
+
+/* CARDS */
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 22px 24px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.03);
+  margin-bottom: 18px;
+}
+.card-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 700px) { .card-row { grid-template-columns: 1fr; } }
+
+/* FLOW DIAGRAM */
+.flow-card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px 24px; margin-bottom: 24px; box-shadow: 0 2px 8px rgba(0,0,0,0.03); }
+.mermaid { display: flex; justify-content: center; }
+
+/* CONFIDENCE GRID */
+.conf-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 8px; }
+@media (max-width: 700px) { .conf-grid { grid-template-columns: 1fr; } }
+.conf { padding: 18px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); }
+.conf h4 { font-size: 13px; font-weight: 700; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+.conf .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; font-family: 'JetBrains Mono', monospace; }
+.conf p { font-size: 13px; color: var(--muted); margin: 0; line-height: 1.55; }
+.conf-high { border-top: 3px solid #2f6f5e; }
+.conf-medium { border-top: 3px solid #c97b3f; }
+.conf-none { border-top: 3px solid #b06367; }
+.conf-manual { border-top: 3px solid #3a6c8c; }
+.badge-high { background: rgba(47,111,94,0.12); color: #2f6f5e; }
+.badge-medium { background: rgba(201,123,63,0.12); color: #c97b3f; }
+.badge-none { background: rgba(176,99,103,0.12); color: #b06367; }
+.badge-manual { background: rgba(58,108,140,0.12); color: #3a6c8c; }
+
+/* TABLE */
+table { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13.5px; }
+th { text-align: left; padding: 10px 12px; border-bottom: 2px solid var(--line); color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; }
+td { padding: 10px 12px; border-bottom: 1px solid var(--line-soft); }
+tr:last-child td { border-bottom: none; }
+
+/* STEP TIMELINE */
+.timeline { list-style: none; padding: 0; margin: 16px 0; position: relative; }
+.timeline::before { content: ""; position: absolute; left: 11px; top: 6px; bottom: 6px; width: 2px; background: var(--primary); opacity: 0.3; }
+.timeline li { position: relative; padding: 0 0 22px 42px; }
+.timeline li::before { content: ""; position: absolute; left: 4px; top: 6px; width: 16px; height: 16px; border-radius: 50%; background: white; border: 3px solid var(--primary); }
+.timeline li strong { display: block; font-weight: 700; margin-bottom: 4px; }
+.timeline li p { color: var(--muted); margin: 0; font-size: 13.5px; }
+
+/* CALLOUT */
+.callout { padding: 16px 18px; border-radius: 10px; margin: 14px 0; font-size: 13.5px; display: flex; gap: 12px; align-items: flex-start; }
+.callout svg { flex-shrink: 0; margin-top: 2px; }
+.callout p { margin: 0; }
+.callout.tip { background: rgba(47,111,94,0.08); border-left: 3px solid var(--primary); }
+.callout.warn { background: rgba(201,123,63,0.08); border-left: 3px solid var(--warn); }
+.callout.danger { background: rgba(176,99,103,0.08); border-left: 3px solid var(--danger); }
+.callout strong { font-weight: 700; }
+
+/* KEY-VALUE */
+.kv { display: grid; grid-template-columns: 130px 1fr; row-gap: 8px; column-gap: 16px; margin: 12px 0; }
+.kv dt { color: var(--muted); padding-bottom: 8px; border-bottom: 1px dashed var(--line); font-size: 12.5px; }
+.kv dd { margin: 0; padding-bottom: 8px; border-bottom: 1px dashed var(--line); font-size: 13.5px; }
+
+/* MERMAID overrides */
+.mermaid .nodeLabel { font-family: 'Outfit', sans-serif !important; font-size: 13px !important; }
+.mermaid .edgeLabel { font-family: 'Outfit', sans-serif !important; font-size: 11px !important; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="kicker">运营手册 · v2.2.2</div>
+  <h1>逐梦 ERP 跟卖流程图</h1>
+  <p>从粘贴 SKU 到 Ozon 上架, 庄国超团队运营人员的端到端操作指南。聚焦类目解析的 4 档置信度、新增的候选类目选择 modal、以及版本同步规则。</p>
+  <div class="hero-meta">
+    <span><span class="dot"></span>2026-07-09 写入</span>
+    <span><span class="dot"></span>插件 v2.2.2</span>
+    <span><span class="dot"></span>服务端 API /api/seller/products/category-resolve</span>
+    <span><span class="dot"></span>4 个店铺并行</span>
+  </div>
+</header>
+
+<!-- SECTION 1: 一图看懂 -->
+<section>
+  <h2><span class="num">01</span>一图看懂 — 5 步跟卖流程</h2>
+  <p>整个流程从粘贴 SKU 到上架完成, 每步都能在页面上看到状态, 失败有具体原因。下面用流程图把 5 步串起来:</p>
+
+  <div class="flow-card">
+    <div class="mermaid">
+flowchart LR
+    A["<b>粘贴 SKU</b><br/>每行一条<br/>6-16 位纯数字"] -->|解析| B["<b>采集</b><br/>插件读 Ozon 公开页<br/>+ 同店同款 OPI 辅源"]
+    B --> C{"<b>类目解析</b><br/>name + type_id<br/>5 级 fallback"}
+    C -->|high/medium| D["<b>提交 Ozon</b><br/>POST /v3/product/import"]
+    C -->|none| E["<b>候选类目 modal</b><br/>用户 1-click 选"]
+    E --> D
+    D --> F{"Ozon 是否<br/>接受?"}
+    F -->|接受| G["<b>ListingHistory</b><br/>imported · 销售中"]
+    F -->|拒绝| H["<b>后台改类目</b><br/>seller.ozon.ru"]
+    H --> G
+
+    style A fill:#f7f5f0,stroke:#7c7a72,color:#14171e
+    style B fill:#f7f5f0,stroke:#7c7a72,color:#14171e
+    style C fill:#fffbeb,stroke:#c97b3f,color:#14171e
+    style D fill:#ecfdf5,stroke:#2f6f5e,color:#14171e
+    style E fill:#fffbeb,stroke:#c97b3f,color:#14171e
+    style F fill:#fffbeb,stroke:#c97b3f,color:#14171e
+    style G fill:#ecfdf5,stroke:#2f6f5e,color:#14171e
+    style H fill:#fef2f2,stroke:#b06367,color:#14171e
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);margin-top:2px"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+    <p><strong>关键原则:</strong> ERP 不替 Ozon 做主。类目解析只是"建议", 真正上传是直接交给 Ozon, Ozon 说不行用户去 seller.ozon.ru 后台手动改。这样少一层 ERP 验证逻辑, 上传更快、更稳。</p>
+  </div>
+</section>
+
+<!-- SECTION 2: 类目解析 4 档 -->
+<section>
+  <h2><span class="num">02</span>类目解析 — 4 档置信度</h2>
+  <p>插件采集每个商品时会调 <code>/api/seller/products/category-resolve</code>, 服务端会返回 5 级 fallback 的结果, 综合为以下 4 档置信度:</p>
+
+  <div class="conf-grid">
+    <div class="conf conf-high">
+      <h4>🟢 高置信 <span class="badge badge-high">high</span></h4>
+      <p>服务端找到本店已有商品的 <b>2 个不同 token 都命中</b> 的名字 (例: "кемпинговый" AND "фонарь" 都出现在历史商品名里), 或 SKU 完全匹配本地库。 <b>直接提交, 不需要人工确认。</b></p>
+    </div>
+    <div class="conf conf-medium">
+      <h4>🟡 中置信 <span class="badge badge-medium">medium</span></h4>
+      <p>只有 1 个 token 命中, 或同一 <code>type_id</code> 在本店历史归过此类目。 <b>系统自动用, 但用户可以"换一个"</b> — 表格里点链接打开 modal 重选。</p>
+    </div>
+    <div class="conf conf-none">
+      <h4>🔴 未解析 <span class="badge badge-none">none</span></h4>
+      <p>名字 0 命中, type_id 也无历史。返回该店 top-10 高频类目作为 <b>候选</b>, 表格里显示 <code>选类目 (N)</code> 按钮, 用户必点选才能提交。</p>
+    </div>
+    <div class="conf conf-manual">
+      <h4>🔵 已手动选 <span class="badge badge-manual">manual</span></h4>
+      <p>用户从候选 modal 选了类目, 或 localStorage 自动恢复了之前选过的类目。 <b>自动提交</b>。手动选过的类目会被记住, 下次同 SKU 采集后自动恢复。</p>
+    </div>
+  </div>
+
+  <h3>5 级 fallback 服务端逻辑</h3>
+  <table>
+    <thead><tr><th>优先级</th><th>匹配策略</th><th>置信度</th><th>条件</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>本地库 SKU 直查</td><td><span class="badge badge-high">high</span></td><td>商品已在你本地 app_products 库里</td></tr>
+      <tr><td>2</td><td>Ozon 卖家 API /v3/product/info</td><td><span class="badge badge-high">high</span></td><td>该店铺 SKU 已有商品 (别人的店不行)</td></tr>
+      <tr><td>3</td><td>跨店同 SKU</td><td><span class="badge badge-high">high</span></td><td>其他店的同一商品在 app_products 库</td></tr>
+      <tr><td>4</td><td>同店名字相似 (AND 匹配)</td><td><span class="badge badge-high">high</span></td><td>本店历史商品名里 ≥2 个不同 token 都命中</td></tr>
+      <tr><td>4b</td><td>同店 type_id 匹配</td><td><span class="badge badge-medium">medium</span></td><td>URL 抓的 type_id 在本店某类目下用过</td></tr>
+      <tr><td>5</td><td>全部失败</td><td><span class="badge badge-none">none</span></td><td>返回 top-10 高频类目作为候选</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- SECTION 3: 候选选择 modal -->
+<section>
+  <h2><span class="num">03</span>候选类目选择 modal</h2>
+  <p>当置信度是 <span class="badge badge-none">none</span>, 表格对应行会显示 <code>⚠ 未解析</code> 状态 + <code>选类目 (N)</code> 按钮。点击打开全屏 modal:</p>
+
+  <div class="flow-card">
+    <div class="mermaid">
+flowchart TB
+    P["modal 打开<br/>🎯 选类目 — #X SKU"]
+    P --> Q["输入框过滤<br/>输入 'фонарь' 或 '17028'"]
+    Q --> R["候选列表<br/>按 count 排序"]
+    R --> S["鼠标 hover<br/>或键盘 ↑↓"]
+    S --> T["Enter / 点击<br/>→ 写入行"]
+    T --> U["localStorage 记忆<br/>sku → cat_id"]
+    U --> V["关闭 modal<br/>状态: 🔵 已手动选"]
+
+    style P fill:#fffbeb,stroke:#c97b3f
+    style V fill:#dbeafe,stroke:#3a6c8c
+    </div>
+  </div>
+
+  <h3>键盘快捷键</h3>
+  <table>
+    <thead><tr><th>键</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>↑</code> / <code>↓</code></td><td>在候选列表中移动焦点 (选中行高亮米色)</td></tr>
+      <tr><td><code>Enter</code></td><td>选中当前焦点候选并写入</td></tr>
+      <tr><td><code>Esc</code></td><td>关闭 modal, 不保存</td></tr>
+      <tr><td>鼠标 hover</td><td>自动同步到键盘焦点 (亮的那行)</td></tr>
+    </tbody>
+  </div>
+
+  <div class="callout warn">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--warn);margin-top:2px"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+    <p><strong>类目选错了怎么办?</strong> 选错不要紧 — Ozon 接受后会在 ListingHistory 显示 imported, 你去 <code>seller.ozon.ru</code> 后台改类目就行。ERP 这边不做"类目合法性"二次校验, Ozon 是 source of truth。</p>
+  </div>
+
+  <h3>localStorage 记忆机制</h3>
+  <p>用户手动选过的类目会被缓存在 <code>localStorage['zhumeng_category_choice_v1']</code>, key 是 SKU, 最多保留 500 条。下次同 SKU 采集完成后, 服务端给 <code>none</code> 时, 前端自动从这个 cache 恢复 → 状态变 <span class="badge badge-manual">manual</span>, source = <code>history-auto</code>。</p>
+</section>
+
+<!-- SECTION 4: 插件版本 -->
+<section>
+  <h2><span class="num">04</span>插件版本与安装</h2>
+  <p>插件跟随 ERP 版本号同步。 <b>v2.2.x = 增量改进, 不破坏接口。</b> 升级路径是 <code>chrome://extensions</code> → 卸旧 → 装新 zip:</p>
+
+  <ol class="timeline">
+    <li>
+      <strong>下载新版 zip</strong>
+      <p>访问 <code>http://test.renwz.cn:5178/extension/zhumeng-collector.zip</code>, 保存到本地。</p>
+    </li>
+    <li>
+      <strong>删除旧版</strong>
+      <p>打开 <code>chrome://extensions/</code>, 找到"逐梦 Ozon 采集器", 点 <code>移除</code>。</p>
+    </li>
+    <li>
+      <strong>开发者模式加载</strong>
+      <p>右上角打开"开发者模式"开关 → 点 <code>加载已解压的扩展程序</code> → 选刚才下载并解压的 <code>zhumeng-collector</code> 文件夹。</p>
+    </li>
+    <li>
+      <strong>登录 Ozon Seller</strong>
+      <p>打开 <code>seller.ozon.ru</code> 标签页并登录, 插件会自动检测 cookie 状态。</p>
+    </li>
+    <li>
+      <strong>回到 ERP 刷新页面</strong>
+      <p>在 ERP 的 BatchUpload 页面, 顶部应该显示"🟢 插件已连接"。如果不是, 点 <code>🔄 刷新状态</code>。</p>
+    </li>
+  </ol>
+
+  <h3>版本号一致性检查清单</h3>
+  <p>每次插件版本号变更, 这 4 个地方必须同步:</p>
+  <dl class="kv">
+    <dt>manifest.json</dt><dd><code>"version": "2.2.x"</code></dd>
+    <dt>background.js</dt><dd><code>const VERSION = "2.2.x"</code></dd>
+    <dt>StoreManagement.js</dt><dd>卡片标题 + el-tag 显示版本号</dd>
+    <dt>zhumeng-collector.zip</dt><dd>重新打包并部署到 <code>/opt/ozon/app-test/public/extension/</code></dd>
+  </dl>
+</section>
+
+<!-- SECTION 5: FAQ -->
+<section>
+  <h2><span class="num">05</span>常见问题</h2>
+
+  <div class="card">
+    <h3>Q1: 采集后所有商品都显示"⚠ 未解析", 没有候选?</h3>
+    <p>这通常意味着这家店 <b>还没在 ERP 后台同步过任何商品</b> (app_products 表为空), 或者同步过但 description_category_id 字段全空。解决: 去 <code>app_stores</code> 配 client_id + api_key → 触发首次 Sync-All → 等 sync 完成 → 再试采集。</p>
+  </div>
+
+  <div class="card">
+    <h3>Q2: 选了类目还是上传失败, Ozon 返回 400 "category not found"?</h3>
+    <p>可能候选类是 <b>这家店不存在</b> 的类目 (树缓存过期或 storeId 错)。刷新类目树: 顶部 <code>🔄 刷新状态</code> → 后台会调用 <code>/v1/description-category/tree</code> 重建缓存。如果还失败, 去 seller.ozon.ru 后台选。</p>
+  </div>
+
+  <div class="card">
+    <h3>Q3: 我手动选过 1 次类目, 下次同 SKU 应该自动恢复, 但没生效?</h3>
+    <p>检查 3 个条件: ① SKU 完全相同 (含前后 0) ② 该行 <code>_category_resolved.confidence === 'none'</code> (不是 manual) ③ localStorage 没被浏览器清掉 (隐身模式 / 浏览器 data 清理会丢)。如果都满足, 看控制台有没有 <code>💾 N 个商品自动恢复</code> 的日志。</p>
+  </div>
+
+  <div class="card">
+    <h3>Q4: type_id 我知道是 95120, 但插件说 0, 没拿到?</h3>
+    <p>Ozon 公开页面不展示 type_id, 只有 seller API 才返回。插件会通过 OPI 辅源拉同店同款的 type_id — 如果你店 <b>完全没卖过这个 type_id</b> 的商品, 就拿不到。解决: 选个相似商品的 type_id (modal 的 type_id 兜底会自动按店铺历史推荐)。</p>
+  </div>
+
+  <div class="card">
+    <h3>Q5: 4 个店(LuckyDay / Polarwind / Superstar / Three Latte)能同时跑吗?</h3>
+    <p>可以。BatchUpload 顶部 <code>目标店铺</code> 多选 (Ctrl/Cmd 点), 服务端会扇出到每个店, 每个店独立调它的 client_id + api_key。但 <b>同一 SKU 在多个店不能完全同图同标题</b>, Ozon 会判定重复商品。建议: 同店复用, 跨店至少换 1-2 张图、改改标题。</p>
+  </div>
+
+  <div class="card">
+    <h3>Q6: 上架后我看哪个页面?</h3>
+    <p>顶部菜单 → <code>📜 历史记录</code> 或直接 <code>#/listing-history</code>。每 30 秒自动刷新, 显示 Ozon 接受的 status (imported / processing / failed)。Ozon 异步审核可能延迟 5-30 分钟, 看到 processing 别慌。</p>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<section>
+  <div class="callout tip">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--primary);margin-top:2px"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+    <p><strong>反馈入口:</strong> 发现 bug / 想加功能, 直接在团队群里 ping <code>逐梦 ERP 助手</code>, 把控制台日志 (F12 → Console) + 截屏发出来即可。版本号是判断"是不是最新代码"的最快方式, 永远附带插件版本号 (右上角 StoreManagement 卡片可查)。</p>
+  </div>
+</section>
+
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'base',
+  themeVariables: {
+    primaryColor: '#ffffff',
+    primaryTextColor: '#14171e',
+    primaryBorderColor: '#e9e3d6',
+    lineColor: '#7c7a72',
+    secondaryColor: '#f7f5f0',
+    tertiaryColor: '#fffbeb',
+    fontFamily: "'Outfit', sans-serif",
+    fontSize: '13px',
+    noteBkgColor: '#fffbeb',
+    noteTextColor: '#14171e',
+    noteBorderColor: '#c97b3f',
+    activationBorderColor: '#c97b3f',
+    activationBkgColor: '#fffbeb',
+    errorBkgColor: '#fef2f2',
+    errorBorderColor: '#b06367'
+  },
+  flowchart: { curve: 'basis', padding: 12, nodeSpacing: 36, rankSpacing: 48 }
+});
+</script>
+</body>
+</html>
