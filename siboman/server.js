@@ -3661,6 +3661,8 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
     const offerId = String(req.body?.offer_id || "").trim();
     const productName = String(req.body?.name || "").trim();
     const typeId = req.body?.type_id || req.body?.typeId || 0;
+    const breadcrumbCatId = Number(req.body?.breadcrumb_cat_id || 0);  // v2.2.9 trace
+    console.log(`[category-resolve] sku=${sku} name="${productName.slice(0,40)}" type_id=${typeId} breadcrumb_cat_id=${breadcrumbCatId} store=${storeId.slice(-8)}`);
     if (!storeId) return res.status(400).json({ success: false, error: "需要 store_id" });
     if (!sku && !offerId && !productName && !typeId) return res.status(400).json({ success: false, error: "需要 sku/offer_id/name/type_id 至少一个" });
 
@@ -3814,26 +3816,88 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
     }
 
     // 5. 全部失败 - 返回目标店高频类目作为候选 (让前端给 user 看)
+    // v2.2.9.1: 增加 "按当前商品 name 关键词从 Ozon 全 tree 过滤" 作为第一批候选
+    //   之前只给店铺历史高频 (跟当前商品可能完全不相关), 现在用 name 匹配 Ozon 全树
     const fallbackCandidates = async () => {
       if (!db) return [];
       // 确保 tree cache 已加载, 不然 name 查不到
       if (userId) await getValidCategoryIds(storeId, userId);
+      const candidates = [];
+      const seen = new Set();
+
+      // v2.2.9.1 第一优先: 用商品名俄文 token 从 Ozon 全 tree 过滤
+      //   比如 "Чайник заварочный" → tokens=[чайник, заварочный]
+      //   从 categoryTreeCache 里找 name 含这些 token 的 cat, 跟当前商品最相关
+      //   关键: type_id 节点 (Ozon tree 叶子) 的 description_category_id=0, 要用父级 cat 的 id
+      if (productName && productName.length >= 3) {
+        try {
+          const tokens = productName.toLowerCase()
+            .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+            .split(/\s+/)
+            .filter(t => t.length >= 3)
+            .sort((a, b) => b.length - a.length)
+            .slice(0, 3);
+          if (tokens.length) {
+            const tree = await getCategoryTreeForStore(storeId, userId);
+            const matches = [];
+            const walk = (nodes, parentCatId = null, breadcrumb = []) => {
+              for (const n of nodes || []) {
+                const name = (n.category_name || n.type_name || '').toLowerCase();
+                const hits = tokens.filter(t => name.includes(t)).length;
+                // v2.2.9.1: type_id 节点 (叶子) 没有 description_category_id, 用父 cat id
+                const catId = Number(n.description_category_id) || parentCatId;
+                const typeId = Number(n.type_id) || 0;
+                if (hits > 0 && catId) {
+                  matches.push({
+                    description_category_id: catId,
+                    type_id: typeId,
+                    name: n.category_name || n.type_name || '',
+                    match_score: hits,
+                    breadcrumb: [...breadcrumb, n.category_name || n.type_name].join(" › "),
+                  });
+                }
+                walk(n.children || [], catId, [...breadcrumb, n.category_name || n.type_name || '']);
+              }
+            };
+            walk(tree, null, []);
+            // 按 match_score 排序, 取前 8
+            matches.sort((a, b) => b.match_score - a.match_score);
+            for (const m of matches.slice(0, 8)) {
+              if (!seen.has(m.description_category_id)) {
+                candidates.push({ ...m, source: 'ozon-tree-name-match' });
+                seen.add(m.description_category_id);
+              }
+            }
+          }
+        } catch (e) {
+          console.warn("[category-resolve] ozon-tree name match fail:", e.message);
+        }
+      }
+
+      // 第二优先: 店铺历史高频 cat (兜底, 如果 name 匹配不到才显示)
       try {
         const r = await db.query(
           `SELECT description_category_id, COUNT(*) as cnt FROM app_products
            WHERE store_id = $1 AND description_category_id IS NOT NULL AND description_category_id > 0
+             AND description_category_id NOT IN (${[...seen].map((_, i) => `$${i + 2}`).join(',') || '$2'})
            GROUP BY description_category_id ORDER BY cnt DESC LIMIT 10`,
-          [storeId],
+          [storeId, ...[...seen].map(Number)],
         );
-        return r.rows.map(x => {
+        for (const x of r.rows) {
           const id = Number(x.description_category_id);
-          return {
+          if (seen.has(id)) continue;
+          candidates.push({
             description_category_id: id,
             name: getCategoryName(storeId, id) || '',
             count: Number(x.cnt),
-          };
-        });
-      } catch { return []; }
+            source: 'store-history',
+          });
+          seen.add(id);
+          if (candidates.length >= 15) break;
+        }
+      } catch { /* 兜底查询失败不阻塞 */ }
+
+      return candidates.slice(0, 15);
     };
 
     const candidates = await fallbackCandidates();

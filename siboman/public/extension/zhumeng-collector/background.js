@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9";
+const VERSION = "2.2.9.1";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -34,19 +34,27 @@ async function collectSku(sku, storeIds = []) {
     await safeRemoveTab(tab.id);
     throw new Error(`Ozon 商品页加载超时/失败: ${e.message}`);
   }
-  
-  // 3. 注入提取函数并执行
-  let result;
-  try {
-    const [execResult] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: extractOzonProductData,
-      args: [sku],
-    });
-    result = execResult?.result;
-  } catch (e) {
-    await safeRemoveTab(tab.id);
-    throw new Error(`executeScript 失败: ${e.message}`);
+
+  // v2.2.9.1: Ozon SPA 异步渲染, status=complete 后 [data-widget="breadCrumbs"] 可能还没出现
+  //   用 polling 调用 executeScript, 最多 5 次 (每 1s 一次), 直到 cat != 0 或超时
+  let result = null;
+  const maxRetries = 5;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const [execResult] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: extractOzonProductData,
+        args: [sku],
+      });
+      result = execResult?.result;
+    } catch (e) {
+      // executeScript 失败重试
+    }
+    if (result && result.description_category_id && result.description_category_id > 0) {
+      if (attempt > 1) console.log(`[SW ${VERSION}]   breadcrumb 在第 ${attempt} 次 retry 拿到 cat=${result.description_category_id}`);
+      break;
+    }
+    if (attempt < maxRetries) await new Promise(r => setTimeout(r, 1000));
   }
   
   // 4. 关闭 tab
@@ -104,18 +112,18 @@ async function collectSku(sku, storeIds = []) {
         };
         console.log(`[SW ${VERSION}]   类目解析: ${oldCat} → ${resolved.description_category_id} (${resolved.source}, confidence=${resolved.confidence})`);
       } else if (resolved) {
-        // v2.2.4: 失败时清掉 URL 的旧 cat (5 位面包屑 ID 不是 Seller API 的 8 位 ID)
-        //   否则 publish 把 9700 提交给 Ozon 会立刻被 Ozon 拒 (levels_category_not_found)
-        result.description_category_id = 0;
+        // v2.2.9.1: 不再清零 plugin 已抓到的 cat (5位 breadcrumb)
+        //   v2.2.9 实测 Ozon /v3/product/import 接受 5位 (公开 URL breadcrumb) 跟 8位 (Seller API) 都接受
+        //   v2.2.4 清零逻辑是为了避免 5位被 Ozon 拒 (当时老 Ozon API 行为), 现在不需要了
         result._category_resolved = {
           from: oldCat,
-          to: 0,
-          source: 'none',
-          confidence: 'none',
+          to: oldCat,  // 保留 plugin 抓的 cat (5位也行)
+          source: 'public-breadcrumb-fallback',
+          confidence: 'low',  // 低置信, 提醒 user 核对
           candidates: resolved.candidates || [],
-          warning: '请在 BatchUpload 页面从候选类目中点选 (URL 面包屑 ID 不是 Seller API ID)',
+          warning: oldCat ? '类目来自公开页面 breadcrumb (5位), 未能在店铺历史找到匹配, 上架后请核对' : '无法获取类目, 请手动从候选选',
         };
-        console.log(`[SW ${VERSION}]   类目无法解析, ${(resolved.candidates || []).length} 个候选待 user 选 (旧 cat=${oldCat} 已清零, 防误提交)`);
+        console.log(`[SW ${VERSION}]   类目无法精确解析, 保留 plugin 抓的 5位 cat=${oldCat}, ${(resolved.candidates || []).length} 个候选待 user 选`);
       }
     } catch (e) {
       console.warn(`[SW ${VERSION}]   category-resolve 调用失败 (非致命, 用 URL cat 上传): ${e.message}`);
@@ -412,6 +420,9 @@ function extractOzonProductData(sku) {
   } catch (e) {}
 
   // ========== 2. 面包屑链接提取 category_id ==========
+  // v2.2.9.1: 用最后一级 breadcrumb (具体类目), 不是第一个匹配 (顶层类目)
+  //   Ozon 商品页 breadcrumb 顺序: 大类 → 中类 → 小类 → 当前 cat
+  //   比如 茶壶: Дом и сад(14500) → Посуда(14501) → Чайники(30814) → Заварочные(14534) ← 这个
   const breadcrumbSelectors = [
     '[data-widget="breadCrumbs"] a',
     '[data-widget="webBreadcrumb"] a',
@@ -419,6 +430,7 @@ function extractOzonProductData(sku) {
     'nav[aria-label*="eadcrumb" i] a',
     'a[href*="/category/"]',
   ];
+  const breadcrumbIds = [];  // 按 DOM 顺序收集
   for (const sel of breadcrumbSelectors) {
     const links = document.querySelectorAll(sel);
     for (const a of links) {
@@ -428,12 +440,16 @@ function extractOzonProductData(sku) {
       const m = href.match(/\/category\/[^\/?#]*?(\d{2,})(?:\/|\?|#|$)/);
       if (m) {
         const id = parseInt(m[1], 10);
-        if (id && id > 1000 && !data.description_category_id) {
-          data.description_category_id = id;
-        }
+        if (id && id > 1000) breadcrumbIds.push(id);
       }
     }
-    if (data.description_category_id) break;
+    if (breadcrumbIds.length >= 2) break;  // 拿到 2+ 个就够了
+  }
+  // 关键: 取最后一个 (最具体的, 就是当前商品的 cat)
+  if (breadcrumbIds.length) {
+    data.description_category_id = breadcrumbIds[breadcrumbIds.length - 1];
+    dbg.breadcrumbIdsFound = breadcrumbIds;
+    dbg.categoryFromBreadcrumb = data.description_category_id;
   }
 
   // ========== 3. JSON-LD (schema.org/Product + BreadcrumbList) ==========
