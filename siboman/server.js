@@ -3946,11 +3946,24 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v2.2.0: 不再校验 description_category_id (公开站类目 ≠ Seller API, 强行校验会拦掉大量合规商品)
     // Ozon 自己会拒 (返回 failed), 用户去 seller.ozon.ru 后台改类目更直接.
     // 仅在后台 polling 把失败原因写回 DB, listing-history 页可见.
-    // v2.2.9: 5位 (公开 URL breadcrumb) 和 8位 (Seller API) 都接受, 直接转发不再 normalize
+    // v2.2.9.3: 5位 (公开 URL breadcrumb) 大概率会被 Ozon 拒 levels_category_not_found
+    //   实测 5位 cat 11427 在 Seller API tree 查不到 (空 types 列表), Ozon 立刻拒
+    //   5位跟 8位是两套体系: 5位是公开 URL slug 末尾, 8位是 Seller API 内部 id
+    //   plugin v2.2.9.3 默认用 candidates 第一个 (8位), 这里兜底: 5位没匹配上就直接 400
     if (Number(categoryId) > 0 && Number(categoryId) < 100000) {
-      console.log(`[v2.2.9 import] 5位 description_category_id=${categoryId} (公开 URL breadcrumb, Ozon 直接接受)`);
+      // 5位 cat - 验证是否在 Seller API tree 存在, 不存在直接 400
+      const validIds = await getValidCategoryIds(storeId, req.user.id);
+      if (validIds && !validIds.has(Number(categoryId))) {
+        console.warn(`[v2.2.9.3 import] 拒绝 5位 description_category_id=${categoryId} (不在 Seller API tree, Ozon 会拒)`);
+        return res.status(400).json({
+          success: false,
+          error: `description_category_id=${categoryId} 是 5位公开 URL cat, 不在 Seller API tree. 请从 candidates 选 8位 cat, 或去 Ozon 后台改类目`,
+          hint: 'plugin v2.2.9.3 会自动选 candidates 第一个, 如果这里报错说明 plugin 没选, 检查 plugin 是否已 reload',
+        });
+      }
+      console.log(`[v2.2.9.3 import] 5位 description_category_id=${categoryId} (在 Seller API tree, 合法)`);
     } else if (Number(categoryId) >= 100000) {
-      console.log(`[v2.2.9 import] 8位 description_category_id=${categoryId} (Seller API 内部 id)`);
+      console.log(`[v2.2.9.3 import] 8位 description_category_id=${categoryId} (Seller API 内部 id)`);
     }
 
     // Ozon /v3/product/import 规范化

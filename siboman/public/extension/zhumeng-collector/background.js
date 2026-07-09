@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.2";
+const VERSION = "2.2.9.4";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -100,6 +100,7 @@ async function collectSku(sku, storeIds = []) {
         storeIds[0],
         result.type_id,
         Number(result.description_category_id) || 0,  // 5位 breadcrumb
+        result.name,  // v2.2.9.3: 让 server candidates 能用 name 关键词匹配
       );
       if (resolved && resolved.success) {
         result.description_category_id = resolved.description_category_id;
@@ -113,39 +114,54 @@ async function collectSku(sku, storeIds = []) {
         console.log(`[SW ${VERSION}]   类目解析: ${oldCat} → ${resolved.description_category_id} (${resolved.source}, confidence=${resolved.confidence})`);
       } else if (resolved) {
         // v2.2.9.1: 不再清零 plugin 已抓到的 cat (5位 breadcrumb)
-        //   v2.2.9 实测 Ozon /v3/product/import 接受 5位 (公开 URL breadcrumb) 跟 8位 (Seller API) 都接受
-        //   v2.2.4 清零逻辑是为了避免 5位被 Ozon 拒 (当时老 Ozon API 行为), 现在不需要了
         // v2.2.9.2: 自动应用 candidates 第一个 (按商品 name 关键词匹配的最高分 cat)
-        //   user 期望: 采集到 cat 就自动填上, 不要每次都手动选. candidates 第一批现在已经是
-        //   ozon-tree-name-match 排好序的 (高分在前), 直接用第一个最相关的
+        // v2.2.9.3: 关键修复 — plugin 抓的 5位 breadcrumb 跟 Ozon Seller API 8位 cat 是两套体系
+        //   5位 (e.g. 11427) 是公开 URL slug 末尾, 在 Seller API tree 里不存在, 提交会被拒 levels_category_not_found
+        //   8位 (e.g. 17029010) 是 Seller API 内部 id, Ozon /v3/product/import 接受
+        //   所以: 5位 cat 只用作 candidates 排序参考, 实际提交用 candidates 第一个 8位 cat + 它的 type_id
+        //   user 拿到结果后可在 BatchUpload 表格里点"换一个"切换到更准的
         const candidates = resolved.candidates || [];
-        let autoCat = oldCat;  // 默认保留 plugin 抓的 (5位)
+        let autoCat = 0;  // 默认不提交 cat, 让 server 拒绝触发 user 选
         let autoType = result.type_id;
-        let autoSource = 'public-breadcrumb-fallback';
-        let autoConfidence = 'medium';  // 公开页 cat, 中等置信
+        let autoSource = 'none';
+        let autoConfidence = 'none';
+        let autoWarning = '无法获取类目, 请手动从候选选';
         if (candidates.length > 0) {
-          // 优先选 ozon-tree-name-match 来源且 match_score 最高的
-          const best = candidates.find(c => c.source === 'ozon-tree-name-match' && c.description_category_id)
+          // 优先选 ozon-tree-name-match 来源 + 有 cat_id + 有 type_id 的
+          //   (没 type_id 的 candidates 来自 type_id 叶子节点, 8位 cat_id 来自父节点, 实际提交时 cat+type 缺一个会被拒)
+          const best = candidates.find(c => c.source === 'ozon-tree-name-match' && c.description_category_id && c.type_id > 0)
+                    || candidates.find(c => c.description_category_id && c.type_id > 0)
+                    || candidates.find(c => c.source === 'ozon-tree-name-match' && c.description_category_id)
                     || candidates.find(c => c.description_category_id);
           if (best) {
             autoCat = best.description_category_id;
             if (best.type_id) autoType = best.type_id;
             autoSource = 'auto-from-candidates';
-            autoConfidence = best.match_score >= 2 ? 'high' : 'medium';  // 多 token 命中 = high
+            autoConfidence = best.match_score >= 2 ? 'high' : 'medium';
+            autoWarning = '类目自动从商品名称匹配填上 (不一定最准, 可点"换一个"切换到更合适的)';
             console.log(`[SW ${VERSION}]   自动应用候选: cat=${autoCat} type_id=${autoType || '(无)'} (${best.name}, score=${best.match_score || '-'})`);
           }
         }
-        result.description_category_id = autoCat;
-        if (autoType && !result.type_id) result.type_id = autoType;
+        if (autoCat) {
+          result.description_category_id = autoCat;
+          if (autoType && !result.type_id) result.type_id = autoType;
+        } else {
+          // 没 candidates, 保留 plugin 抓的 5位 cat (虽然 Ozon 可能拒, 但作为兜底总比 0 强)
+          result.description_category_id = oldCat;
+          autoSource = 'public-breadcrumb-fallback';
+          autoConfidence = 'low';
+          autoWarning = '类目来自公开页面 5位 breadcrumb, Seller API tree 找不到, 上架后会被拒, 请去 Ozon 后台改';
+          console.log(`[SW ${VERSION}]   无 candidates, 保留 5位 breadcrumb cat=${oldCat} (Ozon 可能拒)`);
+        }
         result._category_resolved = {
           from: oldCat,
-          to: autoCat,
+          to: result.description_category_id,
           source: autoSource,
           confidence: autoConfidence,
           candidates,  // 保留备选, user 可点"换一个"切换
-          warning: autoCat ? '类目自动从公开页面或名称匹配填上, 上架后请核对' : '无法获取类目, 请手动从候选选',
+          warning: autoWarning,
         };
-        console.log(`[SW ${VERSION}]   类目自动填上: cat=${autoCat} type_id=${autoType || '(待补)'} (${autoSource}, confidence=${autoConfidence})`);
+        console.log(`[SW ${VERSION}]   类目自动填上: cat=${result.description_category_id} type_id=${autoType || '(待补)'} (${autoSource}, confidence=${autoConfidence})`);
       }
     } catch (e) {
       console.warn(`[SW ${VERSION}]   category-resolve 调用失败 (非致命, 用 URL cat 上传): ${e.message}`);
@@ -329,7 +345,8 @@ async function enrichFromOpi(data, storeId) {
 
 // ========== v2.1.9+: 通过 ERP 后端解析 Seller 类目 (替换不可靠的 URL 解析) ==========
 // v2.3.0+: 带 type_id + candidates
-async function resolveSellerCategory(sku, storeId, typeId, breadcrumbCatId) {
+// v2.2.9.3: 加 name 参数, 让 server 端 candidates 能用 name 关键词从 Ozon 全 tree 过滤
+async function resolveSellerCategory(sku, storeId, typeId, breadcrumbCatId, name) {
   if ((!sku && !typeId) || !storeId) return null;
   try {
     const ctrl = new AbortController();
@@ -343,6 +360,7 @@ async function resolveSellerCategory(sku, storeId, typeId, breadcrumbCatId) {
         store_id: storeId,
         type_id: Number(typeId) || 0,
         breadcrumb_cat_id: Number(breadcrumbCatId) || 0,  // 5位 URL breadcrumb (v2.2.9)
+        name: String(name || '').trim(),  // v2.2.9.3: 让 server 端用 name 关键词匹配 Ozon tree
       }),
       signal: ctrl.signal,
     });
