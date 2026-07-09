@@ -3005,6 +3005,110 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
+// v2.1.9: 上架历史列表 (含统计) - 用户在前端"上架记录"页用
+app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const status = String(req.query.status || "").trim();   // all|imported|failed|processing|pending
+    const storeId = String(req.query.store_id || "").trim();
+    const sku = String(req.query.sku || "").trim();
+    const startDate = String(req.query.start_date || "").trim();
+    const endDate = String(req.query.end_date || "").trim();
+    const limit = Math.min(parseInt(req.query.limit || "50"), 200);
+    const offset = Math.max(parseInt(req.query.offset || "0"), 0);
+
+    const conds = ["lh.user_id = $1"];
+    const params = [userId];
+    if (status && status !== "all") {
+      // 兼容: 处理中 = processing + pending
+      if (status === "processing") {
+        conds.push(`lh.status IN ('processing','pending')`);
+      } else {
+        params.push(status);
+        conds.push(`lh.status = $${params.length}`);
+      }
+    }
+    if (storeId) { params.push(storeId); conds.push(`lh.store_id = $${params.length}`); }
+    if (sku) { params.push(`%${sku}%`); conds.push(`(lh.offer_id ILIKE $${params.length} OR lh.product_name ILIKE $${params.length} OR lh.task_id = $${params.length - 0})`); }
+    if (startDate) { params.push(startDate); conds.push(`lh.created_at >= $${params.length}`); }
+    if (endDate) { params.push(endDate); conds.push(`lh.created_at < $${params.length}`); }
+
+    const where = conds.join(" AND ");
+
+    // 列表 (带店铺名)
+    const listParams = [...params, limit, offset];
+    const listSql = `
+      SELECT lh.id, lh.task_id, lh.offer_id, lh.product_name, lh.main_image, lh.price_rub,
+             lh.status, lh.created_at, lh.updated_at, lh.store_id, lh.errors_json,
+             lh.variants_count, lh.failed_variants_count, lh.partial_success,
+             s.name AS store_name
+      FROM app_listing_history lh
+      LEFT JOIN app_stores s ON s.id = lh.store_id
+      WHERE ${where}
+      ORDER BY lh.created_at DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+
+    // 总数 + KPI 统计 (一次 query 用 FILTER)
+    const statsParams = [...params];
+    const statsSql = `
+      SELECT
+        COUNT(*) AS total,
+        COUNT(*) FILTER (WHERE lh.status = 'imported') AS imported,
+        COUNT(*) FILTER (WHERE lh.status = 'failed') AS failed,
+        COUNT(*) FILTER (WHERE lh.status IN ('processing','pending')) AS processing,
+        COUNT(*) FILTER (WHERE lh.created_at >= CURRENT_DATE) AS today
+      FROM app_listing_history lh
+      WHERE ${where}`;
+
+    const [listRes, statsRes] = await Promise.all([
+      db.query(listSql, listParams),
+      db.query(statsSql, statsParams),
+    ]);
+
+    const stats = statsRes.rows[0] || {};
+    const successRate = Number(stats.imported || 0) + Number(stats.failed || 0) > 0
+      ? Math.round((Number(stats.imported) / (Number(stats.imported) + Number(stats.failed))) * 1000) / 10
+      : 0;
+
+    res.json({
+      success: true,
+      items: listRes.rows.map(r => ({
+        ...r,
+        errors_json: r.errors_json || [],
+      })),
+      total: Number(stats.total || 0),
+      stats: {
+        total: Number(stats.total || 0),
+        imported: Number(stats.imported || 0),
+        failed: Number(stats.failed || 0),
+        processing: Number(stats.processing || 0),
+        today: Number(stats.today || 0),
+        success_rate: successRate,
+      },
+      limit, offset,
+    });
+  } catch (e) {
+    console.error("[listing-history]", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// v2.1.9: 删除上架记录
+app.delete("/api/seller/listing-history/:id", requireAuth, async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    if (!id) return res.status(400).json({ success: false, error: "需要 id" });
+    const r = await db.query(
+      `DELETE FROM app_listing_history WHERE id = $1 AND user_id = $2 RETURNING task_id`,
+      [id, req.user.id],
+    );
+    if (r.rows.length === 0) return res.status(404).json({ success: false, error: "未找到记录或无权删除" });
+    res.json({ success: true, deleted: r.rows[0].task_id });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 app.post("/api/seller/categories/tree", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;

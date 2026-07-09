@@ -581,8 +581,7 @@ window.BatchUploadView = {
     const openHelp = () => { helpOpen.value = true; };
     const closeHelp = () => { helpOpen.value = false; };
     const openHistory = () => {
-      appendLog('📜 历史记录: 跳转到 MY ERP 上架记录页 (阶段 3 实现)', 'info');
-      notify.info('历史记录入口 (阶段 3 即将上线)');
+      window.location.hash = '#/listing-history';
     };
 
     Vue.onMounted(() => { /* 已在插件检测中调用 fetchStores + loadConfig */ });

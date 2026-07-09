@@ -142,6 +142,7 @@ const initApp = () => {
         if (path.includes('inventory')) return 'inventory';
         if (path.includes('order')) return 'orders';
         if (path.includes('upload')) return 'upload';
+        if (path.includes('listing-history')) return 'listing-history';
         if (path.includes('ai-generator')) return 'ai-generator';
         if (path.includes('stores')) return 'stores';
         return 'dashboard';
@@ -178,6 +179,9 @@ const initApp = () => {
             <el-menu-item index="#/upload" @click="goTo('#/upload')">
               <el-icon><UploadFilled /></el-icon><span>批量上架</span>
             </el-menu-item>
+            <el-menu-item index="#/listing-history" @click="goTo('#/listing-history')">
+              <el-icon><Document /></el-icon><span>上架记录</span>
+            </el-menu-item>
             <el-menu-item index="#/ai-generator" @click="goTo('#/ai-generator')">
               <el-icon><MagicStick /></el-icon><span>AI 套图</span>
             </el-menu-item>
@@ -208,6 +212,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
             <div v-else-if="routeName === 'orders'"><order-list-view /></div>
             <div v-else-if="routeName === 'upload'"><batch-upload-view /></div>
+            <div v-else-if="routeName === 'listing-history'"><listing-history-view /></div>
             <div v-else-if="routeName === 'ai-generator'"><ai-image-generator-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
           </el-main>
@@ -238,6 +243,7 @@ const initApp = () => {
   register('inventory-management-view', window.InventoryManagementView);
   register('order-list-view', window.OrderListView);
   register('batch-upload-view', window.BatchUploadView);
+  register('listing-history-view', window.ListingHistoryView);
   register('ai-image-generator-view', window.AIImageGeneratorView);
   register('store-management-view', window.StoreManagementView);
 
