@@ -25,7 +25,6 @@ window.ListingHistoryView = {
     let refreshTimer = null;
 
     const fetchList = async () => {
-      if (!window.appState?.currentUser?.id) return;
       loading.value = true;
       try {
         const params = new URLSearchParams();
@@ -121,7 +120,7 @@ window.ListingHistoryView = {
 
     return {
       loading, items, total, stats, filter, selectedIds,
-      onQuery, onReset, deleteOne, batchDelete,
+      fetchList, onQuery, onReset, deleteOne, batchDelete,
       statusBadge, fmtMoney, fmtDate, onSelectionChange,
     };
   },
