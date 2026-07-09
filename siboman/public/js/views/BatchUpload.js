@@ -155,13 +155,52 @@ window.BatchUploadView = {
     // v2.2.2: 候选类目选择器状态. pickingRow 持当前要选类目的行, 选择后写回 row.distilled
     const categoryPickerOpen = Vue.ref(false);
     const pickingRow = Vue.ref(null);
+    const candidateSearch = Vue.ref('');
+    const filteredCandidates = Vue.computed(() => {
+      const all = pickingRow.value?._category_resolved?.candidates || [];
+      const q = candidateSearch.value.trim().toLowerCase();
+      if (!q) return all;
+      return all.filter(c =>
+        (c.name || '').toLowerCase().includes(q) ||
+        String(c.description_category_id).includes(q)
+      );
+    });
+    // v2.2.2: 类目统计 - 让顶部一行清晰显示 high/medium/none/manual 各多少
+    const categoryStats = Vue.computed(() => {
+      const valid = items.value.filter(r => r.valid && r.distilled);
+      const stats = { high: 0, medium: 0, none: 0, manual: 0, total: valid.length, pending: 0 };
+      for (const r of valid) {
+        const c = r._category_resolved?.confidence;
+        if (c === 'high') stats.high++;
+        else if (c === 'medium') stats.medium++;
+        else if (c === 'manual') stats.manual++;
+        else if (c === 'none') stats.none++;
+        else stats.pending++;
+      }
+      return stats;
+    });
+    // v2.2.2: localStorage 记忆用户手动选过的 (sku → description_category_id)
+    const CATEGORY_HISTORY_KEY = 'zhumeng_category_choice_v1';
+    const getCategoryHistory = () => {
+      try { return JSON.parse(localStorage.getItem(CATEGORY_HISTORY_KEY) || '{}'); } catch { return {}; }
+    };
+    const setCategoryHistory = (sku, catId, name) => {
+      const h = getCategoryHistory();
+      h[String(sku)] = { description_category_id: Number(catId), name: name || '', ts: Date.now() };
+      // 最多保留 500 条
+      const entries = Object.entries(h).sort((a, b) => b[1].ts - a[1].ts).slice(0, 500);
+      localStorage.setItem(CATEGORY_HISTORY_KEY, JSON.stringify(Object.fromEntries(entries)));
+    };
+
     const openCategoryPicker = (row) => {
       pickingRow.value = row;
+      candidateSearch.value = '';
       categoryPickerOpen.value = true;
     };
     const closeCategoryPicker = () => {
       categoryPickerOpen.value = false;
       pickingRow.value = null;
+      candidateSearch.value = '';
     };
     const applyCategoryChoice = (candidate) => {
       if (!pickingRow.value || !candidate) return;
@@ -176,8 +215,34 @@ window.BatchUploadView = {
         to: Number(candidate.description_category_id),
         source: 'manual-candidate-pick',
       };
+      // 记住用户选过, 下次同 SKU 自动恢复
+      setCategoryHistory(row.sku, candidate.description_category_id, candidate.name);
       appendLog(`  ✓ #${row.index} 手动选类目: ${candidate.description_category_id} (${candidate.name || '无名'})`, 'success');
       closeCategoryPicker();
+    };
+
+    // v2.2.2: 采集完成后, 把 localStorage 记忆的类目应用到 _category_resolved.none 行
+    const applyCategoryHistory = () => {
+      const h = getCategoryHistory();
+      let restored = 0;
+      for (const row of items.value) {
+        if (!row.valid || !row.distilled) continue;
+        if (row._category_resolved?.confidence !== 'none') continue;
+        const remembered = h[String(row.sku)];
+        if (remembered && !row.distilled.descriptionCategoryId) {
+          row.distilled.descriptionCategoryId = remembered.description_category_id;
+          row.distilled.descriptionCategoryName = remembered.name || '';
+          row._category_resolved = {
+            ...row._category_resolved,
+            confidence: 'manual',
+            to: remembered.description_category_id,
+            source: 'history-auto',
+          };
+          restored++;
+        }
+      }
+      if (restored) appendLog(`  💾 ${restored} 个商品自动恢复了之前选过的类目`, 'info');
+      return restored;
     };
 
     window.addEventListener("message", (event) => {
@@ -403,6 +468,12 @@ window.BatchUploadView = {
               }
             }
             appendLog(`采集完成: ${ok} 成功, ${fail} 失败 (${((Date.now()-t0)/1000).toFixed(1)}s)`, fail===0 ? 'success' : 'warn');
+            // v2.2.2: 自动恢复 localStorage 记忆的类目 (none → manual)
+            const restored = applyCategoryHistory();
+            if (restored > 0) {
+              const s = categoryStats.value;
+              appendLog(`  📊 类目状态: 高 ${s.high} · 中 ${s.medium} · 已选 ${s.manual} · 未选 ${s.none}`, 'info');
+            }
             notify.success(`采集 ${ok} 个商品`);
           } else {
             appendLog(`插件采集失败: ${resp.error}`, 'error');
@@ -660,6 +731,7 @@ window.BatchUploadView = {
       pingExtension, checkSellerStatus, refreshStatus,
       helpOpen, openHelp, closeHelp, openHistory,
       categoryPickerOpen, pickingRow, openCategoryPicker, closeCategoryPicker, applyCategoryChoice,
+      candidateSearch, filteredCandidates, categoryStats, applyCategoryHistory,
     };
   },
   template: `
@@ -811,6 +883,26 @@ window.BatchUploadView = {
                   </tr>
                 </tbody>
               </table>
+            </div>
+          </section>
+
+          <!-- v2.2.2: 类目状态概览 (采集后自动出现) -->
+          <section v-if="categoryStats.total > 0" class="bu-card" style="background:#fff; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.05); padding:14px 20px">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
+              <div style="display:flex; align-items:center; gap:6px; font-weight:700; font-size:13px; color:#0f172a">
+                🎯 类目状态
+                <span style="font-size:11px; color:#94a3b8; font-weight:500">共 {{ categoryStats.total }} 件已采商品</span>
+              </div>
+              <div style="display:flex; gap:8px; flex-wrap:wrap; font-size:12px">
+                <span style="padding:4px 10px; background:#dcfce7; color:#166534; border-radius:10px; font-weight:600">✓ 高 {{ categoryStats.high }}</span>
+                <span style="padding:4px 10px; background:#fef3c7; color:#92400e; border-radius:10px; font-weight:600">⚠ 中 {{ categoryStats.medium }}</span>
+                <span style="padding:4px 10px; background:#dbeafe; color:#1e40af; border-radius:10px; font-weight:600">👆 已选 {{ categoryStats.manual }}</span>
+                <span :style="{ padding:'4px 10px', borderRadius:'10px', fontWeight:600, background: categoryStats.none ? '#fee2e2' : '#f1f5f9', color: categoryStats.none ? '#991b1b' : '#94a3b8' }">⚠ 未选 {{ categoryStats.none }}</span>
+                <span v-if="categoryStats.pending" style="padding:4px 10px; background:#f1f5f9; color:#64748b; border-radius:10px; font-weight:600">? 待解析 {{ categoryStats.pending }}</span>
+              </div>
+            </div>
+            <div v-if="categoryStats.none > 0" style="margin-top:10px; padding:8px 12px; background:#fef3c7; color:#92400e; border-radius:6px; font-size:12px">
+              ⚠ 还有 {{ categoryStats.none }} 件商品未自动解析类目, 点击表格"⚠ 未解析"行的"选类目"按钮手动选 (提交后还能去 Ozon 后台改).
             </div>
           </section>
 
@@ -998,13 +1090,20 @@ window.BatchUploadView = {
             </div>
             <button @click="closeCategoryPicker" style="background:transparent; border:none; font-size:18px; color:#94a3b8; cursor:pointer; padding:4px 8px">✕</button>
           </div>
+          <div v-if="(pickingRow._category_resolved?.candidates || []).length > 3" style="padding:10px 20px 0">
+            <input v-model="candidateSearch" placeholder="🔍 按名称或 cat id 过滤 (如输入 'фонарь' 或 '17028')" style="width:100%; padding:8px 12px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; outline:none" />
+          </div>
           <div style="overflow-y:auto; padding:14px 20px; display:flex; flex-direction:column; gap:8px">
             <div v-if="!pickingRow._category_resolved?.candidates?.length" style="padding:40px 20px; text-align:center; color:#94a3b8">
               <div style="font-size:32px; margin-bottom:8px">📭</div>
               <div style="font-size:13px">没有候选类目 (店铺还没有任何已上架商品可参考)</div>
               <div style="font-size:11px; margin-top:4px">直接提交后去 Ozon 后台选</div>
             </div>
-            <div v-for="(c, i) in pickingRow._category_resolved?.candidates || []" :key="i" @click="applyCategoryChoice(c)" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; cursor:pointer; transition:all 0.15s" :style="{ background: '#fff' }" onmouseover="this.style.background='#fefce8';this.style.borderColor='#fbbf24'" onmouseout="this.style.background='#fff';this.style.borderColor='#e2e8f0'">
+            <div v-else-if="!filteredCandidates.length" style="padding:30px 20px; text-align:center; color:#94a3b8">
+              <div style="font-size:13px">没有匹配 "{{ candidateSearch }}" 的候选</div>
+              <div style="font-size:11px; margin-top:4px">共 {{ (pickingRow._category_resolved?.candidates || []).length }} 个候选</div>
+            </div>
+            <div v-for="(c, i) in filteredCandidates" :key="i" @click="applyCategoryChoice(c)" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; cursor:pointer; transition:all 0.15s" :style="{ background: '#fff' }" onmouseover="this.style.background='#fefce8';this.style.borderColor='#fbbf24'" onmouseout="this.style.background='#fff';this.style.borderColor='#e2e8f0'">
               <div style="flex:1; min-width:0">
                 <div style="font-size:13px; font-weight:600; color:#0f172a; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ c.name || '(无名)' }}</div>
                 <div style="font-size:11px; color:#64748b; font-family:monospace; margin-top:2px">cat {{ c.description_category_id }}</div>
