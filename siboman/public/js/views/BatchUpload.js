@@ -156,6 +156,7 @@ window.BatchUploadView = {
     const categoryPickerOpen = Vue.ref(false);
     const pickingRow = Vue.ref(null);
     const candidateSearch = Vue.ref('');
+    const pickerFocusIdx = Vue.ref(0);  // 键盘 ↑↓ 选中候选
     const filteredCandidates = Vue.computed(() => {
       const all = pickingRow.value?._category_resolved?.candidates || [];
       const q = candidateSearch.value.trim().toLowerCase();
@@ -165,6 +166,8 @@ window.BatchUploadView = {
         String(c.description_category_id).includes(q)
       );
     });
+    // v2.2.2: 搜索时若结果数变, 重置 focus 到第一项
+    Vue.watch(filteredCandidates, () => { pickerFocusIdx.value = 0; });
     // v2.2.2: 类目统计 - 让顶部一行清晰显示 high/medium/none/manual 各多少
     const categoryStats = Vue.computed(() => {
       const valid = items.value.filter(r => r.valid && r.distilled);
@@ -195,12 +198,28 @@ window.BatchUploadView = {
     const openCategoryPicker = (row) => {
       pickingRow.value = row;
       candidateSearch.value = '';
+      pickerFocusIdx.value = 0;
       categoryPickerOpen.value = true;
+      // v2.2.2: 让 modal 拿到焦点才能接收键盘事件
+      Vue.nextTick(() => {
+        document.querySelector('.batch-upload-v2 [tabindex="-1"]')?.focus();
+      });
     };
     const closeCategoryPicker = () => {
       categoryPickerOpen.value = false;
       pickingRow.value = null;
       candidateSearch.value = '';
+      pickerFocusIdx.value = 0;
+    };
+    // v2.2.2: 键盘处理 — Esc 关, ↑↓ 移焦点, Enter 选
+    const onPickerKeydown = (e) => {
+      if (!categoryPickerOpen.value) return;
+      const list = filteredCandidates.value;
+      if (e.key === 'Escape') { e.preventDefault(); closeCategoryPicker(); return; }
+      if (!list.length) return;
+      if (e.key === 'ArrowDown') { e.preventDefault(); pickerFocusIdx.value = (pickerFocusIdx.value + 1) % list.length; return; }
+      if (e.key === 'ArrowUp') { e.preventDefault(); pickerFocusIdx.value = (pickerFocusIdx.value - 1 + list.length) % list.length; return; }
+      if (e.key === 'Enter') { e.preventDefault(); applyCategoryChoice(list[pickerFocusIdx.value]); return; }
     };
     const applyCategoryChoice = (candidate) => {
       if (!pickingRow.value || !candidate) return;
@@ -732,6 +751,7 @@ window.BatchUploadView = {
       helpOpen, openHelp, closeHelp, openHistory,
       categoryPickerOpen, pickingRow, openCategoryPicker, closeCategoryPicker, applyCategoryChoice,
       candidateSearch, filteredCandidates, categoryStats, applyCategoryHistory,
+      pickerFocusIdx, onPickerKeydown,
     };
   },
   template: `
@@ -1079,10 +1099,10 @@ window.BatchUploadView = {
       </transition>
     </div>
 
-    <!-- v2.2.2: 候选类目选择 modal -->
+    <!-- v2.2.2: 候选类目选择 modal (keyboard UX: ↑↓ Enter Esc) -->
     <transition name="bu-fade">
-      <div v-if="categoryPickerOpen && pickingRow" @click.self="closeCategoryPicker" style="position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px">
-        <div style="background:#fff; border-radius:12px; max-width:640px; width:100%; max-height:80vh; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.25); display:flex; flex-direction:column">
+      <div v-if="categoryPickerOpen && pickingRow" @click.self="closeCategoryPicker" tabindex="-1" @keydown="onPickerKeydown" style="position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px">
+        <div style="background:#fff; border-radius:12px; max-width:640px; width:100%; max-height:80vh; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.25); display:flex; flex-direction:column" ref="pickerModalEl">
           <div style="padding:16px 20px; border-bottom:1px solid #f1f5f9; display:flex; justify-content:space-between; align-items:center; background:linear-gradient(90deg,#fffbeb,#fff)">
             <div>
               <div style="font-size:15px; font-weight:700; color:#0f172a">🎯 选类目 — #{{ pickingRow.index }} {{ pickingRow.sku }}</div>
@@ -1091,7 +1111,7 @@ window.BatchUploadView = {
             <button @click="closeCategoryPicker" style="background:transparent; border:none; font-size:18px; color:#94a3b8; cursor:pointer; padding:4px 8px">✕</button>
           </div>
           <div v-if="(pickingRow._category_resolved?.candidates || []).length > 3" style="padding:10px 20px 0">
-            <input v-model="candidateSearch" placeholder="🔍 按名称或 cat id 过滤 (如输入 'фонарь' 或 '17028')" style="width:100%; padding:8px 12px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; outline:none" />
+            <input v-model="candidateSearch" placeholder="🔍 按名称或 cat id 过滤 (如 'фонарь' 或 '17028')" style="width:100%; padding:8px 12px; border:1px solid #cbd5e1; border-radius:6px; font-size:13px; outline:none" />
           </div>
           <div style="overflow-y:auto; padding:14px 20px; display:flex; flex-direction:column; gap:8px">
             <div v-if="!pickingRow._category_resolved?.candidates?.length" style="padding:40px 20px; text-align:center; color:#94a3b8">
@@ -1103,7 +1123,8 @@ window.BatchUploadView = {
               <div style="font-size:13px">没有匹配 "{{ candidateSearch }}" 的候选</div>
               <div style="font-size:11px; margin-top:4px">共 {{ (pickingRow._category_resolved?.candidates || []).length }} 个候选</div>
             </div>
-            <div v-for="(c, i) in filteredCandidates" :key="i" @click="applyCategoryChoice(c)" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; cursor:pointer; transition:all 0.15s" :style="{ background: '#fff' }" onmouseover="this.style.background='#fefce8';this.style.borderColor='#fbbf24'" onmouseout="this.style.background='#fff';this.style.borderColor='#e2e8f0'">
+            <div v-for="(c, i) in filteredCandidates" :key="c.description_category_id" @click="applyCategoryChoice(c)" @mouseenter="pickerFocusIdx = i" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border:2px solid; border-radius:8px; cursor:pointer; transition:all 0.1s"
+                 :style="{ background: i === pickerFocusIdx ? '#fef3c7' : '#fff', borderColor: i === pickerFocusIdx ? '#f59e0b' : '#e2e8f0' }">
               <div style="flex:1; min-width:0">
                 <div style="font-size:13px; font-weight:600; color:#0f172a; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ c.name || '(无名)' }}</div>
                 <div style="font-size:11px; color:#64748b; font-family:monospace; margin-top:2px">cat {{ c.description_category_id }}</div>
@@ -1114,8 +1135,8 @@ window.BatchUploadView = {
               </div>
             </div>
           </div>
-          <div style="padding:12px 20px; border-top:1px solid #f1f5f9; background:#f8fafc; font-size:11px; color:#64748b; display:flex; justify-content:space-between; align-items:center">
-            <span>提示: 这是你店里的高频类目 (top {{ (pickingRow._category_resolved?.candidates || []).length }}). 不一定全对, 选错了 Ozon 后台还能改.</span>
+          <div style="padding:10px 20px; border-top:1px solid #f1f5f9; background:#f8fafc; font-size:11px; color:#64748b; display:flex; justify-content:space-between; align-items:center">
+            <span>提示: ↑↓ 移动焦点 · Enter 选中 · Esc 关闭 · 选错 Ozon 后台还能改</span>
             <button @click="closeCategoryPicker" style="padding:4px 12px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:5px; cursor:pointer; color:#475569">关闭</button>
           </div>
         </div>
