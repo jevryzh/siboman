@@ -638,11 +638,19 @@ window.BatchUploadView = {
       appendLog(`========== 批量跟卖开始 ==========`, 'info');
       appendLog(`商品: ${rows.length} 个 | 店铺: ${selectedStores.value.length} 个`, 'info');
 
-      let totalOk=0, totalFail=0;
+      let totalOk=0, totalFail=0, totalSkipped=0;
       for(const storeId of selectedStores.value){
         const storeName = allStores.value.find(s=>s.id===storeId)?.name || storeId;
         appendLog(`\n--- [${storeName}] 开始 ---`, 'info');
         for(const row of rows){
+          // v2.2.4: 拦截 confidence='none' 且 to=0 的行 (URL 面包屑 ID 不是 Seller API 的)
+          //   Ozon 必拒 levels_category_not_found, 前端必须拦住不让提交
+          const catRes = row._category_resolved || {};
+          if (catRes.confidence === 'none' && !catRes.to) {
+            appendLog(`  ⚠ #${row.index} SKU ${row.sku}: 类目未解析, 跳过 (去表格"选类目"按钮先选)`, 'warn');
+            totalSkipped++;
+            continue;
+          }
           const issues = checkTitleQuality(row.distilled.name);
           if(issues.length && !config.aiRewrite) {
             appendLog(`  ⚠ #${row.index} 标题问题: ${issues.join(', ')}`, 'warn');
@@ -671,11 +679,12 @@ window.BatchUploadView = {
         }
         appendLog(`--- [${storeName}] 完成 ---`, 'info');
       }
-      appendLog(`\n========== 全部完成: ${totalOk} 提交 Ozon, ${totalFail} 本地校验失败 ==========`, totalFail?'warn':'success');
+      appendLog(`\n========== 全部完成: ${totalOk} 提交 Ozon, ${totalFail} 本地校验失败, ${totalSkipped} 未选类目跳过 ==========`, (totalFail||totalSkipped)?'warn':'success');
       publishLoading.value = false;
       // v2.2.3: 上架后给一个明显的"→ 查看上架状态" 入口
-      const tip = totalFail
-        ? `已提交 ${totalOk} 个到 Ozon, ${totalFail} 个本地校验失败 (后台 60s 自动同步真实状态, 去 seller.ozon.ru 后台改类目)`
+      const skipMsg = totalSkipped ? `, ${totalSkipped} 个未选类目已跳过` : '';
+      const tip = (totalFail || totalSkipped)
+        ? `已提交 ${totalOk} 个到 Ozon${skipMsg} (后台 60s 自动同步真实状态, 去 seller.ozon.ru 后台改类目)`
         : `已提交 ${totalOk} 个到 Ozon。后台 60s 自动同步状态`;
       notify.success({
         message: tip,
@@ -810,7 +819,7 @@ window.BatchUploadView = {
         <button @click="openHistory" style="padding:6px 12px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:6px; color:#475569; cursor:pointer; font-size:13px">📜 历史记录</button>
         <button @click="parsePaste" style="padding:6px 14px; background:#3b82f6; border:none; border-radius:6px; color:#fff; cursor:pointer; font-size:13px; font-weight:600">🔍 解析</button>
         <button @click="collectSkus" :loading="parseLoading" :disabled="!items.filter(r=>r.valid).length" style="padding:6px 14px; background:#f59e0b; border:none; border-radius:6px; color:#fff; cursor:pointer; font-size:13px; font-weight:600">📡 采集 ({{ items.filter(r=>r.valid).length }})</button>
-        <button @click="publishBatch" :loading="publishLoading" :disabled="!items.filter(r=>r.valid&&r.distilled).length" style="padding:8px 18px; background:linear-gradient(135deg,#10b981,#059669); border:none; border-radius:8px; color:#fff; cursor:pointer; font-size:14px; font-weight:700; box-shadow:0 2px 6px rgba(16,185,129,0.3)">🚀 开始批采 + 上架 ({{ items.filter(r=>r.valid&&r.distilled).length }})</button>
+        <button @click="publishBatch" :loading="publishLoading" :disabled="!items.filter(r=>r.valid&&r.distilled).length || !!items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence==='none'&&!r._category_resolved.to).length" style="padding:8px 18px; background:linear-gradient(135deg,#10b981,#059669); border:none; border-radius:8px; color:#fff; cursor:pointer; font-size:14px; font-weight:700; box-shadow:0 2px 6px rgba(16,185,129,0.3)">🚀 开始批采 + 上架 ({{ items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence!=='none').length }})</button>
       </header>
 
       <main class="bu-body" style="display:grid; grid-template-columns:1fr 360px; gap:16px; padding:20px; align-items:start">
