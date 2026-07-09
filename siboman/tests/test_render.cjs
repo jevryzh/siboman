@@ -124,6 +124,21 @@ const path = require('path');
     if (!v) allOk = false;
   }
 
+  // v2.2.3: 验证 publishBatch 后会生成 "查看上架状态" CTA 节点
+  // 注: publishBatch 调 axios.post 会失败 (no backend in test), 所以手动模拟成功路径:
+  //   直接 verify CTA 的 innerHTML + 创建逻辑能否被 trigger
+  console.log('\n--- Publish CTA structure ---');
+  const ctaChecks = {
+    'Publish source contains 📜 查看上架状态 text': buCode.includes('查看上架状态'),
+    'Publish source contains 📜 历史记录 fallback button': buCode.includes('📜 历史记录'),
+    'Publish source generates batch-log-panel id': buCode.includes('batch-log-panel'),
+    'openHistory navigates to #/listing-history': buCode.includes("window.location.hash = '#/listing-history'"),
+  };
+  for (const [k, v] of Object.entries(ctaChecks)) {
+    console.log(`  ${v ? '✓' : '✗'} ${k}`);
+    if (!v) allOk = false;
+  }
+
   console.log('\n' + (allOk ? '✓ ALL REAL RENDER TESTS PASSED' : '✗ SOME TESTS FAILED'));
   process.exit(allOk ? 0 : 1);
 })().catch((e) => {

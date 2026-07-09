@@ -673,11 +673,39 @@ window.BatchUploadView = {
       }
       appendLog(`\n========== 全部完成: ${totalOk} 提交 Ozon, ${totalFail} 本地校验失败 ==========`, totalFail?'warn':'success');
       publishLoading.value = false;
-      // v2.2.0: 不再用"成功"字眼, Ozon 异步审核, 上架记录页或 seller.ozon.ru 后台看真实结果
+      // v2.2.3: 上架后给一个明显的"→ 查看上架状态" 入口
       const tip = totalFail
         ? `已提交 ${totalOk} 个到 Ozon, ${totalFail} 个本地校验失败 (后台 60s 自动同步真实状态, 去 seller.ozon.ru 后台改类目)`
-        : `已提交 ${totalOk} 个到 Ozon。后台 60s 自动同步状态, 刷新本页面或去 seller.ozon.ru 后台查看`;
-      notify.success(tip);
+        : `已提交 ${totalOk} 个到 Ozon。后台 60s 自动同步状态`;
+      notify.success({
+        message: tip,
+        duration: 8000,
+        dangerouslyUseHTMLString: true,
+        customClass: 'zhumeng-publish-done',
+        // v2.2.3: 按钮"查看上架状态" + "继续" 两条出口
+        // Element Plus ElNotification 不原生支持按钮, 用 HTML 拼接 + onclick
+      });
+      // v2.2.3: 在主区日志下方加一条 CTA 条
+      const cta = document.createElement('div');
+      cta.style.cssText = 'margin-top:12px; padding:14px 18px; background:linear-gradient(90deg,#ecfdf5,#fff); border:1px solid #10b981; border-radius:8px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap';
+      cta.innerHTML = `
+        <div style="font-size:13px; color:#065f46">
+          <b>✓ ${totalOk}</b> 个已提交 Ozon · 后台 60s 后同步真实状态
+        </div>
+        <div style="display:flex; gap:8px">
+          <button id="zhumeng-go-listing" style="padding:8px 16px; background:#10b981; color:#fff; border:none; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600">📜 查看上架状态</button>
+          <button id="zhumeng-stay" style="padding:8px 12px; background:#fff; color:#475569; border:1px solid #cbd5e1; border-radius:6px; cursor:pointer; font-size:13px">留在本页</button>
+        </div>`;
+      // 挂到日志区域下方
+      const logPanel = document.getElementById('batch-log-panel');
+      if (logPanel && logPanel.parentElement) {
+        logPanel.parentElement.appendChild(cta);
+        document.getElementById('zhumeng-go-listing')?.addEventListener('click', () => {
+          window.location.hash = '#/listing-history';
+          cta.remove();
+        });
+        document.getElementById('zhumeng-stay')?.addEventListener('click', () => cta.remove());
+      }
     };
 
     // ========== 店铺列表 (保留) ==========
