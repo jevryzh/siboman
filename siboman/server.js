@@ -3724,45 +3724,9 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
       return res.status(400).json({ success: false, error: "标题/货号/类目ID不能为空 (需要 description_category_id)" });
     }
 
-    // v0.6.2: 校验 description_category_id 在该店铺 Seller 类目树里 (缓存 24h)
-    const validIds = await getValidCategoryIds(storeId, req.user.id);
-    if (validIds && !validIds.has(Number(categoryId))) {
-      // v2.1.9: 自动 fallback - 调 category-resolve 找同店相似商品复用类目
-      try {
-        const resolveResp = await fetch(`http://127.0.0.1:${process.env.PORT || 5178}/api/seller/products/category-resolve`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "Cookie": req.headers.cookie || "" },
-          body: JSON.stringify({
-            sku: Number(offerId.split("-").pop()) || 0,
-            offer_id: offerId,
-            store_id: storeId,
-            name: item.name || "",
-          }),
-        }).then(r => r.json()).catch(() => null);
-
-        if (resolveResp?.success && resolveResp?.description_category_id && validIds.has(Number(resolveResp.description_category_id))) {
-          console.log(`[import] cat auto-resolve: ${categoryId} → ${resolveResp.description_category_id} (via ${resolveResp.source}) for ${offerId}`);
-          item.description_category_id = Number(resolveResp.description_category_id);
-          if (resolveResp.type_id && !item.type_id) item.type_id = Number(resolveResp.type_id);
-          // 继续往下走 (用修正后的 category_id)
-        } else {
-          return res.status(400).json({
-            success: false,
-            error: `类目 ID ${categoryId} 不在该店铺 Seller 类目树 (公开站类目 ≠ Seller API, 自动解析也失败: ${resolveResp?.error || "无候选"}), 候选: ${(resolveResp?.candidates || []).slice(0, 3).map(c => c.description_category_id).join(",") || "无"}`,
-            code: "CATEGORY_NOT_IN_SELLER_TREE",
-            category_id: Number(categoryId),
-            resolved: resolveResp,
-          });
-        }
-      } catch (e) {
-        return res.status(400).json({
-          success: false,
-          error: `类目 ID ${categoryId} 不在该店铺 Seller 类目树 (fallback 解析失败: ${e.message})`,
-          code: "CATEGORY_NOT_IN_SELLER_TREE",
-          category_id: Number(categoryId),
-        });
-      }
-    }
+    // v2.2.0: 不再校验 description_category_id (公开站类目 ≠ Seller API, 强行校验会拦掉大量合规商品)
+    // Ozon 自己会拒 (返回 failed), 用户去 seller.ozon.ru 后台改类目更直接.
+    // 仅在后台 polling 把失败原因写回 DB, listing-history 页可见.
 
     // Ozon /v3/product/import 规范化
     item.offer_id = offerId;

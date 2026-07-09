@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.1.9";
+const VERSION = "2.2.0";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -79,20 +79,10 @@ async function collectSku(sku, storeIds = []) {
     result._opi_enriched = "skipped";
   }
 
-  // v2.1.9: 优先用店铺 Seller API 真实类目 (替换 URL/breadcrumb 解析的不可靠 ID)
-  if (storeIds && storeIds.length > 0) {
-    const oldCat = result.description_category_id;
-    const resolved = await resolveSellerCategory(result.sku, storeIds[0]);
-    if (resolved && resolved.description_category_id) {
-      result.description_category_id = resolved.description_category_id;
-      if (resolved.type_id && !result.type_id) result.type_id = resolved.type_id;
-      result._category_resolved = { from: oldCat, to: resolved.description_category_id, source: resolved.source };
-      console.log(`[SW ${VERSION}]   类目修正: ${oldCat} → ${resolved.description_category_id} (via ${resolved.source})`);
-    } else {
-      result._category_resolved = { from: oldCat, to: oldCat, source: "fallback-url", warn: "未解析到 Seller 类目, 提交时会被服务端拒绝" };
-      console.warn(`[SW ${VERSION}]   类目未解析: cat=${oldCat} (提交时会被服务端校验拒绝)`);
-    }
-  }
+  // v2.2.0: 不再调 resolveSellerCategory.
+//   公开 Ozon 类目跟 Seller API 不通用, autofix 反而会猜错 (如 Лупа 误匹配 Оплетка).
+//   现在直接用 URL 抓的 cat 提交, Ozon 拒了用户去 seller.ozon.ru 后台改类目即可.
+  // (保留 _category_resolved 元数据供前端调试)
 
   // v1.0.9: 详细打印每个字段的来源 + 关键数据
   const dbg = result._debug || {};

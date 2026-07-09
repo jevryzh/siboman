@@ -537,29 +537,26 @@ window.BatchUploadView = {
               store_id: storeId, item: built.item,
             }, {timeout: 60000});
             const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
-            appendLog(`  ✓ #${row.index} SKU ${row.sku} → task_id=${tid}`, 'success');
-            // v2.1.9: 后台 polling 每 60s 同步状态, 这里只 log 不阻塞
+            // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
+            appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}`, 'info');
+            // 后台 polling 每 60s 同步 Ozon 真实状态
             totalOk++;
           } catch(e) {
-            // v2.1.9: 优先展示服务端返回的 code + 字段 (类目校验失败等)
-            const data = e.response?.data || {};
-            let errMsg = data.error || e.message;
-            if (data.code === 'CATEGORY_NOT_IN_SELLER_TREE') {
-              errMsg = `类目 ${data.category_id} 不在该店铺 Seller 类目树 (公开站类目 ≠ Seller API, 用插件 v2.1.9+ 或 collect-competitor 重新解析)`;
-              appendLog(`  ✗ #${row.index} SKU ${row.sku} → ${errMsg}`, 'error');
-            } else {
-              appendLog(`  ✗ #${row.index} SKU ${row.sku} → ${errMsg}`, 'error');
-            }
+            // v2.2.0: 只有本地校验失败 (商品字段缺失) 才会报错
+            // 类目等问题让 Ozon 处理, 不再前端拦截
+            const errMsg = e.response?.data?.error || e.message;
+            appendLog(`  ✗ #${row.index} SKU ${row.sku} → 提交失败: ${errMsg}`, 'error');
             totalFail++;
           }
         }
         appendLog(`--- [${storeName}] 完成 ---`, 'info');
       }
-      appendLog(`\n========== 全部完成: ${totalOk} 提交, ${totalFail} 失败 ==========`, totalFail?'warn':'success');
+      appendLog(`\n========== 全部完成: ${totalOk} 提交 Ozon, ${totalFail} 本地校验失败 ==========`, totalFail?'warn':'success');
       publishLoading.value = false;
+      // v2.2.0: 不再用"成功"字眼, Ozon 异步审核, 上架记录页或 seller.ozon.ru 后台看真实结果
       const tip = totalFail
-        ? `批量跟卖: ${totalOk} 提交, ${totalFail} 失败 (后台 60s 自动同步 Ozon 真实状态)`
-        : `批量跟卖: ${totalOk} 已提交 Ozon, 后台 60s 自动同步状态, 刷新页面查看实际结果`;
+        ? `已提交 ${totalOk} 个到 Ozon, ${totalFail} 个本地校验失败 (后台 60s 自动同步真实状态, 去 seller.ozon.ru 后台改类目)`
+        : `已提交 ${totalOk} 个到 Ozon。后台 60s 自动同步状态, 刷新本页面或去 seller.ozon.ru 后台查看`;
       notify.success(tip);
     };
 
