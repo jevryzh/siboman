@@ -3440,15 +3440,20 @@ if (db) {
 }
 
 // v0.6.2: 按 sku 解析 Seller API 类目 (供 plugin 用, 替换 URL 解析)
+// v2.1.9+: 多级 fallback - 本地 → Ozon 本店 → 跨店 → 同店名字相似 → 失败带候选
 app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     const sku = Number(req.body?.sku || 0);
     const offerId = String(req.body?.offer_id || "").trim();
+    const productName = String(req.body?.name || "").trim();
     if (!storeId) return res.status(400).json({ success: false, error: "需要 store_id" });
-    if (!sku && !offerId) return res.status(400).json({ success: false, error: "需要 sku 或 offer_id" });
+    if (!sku && !offerId && !productName) return res.status(400).json({ success: false, error: "需要 sku/offer_id/name 至少一个" });
 
-    // 1. 先查本地 DB (同店铺已有商品)
+    const userId = req.user.id;
+    let resolvedName = productName;
+
+    // 1. 本地 DB 查 (同店铺已有)
     if (offerId || sku) {
       const r = await db.query(
         `SELECT description_category_id, type_id, name FROM app_products
@@ -3458,7 +3463,7 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
       if (r.rows[0]?.description_category_id) {
         return res.json({
           success: true,
-          source: "local",
+          source: "local-same-store",
           description_category_id: Number(r.rows[0].description_category_id),
           type_id: Number(r.rows[0].type_id || 0),
           name: r.rows[0].name || "",
@@ -3466,26 +3471,116 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
       }
     }
 
-    // 2. 没本地 → 调 Ozon /v3/product/info/list (用 sku)
+    // 2. Ozon 本店 API (sku 必须在这家店存在, 竞品不会返回)
     if (sku) {
       try {
-        const data = await callOzonSellerAPI("/v3/product/info/list", { sku: [sku] }, { storeId, userId: req.user.id });
+        const data = await callOzonSellerAPI("/v3/product/info/list", { sku: [sku] }, { storeId, userId });
         const it = (data?.items || data?.result?.items || [])[0];
         if (it?.description_category_id) {
           return res.json({
             success: true,
-            source: "ozon_seller_api",
+            source: "ozon-same-store",
             description_category_id: Number(it.description_category_id),
             type_id: Number(it.type_id || 0),
             name: it.name || "",
           });
         }
       } catch (e) {
-        console.warn("[category-resolve] Ozon API fail:", e.message);
+        console.warn("[category-resolve] Ozon 本店 API fail:", e.message);
       }
     }
 
-    res.json({ success: false, error: "无法解析 (本地无此商品, Ozon 也查不到)", description_category_id: 0 });
+    // 3. 跨店查询 - 同用户其他店可能有这个 sku (例如从 LuckyDay 采集, 上传到 Three Latte)
+    if (sku && db) {
+      try {
+        const otherStores = await db.query(
+          `SELECT id, client_id, api_key FROM app_stores WHERE user_id = $1 AND id != $2 AND active = TRUE`,
+          [userId, storeId],
+        );
+        for (const st of otherStores.rows) {
+          try {
+            const data = await callOzonSellerAPI("/v3/product/info/list", { sku: [sku] }, { storeId: st.id, userId });
+            const it = (data?.items || data?.result?.items || [])[0];
+            if (it?.description_category_id) {
+              // 注意: 跨店的 category 可能也不在目标店 tree 里, 但概率高
+              return res.json({
+                success: true,
+                source: `cross-store:${st.id}`,
+                description_category_id: Number(it.description_category_id),
+                type_id: Number(it.type_id || 0),
+                name: it.name || "",
+                warning: "跨店匹配, 可能与目标店类目树不兼容",
+              });
+            }
+          } catch (e) { /* 单店失败不阻塞 */ }
+        }
+      } catch (e) {
+        console.warn("[category-resolve] 跨店查询 fail:", e.message);
+      }
+    }
+
+    // 4. 同店名字相似 - 找同店铺商品名相似商品复用其类目
+    if (productName && productName.length >= 3 && db) {
+      try {
+        // 取关键词 (俄文 / 中文 / 英文 单词, 取前 2 个最长)
+        const tokens = productName.toLowerCase()
+          .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+          .split(/\s+/)
+          .filter(t => t.length >= 3)
+          .sort((a, b) => b.length - a.length)
+          .slice(0, 2);
+        if (tokens.length > 0) {
+          // 每个 token 一个 ILIKE 参数, 用 OR 连接
+          const conditions = tokens.map((_, i) => `name ILIKE $${i + 2}`).join(' OR ');
+          const params = [storeId, ...tokens.map(t => `%${t}%`)];
+          const r = await db.query(
+            `SELECT description_category_id, type_id, name FROM app_products
+             WHERE store_id = $1 AND description_category_id IS NOT NULL
+               AND description_category_id > 0 AND (${conditions})
+             GROUP BY description_category_id, type_id, name
+             ORDER BY COUNT(*) DESC LIMIT 5`,
+            params,
+          );
+          if (r.rows.length > 0) {
+            // 验证找到的类目在树里 (避免历史脏数据污染)
+            const validIds = await getValidCategoryIds(storeId, userId);
+            const validHit = r.rows.find(row => validIds?.has(Number(row.description_category_id)));
+            if (validHit) {
+              return res.json({
+                success: true,
+                source: "similar-name-same-store",
+                description_category_id: Number(validHit.description_category_id),
+                type_id: Number(validHit.type_id || 0),
+                name: validHit.name || "",
+                matched_tokens: tokens,
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("[category-resolve] 名字相似查询 fail:", e.message);
+      }
+    }
+
+    // 5. 全部失败 - 返回目标店高频类目作为候选 (让前端给 user 看)
+    if (db) {
+      try {
+        const r = await db.query(
+          `SELECT description_category_id, COUNT(*) as cnt FROM app_products
+           WHERE store_id = $1 AND description_category_id IS NOT NULL AND description_category_id > 0
+           GROUP BY description_category_id ORDER BY cnt DESC LIMIT 10`,
+          [storeId],
+        );
+        return res.json({
+          success: false,
+          error: "无法自动解析 (sku 不在任何店, 名字相似也找不到)",
+          description_category_id: 0,
+          candidates: r.rows.map(x => ({ description_category_id: Number(x.description_category_id), count: Number(x.cnt) })),
+        });
+      } catch {}
+    }
+
+    res.json({ success: false, error: "无法解析", description_category_id: 0, candidates: [] });
   } catch (error) {
     res.status(error.statusCode || 502).json({ success: false, error: error.message });
   }
@@ -3522,12 +3617,41 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v0.6.2: 校验 description_category_id 在该店铺 Seller 类目树里 (缓存 24h)
     const validIds = await getValidCategoryIds(storeId, req.user.id);
     if (validIds && !validIds.has(Number(categoryId))) {
-      return res.status(400).json({
-        success: false,
-        error: `类目 ID ${categoryId} 不在该店铺 Seller 类目树里 (可能来自公开站 URL 或其他店铺, 请用 collect-competitor 重新解析)`,
-        code: "CATEGORY_NOT_IN_SELLER_TREE",
-        category_id: Number(categoryId),
-      });
+      // v2.1.9: 自动 fallback - 调 category-resolve 找同店相似商品复用类目
+      try {
+        const resolveResp = await fetch(`http://127.0.0.1:${process.env.PORT || 5178}/api/seller/products/category-resolve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "Cookie": req.headers.cookie || "" },
+          body: JSON.stringify({
+            sku: Number(offerId.split("-").pop()) || 0,
+            offer_id: offerId,
+            store_id: storeId,
+            name: item.name || "",
+          }),
+        }).then(r => r.json()).catch(() => null);
+
+        if (resolveResp?.success && resolveResp?.description_category_id && validIds.has(Number(resolveResp.description_category_id))) {
+          console.log(`[import] cat auto-resolve: ${categoryId} → ${resolveResp.description_category_id} (via ${resolveResp.source}) for ${offerId}`);
+          item.description_category_id = Number(resolveResp.description_category_id);
+          if (resolveResp.type_id && !item.type_id) item.type_id = Number(resolveResp.type_id);
+          // 继续往下走 (用修正后的 category_id)
+        } else {
+          return res.status(400).json({
+            success: false,
+            error: `类目 ID ${categoryId} 不在该店铺 Seller 类目树 (公开站类目 ≠ Seller API, 自动解析也失败: ${resolveResp?.error || "无候选"}), 候选: ${(resolveResp?.candidates || []).slice(0, 3).map(c => c.description_category_id).join(",") || "无"}`,
+            code: "CATEGORY_NOT_IN_SELLER_TREE",
+            category_id: Number(categoryId),
+            resolved: resolveResp,
+          });
+        }
+      } catch (e) {
+        return res.status(400).json({
+          success: false,
+          error: `类目 ID ${categoryId} 不在该店铺 Seller 类目树 (fallback 解析失败: ${e.message})`,
+          code: "CATEGORY_NOT_IN_SELLER_TREE",
+          category_id: Number(categoryId),
+        });
+      }
     }
 
     // Ozon /v3/product/import 规范化
