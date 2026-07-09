@@ -2973,14 +2973,26 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
   try {
     const { taskId } = req.body || {};
     if (!taskId) { res.status(400).json({ success: false, error: "需要 taskId" }); return; }
-    const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(taskId) });
+
+    // v0.6.2: 优先用请求体里的 store_id (前端知道是哪个店铺)
+    // 否则从 history 表里查 (旧记录可能 store_id 为 null, 会 fallback 到 env 默认)
+    let storeId = req.body?.store_id || req.body?.storeId || null;
+    if (!storeId && db && req.user?.id) {
+      const r = await db.query(
+        `SELECT store_id FROM app_listing_history WHERE task_id = $1 AND user_id = $2 LIMIT 1`,
+        [String(taskId), req.user.id],
+      );
+      storeId = r.rows[0]?.store_id || null;
+    }
+
+    const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(taskId) }, { storeId, userId: req.user?.id });
     const items = data?.result?.items || data?.items || [];
     const item = items[0] || {};
     const ozonStatus = item.status || "unknown";
     const errors = Array.isArray(item.errors) ? item.errors : [];
 
     // 映射到本地状态
-    const statusMap = { imported: "imported", failed: "failed", processing: "processing", moderating: "moderating" };
+    const statusMap = { imported: "imported", failed: "failed", processing: "processing", moderating: "moderating", pending: "processing" };
     const localStatus = statusMap[ozonStatus] || ozonStatus;
 
     if (db && req.user?.id) {
@@ -3366,11 +3378,12 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     if (db && req.user?.id && taskId) {
       try {
         await db.query(
-          `INSERT INTO app_listing_history (user_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+          `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
            ON CONFLICT (task_id) DO NOTHING`,
           [
             req.user.id,
+            storeId || null,
             String(taskId),
             String(item.offer_id || ""),
             String(item.name || ""),
