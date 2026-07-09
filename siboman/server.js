@@ -3409,6 +3409,12 @@ async function pollPendingListingTasks() {
           );
           console.log(`[poll-pending] task=${row.task_id} offer=${row.offer_id} → ${localStatus}${errors.length ? ' errors=' + errors.length : ''}`);
           updated++;
+        } else {
+          // v2.1.9: pending/processing 也 touch updated_at, 让 user 看到 polling 活着
+          await db.query(
+            `UPDATE app_listing_history SET updated_at = now() WHERE task_id = $1 AND user_id = $2`,
+            [row.task_id, row.user_id],
+          );
         }
       } catch (e) {
         const msg = e.message || "";
