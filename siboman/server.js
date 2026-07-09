@@ -3831,12 +3831,17 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
       //   关键: type_id 节点 (Ozon tree 叶子) 的 description_category_id=0, 要用父级 cat 的 id
       if (productName && productName.length >= 3) {
         try {
-          const tokens = productName.toLowerCase()
+          // v2.2.9.5: 加大到 8 个 + 优先俄文 (cyrillic) token, 英文 token 降权
+          //   之前 slice(0, 3) 太短, 商品名 "Большой туристический тент Cloud Skies Tarp Lite (L)" 7 个 token 只取 3,
+          //   核心词 "тент" 被英文 "cloud" 挤掉, candidates 拿不到正确的 Тент 类目
+          const allTokens = productName.toLowerCase()
             .replace(/[^\p{L}\p{N}\s]/gu, ' ')
             .split(/\s+/)
-            .filter(t => t.length >= 3)
-            .sort((a, b) => b.length - a.length)
-            .slice(0, 3);
+            .filter(t => t.length >= 3);
+          // 优先俄文 (cyrillic range 0400-04FF), 英文 (latin range) 排后面
+          const cyr = allTokens.filter(t => /[Ѐ-ӿ]/.test(t));
+          const lat = allTokens.filter(t => /[a-z]/.test(t) && !/[Ѐ-ӿ]/.test(t));
+          const tokens = [...cyr.sort((a, b) => b.length - a.length), ...lat.sort((a, b) => b.length - a.length)].slice(0, 8);
           if (tokens.length) {
             const tree = await getCategoryTreeForStore(storeId, userId);
             const matches = [];
@@ -3861,7 +3866,18 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
             };
             walk(tree, null, []);
             // 按 match_score 排序, 取前 8
-            matches.sort((a, b) => b.match_score - a.match_score);
+            // v2.2.9.5: 排序 score 相同时, 优先 name 直接命中商品 token (e.g. "Тент" name 完全等于商品 "тент" token)
+            //   之前 sort 不稳, 同样 score=1 的会被随机排, 正确 cat (Тент) 经常被截断到 8+ 名
+            matches.sort((a, b) => {
+              if (b.match_score !== a.match_score) return b.match_score - a.match_score;
+              // score 相同时: 优先 name 跟商品 token 完全相等的 (e.g. "Тент" name == "тент" token)
+              const aExact = tokens.some(t => a.name.toLowerCase() === t) ? 1 : 0;
+              const bExact = tokens.some(t => b.name.toLowerCase() === t) ? 1 : 0;
+              if (bExact !== aExact) return bExact - aExact;
+              // 再按 name 长度 (短的优先, 更可能是叶子)
+              return a.name.length - b.name.length;
+            });
+            console.log(`[fallbackCandidates] productName="${productName.slice(0,40)}" tokens=${JSON.stringify(tokens)} matches=${matches.length}`);
             for (const m of matches.slice(0, 8)) {
               if (!seen.has(m.description_category_id)) {
                 candidates.push({ ...m, source: 'ozon-tree-name-match' });
