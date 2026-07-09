@@ -587,16 +587,28 @@ window.BatchUploadView = {
       if(Array.isArray(d.attributes) && d.attributes.length) {
         item.attributes = d.attributes;
       }
+      // v2.2.8: 透传 _sourceVariant — server 端会从中提取完整 attributes (含 dictionary_value_id)
+      //   跟 MY ERP 一样, 让 Ozon 看到 source 数据, relevance 判断才能过
+      if (d._sourceVariant) {
+        item._sourceVariant = d._sourceVariant;
+      }
       return {ok:true, item};
     };
 
-    // ========== 标题质量预检 (保留) ==========
+// ========== 标题质量预检 (保留) ==========
     const checkTitleQuality = (name) => {
       const issues = [];
       if(/[\u4e00-\u9fff]/.test(name)) issues.push('含中文字符');
       if(name.length>190) issues.push('标题过长(>190)');
       const upperWords = name.match(/\b[A-Z]{2,}\b/g);
-      if(upperWords && upperWords.length>=2) issues.push('多个全大写词');
+      if (upperWords && upperWords.length>=2) issues.push('多个全大写词');
+      // v2.2.8: Ozon 名称不能是拉丁字母 — 必须含 Cyrillic (俄文)
+      //   Cyrillic Unicode 范围: \u0400-\u04FF (Cyrillic), \u0500-\u052F (Cyrillic Supplement)
+      const hasCyrillic = /[\u0400-\u04FF\u0500-\u052F]/.test(name);
+      const asciiCount = (name.match(/[\x00-\x7F]/g) || []).length;
+      if (!hasCyrillic && asciiCount > 5) {
+        issues.push('Ozons 拒纯拉丁字母标题 (必须含俄文/西里尔字母)');
+      }
       return issues;
     };
 

@@ -3817,17 +3817,51 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
 
     // v2.2.7: 规范化 attributes (透传 dictionary_value_id, 客户端传了才带, Ozon 不强求)
     //   之前的代码已经通过 {items: [item]} 透传 attributes, 这里只是保证结构干净
-    if (Array.isArray(item.attributes)) {
-      item.attributes = item.attributes.map(a => ({
-        id: Number(a.id ?? a.attribute_id),
-        values: Array.isArray(a.values)
+    // v2.2.8: 如果客户端传了 _sourceVariant, 优先用 _sourceVariant.attributes (含完整 dictionary_value_id + complex_id)
+    //   跟 MY ERP 一样让 Ozon 看到 source variant, relevance 判断才能过
+    const srcVariant = item._sourceVariant;
+    if (srcVariant && Array.isArray(srcVariant.attributes) && srcVariant.attributes.length) {
+      console.log(`[v2.2.8 import] 使用 _sourceVariant.attributes (${srcVariant.attributes.length} 个, 含 dictionary_value_id)`);
+      item.attributes = srcVariant.attributes.map(a => {
+        // _sourceVariant.attributes 已经是 Ozon 原始结构 {id/attribute_id, complex_id, values:[{value, dictionary_value_id}]}
+        const aId = Number(a.id ?? a.attribute_id);
+        const values = Array.isArray(a.values) ? a.values.map(v => ({
+          value: String(v.value ?? ""),
+          ...(v.dictionary_value_id ? { dictionary_value_id: Number(v.dictionary_value_id) } : {}),
+        })) : [];
+        return {
+          id: aId,
+          ...(a.complex_id ? { complex_id: Number(a.complex_id) } : {}),
+          values,
+        };
+      }).filter(a => a.id && a.values.length);
+      // 同时透传 complex_attributes (如果有)
+      if (Array.isArray(srcVariant.complex_attributes) && srcVariant.complex_attributes.length) {
+        item.complex_attributes = srcVariant.complex_attributes;
+      }
+      // 如果 item.description_category_id 是 5 位 breadcrumb 而 _sourceVariant.description_category_id 是 8 位 leaf, 用 8 位
+      if (srcVariant.description_category_id && Number(srcVariant.description_category_id) > 100000) {
+        item.description_category_id = Number(srcVariant.description_category_id);
+      }
+    } else if (Array.isArray(item.attributes)) {
+      // 客户端没传 _sourceVariant, 用扁平化的 attributes, 尽量补 dictionary_value_id
+      item.attributes = item.attributes.map(a => {
+        const aId = Number(a.id ?? a.attribute_id);
+        // 兼容 v2.2.8 新的 plugin 透传格式: {id, name, value, dictionary_value_id?, dictionary_value_ids?}
+        let dictId = null;
+        if (a.dictionary_value_id) dictId = Number(a.dictionary_value_id);
+        else if (Array.isArray(a.dictionary_value_ids) && a.dictionary_value_ids.length === 1) dictId = a.dictionary_value_ids[0];
+
+        const values = Array.isArray(a.values)
           ? a.values.map(v => ({
               value: String(v.value ?? ""),
               ...(v.dictionary_value_id ? { dictionary_value_id: Number(v.dictionary_value_id) } : {}),
             }))
-          : (a.value !== undefined ? [{ value: String(a.value), ...(a.dictionary_value_id ? { dictionary_value_id: Number(a.dictionary_value_id) } : {}) }] : []),
-      })).filter(a => a.id && a.values.length);
+          : (a.value !== undefined ? [{ value: String(a.value), ...(dictId ? { dictionary_value_id: dictId } : {}) }] : []);
+        return { id: aId, values };
+      }).filter(a => a.id && a.values.length);
     }
+    delete item._sourceVariant;  // Ozon 不认这个字段, 不删会拒
 
     // v2.2.7: 顶层 stocks 数组 (跟 MY 一样, 一次原子提交)
     let ozonStocks = null;
