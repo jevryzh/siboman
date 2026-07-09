@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.7)
+            逐梦 Ozon 采集器 (v2.2.8)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.7</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.8</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.8 跟卖深度适配: plugin enrichFromOpi 保存 data._sourceVariant = detail (完整 OPI 原始数据, 含 attributes 完整结构 + complex_attributes + 8 位 leaf cat + dimensions). mapOpiAttributes 改成 passthrough 模式保留 dictionary_value_id (单值) + dictionary_value_ids (多值). BatchUpload buildV3Item 透传 _sourceVariant 到 server, server 优先用 _sourceVariant.attributes (完整结构) 替代扁平 [{id,name,value}], 跟 MY ERP 一样让 Ozon 看到 source 数据. checkTitleQuality 加 Cyrillic 检测 (\u0400-\u04FF, 纯拉丁字母警告). 原因: 跟卖商品图片和商品信息都要跟竞品一样才会有流量</li>
             <li>✅ v2.2.7 Ozon 适配: 仿 MY 批量上架 payload, 调 Ozon /v3/product/import 时增加 service_type=IS_CODE_SERVICE (跟卖场景), attribute 自动带 dictionary_value_id (客户端传了才带), stocks 跟 items 同一次原子提交 (替代 v2.2.6 的二次 /v2/products/stocks 调用). 9 case 实测确认 Ozon /v3/product/import 强制 type_id>0 (service_type 不豁免), 8 位 leaf cat 比 5 位 breadcrumb 更稳</li>
             <li>✅ v2.2.6 per-store 仓库: 选店铺后自动拉 FBS 仓库, 每店一个, 上架成功后写库存到指定 warehouse_id</li>
             <li>✅ v2.2.5 type_id 折叠: 类目 cell 内置小灰字 type XXXXX (用户不用填), 选类目 modal 后自动调 /api/seller/type-id-suggestion 配 type_id</li>
