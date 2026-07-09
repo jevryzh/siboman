@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.1";
+const VERSION = "2.2.2";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";

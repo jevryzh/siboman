@@ -3448,31 +3448,45 @@ app.post("/api/seller/type-id-suggestion", requireAuth, async (req, res, next) =
 });
 
 // ========== v0.6.2: 类目树缓存 + 校验 + 后台 polling ==========
-const categoryTreeCache = new Map();   // storeId -> { validIds: Set<number>, fetchedAt: number }
+const categoryTreeCache = new Map();   // storeId -> { validIds: Set<number>, nameById: Map<number,string>, fetchedAt: number }
 const CATEGORY_TTL_MS = 24 * 3600 * 1000;
 
 async function getValidCategoryIds(storeId, userId) {
   if (!storeId || !userId) return null;
   const cached = categoryTreeCache.get(storeId);
   if (cached && (Date.now() - cached.fetchedAt) < CATEGORY_TTL_MS) return cached.validIds;
+  // 缓存命中但只有 validIds (旧格式), 触发一次 refresh 重建带 name 的新缓存
+  if (cached && !cached.nameById) {
+    // fall through, 走下面的 rebuild
+  }
   try {
     const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" }, { storeId, userId });
     const validIds = new Set();
+    const nameById = new Map();
     const walk = (items) => {
       for (const it of (items || [])) {
         const cid = Number(it.description_category_id || 0);
-        if (cid > 0) validIds.add(cid);
+        if (cid > 0) {
+          validIds.add(cid);
+          if (it.category_name) nameById.set(cid, it.category_name);
+        }
         if (Array.isArray(it.children) && it.children.length) walk(it.children);
       }
     };
     walk(data?.result);
-    categoryTreeCache.set(storeId, { validIds, fetchedAt: Date.now() });
-    console.log(`[category-cache] store=${storeId} loaded ${validIds.size} categories`);
+    categoryTreeCache.set(storeId, { validIds, nameById, fetchedAt: Date.now() });
+    console.log(`[category-cache] store=${storeId} loaded ${validIds.size} categories (${nameById.size} with names)`);
     return validIds;
   } catch (e) {
     console.warn(`[category-cache] load failed store=${storeId}:`, e.message);
     return cached?.validIds || null;  // 失败时用旧缓存, 不阻塞上传
   }
+}
+
+// 给定店铺 + id, 返回类目名 (从 tree cache). 找不到返回 null.
+function getCategoryName(storeId, id) {
+  const c = categoryTreeCache.get(storeId);
+  return c?.nameById?.get(Number(id)) || null;
 }
 
 // 失效某个店铺的类目缓存 (供 refresh 接口用)
@@ -3713,6 +3727,8 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
     // 5. 全部失败 - 返回目标店高频类目作为候选 (让前端给 user 看)
     const fallbackCandidates = async () => {
       if (!db) return [];
+      // 确保 tree cache 已加载, 不然 name 查不到
+      if (userId) await getValidCategoryIds(storeId, userId);
       try {
         const r = await db.query(
           `SELECT description_category_id, COUNT(*) as cnt FROM app_products
@@ -3720,7 +3736,14 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
            GROUP BY description_category_id ORDER BY cnt DESC LIMIT 10`,
           [storeId],
         );
-        return r.rows.map(x => ({ description_category_id: Number(x.description_category_id), count: Number(x.cnt) }));
+        return r.rows.map(x => {
+          const id = Number(x.description_category_id);
+          return {
+            description_category_id: id,
+            name: getCategoryName(storeId, id) || '',
+            count: Number(x.cnt),
+          };
+        });
       } catch { return []; }
     };
 

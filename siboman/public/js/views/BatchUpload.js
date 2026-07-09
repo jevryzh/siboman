@@ -152,6 +152,34 @@ window.BatchUploadView = {
       return d || { ok: false, error: '采集超时 (120s)' };
     });
 
+    // v2.2.2: 候选类目选择器状态. pickingRow 持当前要选类目的行, 选择后写回 row.distilled
+    const categoryPickerOpen = Vue.ref(false);
+    const pickingRow = Vue.ref(null);
+    const openCategoryPicker = (row) => {
+      pickingRow.value = row;
+      categoryPickerOpen.value = true;
+    };
+    const closeCategoryPicker = () => {
+      categoryPickerOpen.value = false;
+      pickingRow.value = null;
+    };
+    const applyCategoryChoice = (candidate) => {
+      if (!pickingRow.value || !candidate) return;
+      const row = pickingRow.value;
+      if (!row.distilled) row.distilled = {};
+      row.distilled.descriptionCategoryId = Number(candidate.description_category_id);
+      row.distilled.descriptionCategoryName = candidate.name || '';
+      // 用户手动选时, 把 confidence 标为 'manual' 让 UI 显示"已选"
+      row._category_resolved = {
+        ...(row._category_resolved || {}),
+        confidence: 'manual',
+        to: Number(candidate.description_category_id),
+        source: 'manual-candidate-pick',
+      };
+      appendLog(`  ✓ #${row.index} 手动选类目: ${candidate.description_category_id} (${candidate.name || '无名'})`, 'success');
+      closeCategoryPicker();
+    };
+
     window.addEventListener("message", (event) => {
       // v2.1.3: ready 改走 document.addEventListener('__zhumeng_reply__') 在更上面, 这里留空 stub 兼容老逻辑
     });
@@ -344,6 +372,8 @@ window.BatchUploadView = {
                   country_of_origin: d.country_of_origin || '',
                   price: d.price || '',
                 };
+                // v2.2.2: 把 plugin 端类目解析结果透出, 让表格显示置信度 + 候选给用户选
+                if (d._category_resolved) row._category_resolved = d._category_resolved;
                 // v2.1.10: type_id 兜底 - SW 拿到 0 时, 反查 MY 后端用同店铺同 cat_id
                 //   已发布过的 (type_id, 中文名) 历史, 自动填入 + 缓存. 用户无需手工填.
                 if ((!row.distilled.typeId || row.distilled.typeId === 0)
@@ -629,6 +659,7 @@ window.BatchUploadView = {
       fetchStores, saveConfig, loadConfig, fmtMoney, clearAll, appendLog,
       pingExtension, checkSellerStatus, refreshStatus,
       helpOpen, openHelp, closeHelp, openHistory,
+      categoryPickerOpen, pickingRow, openCategoryPicker, closeCategoryPicker, applyCategoryChoice,
     };
   },
   template: `
@@ -721,6 +752,7 @@ window.BatchUploadView = {
                     <th style="padding:10px 12px; text-align:right">三维 L×W×H</th>
                     <th style="padding:10px 12px; text-align:left">格式</th>
                     <th style="padding:10px 12px; text-align:left; min-width:120px">Type ID (上架要)</th>
+                    <th style="padding:10px 12px; text-align:left; min-width:160px">类目 (v2.2.2)</th>
                     <th style="padding:10px 12px; text-align:left">问题/状态</th>
                   </tr>
                 </thead>
@@ -740,6 +772,35 @@ window.BatchUploadView = {
                     </td>
                     <td style="padding:10px 12px">
                       <input v-model="row.typeIdInput" @change="saveTypeIdCache(row)" :placeholder="row.distilled?.typeId ? String(row.distilled.typeId) : '必填'" style="width:90px; padding:4px 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; font-family:monospace; text-align:right" />
+                    </td>
+                    <td style="padding:10px 12px; font-size:12px">
+                      <!-- v2.2.2: 类目置信度列 — high/medium/none/manual -->
+                      <template v-if="row._category_resolved">
+                        <div v-if="row._category_resolved.confidence === 'high'" style="display:flex; flex-direction:column; gap:2px">
+                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#dcfce7; color:#166534; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">✓ 高置信</span>
+                          <span style="color:#475569; font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">cat {{ row._category_resolved.to }}</span>
+                          <span style="color:#94a3b8; font-size:10px">{{ row._category_resolved.source }}</span>
+                        </div>
+                        <div v-else-if="row._category_resolved.confidence === 'medium'" style="display:flex; flex-direction:column; gap:2px">
+                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#fef3c7; color:#92400e; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">⚠ 中置信</span>
+                          <span style="color:#475569; font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">建议 cat {{ row._category_resolved.to }} — 可改</span>
+                          <button v-if="(row._category_resolved.candidates || []).length" @click="openCategoryPicker(row)" style="background:transparent; border:none; color:#2563eb; cursor:pointer; font-size:11px; padding:0; text-align:left">↻ 换一个</button>
+                        </div>
+                        <div v-else-if="row._category_resolved.confidence === 'manual'" style="display:flex; flex-direction:column; gap:2px">
+                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#dbeafe; color:#1e40af; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">✓ 已手动选</span>
+                          <span style="color:#475569; font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.distilled?.descriptionCategoryName || ('cat ' + row._category_resolved.to) }}</span>
+                          <button v-if="(row._category_resolved.candidates || []).length" @click="openCategoryPicker(row)" style="background:transparent; border:none; color:#2563eb; cursor:pointer; font-size:11px; padding:0; text-align:left">↻ 换一个</button>
+                        </div>
+                        <div v-else style="display:flex; flex-direction:column; gap:4px">
+                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#fee2e2; color:#991b1b; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">⚠ 未解析</span>
+                          <button @click="openCategoryPicker(row)" :disabled="!(row._category_resolved.candidates || []).length" style="padding:3px 10px; background:(row._category_resolved.candidates||[]).length ? '#f59e0b' : '#cbd5e1'; border:none; border-radius:5px; color:#fff; cursor:pointer; font-size:11px; font-weight:600; width:fit-content">
+                            {{ (row._category_resolved.candidates || []).length ? '选类目 (' + (row._category_resolved.candidates || []).length + ')' : '无候选' }}
+                          </button>
+                          <span v-if="!row._category_resolved.candidates?.length" style="color:#94a3b8; font-size:10px">上架时去 Ozon 后台选</span>
+                        </div>
+                      </template>
+                      <span v-else-if="row.distilled" style="color:#94a3b8; font-size:11px">采集时未调解析</span>
+                      <span v-else style="color:#cbd5e1; font-size:11px">-</span>
                     </td>
                     <td style="padding:10px 12px; color:#64748b; font-size:12px">
                       <span v-if="row.distilled" style="color:#059669; font-weight:600">✓ 已采</span>
@@ -925,6 +986,42 @@ window.BatchUploadView = {
         </aside>
       </transition>
     </div>
+
+    <!-- v2.2.2: 候选类目选择 modal -->
+    <transition name="bu-fade">
+      <div v-if="categoryPickerOpen && pickingRow" @click.self="closeCategoryPicker" style="position:fixed; inset:0; background:rgba(15,23,42,0.5); z-index:1000; display:flex; align-items:center; justify-content:center; padding:20px">
+        <div style="background:#fff; border-radius:12px; max-width:640px; width:100%; max-height:80vh; overflow:hidden; box-shadow:0 20px 50px rgba(0,0,0,0.25); display:flex; flex-direction:column">
+          <div style="padding:16px 20px; border-bottom:1px solid #f1f5f9; display:flex; justify-content:space-between; align-items:center; background:linear-gradient(90deg,#fffbeb,#fff)">
+            <div>
+              <div style="font-size:15px; font-weight:700; color:#0f172a">🎯 选类目 — #{{ pickingRow.index }} {{ pickingRow.sku }}</div>
+              <div style="font-size:11px; color:#64748b; margin-top:2px">{{ pickingRow.distilled?.name || pickingRow._category_resolved?.warning || '选一个 candidate 给这个商品' }}</div>
+            </div>
+            <button @click="closeCategoryPicker" style="background:transparent; border:none; font-size:18px; color:#94a3b8; cursor:pointer; padding:4px 8px">✕</button>
+          </div>
+          <div style="overflow-y:auto; padding:14px 20px; display:flex; flex-direction:column; gap:8px">
+            <div v-if="!pickingRow._category_resolved?.candidates?.length" style="padding:40px 20px; text-align:center; color:#94a3b8">
+              <div style="font-size:32px; margin-bottom:8px">📭</div>
+              <div style="font-size:13px">没有候选类目 (店铺还没有任何已上架商品可参考)</div>
+              <div style="font-size:11px; margin-top:4px">直接提交后去 Ozon 后台选</div>
+            </div>
+            <div v-for="(c, i) in pickingRow._category_resolved?.candidates || []" :key="i" @click="applyCategoryChoice(c)" style="display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; cursor:pointer; transition:all 0.15s" :style="{ background: '#fff' }" onmouseover="this.style.background='#fefce8';this.style.borderColor='#fbbf24'" onmouseout="this.style.background='#fff';this.style.borderColor='#e2e8f0'">
+              <div style="flex:1; min-width:0">
+                <div style="font-size:13px; font-weight:600; color:#0f172a; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ c.name || '(无名)' }}</div>
+                <div style="font-size:11px; color:#64748b; font-family:monospace; margin-top:2px">cat {{ c.description_category_id }}</div>
+              </div>
+              <div style="display:flex; flex-direction:column; align-items:flex-end; gap:2px">
+                <span style="padding:3px 8px; background:#dbeafe; color:#1e40af; border-radius:10px; font-size:11px; font-weight:600">📊 {{ c.count || 0 }} 件</span>
+                <span style="font-size:10px; color:#94a3b8">店铺历史频率</span>
+              </div>
+            </div>
+          </div>
+          <div style="padding:12px 20px; border-top:1px solid #f1f5f9; background:#f8fafc; font-size:11px; color:#64748b; display:flex; justify-content:space-between; align-items:center">
+            <span>提示: 这是你店里的高频类目 (top {{ (pickingRow._category_resolved?.candidates || []).length }}). 不一定全对, 选错了 Ozon 后台还能改.</span>
+            <button @click="closeCategoryPicker" style="padding:4px 12px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:5px; cursor:pointer; color:#475569">关闭</button>
+          </div>
+        </div>
+      </div>
+    </transition>
 
     <!-- 样式已挪到文件顶部 IIFE 注入, Vue runtime template 不允许 <style> 标签 -->
   `

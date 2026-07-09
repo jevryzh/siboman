@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.1)
+            逐梦 Ozon 采集器 (v2.2.2)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.1</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.2</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.2 BatchUpload 表格新增"类目"列, 高/中/无置信度 badge + 候选选择 modal, 用户 1-click 改类目</li>
             <li>✅ v2.2.1 类目解析优化: 调 ERP /category-resolve 时带 type_id, 严格名字匹配 (2 token 都中才用), 失败带 candidates 让前端展示</li>
             <li>✅ v2.2.0 流程简化: 不再前端校验类目, 直接提交让 Ozon 自己拒, 用户去 seller.ozon.ru 后台改类目更直接</li>
             <li>✅ v2.1.9 类目解析升级: 采集后自动调 ERP /category-resolve 拿店铺 Seller API 真实类目 (替换 URL 解析的不可靠 ID)</li>
