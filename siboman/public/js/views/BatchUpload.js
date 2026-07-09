@@ -659,8 +659,11 @@ window.BatchUploadView = {
       for(const storeId of selectedStores.value){
         const storeName = allStores.value.find(s=>s.id===storeId)?.name || storeId;
         appendLog(`\n--- [${storeName}] 开始 ---`, 'info');
-        // v2.2.6: 收集本店铺本轮成功提交的商品, 用于上架成功后批量调 import-stocks 设仓库库存
-        const acceptedInThisStore = [];
+        // v2.2.7: 收集本店铺本轮所有有效商品, 一次性 POST 给 /api/seller/products/import
+        //   (server 现在接收顶层 stocks, 跟 MY 一样原子提交 items + stocks 给 Ozon /v3/product/import)
+        const storeItems = [];
+        const storeStocks = [];
+        const whId = selectedWarehousesByStore.value[storeId];  // v2.2.6 每店仓库, v2.2.7 仍按店走
         for(const row of rows){
           // v2.2.4: 拦截 confidence='none' 且 to=0 的行 (URL 面包屑 ID 不是 Seller API 的)
           //   Ozon 必拒 levels_category_not_found, 前端必须拦住不让提交
@@ -679,16 +682,36 @@ window.BatchUploadView = {
             brand: config.brand, defaultStock: config.defaultStock,
           });
           if(!built.ok){ appendLog(`  ✗ #${row.index} ${built.error}`, 'error'); totalFail++; continue; }
+          storeItems.push({ row, item: built.item });
+          // v2.2.7: stocks 跟 items 同发 (Ozon 原子处理), 默认库存用 defaultStock
+          if (whId && (config.defaultStock || 0) > 0) {
+            storeStocks.push({
+              offer_id: built.item.offer_id,
+              stock: config.defaultStock,
+              warehouse_id: whId,
+            });
+          }
+        }
+
+        if (!storeItems.length) {
+          appendLog(`  — [${storeName}] 没有可上架商品, 跳过`, 'warn');
+          continue;
+        }
+
+        // v2.2.7: 逐个提交 (Ozon /v3/product/import 一次只接受一个 items 比较稳; 我们的 server 也只接受单 item)
+        //   stocks 全部并到每个请求, Ozon 服务端会自动按 offer_id 匹配
+        for (const { row, item } of storeItems) {
           try {
             const res = await axios.post('/api/seller/products/import', {
-              store_id: storeId, item: built.item,
-            }, {timeout: 60000});
+              store_id: storeId,
+              item,
+              stocks: storeStocks.filter(s => s.offer_id === item.offer_id),  // 只发当前这个 offer 的 stock
+            }, { timeout: 60000 });
             const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
             // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
-            appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}`, 'info');
+            appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${whId ? ` + stock=${config.defaultStock} → wh=${whId}` : ''}`, 'info');
             // 后台 polling 每 60s 同步 Ozon 真实状态
             totalOk++;
-            acceptedInThisStore.push({ offer_id: built.item.offer_id, stock: config.defaultStock || 0 });
           } catch(e) {
             // v2.2.0: 只有本地校验失败 (商品字段缺失) 才会报错
             // 类目等问题让 Ozon 处理, 不再前端拦截
@@ -698,25 +721,7 @@ window.BatchUploadView = {
           }
         }
 
-        // v2.2.6: 上架成功后, 把库存写入本店铺所选仓库 (Ozon /v1/product/import-stocks + warehouse_id)
-        //   Ozon 异步审核商品任务期间, import-stocks 会被队列等任务完成才生效, 但不需要商品已 imported — 通常 5-30 分钟内生效
-        const whId = selectedWarehousesByStore.value[storeId];
-        if (acceptedInThisStore.length && whId) {
-          try {
-            const res = await axios.post('/api/seller/products/import-stocks', {
-              store_id: storeId,
-              stocks: acceptedInThisStore.map(s => ({
-                offer_id: s.offer_id,
-                stocks: s.stock,
-                warehouse_id: whId,
-              })),
-            }, { timeout: 60000 });
-            appendLog(`  📦 已分配 ${acceptedInThisStore.length} 个商品到 warehouse_id=${whId} (库存=${config.defaultStock||0})`, 'success');
-          } catch (e) {
-            const errMsg = e.response?.data?.error || e.message;
-            appendLog(`  ⚠ 库存分配失败 (商品仍上架了): ${errMsg}`, 'warn');
-          }
-        } else if (acceptedInThisStore.length && !whId) {
+        if (storeItems.length && !whId) {
           appendLog(`  ⚠ [${storeName}] 未选仓库, 库存会进默认仓 (用户可去 Ozon 后台手动调)`, 'warn');
         }
 

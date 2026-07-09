@@ -113,13 +113,16 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.4)
+            逐梦 Ozon 采集器 (v2.2.7)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.4</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.7</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.7 Ozon 适配: 仿 MY 批量上架 payload, 调 Ozon /v3/product/import 时增加 service_type=IS_CODE_SERVICE (跟卖场景), attribute 自动带 dictionary_value_id (客户端传了才带), stocks 跟 items 同一次原子提交 (替代 v2.2.6 的二次 /v2/products/stocks 调用). 9 case 实测确认 Ozon /v3/product/import 强制 type_id>0 (service_type 不豁免), 8 位 leaf cat 比 5 位 breadcrumb 更稳</li>
+            <li>✅ v2.2.6 per-store 仓库: 选店铺后自动拉 FBS 仓库, 每店一个, 上架成功后写库存到指定 warehouse_id</li>
+            <li>✅ v2.2.5 type_id 折叠: 类目 cell 内置小灰字 type XXXXX (用户不用填), 选类目 modal 后自动调 /api/seller/type-id-suggestion 配 type_id</li>
             <li>✅ v2.2.4 fix bug: 商品上架时 plugin 不会把 URL 面包屑 5 位 cat ID (9700) 误提交给 Seller API 了 (之前会让 Ozon 返回 levels_category_not_found, 后台看不到商品). 三处拦截: plugin 清空 + 前端按钮 disabled + publishBatch 跳过</li>
             <li>✅ v2.2.3 polish: publishBatch 完成后加 "查看上架状态" CTA, 一键跳 #/listing-history 看真实状态</li>
             <li>✅ v2.2.2 BatchUpload 表格新增"类目"列, 高/中/无置信度 badge + 候选选择 modal, 用户 1-click 改类目</li>

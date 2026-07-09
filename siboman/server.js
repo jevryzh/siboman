@@ -3775,6 +3775,8 @@ app.post("/api/seller/categories/refresh-cache", requireAuth, async (req, res, n
 app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
   try {
     const { item: rawItem } = req.body;
+    // v2.2.7: 接受顶层 stocks (跟 MY 一样, items 和 stocks 一起传给 Ozon /v3/product/import)
+    const rawStocks = Array.isArray(req.body?.stocks) ? req.body.stocks : null;
     const storeId = req.body?.store_id || req.body?.storeId;
     if (!rawItem || typeof rawItem !== "object") {
       return res.status(400).json({ success: false, error: "缺少商品数据" });
@@ -3791,6 +3793,10 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v2.2.0: 不再校验 description_category_id (公开站类目 ≠ Seller API, 强行校验会拦掉大量合规商品)
     // Ozon 自己会拒 (返回 failed), 用户去 seller.ozon.ru 后台改类目更直接.
     // 仅在后台 polling 把失败原因写回 DB, listing-history 页可见.
+    // v2.2.7: 但 5 位 (URL 面包屑) ID 我们已知大概率被 Ozon 拒, 加一行 warn log 给前端看
+    if (Number(categoryId) > 0 && Number(categoryId) < 100000) {
+      console.warn(`[v2.2.7 import] 5 位 description_category_id=${categoryId} (URL 面包屑, 非 Seller API 8 位 leaf), Ozon 大概率会拒`);
+    }
 
     // Ozon /v3/product/import 规范化
     item.offer_id = offerId;
@@ -3804,7 +3810,42 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     if (!item.dimension_unit) item.dimension_unit = "mm";
     if (Array.isArray(item.images) && item.images.length) item.primary_image = item.images[0];
 
-    const data = await callOzonSellerAPI("/v3/product/import", { items: [item] }, { storeId, userId: req.user.id });
+    // v2.2.7: 默认 service_type=IS_CODE_SERVICE (跟卖场景, Ozon 可能走 source_variant 路径)
+    //   客户端可覆盖 (传 rawItem.service_type 优先). 7 case 实测显示不带不带豁免 type_id 验证,
+    //   但加上没坏处 (D vs G 都 pending), 沿用 MY 习惯.
+    if (!item.service_type) item.service_type = "IS_CODE_SERVICE";
+
+    // v2.2.7: 规范化 attributes (透传 dictionary_value_id, 客户端传了才带, Ozon 不强求)
+    //   之前的代码已经通过 {items: [item]} 透传 attributes, 这里只是保证结构干净
+    if (Array.isArray(item.attributes)) {
+      item.attributes = item.attributes.map(a => ({
+        id: Number(a.id ?? a.attribute_id),
+        values: Array.isArray(a.values)
+          ? a.values.map(v => ({
+              value: String(v.value ?? ""),
+              ...(v.dictionary_value_id ? { dictionary_value_id: Number(v.dictionary_value_id) } : {}),
+            }))
+          : (a.value !== undefined ? [{ value: String(a.value), ...(a.dictionary_value_id ? { dictionary_value_id: Number(a.dictionary_value_id) } : {}) }] : []),
+      })).filter(a => a.id && a.values.length);
+    }
+
+    // v2.2.7: 顶层 stocks 数组 (跟 MY 一样, 一次原子提交)
+    let ozonStocks = null;
+    if (rawStocks && rawStocks.length) {
+      ozonStocks = rawStocks
+        .filter(s => s && s.offer_id)
+        .map(s => ({
+          offer_id: String(s.offer_id),
+          stock: parseInt(s.stock ?? s.stocks ?? 0, 10),
+          ...(s.warehouse_id ? { warehouse_id: String(s.warehouse_id) } : {}),
+        }))
+        .filter(s => s.stock >= 0);
+    }
+
+    const ozonPayload = { items: [item] };
+    if (ozonStocks && ozonStocks.length) ozonPayload.stocks = ozonStocks;
+
+    const data = await callOzonSellerAPI("/v3/product/import", ozonPayload, { storeId, userId: req.user.id });
     const taskId = data?.result?.task_id || data?.task_id || "";
 
     // 写入上架历史
