@@ -1770,9 +1770,48 @@ app.patch("/api/products/:offer_id/field", async (req, res, next) => {
 
     res.json({ success: true });
   } catch (error) {
-    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+    res.status(error.statusCode || 502).json({ success: false, error: error.message });
   }
 });
+
+/**
+ * v2.2.9: 类目示例商品 — 给 picker 候选显示 5 个真实商品名 (俄文), 让用户
+ *   不用懂俄文也能按业务含义选类目 (例: "Когтерез-секатор" → 用户认"宠物指甲钳对")
+ *   入参: ?store_id=X&description_category_id=Y&limit=5
+ *   出参: { examples: [{sku, offer_id, name, image}] }
+ */
+app.get("/api/seller/products/category-examples", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = req.query?.store_id || req.query?.storeId;
+    const catId = Number(req.query?.description_category_id || req.query?.catId);
+    const limit = Math.min(Number(req.query?.limit) || 5, 20);
+    if (!storeId || !catId) {
+      return res.status(400).json({ success: false, error: "需要 store_id + description_category_id" });
+    }
+    if (!db) return res.json({ success: true, examples: [] });
+    const r = await db.query(
+      `SELECT sku, offer_id, name, images
+         FROM app_products
+        WHERE store_id = $1 AND description_category_id = $2 AND name != ''
+        ORDER BY updated_at DESC NULLS LAST
+        LIMIT $3`,
+      [storeId, catId, limit],
+    );
+    res.json({
+      success: true,
+      examples: r.rows.map(x => ({
+        sku: String(x.sku || ""),
+        offer_id: x.offer_id || "",
+        name: x.name || "",
+        image: (Array.isArray(x.images) && x.images[0]) || "",
+      })),
+    });
+  } catch (e) {
+    console.error("[category-examples]", e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
 
 app.post("/api/seller/analytics/categories", requireAuth, async (req, res, next) => {
   try {
@@ -3447,6 +3486,56 @@ app.post("/api/seller/type-id-suggestion", requireAuth, async (req, res, next) =
   }
 });
 
+/**
+ * v2.2.9: 类目下所有 type_id 列表 (从 Ozon /v1/description-category/tree 直接拿)
+ *   入参: { description_category_id: 5位 OR 8位, store_id }
+ *   出参: { types: [{type_id, type_name}], count }
+ *   这个 endpoint 是 type_id 推断的"真相来源" - 直接调 Ozon, 不依赖历史
+ */
+app.post("/api/seller/description-category-types", requireAuth, async (req, res, next) => {
+  try {
+    const catId = Number(req.body?.description_category_id || req.body?.cat_id || 0);
+    const storeId = req.body?.store_id || req.body?.storeId;
+    if (!catId) return res.status(400).json({ success: false, error: "需要 description_category_id" });
+    if (!storeId) return res.status(400).json({ success: false, error: "需要 store_id" });
+
+    // v2.2.9: 直接调 Ozon /v1/description-category/tree (拿这个 cat 下的所有 type_id)
+    //   这个 endpoint 返回 全部 leaf cat + 它们的 type_ids, 我们 walk 找到 catId 那一支
+    const tree = await getCategoryTreeForStore(storeId, req.user.id);
+    const findTypes = (nodes) => {
+      for (const n of nodes || []) {
+        if (Number(n.description_category_id) === catId) {
+          return (n.children || []).map(c => ({
+            type_id: Number(c.type_id),
+            type_name: c.type_name || c.category_name || "",
+            disabled: c.disabled || false,
+          })).filter(t => t.type_id);
+        }
+        const sub = findTypes(n.children || []);
+        if (sub.length) return sub;
+      }
+      return [];
+    };
+    const types = findTypes(tree);
+    res.json({ success: true, types, count: types.length, source: "ozon-tree" });
+  } catch (error) {
+    console.error("[description-category-types]", error.message);
+    res.status(error.statusCode || 502).json({ success: false, error: error.message });
+  }
+});
+
+// v2.2.9: 缓存 (跟 categoryTreeCache 分开, 因为这个是商家级别全 tree, 不是 valid 子集)
+const ozonCategoryTreeCache = new Map();  // storeId -> { tree, fetchedAt }
+async function getCategoryTreeForStore(storeId, userId) {
+  if (!storeId || !userId) return [];
+  const cached = ozonCategoryTreeCache.get(storeId);
+  if (cached && Date.now() - cached.fetchedAt < CATEGORY_TTL_MS) return cached.tree;
+  const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" }, { storeId, userId });
+  const tree = data?.result || [];
+  ozonCategoryTreeCache.set(storeId, { tree, fetchedAt: Date.now() });
+  return tree;
+}
+
 // ========== v0.6.2: 类目树缓存 + 校验 + 后台 polling ==========
 const categoryTreeCache = new Map();   // storeId -> { validIds: Set<number>, nameById: Map<number,string>, fetchedAt: number }
 const CATEGORY_TTL_MS = 24 * 3600 * 1000;
@@ -3793,14 +3882,16 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v2.2.0: 不再校验 description_category_id (公开站类目 ≠ Seller API, 强行校验会拦掉大量合规商品)
     // Ozon 自己会拒 (返回 failed), 用户去 seller.ozon.ru 后台改类目更直接.
     // 仅在后台 polling 把失败原因写回 DB, listing-history 页可见.
-    // v2.2.7: 但 5 位 (URL 面包屑) ID 我们已知大概率被 Ozon 拒, 加一行 warn log 给前端看
+    // v2.2.9: 5位 (公开 URL breadcrumb) 和 8位 (Seller API) 都接受, 直接转发不再 normalize
     if (Number(categoryId) > 0 && Number(categoryId) < 100000) {
-      console.warn(`[v2.2.7 import] 5 位 description_category_id=${categoryId} (URL 面包屑, 非 Seller API 8 位 leaf), Ozon 大概率会拒`);
+      console.log(`[v2.2.9 import] 5位 description_category_id=${categoryId} (公开 URL breadcrumb, Ozon 直接接受)`);
+    } else if (Number(categoryId) >= 100000) {
+      console.log(`[v2.2.9 import] 8位 description_category_id=${categoryId} (Seller API 内部 id)`);
     }
 
     // Ozon /v3/product/import 规范化
     item.offer_id = offerId;
-    item.description_category_id = Number(categoryId);
+    item.description_category_id = Number(categoryId);  // v2.2.9: 不再 5位↔8位 转换, 透传
     if (typeId) item.type_id = Number(typeId);
     delete item.category_id;  // 移除非标字段, 避免 Ozon 报错
     if (item.price_rub) item.price = String(item.price_rub);
@@ -3811,43 +3902,13 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     if (Array.isArray(item.images) && item.images.length) item.primary_image = item.images[0];
 
     // v2.2.7: 默认 service_type=IS_CODE_SERVICE (跟卖场景, Ozon 可能走 source_variant 路径)
-    //   客户端可覆盖 (传 rawItem.service_type 优先). 7 case 实测显示不带不带豁免 type_id 验证,
-    //   但加上没坏处 (D vs G 都 pending), 沿用 MY 习惯.
     if (!item.service_type) item.service_type = "IS_CODE_SERVICE";
 
-    // v2.2.7: 规范化 attributes (透传 dictionary_value_id, 客户端传了才带, Ozon 不强求)
-    //   之前的代码已经通过 {items: [item]} 透传 attributes, 这里只是保证结构干净
-    // v2.2.8: 如果客户端传了 _sourceVariant, 优先用 _sourceVariant.attributes (含完整 dictionary_value_id + complex_id)
-    //   跟 MY ERP 一样让 Ozon 看到 source variant, relevance 判断才能过
-    const srcVariant = item._sourceVariant;
-    if (srcVariant && Array.isArray(srcVariant.attributes) && srcVariant.attributes.length) {
-      console.log(`[v2.2.8 import] 使用 _sourceVariant.attributes (${srcVariant.attributes.length} 个, 含 dictionary_value_id)`);
-      item.attributes = srcVariant.attributes.map(a => {
-        // _sourceVariant.attributes 已经是 Ozon 原始结构 {id/attribute_id, complex_id, values:[{value, dictionary_value_id}]}
-        const aId = Number(a.id ?? a.attribute_id);
-        const values = Array.isArray(a.values) ? a.values.map(v => ({
-          value: String(v.value ?? ""),
-          ...(v.dictionary_value_id ? { dictionary_value_id: Number(v.dictionary_value_id) } : {}),
-        })) : [];
-        return {
-          id: aId,
-          ...(a.complex_id ? { complex_id: Number(a.complex_id) } : {}),
-          values,
-        };
-      }).filter(a => a.id && a.values.length);
-      // 同时透传 complex_attributes (如果有)
-      if (Array.isArray(srcVariant.complex_attributes) && srcVariant.complex_attributes.length) {
-        item.complex_attributes = srcVariant.complex_attributes;
-      }
-      // 如果 item.description_category_id 是 5 位 breadcrumb 而 _sourceVariant.description_category_id 是 8 位 leaf, 用 8 位
-      if (srcVariant.description_category_id && Number(srcVariant.description_category_id) > 100000) {
-        item.description_category_id = Number(srcVariant.description_category_id);
-      }
-    } else if (Array.isArray(item.attributes)) {
-      // 客户端没传 _sourceVariant, 用扁平化的 attributes, 尽量补 dictionary_value_id
+    // v2.2.8 (回退 _sourceVariant 逻辑): 客户端没传 _sourceVariant, 用扁平化 attributes, 尽量补 dictionary_value_id
+    if (Array.isArray(item.attributes)) {
       item.attributes = item.attributes.map(a => {
         const aId = Number(a.id ?? a.attribute_id);
-        // 兼容 v2.2.8 新的 plugin 透传格式: {id, name, value, dictionary_value_id?, dictionary_value_ids?}
+        // 兼容 v2.2.8 plugin 透传格式: {id, name, value, dictionary_value_id?, dictionary_value_ids?}
         let dictId = null;
         if (a.dictionary_value_id) dictId = Number(a.dictionary_value_id);
         else if (Array.isArray(a.dictionary_value_ids) && a.dictionary_value_ids.length === 1) dictId = a.dictionary_value_ids[0];
@@ -3861,7 +3922,8 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         return { id: aId, values };
       }).filter(a => a.id && a.values.length);
     }
-    delete item._sourceVariant;  // Ozon 不认这个字段, 不删会拒
+    // v2.2.9: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
+    delete item._sourceVariant;
 
     // v2.2.7: 顶层 stocks 数组 (跟 MY 一样, 一次原子提交)
     let ozonStocks = null;

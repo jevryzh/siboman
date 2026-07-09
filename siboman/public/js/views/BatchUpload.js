@@ -587,11 +587,6 @@ window.BatchUploadView = {
       if(Array.isArray(d.attributes) && d.attributes.length) {
         item.attributes = d.attributes;
       }
-      // v2.2.8: 透传 _sourceVariant — server 端会从中提取完整 attributes (含 dictionary_value_id)
-      //   跟 MY ERP 一样, 让 Ozon 看到 source 数据, relevance 判断才能过
-      if (d._sourceVariant) {
-        item._sourceVariant = d._sourceVariant;
-      }
       return {ok:true, item};
     };
 

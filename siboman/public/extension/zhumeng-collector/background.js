@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.8";
+const VERSION = "2.2.9";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -86,7 +86,13 @@ async function collectSku(sku, storeIds = []) {
   if (storeIds && storeIds.length > 0 && (result.name || result.type_id)) {
     try {
       const oldCat = result.description_category_id;
-      const resolved = await resolveSellerCategory(result.sku || result.product_id, storeIds[0], result.type_id);
+      // v2.2.9: 把 5位 breadcrumb 透传给 server, 配合 name+type_id 多信号解析
+      const resolved = await resolveSellerCategory(
+        result.sku || result.product_id,
+        storeIds[0],
+        result.type_id,
+        Number(result.description_category_id) || 0,  // 5位 breadcrumb
+      );
       if (resolved && resolved.success) {
         result.description_category_id = resolved.description_category_id;
         if (resolved.type_id && !result.type_id) result.type_id = resolved.type_id;
@@ -251,24 +257,6 @@ async function enrichFromOpi(data, storeId) {
       data._source_attributes = "opi-direct-sku-lookup";
       console.log(`[SW ${VERSION}]   OPI 直查 SKU 拿到 ${own.attributes.length} 个 attributes`);
     }
-    // v2.2.8: 即使已经找到 attributes, 也保存 _sourceVariant 给 server 端透传
-    if (own && (own.attributes || own.description_category_id)) {
-      data._sourceVariant = {
-        variant_id: own.variant_id || own.id || 0,
-        description_category_id: own.description_category_id || 0,
-        attributes: Array.isArray(own.attributes) ? own.attributes : [],
-        complex_attributes: Array.isArray(own.complex_attributes) ? own.complex_attributes : [],
-        weight: own.weight || 0,
-        depth: own.dimensions?.depth || 0,
-        width: own.dimensions?.width || 0,
-        height: own.dimensions?.height || 0,
-        primary_image: own.primary_image || "",
-        images: Array.isArray(own.images) ? own.images : [],
-        name: own.name || "",
-        source_offer_id: String(data.sku || ""),
-      };
-      console.log(`[SW ${VERSION}]   OPI 直查 SKU _sourceVariant 已存 (${data._sourceVariant.attributes.length} attrs)`);
-    }
   } catch (e) {
     console.log(`[SW ${VERSION}]   OPI 直查 SKU 失败 (非致命): ${e.message}`);
   }
@@ -306,29 +294,12 @@ async function enrichFromOpi(data, storeId) {
   }
   // 记录来源
   data._opi_source = similar.offer_id;
-  // v2.2.8: 保存 _sourceVariant = 完整 OPI detail (含 attributes 原始结构 + complex_attributes + 8 位 leaf cat)
-  //   server 端 publishBatch 会用它的 attributes 替代扁平化的 [{id,name,value}], 跟 MY ERP 一样保证 Ozon 看到完整 attribute
-  data._sourceVariant = {
-    variant_id: detail.variant_id || detail.id || similar.product_id || 0,
-    description_category_id: detail.description_category_id || 0,
-    attributes: Array.isArray(detail.attributes) ? detail.attributes : [],
-    complex_attributes: Array.isArray(detail.complex_attributes) ? detail.complex_attributes : [],
-    weight: detail.weight || 0,
-    depth: detail.dimensions?.depth || 0,
-    width: detail.dimensions?.width || 0,
-    height: detail.dimensions?.height || 0,
-    primary_image: detail.primary_image || "",
-    images: Array.isArray(detail.images) ? detail.images : [],
-    name: detail.name || "",
-    source_offer_id: similar.offer_id,
-  };
-  console.log(`[SW ${VERSION}]   OPI _sourceVariant 已存 (${data._sourceVariant.attributes.length} attrs, cat=${data._sourceVariant.description_category_id})`);
   return { added, overridden };
 }
 
 // ========== v2.1.9+: 通过 ERP 后端解析 Seller 类目 (替换不可靠的 URL 解析) ==========
 // v2.3.0+: 带 type_id + candidates
-async function resolveSellerCategory(sku, storeId, typeId) {
+async function resolveSellerCategory(sku, storeId, typeId, breadcrumbCatId) {
   if ((!sku && !typeId) || !storeId) return null;
   try {
     const ctrl = new AbortController();
@@ -341,6 +312,7 @@ async function resolveSellerCategory(sku, storeId, typeId) {
         sku: Number(sku) || 0,
         store_id: storeId,
         type_id: Number(typeId) || 0,
+        breadcrumb_cat_id: Number(breadcrumbCatId) || 0,  // 5位 URL breadcrumb (v2.2.9)
       }),
       signal: ctrl.signal,
     });
@@ -843,34 +815,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 console.log(`[逐梦采集器 v${VERSION}] Service Worker 已加载 (${new Date().toISOString()}) - 新策略: 采集 www.ozon.ru 商品前端页 DOM`);
 
-// v2.2.8 helper: 把 OPI attributes 合并到公开页采集的 data.attributes
+// v2.1.8 helper: 把 OPI attributes 合并到公开页采集的 data.attributes
 //   公开页拿到 id+name+value 占位, OPI 更准的 values 用同 id 覆盖, 缺则 push
-//   v2.2.8: 同时保留 OPI 给的 dictionary_value_id + complex_id (从 values 数组提取)
-//   即使 _sourceVariant 也存了完整原始 attributes, 这里仍要给 data.attributes 一个可用的扁平版本
 function mapOpiAttributes(opiAttrs, currentAttrs) {
   const attrs = Array.isArray(currentAttrs) ? [...currentAttrs] : [];
   let added = 0, overridden = 0;
   for (const a of (opiAttrs || [])) {
-    const id = a.id || a.attribute_id;
+    const id = a.id;
     const name = a.name || "";
-    // v2.2.8: 收集所有 dictionary_value_id (OPI 结构是 values:[{value, dictionary_value_id}])
     let value = "";
-    let dictionaryValueIds = [];
     if (Array.isArray(a.values) && a.values.length) {
       value = a.values.map(v => v.value || v.text || "").filter(Boolean).join(", ");
-      dictionaryValueIds = a.values.map(v => Number(v.dictionary_value_id) || 0).filter(Boolean);
     } else if (a.value !== undefined) {
       value = String(a.value);
     }
     if (!name && !value) continue;
     const idx = attrs.findIndex(x => x.id === id);
     const attrObj = { id, name, value };
-    // v2.2.8: 如果 OPI 给出了 dictionary_value_id, 保留一份 (server 端 publishBatch 会用)
-    if (dictionaryValueIds.length === 1) {
-      attrObj.dictionary_value_id = dictionaryValueIds[0];
-    } else if (dictionaryValueIds.length > 1) {
-      attrObj.dictionary_value_ids = dictionaryValueIds;  // 多值
-    }
     if (idx >= 0) {
       attrs[idx] = attrObj;
       overridden++;
