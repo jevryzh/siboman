@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.1.0";
+const VERSION = "2.1.9";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -77,6 +77,21 @@ async function collectSku(sku, storeIds = []) {
     }
   } else {
     result._opi_enriched = "skipped";
+  }
+
+  // v2.1.9: 优先用店铺 Seller API 真实类目 (替换 URL/breadcrumb 解析的不可靠 ID)
+  if (storeIds && storeIds.length > 0) {
+    const oldCat = result.description_category_id;
+    const resolved = await resolveSellerCategory(result.sku, storeIds[0]);
+    if (resolved && resolved.description_category_id) {
+      result.description_category_id = resolved.description_category_id;
+      if (resolved.type_id && !result.type_id) result.type_id = resolved.type_id;
+      result._category_resolved = { from: oldCat, to: resolved.description_category_id, source: resolved.source };
+      console.log(`[SW ${VERSION}]   类目修正: ${oldCat} → ${resolved.description_category_id} (via ${resolved.source})`);
+    } else {
+      result._category_resolved = { from: oldCat, to: oldCat, source: "fallback-url", warn: "未解析到 Seller 类目, 提交时会被服务端拒绝" };
+      console.warn(`[SW ${VERSION}]   类目未解析: cat=${oldCat} (提交时会被服务端校验拒绝)`);
+    }
   }
 
   // v1.0.9: 详细打印每个字段的来源 + 关键数据
@@ -252,6 +267,31 @@ async function enrichFromOpi(data, storeId) {
   // 记录来源
   data._opi_source = similar.offer_id;
   return { added, overridden };
+}
+
+// ========== v2.1.9: 通过 ERP 后端解析 Seller 类目 (替换不可靠的 URL 解析) ==========
+// 优先查本地, 没本地查 Ozon Seller API (按 sku)
+async function resolveSellerCategory(sku, storeId) {
+  if (!sku || !storeId) return null;
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    const res = await fetch(`${ERP_BACKEND_ORIGIN}/api/seller/products/category-resolve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({ sku: Number(sku) || 0, store_id: storeId }),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    const d = await res.json();
+    if (d?.success && d?.description_category_id) return d;
+    return null;
+  } catch (e) {
+    console.warn(`[SW ${VERSION}]   resolveSellerCategory 失败 (非致命): ${e.message}`);
+    return null;
+  }
 }
 
 // 等待 tab 状态变成 complete

@@ -538,18 +538,29 @@ window.BatchUploadView = {
             }, {timeout: 60000});
             const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
             appendLog(`  ✓ #${row.index} SKU ${row.sku} → task_id=${tid}`, 'success');
+            // v2.1.9: 后台 polling 每 60s 同步状态, 这里只 log 不阻塞
             totalOk++;
           } catch(e) {
-            const errMsg = e.response?.data?.payload?.message || e.response?.data?.error || e.message;
-            appendLog(`  ✗ #${row.index} SKU ${row.sku} → ${errMsg}`, 'error');
+            // v2.1.9: 优先展示服务端返回的 code + 字段 (类目校验失败等)
+            const data = e.response?.data || {};
+            let errMsg = data.error || e.message;
+            if (data.code === 'CATEGORY_NOT_IN_SELLER_TREE') {
+              errMsg = `类目 ${data.category_id} 不在该店铺 Seller 类目树 (公开站类目 ≠ Seller API, 用插件 v2.1.9+ 或 collect-competitor 重新解析)`;
+              appendLog(`  ✗ #${row.index} SKU ${row.sku} → ${errMsg}`, 'error');
+            } else {
+              appendLog(`  ✗ #${row.index} SKU ${row.sku} → ${errMsg}`, 'error');
+            }
             totalFail++;
           }
         }
         appendLog(`--- [${storeName}] 完成 ---`, 'info');
       }
-      appendLog(`\n========== 全部完成: ${totalOk} 成功, ${totalFail} 失败 ==========`, totalFail?'warn':'success');
+      appendLog(`\n========== 全部完成: ${totalOk} 提交, ${totalFail} 失败 ==========`, totalFail?'warn':'success');
       publishLoading.value = false;
-      notify.success(`批量跟卖完成: ${totalOk} 成功, ${totalFail} 失败`);
+      const tip = totalFail
+        ? `批量跟卖: ${totalOk} 提交, ${totalFail} 失败 (后台 60s 自动同步 Ozon 真实状态)`
+        : `批量跟卖: ${totalOk} 已提交 Ozon, 后台 60s 自动同步状态, 刷新页面查看实际结果`;
+      notify.success(tip);
     };
 
     // ========== 店铺列表 (保留) ==========
@@ -670,13 +681,13 @@ window.BatchUploadView = {
               <button @click="clearAll" style="background:transparent; border:none; color:#64748b; cursor:pointer; font-size:12px">🗑️ 清空</button>
             </div>
             <div style="padding:16px 20px; display:grid; grid-template-columns:1fr 280px; gap:16px">
-              <div style="display:flex; flex-direction:column; gap:6px; min-width:0">
+              <div style="display:flex; flex-direction:column; gap:6px; min-width:0; height:100%">
                 <textarea v-model="pasteText" class="bu-paste-area" spellcheck="false" placeholder="每行一条，格式如下：
 1234567890,99.9
 1234567890,99.9,JZ-001
 1234567890,99.9,150,200,180,80
 1234567890,99.9,JZ-001,200,300,250,120
-1234567890,99.9,~75" style="width:100%; min-height:160px; padding:12px; border:1px solid #e2e8f0; border-radius:8px; font-family:'SF Mono',Monaco,monospace; font-size:13px; resize:vertical; outline:none"></textarea>
+1234567890,99.9,~75" style="width:100%; flex:1; min-height:160px; padding:12px; border:1px solid #e2e8f0; border-radius:8px; font-family:'SF Mono',Monaco,monospace; font-size:13px; resize:vertical; outline:none"></textarea>
                 <div style="font-size:11px; color:#94a3b8; line-height:1.5">
                   粘贴 SKU + 价格 → 解析 → 采集 → 上架 · 支持 10 种格式, 每行一条
                 </div>

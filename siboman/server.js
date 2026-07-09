@@ -3343,6 +3343,166 @@ app.post("/api/seller/type-id-suggestion", requireAuth, async (req, res, next) =
   }
 });
 
+// ========== v0.6.2: 类目树缓存 + 校验 + 后台 polling ==========
+const categoryTreeCache = new Map();   // storeId -> { validIds: Set<number>, fetchedAt: number }
+const CATEGORY_TTL_MS = 24 * 3600 * 1000;
+
+async function getValidCategoryIds(storeId, userId) {
+  if (!storeId || !userId) return null;
+  const cached = categoryTreeCache.get(storeId);
+  if (cached && (Date.now() - cached.fetchedAt) < CATEGORY_TTL_MS) return cached.validIds;
+  try {
+    const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" }, { storeId, userId });
+    const validIds = new Set();
+    const walk = (items) => {
+      for (const it of (items || [])) {
+        const cid = Number(it.description_category_id || 0);
+        if (cid > 0) validIds.add(cid);
+        if (Array.isArray(it.children) && it.children.length) walk(it.children);
+      }
+    };
+    walk(data?.result);
+    categoryTreeCache.set(storeId, { validIds, fetchedAt: Date.now() });
+    console.log(`[category-cache] store=${storeId} loaded ${validIds.size} categories`);
+    return validIds;
+  } catch (e) {
+    console.warn(`[category-cache] load failed store=${storeId}:`, e.message);
+    return cached?.validIds || null;  // 失败时用旧缓存, 不阻塞上传
+  }
+}
+
+// 失效某个店铺的类目缓存 (供 refresh 接口用)
+function invalidateCategoryCache(storeId) {
+  if (storeId) categoryTreeCache.delete(storeId);
+  else categoryTreeCache.clear();
+}
+
+// 后台 polling: 扫所有非终态 task, 调 Ozon 更新到 DB
+const POLL_INTERVAL_MS = 60 * 1000;
+const POLL_BATCH = 50;
+
+async function pollPendingListingTasks() {
+  if (!db) return;
+  try {
+    const r = await db.query(
+      `SELECT task_id, store_id, user_id, offer_id FROM app_listing_history
+       WHERE status IN ('processing', 'pending')
+         AND created_at > now() - interval '7 days'
+       ORDER BY created_at DESC LIMIT $1`,
+      [POLL_BATCH],
+    );
+    if (!r.rows.length) return;
+    let updated = 0, gc = 0;
+    for (const row of r.rows) {
+      try {
+        const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(row.task_id) }, { storeId: row.store_id, userId: row.user_id });
+        const it = (data?.result?.items || [])[0];
+        if (!it) continue;
+        const ozonStatus = it.status || "unknown";
+        const errors = Array.isArray(it.errors) ? it.errors : [];
+        const statusMap = { imported: "imported", failed: "failed", processing: "processing", moderating: "moderating", pending: "processing" };
+        const localStatus = statusMap[ozonStatus] || ozonStatus;
+        if (["imported", "failed"].includes(localStatus)) {
+          await db.query(
+            `UPDATE app_listing_history SET status = $1, errors_json = $2::jsonb, updated_at = now() WHERE task_id = $3 AND user_id = $4`,
+            [localStatus, JSON.stringify(errors), row.task_id, row.user_id],
+          );
+          console.log(`[poll-pending] task=${row.task_id} offer=${row.offer_id} → ${localStatus}${errors.length ? ' errors=' + errors.length : ''}`);
+          updated++;
+        }
+      } catch (e) {
+        const msg = e.message || "";
+        if (msg.includes("task not found")) {
+          await db.query(
+            `UPDATE app_listing_history SET status = 'failed', errors_json = $1::jsonb, updated_at = now() WHERE task_id = $2 AND user_id = $3`,
+            [JSON.stringify([{ code: "task_not_found", message: "Ozon 已清理 (跨店铺/时间 GC)" }]), row.task_id, row.user_id],
+          );
+          console.log(`[poll-pending] task=${row.task_id} → failed (task_not_found)`);
+          gc++;
+        } else {
+          console.warn(`[poll-pending] task=${row.task_id} poll error:`, msg);
+        }
+      }
+    }
+    if (updated || gc) console.log(`[poll-pending] cycle done: ${updated} updated, ${gc} gc`);
+  } catch (e) {
+    console.error("[poll-pending] cycle error:", e.message);
+  }
+}
+
+// 启动 2 分钟后开始, 然后每 60s 跑一次
+if (db) {
+  setTimeout(() => {
+    pollPendingListingTasks();
+    setInterval(pollPendingListingTasks, POLL_INTERVAL_MS);
+    console.log(`[poll-pending] started, interval=${POLL_INTERVAL_MS}ms`);
+  }, 2 * 60 * 1000);
+}
+
+// v0.6.2: 按 sku 解析 Seller API 类目 (供 plugin 用, 替换 URL 解析)
+app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    const sku = Number(req.body?.sku || 0);
+    const offerId = String(req.body?.offer_id || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要 store_id" });
+    if (!sku && !offerId) return res.status(400).json({ success: false, error: "需要 sku 或 offer_id" });
+
+    // 1. 先查本地 DB (同店铺已有商品)
+    if (offerId || sku) {
+      const r = await db.query(
+        `SELECT description_category_id, type_id, name FROM app_products
+         WHERE store_id = $1 AND (offer_id = $2 OR sku = $3) LIMIT 1`,
+        [storeId, offerId || "", sku || 0],
+      );
+      if (r.rows[0]?.description_category_id) {
+        return res.json({
+          success: true,
+          source: "local",
+          description_category_id: Number(r.rows[0].description_category_id),
+          type_id: Number(r.rows[0].type_id || 0),
+          name: r.rows[0].name || "",
+        });
+      }
+    }
+
+    // 2. 没本地 → 调 Ozon /v3/product/info/list (用 sku)
+    if (sku) {
+      try {
+        const data = await callOzonSellerAPI("/v3/product/info/list", { sku: [sku] }, { storeId, userId: req.user.id });
+        const it = (data?.items || data?.result?.items || [])[0];
+        if (it?.description_category_id) {
+          return res.json({
+            success: true,
+            source: "ozon_seller_api",
+            description_category_id: Number(it.description_category_id),
+            type_id: Number(it.type_id || 0),
+            name: it.name || "",
+          });
+        }
+      } catch (e) {
+        console.warn("[category-resolve] Ozon API fail:", e.message);
+      }
+    }
+
+    res.json({ success: false, error: "无法解析 (本地无此商品, Ozon 也查不到)", description_category_id: 0 });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message });
+  }
+});
+
+// v0.6.2: 强制刷新类目缓存
+app.post("/api/seller/categories/refresh-cache", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    invalidateCategoryCache(storeId);
+    const validIds = await getValidCategoryIds(storeId, req.user.id);
+    res.json({ success: true, count: validIds?.size || 0, refreshed: true });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message });
+  }
+});
+
 app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
   try {
     const { item: rawItem } = req.body;
@@ -3357,6 +3517,17 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     const typeId = item.type_id;
     if (!item.name || !offerId || !categoryId) {
       return res.status(400).json({ success: false, error: "标题/货号/类目ID不能为空 (需要 description_category_id)" });
+    }
+
+    // v0.6.2: 校验 description_category_id 在该店铺 Seller 类目树里 (缓存 24h)
+    const validIds = await getValidCategoryIds(storeId, req.user.id);
+    if (validIds && !validIds.has(Number(categoryId))) {
+      return res.status(400).json({
+        success: false,
+        error: `类目 ID ${categoryId} 不在该店铺 Seller 类目树里 (可能来自公开站 URL 或其他店铺, 请用 collect-competitor 重新解析)`,
+        code: "CATEGORY_NOT_IN_SELLER_TREE",
+        category_id: Number(categoryId),
+      });
     }
 
     // Ozon /v3/product/import 规范化
