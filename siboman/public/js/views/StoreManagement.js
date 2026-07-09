@@ -113,15 +113,16 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.0)
+            逐梦 Ozon 采集器 (v2.2.1)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.0</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.1</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
-            <li>✅ v2.2.0 流程简化: 不再前端校验类目/Ozon 自动类目匹配, 直接提交让 Ozon 自己拒, 用户去 seller.ozon.ru 后台改类目更直接</li>
-            <li>✅ v2.1.9 类目解析升级: 采集后自动调 ERP /category-resolve 拿店铺 Seller API 真实类目 (替换 URL 解析的不可靠 ID), 提交时再被服务端校验, 杜绝 "类目 not found" 失败</li>
+            <li>✅ v2.2.1 类目解析优化: 调 ERP /category-resolve 时带 type_id, 严格名字匹配 (2 token 都中才用), 失败带 candidates 让前端展示</li>
+            <li>✅ v2.2.0 流程简化: 不再前端校验类目, 直接提交让 Ozon 自己拒, 用户去 seller.ozon.ru 后台改类目更直接</li>
+            <li>✅ v2.1.9 类目解析升级: 采集后自动调 ERP /category-resolve 拿店铺 Seller API 真实类目 (替换 URL 解析的不可靠 ID)</li>
             <li>✅ v2.1.8 当前最新 (manifest 同步)</li>
             <li>✅ v2.1.0 重磅: 辅源 OPI 上线! 调 api-seller.ozon.ru 找店铺里同款商品, 复用 attributes + 修正 type/cat (基于 0.13.48.1 opi-client.js)</li>
             <li>✅ v2.0 UI 重构: 顶部 toolbar + 10 格式面板 + Help drawer + 实时日志 (参考 MY 批量上架)</li>

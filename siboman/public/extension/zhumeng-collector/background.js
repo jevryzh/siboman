@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.0";
+const VERSION = "2.2.1";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -79,10 +79,40 @@ async function collectSku(sku, storeIds = []) {
     result._opi_enriched = "skipped";
   }
 
-  // v2.2.0: 不再调 resolveSellerCategory.
-//   公开 Ozon 类目跟 Seller API 不通用, autofix 反而会猜错 (如 Лупа 误匹配 Оплетка).
-//   现在直接用 URL 抓的 cat 提交, Ozon 拒了用户去 seller.ozon.ru 后台改类目即可.
-  // (保留 _category_resolved 元数据供前端调试)
+  // v2.3.0: 重新启用 category-resolve, 带 type_id + confidence
+//   - 严格名字匹配 (2 token 都中才用, 避免 Лупа/Оплетка 假阳性)
+//   - type_id 匹配更稳 (同一 type_id 通常同一类目)
+//   - 带回来 candidates 让前端展示供 user 1-click 选
+  if (storeIds && storeIds.length > 0 && (result.name || result.type_id)) {
+    try {
+      const oldCat = result.description_category_id;
+      const resolved = await resolveSellerCategory(result.sku || result.product_id, storeIds[0], result.type_id);
+      if (resolved && resolved.success) {
+        result.description_category_id = resolved.description_category_id;
+        if (resolved.type_id && !result.type_id) result.type_id = resolved.type_id;
+        result._category_resolved = {
+          from: oldCat,
+          to: resolved.description_category_id,
+          source: resolved.source,
+          confidence: resolved.confidence || 'high',
+        };
+        console.log(`[SW ${VERSION}]   类目解析: ${oldCat} → ${resolved.description_category_id} (${resolved.source}, confidence=${resolved.confidence})`);
+      } else if (resolved) {
+        // 失败但带 candidates, 让 ERP UI 显示让用户点选
+        result._category_resolved = {
+          from: oldCat,
+          to: 0,
+          source: 'none',
+          confidence: 'none',
+          candidates: resolved.candidates || [],
+          warning: '请在 BatchUpload 页面从候选类目中点选',
+        };
+        console.log(`[SW ${VERSION}]   类目无法解析, ${(resolved.candidates || []).length} 个候选待 user 选`);
+      }
+    } catch (e) {
+      console.warn(`[SW ${VERSION}]   category-resolve 调用失败 (非致命, 用 URL cat 上传): ${e.message}`);
+    }
+  }
 
   // v1.0.9: 详细打印每个字段的来源 + 关键数据
   const dbg = result._debug || {};
@@ -259,10 +289,10 @@ async function enrichFromOpi(data, storeId) {
   return { added, overridden };
 }
 
-// ========== v2.1.9: 通过 ERP 后端解析 Seller 类目 (替换不可靠的 URL 解析) ==========
-// 优先查本地, 没本地查 Ozon Seller API (按 sku)
-async function resolveSellerCategory(sku, storeId) {
-  if (!sku || !storeId) return null;
+// ========== v2.1.9+: 通过 ERP 后端解析 Seller 类目 (替换不可靠的 URL 解析) ==========
+// v2.3.0+: 带 type_id + candidates
+async function resolveSellerCategory(sku, storeId, typeId) {
+  if ((!sku && !typeId) || !storeId) return null;
   try {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 15000);
@@ -270,14 +300,16 @@ async function resolveSellerCategory(sku, storeId) {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
-      body: JSON.stringify({ sku: Number(sku) || 0, store_id: storeId }),
+      body: JSON.stringify({
+        sku: Number(sku) || 0,
+        store_id: storeId,
+        type_id: Number(typeId) || 0,
+      }),
       signal: ctrl.signal,
     });
     clearTimeout(timer);
     if (!res.ok) return null;
-    const d = await res.json();
-    if (d?.success && d?.description_category_id) return d;
-    return null;
+    return await res.json();
   } catch (e) {
     console.warn(`[SW ${VERSION}]   resolveSellerCategory 失败 (非致命): ${e.message}`);
     return null;
