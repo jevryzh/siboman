@@ -3557,8 +3557,9 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
     const sku = Number(req.body?.sku || 0);
     const offerId = String(req.body?.offer_id || "").trim();
     const productName = String(req.body?.name || "").trim();
+    const typeId = req.body?.type_id || req.body?.typeId || 0;
     if (!storeId) return res.status(400).json({ success: false, error: "需要 store_id" });
-    if (!sku && !offerId && !productName) return res.status(400).json({ success: false, error: "需要 sku/offer_id/name 至少一个" });
+    if (!sku && !offerId && !productName && !typeId) return res.status(400).json({ success: false, error: "需要 sku/offer_id/name/type_id 至少一个" });
 
     const userId = req.user.id;
     let resolvedName = productName;
@@ -3640,24 +3641,29 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
           .sort((a, b) => b.length - a.length)
           .slice(0, 2);
         if (tokens.length > 0) {
-          // 每个 token 一个 ILIKE 参数, 用 OR 连接
-          const conditions = tokens.map((_, i) => `name ILIKE $${i + 2}`).join(' OR ');
+          // v2.3.0: 严格匹配 - 多 token 时要求 ALL 命中 (避免 Лупа/Оплетка 这种假阳性)
+          const useAnd = tokens.length >= 2;
+          const conditions = tokens.map((_, i) => `name ILIKE $${i + 2}`).join(useAnd ? ' AND ' : ' OR ');
           const params = [storeId, ...tokens.map(t => `%${t}%`)];
           const r = await db.query(
-            `SELECT description_category_id, type_id, name FROM app_products
+            `SELECT description_category_id, type_id, name,
+                    (CASE WHEN name ILIKE $2 THEN 1 ELSE 0 END) +
+                    (CASE WHEN $3::text IS NOT NULL AND name ILIKE $3 THEN 1 ELSE 0 END) AS match_score
+             FROM app_products
              WHERE store_id = $1 AND description_category_id IS NOT NULL
                AND description_category_id > 0 AND (${conditions})
-             GROUP BY description_category_id, type_id, name
-             ORDER BY COUNT(*) DESC LIMIT 5`,
+             GROUP BY description_category_id, type_id, name, match_score
+             ORDER BY match_score DESC, COUNT(*) DESC LIMIT 5`,
             params,
           );
           if (r.rows.length > 0) {
-            // 验证找到的类目在树里 (避免历史脏数据污染)
             const validIds = await getValidCategoryIds(storeId, userId);
             const validHit = r.rows.find(row => validIds?.has(Number(row.description_category_id)));
             if (validHit) {
+              const confidence = useAnd ? 'high' : 'medium';
               return res.json({
                 success: true,
+                confidence,
                 source: "similar-name-same-store",
                 description_category_id: Number(validHit.description_category_id),
                 type_id: Number(validHit.type_id || 0),
@@ -3672,8 +3678,41 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
       }
     }
 
+    // 4b. type_id 匹配 - 同 type_id 在店铺里通常在同一类目, 比名字更稳
+    if (typeId && db) {
+      try {
+        const typeRes = Number(typeId);
+        if (typeRes > 0) {
+          const tr = await db.query(
+            `SELECT description_category_id, COUNT(*) as cnt FROM app_products
+             WHERE store_id = $1 AND type_id = $2 AND description_category_id IS NOT NULL AND description_category_id > 0
+             GROUP BY description_category_id ORDER BY cnt DESC LIMIT 3`,
+            [storeId, typeRes],
+          );
+          if (tr.rows.length > 0) {
+            const validIds = await getValidCategoryIds(storeId, userId);
+            const validTypeHit = tr.rows.find(row => validIds?.has(Number(row.description_category_id)));
+            if (validTypeHit) {
+              return res.json({
+                success: true,
+                confidence: 'medium',
+                source: 'same-type-id',
+                description_category_id: Number(validTypeHit.description_category_id),
+                type_id: typeRes,
+                name: '',
+                note: '同一 type_id 在你店通常归此类目 (type_id 比 name 更稳, 但仍建议你核对)',
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("[category-resolve] type_id 匹配 fail:", e.message);
+      }
+    }
+
     // 5. 全部失败 - 返回目标店高频类目作为候选 (让前端给 user 看)
-    if (db) {
+    const fallbackCandidates = async () => {
+      if (!db) return [];
       try {
         const r = await db.query(
           `SELECT description_category_id, COUNT(*) as cnt FROM app_products
@@ -3681,16 +3720,18 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
            GROUP BY description_category_id ORDER BY cnt DESC LIMIT 10`,
           [storeId],
         );
-        return res.json({
-          success: false,
-          error: "无法自动解析 (sku 不在任何店, 名字相似也找不到)",
-          description_category_id: 0,
-          candidates: r.rows.map(x => ({ description_category_id: Number(x.description_category_id), count: Number(x.cnt) })),
-        });
-      } catch {}
-    }
+        return r.rows.map(x => ({ description_category_id: Number(x.description_category_id), count: Number(x.cnt) }));
+      } catch { return []; }
+    };
 
-    res.json({ success: false, error: "无法解析", description_category_id: 0, candidates: [] });
+    const candidates = await fallbackCandidates();
+    res.json({
+      success: false,
+      confidence: 'none',
+      error: "无法自动解析 (sku 不在任何店, 名字相似也找不到, type_id 也没匹配)",
+      description_category_id: 0,
+      candidates,
+    });
   } catch (error) {
     res.status(error.statusCode || 502).json({ success: false, error: error.message });
   }
