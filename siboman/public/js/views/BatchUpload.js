@@ -221,7 +221,7 @@ window.BatchUploadView = {
       if (e.key === 'ArrowUp') { e.preventDefault(); pickerFocusIdx.value = (pickerFocusIdx.value - 1 + list.length) % list.length; return; }
       if (e.key === 'Enter') { e.preventDefault(); applyCategoryChoice(list[pickerFocusIdx.value]); return; }
     };
-    const applyCategoryChoice = (candidate) => {
+    const applyCategoryChoice = async (candidate) => {
       if (!pickingRow.value || !candidate) return;
       const row = pickingRow.value;
       if (!row.distilled) row.distilled = {};
@@ -238,6 +238,23 @@ window.BatchUploadView = {
       setCategoryHistory(row.sku, candidate.description_category_id, candidate.name);
       appendLog(`  ✓ #${row.index} 手动选类目: ${candidate.description_category_id} (${candidate.name || '无名'})`, 'success');
       closeCategoryPicker();
+
+      // v2.2.5: 选完类目立刻自动反查 type_id — 用户不应该手动填 type_id
+      //   /api/seller/type-id-suggestion 已经存在, 这里在 modal 选完时也触发一次
+      if (!row.distilled.typeId && selectedStores.value.length) {
+        try {
+          const sugg = await axios.post('/api/seller/type-id-suggestion', {
+            description_category_id: row.distilled.descriptionCategoryId,
+            store_id: selectedStores.value[0],
+          }, { timeout: 8000 });
+          if (sugg.data?.success && sugg.data.recommended > 0) {
+            row.distilled.typeId = sugg.data.recommended;
+            row._type_id_source = sugg.data.source;
+            row._type_id_candidates = sugg.data.candidates || [];
+            appendLog(`  ✓ #${row.index} 自动配 type_id=${sugg.data.recommended} (${sugg.data.source}, ${(sugg.data.candidates||[]).length} 个候选)`, 'success');
+          }
+        } catch (e) { /* 不阻塞, 让用户手动填 */ }
+      }
     };
 
     // v2.2.2: 采集完成后, 把 localStorage 记忆的类目应用到 _category_resolved.none 行
@@ -880,8 +897,7 @@ window.BatchUploadView = {
                     <th style="padding:10px 12px; text-align:right">重量g</th>
                     <th style="padding:10px 12px; text-align:right">三维 L×W×H</th>
                     <th style="padding:10px 12px; text-align:left">格式</th>
-                    <th style="padding:10px 12px; text-align:left; min-width:120px">Type ID (上架要)</th>
-                    <th style="padding:10px 12px; text-align:left; min-width:160px">类目 (v2.2.2)</th>
+                    <th style="padding:10px 12px; text-align:left; min-width:200px">类目 (含自动 type_id)</th>
                     <th style="padding:10px 12px; text-align:left">问题/状态</th>
                   </tr>
                 </thead>
@@ -899,30 +915,40 @@ window.BatchUploadView = {
                     <td style="padding:10px 12px">
                       <span :style="{ padding:'2px 8px', borderRadius:'10px', fontSize:'10px', fontWeight:600, background: row.valid ? '#dbeafe' : '#fee2e2', color: row.valid ? '#1e40af' : '#991b1b' }">{{ FORMAT_LABELS[row.formatHint] || '?' }}</span>
                     </td>
-                    <td style="padding:10px 12px">
-                      <input v-model="row.typeIdInput" @change="saveTypeIdCache(row)" :placeholder="row.distilled?.typeId ? String(row.distilled.typeId) : '必填'" style="width:90px; padding:4px 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; font-family:monospace; text-align:right" />
-                    </td>
                     <td style="padding:10px 12px; font-size:12px">
-                      <!-- v2.2.2: 类目置信度列 — high/medium/none/manual -->
+                      <!-- v2.2.5: type_id 折叠进类目 cell, 用户完全不感知. 选完类目后自动反查 type_id -->
+                      <input v-if="false" v-model="row.typeIdInput" @change="saveTypeIdCache(row)" :placeholder="row.distilled?.typeId ? String(row.distilled.typeId) : '必填'" style="width:90px; padding:4px 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; font-family:monospace; text-align:right" />
+                    </td>
+                    <td style="padding:10px 12px; font-size:12px; min-width:200px">
+                      <!-- v2.2.2: 类目置信度列 (含 type_id 自动反查结果显示) — high/medium/none/manual -->
                       <template v-if="row._category_resolved">
                         <div v-if="row._category_resolved.confidence === 'high'" style="display:flex; flex-direction:column; gap:2px">
-                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#dcfce7; color:#166534; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">✓ 高置信</span>
-                          <span style="color:#475569; font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">cat {{ row._category_resolved.to }}</span>
+                          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+                            <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#dcfce7; color:#166534; border-radius:10px; font-size:11px; font-weight:600">✓ 高置信</span>
+                            <span style="color:#475569; font-size:11px">cat {{ row._category_resolved.to }}</span>
+                            <span v-if="row.distilled?.typeId" style="color:#94a3b8; font-size:10px; font-family:monospace">type {{ row.distilled.typeId }}</span>
+                          </div>
                           <span style="color:#94a3b8; font-size:10px">{{ row._category_resolved.source }}</span>
                         </div>
                         <div v-else-if="row._category_resolved.confidence === 'medium'" style="display:flex; flex-direction:column; gap:2px">
-                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#fef3c7; color:#92400e; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">⚠ 中置信</span>
-                          <span style="color:#475569; font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">建议 cat {{ row._category_resolved.to }} — 可改</span>
+                          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+                            <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#fef3c7; color:#92400e; border-radius:10px; font-size:11px; font-weight:600">⚠ 中置信</span>
+                            <span style="color:#475569; font-size:11px">cat {{ row._category_resolved.to }}</span>
+                            <span v-if="row.distilled?.typeId" style="color:#94a3b8; font-size:10px; font-family:monospace">type {{ row.distilled.typeId }}</span>
+                          </div>
                           <button v-if="(row._category_resolved.candidates || []).length" @click="openCategoryPicker(row)" style="background:transparent; border:none; color:#2563eb; cursor:pointer; font-size:11px; padding:0; text-align:left">↻ 换一个</button>
                         </div>
                         <div v-else-if="row._category_resolved.confidence === 'manual'" style="display:flex; flex-direction:column; gap:2px">
-                          <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#dbeafe; color:#1e40af; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">✓ 已手动选</span>
-                          <span style="color:#475569; font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.distilled?.descriptionCategoryName || ('cat ' + row._category_resolved.to) }}</span>
+                          <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+                            <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#dbeafe; color:#1e40af; border-radius:10px; font-size:11px; font-weight:600">✓ 已选</span>
+                            <span style="color:#475569; font-size:11px; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.distilled?.descriptionCategoryName || ('cat ' + row._category_resolved.to) }}</span>
+                            <span v-if="row.distilled?.typeId" style="color:#94a3b8; font-size:10px; font-family:monospace">type {{ row.distilled.typeId }}</span>
+                          </div>
                           <button v-if="(row._category_resolved.candidates || []).length" @click="openCategoryPicker(row)" style="background:transparent; border:none; color:#2563eb; cursor:pointer; font-size:11px; padding:0; text-align:left">↻ 换一个</button>
                         </div>
                         <div v-else style="display:flex; flex-direction:column; gap:4px">
                           <span style="display:inline-flex; align-items:center; gap:4px; padding:2px 8px; background:#fee2e2; color:#991b1b; border-radius:10px; font-size:11px; font-weight:600; width:fit-content">⚠ 未解析</span>
-                          <button @click="openCategoryPicker(row)" :disabled="!(row._category_resolved.candidates || []).length" style="padding:3px 10px; background:(row._category_resolved.candidates||[]).length ? '#f59e0b' : '#cbd5e1'; border:none; border-radius:5px; color:#fff; cursor:pointer; font-size:11px; font-weight:600; width:fit-content">
+                          <button @click="openCategoryPicker(row)" :disabled="!(row._category_resolved.candidates || []).length" style="padding:4px 10px; background:(row._category_resolved.candidates||[]).length ? '#f59e0b' : '#cbd5e1'; border:none; border-radius:5px; color:#fff; cursor:pointer; font-size:11px; font-weight:600; width:fit-content">
                             {{ (row._category_resolved.candidates || []).length ? '选类目 (' + (row._category_resolved.candidates || []).length + ')' : '无候选' }}
                           </button>
                           <span v-if="!row._category_resolved.candidates?.length" style="color:#94a3b8; font-size:10px">上架时去 Ozon 后台选</span>
