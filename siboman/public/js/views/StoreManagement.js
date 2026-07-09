@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.1)
+            逐梦 Ozon 采集器 (v2.2.9.2)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.1</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.2</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.2 plugin resolve 失败时自动应用 candidates 第一个 cat (按商品 name 关键词匹配高分优先), 自动填 description_category_id + type_id, confidence=medium/high. user 不再需要手动点选类目 — 采集到就自动填上, 上架后去 Ozon 后台核对即可</li>
             <li>✅ v2.2.9.1 修复 cat=0 让 user 选类目: plugin Ozon SPA breadcrumb 等不到加 polling retry (5次 × 1s), extract 函数改取最后一级 breadcrumb (具体类目, 不是第一个), resolve 失败不清零 cat 保留 plugin 抓的 5位 breadcrumb (Ozon v2.2.9 实测接受 5位). server 端 fallback candidates 改成 "商品 name 关键词从 Ozon 全 tree 匹配" 作为第一批, 店铺历史高频降为兜底, 实测 tea kettle (Чайник заварочный) 现在第一个候选就是 cat=17028741 type_id=92538 ✓</li>
             <li>✅ v2.2.9 简化 type_id 推断: 抛弃 _sourceVariant 透传 + 5位→8位 mapping (Ozon 5位公开 cat + 8位 Seller cat 都接受). 新增 /api/seller/description-category-types endpoint, 直接调 Ozon /v1/description-category/tree 拿这个 cat 下的所有 type_id 列表 (含 type_name), 用户选一个. server 端 products/import 5位/8位 cat_id 都直接转发, 不再 normalize 警告. plugin 不再保存 _sourceVariant, mapOpiAttributes 回退到 v2.1.8 扁平版, BatchUpload 不再透传 _sourceVariant. 实测 cat=17028957 + type_id=970780832 (3035117601 跟卖) → task_id 5039100506 ✓</li>
             <li>✅ v2.2.8 跟卖深度适配: plugin enrichFromOpi 保存 data._sourceVariant = detail (完整 OPI 原始数据, 含 attributes 完整结构 + complex_attributes + 8 位 leaf cat + dimensions). mapOpiAttributes 改成 passthrough 模式保留 dictionary_value_id (单值) + dictionary_value_ids (多值). BatchUpload buildV3Item 透传 _sourceVariant 到 server, server 优先用 _sourceVariant.attributes (完整结构) 替代扁平 [{id,name,value}], 跟 MY ERP 一样让 Ozon 看到 source 数据. checkTitleQuality 加 Cyrillic 检测 (\u0400-\u04FF, 纯拉丁字母警告). 原因: 跟卖商品图片和商品信息都要跟竞品一样才会有流量</li>

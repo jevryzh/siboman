@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.1";
+const VERSION = "2.2.9.2";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -115,15 +115,37 @@ async function collectSku(sku, storeIds = []) {
         // v2.2.9.1: 不再清零 plugin 已抓到的 cat (5位 breadcrumb)
         //   v2.2.9 实测 Ozon /v3/product/import 接受 5位 (公开 URL breadcrumb) 跟 8位 (Seller API) 都接受
         //   v2.2.4 清零逻辑是为了避免 5位被 Ozon 拒 (当时老 Ozon API 行为), 现在不需要了
+        // v2.2.9.2: 自动应用 candidates 第一个 (按商品 name 关键词匹配的最高分 cat)
+        //   user 期望: 采集到 cat 就自动填上, 不要每次都手动选. candidates 第一批现在已经是
+        //   ozon-tree-name-match 排好序的 (高分在前), 直接用第一个最相关的
+        const candidates = resolved.candidates || [];
+        let autoCat = oldCat;  // 默认保留 plugin 抓的 (5位)
+        let autoType = result.type_id;
+        let autoSource = 'public-breadcrumb-fallback';
+        let autoConfidence = 'medium';  // 公开页 cat, 中等置信
+        if (candidates.length > 0) {
+          // 优先选 ozon-tree-name-match 来源且 match_score 最高的
+          const best = candidates.find(c => c.source === 'ozon-tree-name-match' && c.description_category_id)
+                    || candidates.find(c => c.description_category_id);
+          if (best) {
+            autoCat = best.description_category_id;
+            if (best.type_id) autoType = best.type_id;
+            autoSource = 'auto-from-candidates';
+            autoConfidence = best.match_score >= 2 ? 'high' : 'medium';  // 多 token 命中 = high
+            console.log(`[SW ${VERSION}]   自动应用候选: cat=${autoCat} type_id=${autoType || '(无)'} (${best.name}, score=${best.match_score || '-'})`);
+          }
+        }
+        result.description_category_id = autoCat;
+        if (autoType && !result.type_id) result.type_id = autoType;
         result._category_resolved = {
           from: oldCat,
-          to: oldCat,  // 保留 plugin 抓的 cat (5位也行)
-          source: 'public-breadcrumb-fallback',
-          confidence: 'low',  // 低置信, 提醒 user 核对
-          candidates: resolved.candidates || [],
-          warning: oldCat ? '类目来自公开页面 breadcrumb (5位), 未能在店铺历史找到匹配, 上架后请核对' : '无法获取类目, 请手动从候选选',
+          to: autoCat,
+          source: autoSource,
+          confidence: autoConfidence,
+          candidates,  // 保留备选, user 可点"换一个"切换
+          warning: autoCat ? '类目自动从公开页面或名称匹配填上, 上架后请核对' : '无法获取类目, 请手动从候选选',
         };
-        console.log(`[SW ${VERSION}]   类目无法精确解析, 保留 plugin 抓的 5位 cat=${oldCat}, ${(resolved.candidates || []).length} 个候选待 user 选`);
+        console.log(`[SW ${VERSION}]   类目自动填上: cat=${autoCat} type_id=${autoType || '(待补)'} (${autoSource}, confidence=${autoConfidence})`);
       }
     } catch (e) {
       console.warn(`[SW ${VERSION}]   category-resolve 调用失败 (非致命, 用 URL cat 上传): ${e.message}`);
