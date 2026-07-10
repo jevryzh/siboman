@@ -474,6 +474,7 @@ window.BatchUploadView = {
                   descriptionCategoryId: d.description_category_id, typeId: d.type_id,
                   barcode: d.barcode, description: d.description, brand: d.brand,
                   attributes: d.attributes || [],
+                  _sourceVariant: d._sourceVariant || d.variantData || null,
                   country_of_origin: d.country_of_origin || '',
                   price: d.price || '',
                 };
@@ -583,18 +584,19 @@ window.BatchUploadView = {
         description_category_id: d.descriptionCategoryId, type_id: d.typeId,
         primary_image: images[0] || '',
         service_type: 'IS_CODE_SERVICE', complex_attributes: [],
-        // 跟卖优先走 Ozon /v1/product/import-by-sku, 让 Ozon 按源 SKU 复制/关联原卡片.
-        // 这样比手工拼 /v3/product/import 的类目和必填属性更接近 MY ERP, 也更少出现属性不一致.
+        // 跟卖源 SKU 仍保留在 payload 里做记录/后处理，但默认走完整 /v3/product/import。
+        // My ERP 的 followSell 实测也是把源商品图片、属性、尺寸完整提交，而不是只发 SKU。
         source_sku: Number(row.sku) || 0,
-        import_mode: 'sku',
+        import_mode: 'v3',
       };
       if(opts.brand) item.scraped_brand = opts.brand;
       if(row.minPrice>0) item.min_price = row.minPrice.toFixed(2);
       if(opts.defaultStock>0) item._stock = opts.defaultStock;
-      // v1.0.9: 把 attributes 也加到 payload
+	      // v1.0.9: 把 attributes 也加到 payload
       if(Array.isArray(d.attributes) && d.attributes.length) {
         item.attributes = d.attributes;
       }
+      if(d._sourceVariant) item._sourceVariant = d._sourceVariant;
       return {ok:true, item};
     };
 

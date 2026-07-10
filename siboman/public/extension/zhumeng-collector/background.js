@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.12";
+const VERSION = "2.2.9.13";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -310,6 +310,9 @@ async function enrichFromOpi(data, storeId) {
   //   (跟卖场景中同 SKU 通常已发布过), 拿到 type_id / attributes 兜底补齐
   try {
     const own = await getProductInfo(String(data.sku || ""), creds);
+    if (own && typeof own === "object") {
+      data._sourceVariant = own;
+    }
     if (own && own.type_id && !data.type_id) {
       data.type_id = own.type_id;
       data._source_type_id = "opi-direct-sku-lookup";
@@ -334,6 +337,7 @@ async function enrichFromOpi(data, storeId) {
   console.log(`[SW ${VERSION}]   OPI 辅源: 找到 ${similar.offer_id} (${similar.name?.slice(0,30)})`);
   const detail = await getProductInfo(similar.offer_id, creds);
   if (!detail) return null;
+  data._sourceVariant = detail;
   // 合并 attributes
   const opiAttrs = detail.attributes || [];
   if (!opiAttrs.length) {

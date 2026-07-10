@@ -3644,14 +3644,12 @@ async function applyListingPicturesAfterImport(row) {
 
   const item = raw.item && typeof raw.item === "object" ? raw.item : {};
   const sourceItem = raw.source_item && typeof raw.source_item === "object" ? raw.source_item : {};
-  const images = [
+  const images = normalizeImportImageList([
     ...(Array.isArray(item.images) ? item.images : []),
     ...(Array.isArray(sourceItem.images) ? sourceItem.images : []),
+    ...extractSourceVariantImages(sourceItem),
     row.main_image || item.primary_image || sourceItem.primary_image || "",
-  ]
-    .filter(u => typeof u === "string" && /^https?:\/\//i.test(u))
-    .filter((u, idx, arr) => arr.indexOf(u) === idx)
-    .slice(0, 15);
+  ]);
 
   if (!images.length) return { skipped: true, reason: "no_images" };
 
@@ -3715,6 +3713,69 @@ function normalizeOzonAttributeForUpdate(attr) {
   };
 }
 
+function getAttrRawValue(attr) {
+  if (!attr || typeof attr !== "object") return "";
+  if (attr.value !== undefined && attr.value !== null) return String(attr.value).trim();
+  if (Array.isArray(attr.collection)) return attr.collection.map(v => String(v || "").trim()).filter(Boolean);
+  if (Array.isArray(attr.values)) {
+    const values = attr.values
+      .map(v => (v && typeof v === "object") ? (v.value ?? v.name ?? v.text ?? "") : v)
+      .map(v => String(v || "").trim())
+      .filter(Boolean);
+    return values.length > 1 ? values : (values[0] || "");
+  }
+  return "";
+}
+
+function sourceVariantAttributesToImportAttrs(sourceVariant) {
+  const attrs = Array.isArray(sourceVariant?.attributes) ? sourceVariant.attributes : [];
+  const out = [];
+  for (const attr of attrs) {
+    const id = Number(attr?.id ?? attr?.attribute_id ?? attr?.key);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    const raw = getAttrRawValue(attr);
+    const rawValues = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+    if (!rawValues.length) continue;
+    out.push({
+      id,
+      ...(Number(attr?.complex_id) > 0 ? { complex_id: Number(attr.complex_id) } : {}),
+      values: rawValues.map(value => {
+        const v = { value: String(value) };
+        const dictId = Number(attr?.dictionary_value_id ?? attr?.dictionaryValueId ?? 0);
+        if (dictId > 0 && rawValues.length === 1) v.dictionary_value_id = dictId;
+        return v;
+      }),
+    });
+  }
+  return out;
+}
+
+function extractSourceVariantImages(sourceVariant) {
+  const attrs = Array.isArray(sourceVariant?.attributes) ? sourceVariant.attributes : [];
+  const images = [];
+  const push = (u) => {
+    if (typeof u === "string" && /^https?:\/\//i.test(u) && !images.includes(u)) images.push(u);
+  };
+  const primary = attrs.find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === "4194");
+  const gallery = attrs.find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === "4195");
+  const primaryValue = getAttrRawValue(primary);
+  if (typeof primaryValue === "string") push(primaryValue);
+  const galleryValue = getAttrRawValue(gallery);
+  for (const u of (Array.isArray(galleryValue) ? galleryValue : [galleryValue])) push(u);
+  push(sourceVariant?.primary_image);
+  push(sourceVariant?.image);
+  for (const u of (Array.isArray(sourceVariant?.images) ? sourceVariant.images : [])) push(typeof u === "string" ? u : (u?.file_name || u?.url));
+  return images;
+}
+
+function normalizeImportImageList(images) {
+  return (Array.isArray(images) ? images : [])
+    .map(u => typeof u === "string" ? u : (u?.file_name || u?.url || u?.src || ""))
+    .filter(u => typeof u === "string" && /^https?:\/\//i.test(u))
+    .filter((u, idx, arr) => arr.indexOf(u) === idx)
+    .slice(0, 15);
+}
+
 async function applyListingAttributesAfterImport(row) {
   if (!db || !row?.task_id || !row?.user_id || !row?.offer_id) return { skipped: true, reason: "missing_context" };
   const raw = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
@@ -3725,6 +3786,7 @@ async function applyListingAttributesAfterImport(row) {
   const attributes = [
     ...(Array.isArray(item.attributes) ? item.attributes : []),
     ...(Array.isArray(sourceItem.attributes) ? sourceItem.attributes : []),
+    ...sourceVariantAttributesToImportAttrs(sourceItem),
   ]
     .map(normalizeOzonAttributeForUpdate)
     .filter(Boolean);
@@ -4145,6 +4207,8 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
       return res.status(400).json({ success: false, error: "缺少商品数据" });
     }
     const item = { ...rawItem };
+    const sourceVariant = item._sourceVariant && typeof item._sourceVariant === "object" ? item._sourceVariant : null;
+    const sourceImages = sourceVariant ? extractSourceVariantImages(sourceVariant) : [];
     const offerId = String(item.offer_id || item.sku || "").trim();
     const sourceSku = Number(item.source_sku || item.sourceSku || item.ozon_sku || item.ozonSku || 0);
     const importMode = String(item.import_mode || item.importMode || "").trim().toLowerCase();
@@ -4239,7 +4303,39 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v2.2.7: 默认 service_type=IS_CODE_SERVICE (跟卖场景, Ozon 可能走 source_variant 路径)
     if (!item.service_type) item.service_type = "IS_CODE_SERVICE";
 
-    // v2.2.8 (回退 _sourceVariant 逻辑): 客户端没传 _sourceVariant, 用扁平化 attributes, 尽量补 dictionary_value_id
+    // v2.2.10: My ERP 跟卖会把源变体 attributes/images 一起带上。
+    // 先把 _sourceVariant 合并成 Ozon /v3/product/import 能识别的扁平 attributes/images,
+    // 再删除内部字段，避免发给 Ozon 的 payload 出现未知 key。
+    if (sourceVariant) {
+      const sourceAttrs = sourceVariantAttributesToImportAttrs(sourceVariant);
+      if (sourceAttrs.length) {
+        const existing = new Set((Array.isArray(item.attributes) ? item.attributes : [])
+          .map(a => `${Number(a?.id ?? a?.attribute_id) || 0}:${Number(a?.complex_id || 0)}`));
+        item.attributes = [...(Array.isArray(item.attributes) ? item.attributes : [])];
+        for (const attr of sourceAttrs) {
+          const key = `${attr.id}:${attr.complex_id || 0}`;
+          if (!existing.has(key)) {
+            item.attributes.push(attr);
+            existing.add(key);
+          }
+        }
+      }
+      const mergedImages = normalizeImportImageList([...(Array.isArray(item.images) ? item.images : []), ...sourceImages]);
+      if (mergedImages.length) item.images = mergedImages;
+      const sourceAttr = (key) => (sourceVariant.attributes || []).find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === String(key));
+      const readInt = (key) => {
+        const v = getAttrRawValue(sourceAttr(key));
+        const n = parseInt(Array.isArray(v) ? v[0] : v, 10);
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      };
+      if (!Number(item.weight)) item.weight = readInt("4497") || item.weight;
+      if (!Number(item.depth)) item.depth = readInt("9454") || item.depth;
+      if (!Number(item.width)) item.width = readInt("9455") || item.width;
+      if (!Number(item.height)) item.height = readInt("9456") || item.height;
+      if (!item.barcode) item.barcode = getAttrRawValue(sourceAttr("23524")) || getAttrRawValue(sourceAttr("7822")) || item.barcode;
+    }
+
+    // v2.2.8 (回退 attributes 逻辑): 用扁平化 attributes, 尽量补 dictionary_value_id
     if (Array.isArray(item.attributes)) {
       item.attributes = item.attributes.map(a => {
         const aId = Number(a.id ?? a.attribute_id);
@@ -4257,7 +4353,6 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         return { id: aId, values };
       }).filter(a => a.id && a.values.length);
     }
-    // v2.2.9.5: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
     delete item._sourceVariant;
 
     // v2.2.9.6: attribute 9048 (Название модели) 兜底
@@ -4282,7 +4377,6 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         console.log(`[v2.2.9.6 import] attribute 9048 (Название модели) 兜底: "${model}"`);
       }
     }
-    // v2.2.9: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
     delete item._sourceVariant;
     if (Array.isArray(item.attributes)) {
       item.attributes = item.attributes.map(a => {
@@ -4301,7 +4395,6 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         return { id: aId, values };
       }).filter(a => a.id && a.values.length);
     }
-    // v2.2.9: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
     delete item._sourceVariant;
 
     // v2.2.7: 顶层 stocks 数组 (跟 MY 一样, 一次原子提交)
@@ -4338,7 +4431,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             String(item.name || ""),
             String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
             item.price ? Number(item.price) : null,
-            JSON.stringify({ item, submitted_at: new Date().toISOString() }),
+            JSON.stringify({ item, source_item: sourceVariant || null, submitted_at: new Date().toISOString() }),
           ],
         );
       } catch (e) { console.error("[listing-history] insert failed:", e.message); }
