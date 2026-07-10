@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.9";
+const VERSION = "2.2.9.10";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -427,28 +427,116 @@ async function safeRemoveTab(tabId) {
 // 这个函数被 executeScript 注入到 www.ozon.ru 商品页, 在 page context 跑
 // v1.0.9 大幅扩展: 把上架需要的全部字段都尝试从页面拿到
 function extractOzonProductData(sku) {
-  // v2.2.9.8: 整个函数包 try/catch, 任何抛错都 log 到 page console + return minimal data
-  //   之前 plugin 报"executeScript 返回空"但 user console 完全看不到原因 — 抛错被 chrome.scripting.executeScript 吞了
-  //   现在把异常信息 log 到 page console, user 在该 tab DevTools 能看到, 还能 attach _error 到返回 data 里
+  // v2.2.9.10 (fix): 把整个提取逻辑包 try/catch, helper 函数必须在 closure 里
+  //   chrome.scripting.executeScript 注入的函数只能引用自己函数体内代码 (跨函数调 ReferenceError)
   try {
-    return extractOzonProductDataInner(sku);
-  } catch (e) {
-    console.error("[zhumeng-extract] FATAL 抛错:", e.message, e.stack);
-    return {
-      sku: String(sku || ""),
-      name: "",
-      description_category_id: 0,
-      type_id: 0,
-      images: [],
-      attributes: [],
-      _error: e.message,
-      _stack: (e.stack || "").slice(0, 500),
-      raw_url: location.href,
-    };
+    // ========== 内嵌 helper 函数 (必须在 closure 里) ==========
+function deepFindFullProduct(obj, sku, depth) {
+  if (depth > 10 || !obj || typeof obj !== "object") return null;
+  // 命中条件: 同时有 description_category_id + images + name
+  if (typeof obj.description_category_id === "number" &&
+      typeof obj.type_id === "number" &&
+      obj.name &&
+      Array.isArray(obj.images)) {
+    return { source: `obj.sku=${obj.sku || "?"}`, object: obj };
+  }
+  // 备选命中: 只有 description_category_id + type_id + name
+  if (typeof obj.description_category_id === "number" &&
+      typeof obj.type_id === "number" &&
+      obj.name &&
+      (Array.isArray(obj.attributes) || Array.isArray(obj.complex_attributes))) {
+    return { source: `obj.sku=${obj.sku || "?"} (partial)`, object: obj };
+  }
+  // 遍历
+  for (const key of Object.keys(obj)) {
+    const result = deepFindFullProduct(obj[key], sku, depth + 1);
+    if (result) {
+      result.source = `${key}.${result.source}`;
+      return result;
+    }
+  }
+  return null;
+}
+
+function mergeProductObject(data, obj) {
+  if (!obj) return;
+  // 基础字段
+  if (obj.name && !data.name) data.name = String(obj.name).trim();
+  if (obj.sku && !data.offer_id) data.offer_id = String(obj.sku);
+  if (obj.id && !data.product_id) data.product_id = String(obj.id);
+  if (obj.barcode && !data.barcode) data.barcode = String(obj.barcode);
+  if (obj.description && !data.description) data.description = String(obj.description);
+  if (obj.brand && !data.brand) {
+    data.brand = typeof obj.brand === "string" ? obj.brand : (obj.brand?.name || "");
+  }
+  if (obj.description_category_id && !data.description_category_id) data.description_category_id = obj.description_category_id;
+  if (obj.type_id && !data.type_id) data.type_id = obj.type_id;
+  if (obj.vat) data.vat = String(obj.vat);
+  if (obj.currency_code) data.currency_code = String(obj.currency_code);
+  if (obj.weight && !data.weight) {
+    const w = parseWeight(obj.weight);
+    if (w) data.weight = w;
+  }
+  if (obj.country_of_origin && !data.country_of_origin) data.country_of_origin = String(obj.country_of_origin);
+
+  // 尺寸 (Ozon 有时是 dimensions 对象)
+  if (obj.dimensions) {
+    if (obj.dimensions.depth && !data.depth) data.depth = parseInt(obj.dimensions.depth, 10) || 0;
+    if (obj.dimensions.width && !data.width) data.width = parseInt(obj.dimensions.width, 10) || 0;
+    if (obj.dimensions.height && !data.height) data.height = parseInt(obj.dimensions.height, 10) || 0;
+  }
+
+  // 图片 (Ozon 格式: [{url, ...}] 或 [{file_name, ...}])
+  if (Array.isArray(obj.images) && data.images.length === 0) {
+    for (const img of obj.images) {
+      const url = typeof img === "string" ? img : (img.url || img.file_name || img.src);
+      if (url && !data.images.includes(url)) data.images.push(url);
+    }
+  }
+
+  // Attributes 数组 (Ozon 格式: [{id, name, values: [{value}]}])
+  if (Array.isArray(obj.attributes) && data.attributes.length === 0) {
+    for (const attr of obj.attributes) {
+      const id = attr.id || attr.attribute_id;
+      const name = attr.name || attr.title || "";
+      let value = "";
+      if (Array.isArray(attr.values) && attr.values.length > 0) {
+        value = typeof attr.values[0] === "string" ? attr.values[0] : (attr.values[0]?.value || attr.values[0]?.text || "");
+      } else if (attr.value) {
+        value = String(attr.value);
+      }
+      if (name && value) {
+        data.attributes.push({ id, name, value });
+      }
+    }
+  }
+
+  // complex_attributes (Ozon 格式可能不同, 原样保留)
+  if (Array.isArray(obj.complex_attributes) && data.complex_attributes.length === 0) {
+    data.complex_attributes = obj.complex_attributes;
   }
 }
 
-function extractOzonProductDataInner(sku) {
+function parseWeight(w) {
+  if (typeof w === "number") return Math.round(w);
+  if (typeof w === "string") {
+    const m = w.match(/^([\d.]+)\s*(g|kg|г|克)?$/i);
+    if (m) {
+      const val = parseFloat(m[1]);
+      const unit = (m[2] || "g").toLowerCase();
+      if (unit === "kg") return Math.round(val * 1000);
+      return Math.round(val);
+    }
+  }
+  if (typeof w === "object" && w.value) {
+    return parseWeight(w.value);
+  }
+  return 0;
+}
+
+
+    // ========== 主提取逻辑 ==========
+
   const data = {
     sku: String(sku || ""),
     name: "",
@@ -753,113 +841,26 @@ function extractOzonProductDataInner(sku) {
 
   data._debug = dbg;
   return data;
-}
 
-// 深度遍历找完整商品对象
-function deepFindFullProduct(obj, sku, depth) {
-  if (depth > 10 || !obj || typeof obj !== "object") return null;
-  // 命中条件: 同时有 description_category_id + images + name
-  if (typeof obj.description_category_id === "number" &&
-      typeof obj.type_id === "number" &&
-      obj.name &&
-      Array.isArray(obj.images)) {
-    return { source: `obj.sku=${obj.sku || "?"}`, object: obj };
-  }
-  // 备选命中: 只有 description_category_id + type_id + name
-  if (typeof obj.description_category_id === "number" &&
-      typeof obj.type_id === "number" &&
-      obj.name &&
-      (Array.isArray(obj.attributes) || Array.isArray(obj.complex_attributes))) {
-    return { source: `obj.sku=${obj.sku || "?"} (partial)`, object: obj };
-  }
-  // 遍历
-  for (const key of Object.keys(obj)) {
-    const result = deepFindFullProduct(obj[key], sku, depth + 1);
-    if (result) {
-      result.source = `${key}.${result.source}`;
-      return result;
-    }
-  }
-  return null;
-}
-
-// 把找到的 Ozon 内部商品对象 merge 到 data
-function mergeProductObject(data, obj) {
-  if (!obj) return;
-  // 基础字段
-  if (obj.name && !data.name) data.name = String(obj.name).trim();
-  if (obj.sku && !data.offer_id) data.offer_id = String(obj.sku);
-  if (obj.id && !data.product_id) data.product_id = String(obj.id);
-  if (obj.barcode && !data.barcode) data.barcode = String(obj.barcode);
-  if (obj.description && !data.description) data.description = String(obj.description);
-  if (obj.brand && !data.brand) {
-    data.brand = typeof obj.brand === "string" ? obj.brand : (obj.brand?.name || "");
-  }
-  if (obj.description_category_id && !data.description_category_id) data.description_category_id = obj.description_category_id;
-  if (obj.type_id && !data.type_id) data.type_id = obj.type_id;
-  if (obj.vat) data.vat = String(obj.vat);
-  if (obj.currency_code) data.currency_code = String(obj.currency_code);
-  if (obj.weight && !data.weight) {
-    const w = parseWeight(obj.weight);
-    if (w) data.weight = w;
-  }
-  if (obj.country_of_origin && !data.country_of_origin) data.country_of_origin = String(obj.country_of_origin);
-
-  // 尺寸 (Ozon 有时是 dimensions 对象)
-  if (obj.dimensions) {
-    if (obj.dimensions.depth && !data.depth) data.depth = parseInt(obj.dimensions.depth, 10) || 0;
-    if (obj.dimensions.width && !data.width) data.width = parseInt(obj.dimensions.width, 10) || 0;
-    if (obj.dimensions.height && !data.height) data.height = parseInt(obj.dimensions.height, 10) || 0;
-  }
-
-  // 图片 (Ozon 格式: [{url, ...}] 或 [{file_name, ...}])
-  if (Array.isArray(obj.images) && data.images.length === 0) {
-    for (const img of obj.images) {
-      const url = typeof img === "string" ? img : (img.url || img.file_name || img.src);
-      if (url && !data.images.includes(url)) data.images.push(url);
-    }
-  }
-
-  // Attributes 数组 (Ozon 格式: [{id, name, values: [{value}]}])
-  if (Array.isArray(obj.attributes) && data.attributes.length === 0) {
-    for (const attr of obj.attributes) {
-      const id = attr.id || attr.attribute_id;
-      const name = attr.name || attr.title || "";
-      let value = "";
-      if (Array.isArray(attr.values) && attr.values.length > 0) {
-        value = typeof attr.values[0] === "string" ? attr.values[0] : (attr.values[0]?.value || attr.values[0]?.text || "");
-      } else if (attr.value) {
-        value = String(attr.value);
-      }
-      if (name && value) {
-        data.attributes.push({ id, name, value });
-      }
-    }
-  }
-
-  // complex_attributes (Ozon 格式可能不同, 原样保留)
-  if (Array.isArray(obj.complex_attributes) && data.complex_attributes.length === 0) {
-    data.complex_attributes = obj.complex_attributes;
+  } catch (e) {
+    console.error("[zhumeng-extract] FATAL 抛错:", e.message, e.stack);
+    return {
+      sku: String(sku || ""),
+      name: "",
+      description_category_id: 0,
+      type_id: 0,
+      images: [],
+      attributes: [],
+      _error: e.message,
+      _stack: (e.stack || "").slice(0, 500),
+      raw_url: location.href,
+    };
   }
 }
 
-// 解析 weight 字符串
-function parseWeight(w) {
-  if (typeof w === "number") return Math.round(w);
-  if (typeof w === "string") {
-    const m = w.match(/^([\d.]+)\s*(g|kg|г|克)?$/i);
-    if (m) {
-      const val = parseFloat(m[1]);
-      const unit = (m[2] || "g").toLowerCase();
-      if (unit === "kg") return Math.round(val * 1000);
-      return Math.round(val);
-    }
-  }
-  if (typeof w === "object" && w.value) {
-    return parseWeight(w.value);
-  }
-  return 0;
-}
+
+
+
 
 // ========== 消息监听 ==========
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
