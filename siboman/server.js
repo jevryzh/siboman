@@ -4208,6 +4208,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     }
     const item = { ...rawItem };
     const sourceVariant = item._sourceVariant && typeof item._sourceVariant === "object" ? item._sourceVariant : null;
+    const collectMeta = item._collect_meta && typeof item._collect_meta === "object" ? item._collect_meta : null;
     const sourceImages = sourceVariant ? extractSourceVariantImages(sourceVariant) : [];
     const offerId = String(item.offer_id || item.sku || "").trim();
     const sourceSku = Number(item.source_sku || item.sourceSku || item.ozon_sku || item.ozonSku || 0);
@@ -4354,6 +4355,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
       }).filter(a => a.id && a.values.length);
     }
     delete item._sourceVariant;
+    delete item._collect_meta;
 
     // v2.2.9.6: attribute 9048 (Название модели) 兜底
     //   Ozon 17029010 (天幕) 等类目必填 attribute 9048, 不填 Ozon 接受商品但报 error_attribute_values_empty
@@ -4431,7 +4433,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             String(item.name || ""),
             String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
             item.price ? Number(item.price) : null,
-            JSON.stringify({ item, source_item: sourceVariant || null, submitted_at: new Date().toISOString() }),
+            JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, submitted_at: new Date().toISOString() }),
           ],
         );
       } catch (e) { console.error("[listing-history] insert failed:", e.message); }

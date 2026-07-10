@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.15)
+            逐梦 Ozon 采集器 (v2.2.9.16)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.15</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.16</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.16 批量上架增加完整源包保护: 采集结果没有 _sourceVariant / Seller bundle 时直接拦截上架, 并在日志和 payload 里记录插件版本、bundle 成功状态和失败原因, 防止继续生成属性缺失商品。</li>
             <li>✅ v2.2.9.15 对齐 My ERP 复制商品链路: 插件先走 seller /api/v1/search 找真实 variant_id, 再走 create-bundle-by-variant-id 拿完整 bundle item, 把源商品属性、尺寸重量、条码、图片与 _sourceVariant 一起提交, 避免跟卖后只剩少量属性或 100x100x100 兜底尺寸。</li>
             <li>✅ v2.2.9.14 对齐 My ERP 富内容: 采集 Ozon PDP 的 entrypoint/composer widgetStates, 抽取 richAnnotationJson / Rich Content JSON 并作为 attribute 11254 随批量上架提交, 保留 Seller 后台「JSON 富内容」。</li>
             <li>✅ v2.2.9.13 对齐 My ERP followSell: 批量上架默认走完整 /v3/product/import, 保留 source_sku 但不再短路成 import-by-sku; 插件采到的 _sourceVariant 会透传到后端, 后端用源变体补全图片、属性、尺寸重量并保存到上架历史, 避免只上主图或商品信息空。</li>

@@ -44,6 +44,7 @@ window.BatchUploadView = {
     // ========== 插件中继协议 (保留) ==========
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
+    const REQUIRED_BACKGROUND_VERSION = "2.2.9.16";
     const extensionConnected = Vue.ref(false);
     const sellerTabReady = Vue.ref(false);
 
@@ -112,6 +113,27 @@ window.BatchUploadView = {
     const formatPluginVersion = (d) => d?.background_version
       ? `background v${d.background_version}`
       : (d?.version ? `bridge v${d.version}` : '版本未知');
+    const compareVersion = (a, b) => {
+      const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+      const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const da = pa[i] || 0;
+        const db = pb[i] || 0;
+        if (da !== db) return da > db ? 1 : -1;
+      }
+      return 0;
+    };
+    const ensureFreshPlugin = async () => {
+      const ping = await pingExtension();
+      const bg = ping?.background_version || '';
+      if (!ping || compareVersion(bg, REQUIRED_BACKGROUND_VERSION) < 0) {
+        const got = bg || ping?.version || '未检测到';
+        appendLog(`⚠️ 插件版本过旧/未刷新: 当前 ${got}, 需要 background v${REQUIRED_BACKGROUND_VERSION}+。请去店铺管理重新下载插件, 并在 chrome://extensions 点“重新加载”`, 'error');
+        notify.error(`插件需要更新到 v${REQUIRED_BACKGROUND_VERSION}+`);
+        return false;
+      }
+      return true;
+    };
 
     // v2.1.9: type_id 是上架 Ozon 必需但采集不到, 让用户在表中手动填一次
     //   并 localStorage 缓存 (key=sku). 注意: 必须在 parsePaste 等任何调它的地方
@@ -452,6 +474,7 @@ window.BatchUploadView = {
       if(!selectedStores.value.length) return notify.warning('请选择目标店铺');
 
       if(true) {
+        if (!(await ensureFreshPlugin())) return;
         // v2.1.2: 去掉 extensionConnected 卡点, 直接进 plugin path.
         //   即使用户状态机有问题也强制走, 让 SW 端兜底 (找不到数据时 okCount=0 failCount=N).
         //   selleready 是历史遗留, 当前 SW 已经用 cookie 检查不依赖 tab.
@@ -475,6 +498,10 @@ window.BatchUploadView = {
                   barcode: d.barcode, description: d.description, brand: d.brand,
                   attributes: d.attributes || [],
                   _sourceVariant: d._sourceVariant || d.variantData || null,
+                  _pluginVersion: d._plugin_version || d.version || '',
+                  _sellerBundleEnriched: d._seller_bundle_enriched,
+                  _sellerBundleError: d._seller_bundle_error || '',
+                  _sellerBundleSource: d._seller_bundle_source || null,
                   country_of_origin: d.country_of_origin || '',
                   price: d.price || '',
                 };
@@ -501,7 +528,10 @@ window.BatchUploadView = {
                   }
                 }
                 ok++;
-                appendLog(`  ✓ #${row.index} ${d.name?.slice(0,40)} | ${d.images?.length}图 | cat=${d.description_category_id || 0} | attr=${(d.attributes||[]).length}`, 'success');
+                const bundleTip = d._sourceVariant
+                  ? ` | bundle=✓ sourceAttr=${d._sourceVariant?.attributes?.length || 0}`
+                  : ` | bundle=✗ ${d._seller_bundle_error ? String(d._seller_bundle_error).slice(0, 80) : '未拿到完整源包'}`;
+                appendLog(`  ✓ #${row.index} ${d.name?.slice(0,40)} | ${d.images?.length}图 | cat=${d.description_category_id || 0} | attr=${(d.attributes||[]).length}${bundleTip}`, d._sourceVariant ? 'success' : 'warn');
               } else {
                 fail++;
                 row._collectError = errors[row.sku] || '未找到';
@@ -597,6 +627,13 @@ window.BatchUploadView = {
         item.attributes = d.attributes;
       }
       if(d._sourceVariant) item._sourceVariant = d._sourceVariant;
+      item._collect_meta = {
+        plugin_version: d._pluginVersion || '',
+        seller_bundle_enriched: d._sellerBundleEnriched,
+        seller_bundle_error: d._sellerBundleError || '',
+        seller_bundle_source: d._sellerBundleSource || null,
+        source_variant_attrs: Array.isArray(d._sourceVariant?.attributes) ? d._sourceVariant.attributes.length : 0,
+      };
       return {ok:true, item};
     };
 
@@ -693,6 +730,12 @@ window.BatchUploadView = {
           const issues = checkTitleQuality(row.distilled.name);
           if(issues.length && !config.aiRewrite) {
             appendLog(`  ⚠ #${row.index} 标题问题: ${issues.join(', ')}`, 'warn');
+          }
+          if (!row.distilled._sourceVariant) {
+            const reason = row.distilled._sellerBundleError || '未拿到 Seller bundle 完整源包';
+            appendLog(`  ✗ #${row.index} SKU ${row.sku}: ${reason}。为避免生成缺属性商品, 已拦截上架; 请更新/重载插件后重新采集`, 'error');
+            totalFail++;
+            continue;
           }
           const built = buildV3Item(row, {
             vat: config.vat, currencyCode: config.currency,

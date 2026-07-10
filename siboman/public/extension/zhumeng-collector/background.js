@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.15";
+const VERSION = "2.2.9.16";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -85,6 +85,7 @@ async function collectSku(sku, storeIds = []) {
 
   // v2.2.9.15: 优先复用 Seller 后台“复制商品”链路拿完整跟卖源包。
   // 公开页/OPI 只能兜底，My ERP 的完整属性、尺寸、富内容主要来自这个 bundle item。
+  result._plugin_version = VERSION;
   try {
     const bundle = await enrichFromSellerPortalBundle(result, sku, tab.id);
     result._seller_bundle_enriched = Boolean(bundle);
