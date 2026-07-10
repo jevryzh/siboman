@@ -4015,6 +4015,50 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         return { id: aId, values };
       }).filter(a => a.id && a.values.length);
     }
+    // v2.2.9.5: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
+    delete item._sourceVariant;
+
+    // v2.2.9.6: attribute 9048 (Название модели) 兜底
+    //   Ozon 17029010 (天幕) 等类目必填 attribute 9048, 不填 Ozon 接受商品但报 error_attribute_values_empty
+    //   plugin v2.2.9.5+ 应该从 name 提取, 这里 server 端再兜底一次 (plugin 旧版本也不会漏)
+    const has9048 = Array.isArray(item.attributes) && item.attributes.some(a => Number(a.id) === 9048);
+    if (!has9048 && item.name && item.name.length >= 3) {
+      const mainPart = String(item.name).split(",")[0].trim();
+      const tokens = mainPart.split(/\s+/);
+      const genericRu = /^(большой|маленький|туристический|походный|складной|детский|зимний|летний|домашний|уличный|портативный|новый|оригинальный|универсальный|легкий|тяжелый)$/i;
+      const kept = tokens.filter(t => {
+        if (genericRu.test(t)) return false;
+        if (/^[А-Яа-яЁё]{4,}$/.test(t) && !/[A-Za-z]/.test(t)) return false;
+        if (/^\d+([.,]\d+)?$/.test(t)) return false;
+        if (/^\d+\s*(см|мм|м|г|кг|л|мл|w|wt|hz|×|х)$/i.test(t)) return false;
+        return true;
+      });
+      const model = kept.join(" ").trim();
+      if (model && model.length >= 2) {
+        if (!Array.isArray(item.attributes)) item.attributes = [];
+        item.attributes.push({ id: 9048, values: [{ value: model }] });
+        console.log(`[v2.2.9.6 import] attribute 9048 (Название модели) 兜底: "${model}"`);
+      }
+    }
+    // v2.2.9: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
+    delete item._sourceVariant;
+    if (Array.isArray(item.attributes)) {
+      item.attributes = item.attributes.map(a => {
+        const aId = Number(a.id ?? a.attribute_id);
+        // 兼容 v2.2.8 plugin 透传格式: {id, name, value, dictionary_value_id?, dictionary_value_ids?}
+        let dictId = null;
+        if (a.dictionary_value_id) dictId = Number(a.dictionary_value_id);
+        else if (Array.isArray(a.dictionary_value_ids) && a.dictionary_value_ids.length === 1) dictId = a.dictionary_value_ids[0];
+
+        const values = Array.isArray(a.values)
+          ? a.values.map(v => ({
+              value: String(v.value ?? ""),
+              ...(v.dictionary_value_id ? { dictionary_value_id: Number(v.dictionary_value_id) } : {}),
+            }))
+          : (a.value !== undefined ? [{ value: String(a.value), ...(dictId ? { dictionary_value_id: dictId } : {}) }] : []);
+        return { id: aId, values };
+      }).filter(a => a.id && a.values.length);
+    }
     // v2.2.9: 不再处理 _sourceVariant (Ozon 接受 5位 cat_id + 完整 attribute 即可, 不用 source 包装)
     delete item._sourceVariant;
 

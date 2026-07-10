@@ -120,6 +120,7 @@ window.StoreManagementView = {
           <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.2</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.6 attribute 9048 (Название модели 型号名称) 自动兜底: plugin 从商品 name 提取型号 (跳过通用俄文词 + 尺寸/容量, 保留英文 brand+型号), server 端也兜底一次 (plugin 旧版本不会漏). 之前 Ozon 接受商品 (imported) 但 attribute 9048 必填字段空, 商品在 seller 后台无法正常上架. 实测 3678512870 帐篷 → "Cloud Skies Tarp Lite (L)" → Ozon 接受 task 5045289680 ✓</li>
             <li>✅ v2.2.9.5 candidates 排序更智能: server 端 token 集合从 3 扩到 8, 优先俄文 (cyrillic) 降权英文 (商品名常带品牌词 cloud/skies/tarp 等); 排序时 score 相同优先 name 完全等于商品 token 的 (e.g. "Тент" name == "тент" token). 实测 3678512870 大旅行帐篷: candidates #1 = cat=17029010 type_id=93523 "Тент" (天幕), 上架 task 5039550669 接受 ✓</li>
             <li>✅ v2.2.9.3 传 name 给 category-resolve, 让 server candidates 能用 name 关键词匹配 Ozon tree. v2.2.9.4 修复 5位 cat=11427 被 Ozon 拒 levels_category_not_found: 5位 (公开 URL slug) 跟 8位 (Seller API 内部 id) 是两套体系, plugin 默认用 candidates 第一个 8位 cat, server 兜底: 5位不在 Seller API tree 直接 400 (避免 Ozon polling 才暴露). 实测 cat=17029010 type_id=93526 (Шатер туристический 帐篷) → Ozon 接受 task 5039488916 ✓</li>
             <li>✅ v2.2.9.2 plugin resolve 失败时自动应用 candidates 第一个 cat (按商品 name 关键词匹配高分优先), 自动填 description_category_id + type_id, confidence=medium/high. user 不再需要手动点选类目 — 采集到就自动填上, 上架后去 Ozon 后台核对即可</li>

@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.5";
+const VERSION = "2.2.9.6";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -663,6 +663,37 @@ function extractOzonProductData(sku) {
     }
   }
 
+  // ========== 8.5 v2.2.9.5+: attribute 9048 (Название модели) 自动兜底 ==========
+  //   Ozon /v3/product/import 接受商品 (imported) 但 attribute 9048 空的话, 商品在 seller 后台无法正常上架
+  //   公开页 attributes 没抓到时, 从商品 name 自动提取型号名称
+  //   规则: 跳过通用词 (тент/большой/туристический/... + 尺寸/容量/颜色等), 取剩下的英文品牌词段
+  //   例: 'Большой туристический тент Cloud Skies Tarp Lite (L), 500х380 см' → 'Cloud Skies Tarp Lite (L)'
+  if (!data.attributes.some(a => a.id === 9048)) {
+    let model = "";
+    if (data.name) {
+      // 1) 取第一个逗号前的主段 (去掉尺寸/容量/颜色等后缀)
+      const mainPart = data.name.split(",")[0].trim();
+      // 2) 过滤掉通用俄文词 (帐篷/旅行/大型/参数等), 剩下的英文+数字+括号当型号
+      const tokens = mainPart.split(/\s+/);
+      const genericRu = /^(большой|маленький|туристический|походный|складной|детский|зимний|летний|домашний|уличный|портативный|новый|оригинальный|универсальный|легкий|тяжелый)$/i;
+      const kept = tokens.filter(t => {
+        if (genericRu.test(t)) return false;
+        // 跳过纯俄文长词 (形容词)
+        if (/^[А-Яа-яЁё]{4,}$/.test(t) && !/[A-Za-z]/.test(t)) return false;
+        // 跳过纯数字 / 数字+单位
+        if (/^\d+([.,]\d+)?$/.test(t)) return false;
+        if (/^\d+\s*(см|мм|м|г|кг|л|мл|w|wt|hz|×|х)$/i.test(t)) return false;
+        return true;
+      });
+      model = kept.join(" ").trim();
+    }
+    if (model && model.length >= 2) {
+      data.attributes.push({ id: 9048, name: "Название модели", value: model });
+      dbg.attributeSources.push("attribute-9048-from-name");
+      console.log(`[SW ${VERSION}]   attribute 9048 (Название модели) 自动提取: "${model}"`);
+    }
+  }
+
   // ========== 9. 提取 country_of_origin (原产国) ==========
   if (!data.country_of_origin && data.attributes.length > 0) {
     const countryAttr = data.attributes.find(a => {
@@ -797,6 +828,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   if (msg.action === "ping") {
     sendResponse({ ok: true, version: VERSION });
+    return;
+  }
+
+  // v2.2.9.5: 让 ERP 强制 reload plugin (cache 不更新时用)
+  if (msg.action === "reloadPlugin") {
+    console.log(`[SW ${VERSION}] 收到 reloadPlugin 请求, 1s 后 reload service worker`);
+    setTimeout(() => chrome.runtime.reload(), 1000);
+    sendResponse({ ok: true, willReload: true });
     return;
   }
 
