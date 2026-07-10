@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.10";
+const VERSION = "2.2.9.12";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -487,26 +487,39 @@ function mergeProductObject(data, obj) {
   }
 
   // 图片 (Ozon 格式: [{url, ...}] 或 [{file_name, ...}])
-  if (Array.isArray(obj.images) && data.images.length === 0) {
+  if (Array.isArray(obj.images)) {
     for (const img of obj.images) {
       const url = typeof img === "string" ? img : (img.url || img.file_name || img.src);
-      if (url && !data.images.includes(url)) data.images.push(url);
+      addImageUrl(data, url);
     }
   }
+  if (obj.image) {
+    const imgs = Array.isArray(obj.image) ? obj.image : [obj.image];
+    for (const img of imgs) addImageUrl(data, typeof img === "string" ? img : (img.url || img.src || img.file_name));
+  }
+  if (obj.primary_image) addImageUrl(data, obj.primary_image);
+  if (obj.cover_image) addImageUrl(data, obj.cover_image);
+  if (obj.color_image) addImageUrl(data, obj.color_image);
 
   // Attributes 数组 (Ozon 格式: [{id, name, values: [{value}]}])
-  if (Array.isArray(obj.attributes) && data.attributes.length === 0) {
+  if (Array.isArray(obj.attributes)) {
     for (const attr of obj.attributes) {
       const id = attr.id || attr.attribute_id;
       const name = attr.name || attr.title || "";
       let value = "";
+      let dictionary_value_id = 0;
       if (Array.isArray(attr.values) && attr.values.length > 0) {
         value = typeof attr.values[0] === "string" ? attr.values[0] : (attr.values[0]?.value || attr.values[0]?.text || "");
+        dictionary_value_id = Number(attr.values[0]?.dictionary_value_id || attr.values[0]?.id || 0);
       } else if (attr.value) {
         value = String(attr.value);
       }
       if (name && value) {
-        data.attributes.push({ id, name, value });
+        const key = `${id || name}:${value}`;
+        if (!data._attrKeys.has(key)) {
+          data.attributes.push({ id, name, value, ...(dictionary_value_id > 0 ? { dictionary_value_id } : {}) });
+          data._attrKeys.add(key);
+        }
       }
     }
   }
@@ -534,6 +547,67 @@ function parseWeight(w) {
   return 0;
 }
 
+function normalizeImageUrl(url) {
+  if (!url || typeof url !== "string") return "";
+  let s = url.trim()
+    .replace(/\\u002F/g, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&");
+  if (s.startsWith("//")) s = "https:" + s;
+  if (!/^https?:\/\//i.test(s)) return "";
+  if (!/(ozone\.ru|ozonusercontent\.com|ozonru\.cn)/i.test(s)) return "";
+  if (/\.(svg|gif)(?:[?#]|$)/i.test(s)) return "";
+  if (/(logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(s)) return "";
+  s = s.split("?")[0];
+  s = s.replace(/\/wc\d+\//i, "/wc1000/");
+  return s;
+}
+
+function addImageUrl(data, url) {
+  const normalized = normalizeImageUrl(url);
+  if (!normalized) return false;
+  if (data._imageKeys.has(normalized)) return false;
+  data.images.push(normalized);
+  data._imageKeys.add(normalized);
+  return true;
+}
+
+function collectImagesDeep(data, obj, depth) {
+  if (depth > 8 || !obj) return;
+  if (typeof obj === "string") {
+    addImageUrl(data, obj);
+    return;
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      if (data.images.length >= 60) return;
+      collectImagesDeep(data, item, depth + 1);
+    }
+    return;
+  }
+  if (typeof obj !== "object") return;
+  for (const [key, value] of Object.entries(obj)) {
+    if (data.images.length >= 60) return;
+    if (/image|img|photo|picture|gallery|media|cover|src|url|file/i.test(key)) {
+      collectImagesDeep(data, value, depth + 1);
+    } else if (depth < 4 && value && typeof value === "object") {
+      collectImagesDeep(data, value, depth + 1);
+    }
+  }
+}
+
+function collectImagesFromText(data, text) {
+  if (!text || typeof text !== "string") return 0;
+  const before = data.images.length;
+  const normalizedText = text.replace(/\\u002F/g, "/").replace(/\\\//g, "/");
+  const re = /(?:https?:)?\/\/(?:ir(?:-\d+)?\.ozonru\.cn|ir\.ozone\.ru|cdn1\.ozone\.ru|[^"'<>\s()]+ozonusercontent\.com)\/[^"'<>\s()\\]+/gi;
+  let m;
+  while ((m = re.exec(normalizedText)) && data.images.length < 80) {
+    addImageUrl(data, m[0]);
+  }
+  return data.images.length - before;
+}
+
 
     // ========== 主提取逻辑 ==========
 
@@ -559,10 +633,12 @@ function parseWeight(w) {
     vat: "0",
     price: "",
     country_of_origin: "",
-    attributes: [],            // [{id, name, value}] - 上架需要
-    complex_attributes: [],     // 复杂属性
-    raw_url: location.href,
-  };
+	    attributes: [],            // [{id, name, value}] - 上架需要
+	    complex_attributes: [],     // 复杂属性
+	    raw_url: location.href,
+	    _imageKeys: new Set(),
+	    _attrKeys: new Set(),
+	  };
 
   const dbg = {
     title: document.title,
@@ -641,9 +717,9 @@ function parseWeight(w) {
             if (item.image) {
               const imgs = Array.isArray(item.image) ? item.image : [item.image];
               for (const img of imgs) {
-                if (img && !data.images.includes(img)) data.images.push(img);
-              }
-            }
+	                addImageUrl(data, img);
+	              }
+	            }
             if (item.weight) {
               const w = parseWeight(item.weight);
               if (w) data.weight = w;
@@ -679,20 +755,39 @@ function parseWeight(w) {
       () => window.__NEXT_DATA__?.props,
       () => window.__INITIAL_DATA__,
     ];
-    for (const getter of stateContainers) {
-      try {
-        const state = getter();
-        if (!state) continue;
-        const found = deepFindFullProduct(state, sku, 0);
-        if (found) {
+	    for (const getter of stateContainers) {
+	      try {
+	        const state = getter();
+	        if (!state) continue;
+	        const beforeImages = data.images.length;
+	        collectImagesDeep(data, state, 0);
+	        if (data.images.length > beforeImages) {
+	          dbg.attributeSources.push(`state-images.+${data.images.length - beforeImages}`);
+	        }
+	        const found = deepFindFullProduct(state, sku, 0);
+	        if (found) {
           dbg.stateFound = found.source;
           dbg.fullStateObject = found.object;  // 整个对象, 方便后续处理
           // 把 found.object 里的所有相关字段填充到 data
           mergeProductObject(data, found.object);
           dbg.attributeSources.push(`state.${found.source}`);
           break;
-        }
-      } catch (e) {}
+	    }
+	  } catch (e) {}
+
+	  // ========== 4.5. 直接扫所有 script 文本里的 Ozon 图片 URL ==========
+	  // Ozon 的轮播图经常藏在 hydration JSON / widget state 里, 首屏 DOM 只渲染 1 张.
+	  try {
+	    let scriptAdded = 0;
+	    const scripts = Array.from(document.scripts || []);
+	    for (const s of scripts) {
+	      const text = s.textContent || "";
+	      if (!text || !/(ozone\.ru|ozonusercontent\.com|ozonru\.cn|multimedia|images)/i.test(text)) continue;
+	      scriptAdded += collectImagesFromText(data, text);
+	      if (data.images.length >= 80) break;
+	    }
+	    if (scriptAdded > 0) dbg.attributeSources.push(`script-images.+${scriptAdded}`);
+	  } catch (e) {}
     }
   } catch (e) {}
 
@@ -706,23 +801,26 @@ function parseWeight(w) {
     if (ogTitle) data.name = ogTitle.getAttribute("content") || "";
   }
 
-  if (data.images.length === 0) {
-    document.querySelectorAll('img[src*="ozonusercontent"], img[src*="cdn1.ozone"], img[src*="ozone.ru"]').forEach((img) => {
-      const src = img.src || img.dataset.src || img.getAttribute("data-src");
-      if (src && !data.images.includes(src) && !src.includes("svg")) {
-        data.images.push(src);
-      }
-    });
-    if (data.images.length === 0) {
-      const ogImage = document.querySelector('meta[property="og:image"]');
-      if (ogImage) {
-        const src = ogImage.getAttribute("content");
-        if (src) data.images.push(src);
-      }
-    }
-  }
-  data.primary_image = data.images[0] || "";
-  dbg.imageCount = data.images.length;
+	  const beforeDomImages = data.images.length;
+	  document.querySelectorAll('img[src*="ozonusercontent"], img[src*="cdn1.ozone"], img[src*="ozone.ru"], source[srcset*="ozon"], source[srcset*="ozone"]').forEach((img) => {
+	    const srcs = [
+	      img.src,
+	      img.dataset?.src,
+	      img.getAttribute("data-src"),
+	      img.getAttribute("srcset"),
+	      img.getAttribute("data-srcset"),
+	    ].filter(Boolean);
+	    for (const src of srcs) {
+	      String(src).split(",").forEach(part => addImageUrl(data, part.trim().split(/\s+/)[0]));
+	    }
+	  });
+	  const ogImage = document.querySelector('meta[property="og:image"]');
+	  if (ogImage) addImageUrl(data, ogImage.getAttribute("content"));
+	  if (data.images.length > beforeDomImages) {
+	    dbg.attributeSources.push(`DOM-images.+${data.images.length - beforeDomImages}`);
+	  }
+	  data.primary_image = data.images[0] || "";
+	  dbg.imageCount = data.images.length;
 
   // ========== 6. 提取价格 ==========
   if (!data.price) {
@@ -817,7 +915,7 @@ function parseWeight(w) {
     if (model && model.length >= 2) {
       data.attributes.push({ id: 9048, name: "Название модели", value: model });
       dbg.attributeSources.push("attribute-9048-from-name");
-      console.log(`[SW ${VERSION}]   attribute 9048 (Название модели) 自动提取: "${model}"`);
+      console.log(`[zhumeng-extract] attribute 9048 (Название модели) 自动提取: "${model}"`);
     }
   }
 
@@ -836,10 +934,12 @@ function parseWeight(w) {
   dbg.attributesFirst3 = data.attributes.slice(0, 3);
   dbg.fullStateKeys = dbg.fullStateObject ? Object.keys(dbg.fullStateObject) : null;
 
-  // _debug 不返回 fullStateObject (太大), 只返回关键 keys
-  delete dbg.fullStateObject;
+	  // _debug 不返回 fullStateObject (太大), 只返回关键 keys
+	  delete dbg.fullStateObject;
+	  delete data._imageKeys;
+	  delete data._attrKeys;
 
-  data._debug = dbg;
+	  data._debug = dbg;
   return data;
 
   } catch (e) {

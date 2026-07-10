@@ -113,13 +113,15 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.10)
+            逐梦 Ozon 采集器 (v2.2.9.12)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.10</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.12</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.12 强化 Ozon 商品页完整采集: 从页面 state、JSON-LD、script hydration 文本、DOM 图片源多路合并图片 URL, 避免只抓到首屏 1 张图; attributes 也改为追加去重, 为跟卖后补图/补属性提供完整数据</li>
+            <li>✅ v2.2.9.11 修复 2906884816 采集时报 VERSION is not defined: 注入到 Ozon 页面里的 extractOzonProductData 不能引用 service worker 外层 VERSION 常量, 现在改为注入函数内本地日志; ping 也会回传 background 真实版本, 批量页日志可直接看到插件是否已更新</li>
             <li>✅ v2.2.9.10 修复 v2.2.9.9 try/catch 拆分 inner 函数的 ReferenceError: chrome.scripting.executeScript 注入的函数只能引用自己函数体内代码 (跨函数调会 ReferenceError), user SW console 显示 extractOzonProductDataInner is not defined. 现在把 helper (deepFindFullProduct/mergeProductObject/parseWeight) 全内嵌到 extractOzonProductData 函数体内, try/catch 包整个函数</li>
             <li>✅ v2.2.9.9 extract 函数整体包 try/catch (防抛错被吞), 抛错时 log 到 page console + 返回 minimal data 带 _error 字段, polling 检测 _error 打印到 SW console. user 上次反馈 tab.status=complete + result=null (没抛错被打印), 说明 extract 内部异常被吞, 现在 SW console 一定能看到</li>
             <li>✅ v2.2.9.8 增强 plugin 采集 debug: 第 1/5/10 次打印 result 类型 + tab.status + URL, 30s 全空时报最后 raw. 让 user 在 chrome://extensions → service worker console 看具体为啥空 (tab 没渲染/extract 函数抛错/executeScript 权限)</li>

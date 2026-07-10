@@ -41,8 +41,16 @@
     console.log(`[逐梦采集器 v${VERSION}][ISO] 收到 kind=${kind} reqId=${reqId?.slice(0, 20) || "?"}`);
 
     if (kind === "ping.request") {
-      chrome.runtime.sendMessage({ action: "ping" }).catch(() => {});
-      replyToMain(reqId, "ping.response", { ok: true, version: VERSION });
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "ping" });
+        replyToMain(reqId, "ping.response", {
+          ok: resp?.ok === true,
+          version: VERSION,
+          background_version: resp?.version || "",
+        });
+      } catch (e) {
+        replyToMain(reqId, "ping.response", { ok: false, version: VERSION, error: e.message });
+      }
       return;
     }
 

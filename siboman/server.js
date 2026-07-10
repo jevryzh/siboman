@@ -3016,12 +3016,14 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
     // v0.6.2: 优先用请求体里的 store_id (前端知道是哪个店铺)
     // 否则从 history 表里查 (旧记录可能 store_id 为 null, 会 fallback 到 env 默认)
     let storeId = req.body?.store_id || req.body?.storeId || null;
-    if (!storeId && db && req.user?.id) {
+    let historyRow = null;
+    if (db && req.user?.id) {
       const r = await db.query(
-        `SELECT store_id FROM app_listing_history WHERE task_id = $1 AND user_id = $2 LIMIT 1`,
+        `SELECT task_id, store_id, user_id, offer_id, main_image, raw_payload FROM app_listing_history WHERE task_id = $1 AND user_id = $2 LIMIT 1`,
         [String(taskId), req.user.id],
       );
-      storeId = r.rows[0]?.store_id || null;
+      historyRow = r.rows[0] || null;
+      if (!storeId) storeId = historyRow?.store_id || null;
     }
 
     const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(taskId) }, { storeId, userId: req.user?.id });
@@ -3035,10 +3037,21 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
     const localStatus = statusMap[ozonStatus] || ozonStatus;
 
     if (db && req.user?.id) {
+      let stockResult = null;
+      let pictureResult = null;
+      let attributeResult = null;
+      if (localStatus === "imported" && historyRow) {
+        const importRow = { ...historyRow, store_id: storeId || historyRow.store_id };
+        pictureResult = await applyListingPicturesAfterImport(importRow);
+        attributeResult = await applyListingAttributesAfterImport(importRow);
+        stockResult = await applyListingStocksAfterImport(importRow);
+      }
       await db.query(
         `UPDATE app_listing_history SET status = $1, errors_json = $2::jsonb, updated_at = now() WHERE task_id = $3 AND user_id = $4`,
         [localStatus, JSON.stringify(errors), String(taskId), req.user.id],
       );
+      res.json({ success: true, ozonStatus, localStatus, errors, pictureResult, attributeResult, stockResult });
+      return;
     }
     res.json({ success: true, ozonStatus, localStatus, errors });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
@@ -3079,7 +3092,7 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
     const listSql = `
       SELECT lh.id, lh.task_id, lh.offer_id, lh.product_name, lh.main_image, lh.price_rub,
              lh.status, lh.created_at, lh.updated_at, lh.store_id, lh.errors_json,
-             lh.variants_count, lh.failed_variants_count, lh.partial_success,
+             lh.variants_count, lh.failed_variants_count, lh.partial_success, lh.raw_payload,
              s.name AS store_name
       FROM app_listing_history lh
       LEFT JOIN app_stores s ON s.id = lh.store_id
@@ -3584,6 +3597,182 @@ function invalidateCategoryCache(storeId) {
   else categoryTreeCache.clear();
 }
 
+async function applyListingStocksAfterImport(row) {
+  if (!db || !row?.task_id || !row?.user_id) return { skipped: true, reason: "missing_context" };
+  const raw = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
+  if (raw.stock_applied_at) return { skipped: true, reason: "already_applied" };
+  const stocks = Array.isArray(raw.stocks) ? raw.stocks : [];
+  const normalizedStocks = stocks
+    .filter(s => s && s.offer_id && Number(s.stock ?? s.stocks) >= 0)
+    .map(s => ({
+      offer_id: String(s.offer_id),
+      stock: parseInt(s.stock ?? s.stocks, 10),
+      ...(Number(s.warehouse_id) > 0 ? { warehouse_id: Number(s.warehouse_id) } : {}),
+    }))
+    .filter(s => Number.isFinite(s.stock) && s.stock >= 0);
+
+  if (!normalizedStocks.length) return { skipped: true, reason: "no_valid_stocks" };
+
+  try {
+    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: normalizedStocks }, { storeId: row.store_id, userId: row.user_id });
+    await db.query(
+      `UPDATE app_listing_history
+          SET raw_payload = jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{stock_applied_at}', to_jsonb(now()::text), true),
+              updated_at = now()
+        WHERE task_id = $1 AND user_id = $2`,
+      [String(row.task_id), row.user_id],
+    );
+    console.log(`[listing-stocks] task=${row.task_id} applied stocks=${normalizedStocks.length}`);
+    return { applied: true, data, count: normalizedStocks.length };
+  } catch (e) {
+    await db.query(
+      `UPDATE app_listing_history
+          SET raw_payload = jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{stock_apply_error}', to_jsonb($1::text), true),
+              updated_at = now()
+        WHERE task_id = $2 AND user_id = $3`,
+      [String(e.message || e), String(row.task_id), row.user_id],
+    );
+    console.warn(`[listing-stocks] task=${row.task_id} apply failed:`, e.message || e);
+    return { applied: false, error: e.message || String(e) };
+  }
+}
+
+async function applyListingPicturesAfterImport(row) {
+  if (!db || !row?.task_id || !row?.user_id || !row?.offer_id) return { skipped: true, reason: "missing_context" };
+  const raw = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
+  if (raw.picture_applied_at) return { skipped: true, reason: "already_applied" };
+
+  const item = raw.item && typeof raw.item === "object" ? raw.item : {};
+  const sourceItem = raw.source_item && typeof raw.source_item === "object" ? raw.source_item : {};
+  const images = [
+    ...(Array.isArray(item.images) ? item.images : []),
+    ...(Array.isArray(sourceItem.images) ? sourceItem.images : []),
+    row.main_image || item.primary_image || sourceItem.primary_image || "",
+  ]
+    .filter(u => typeof u === "string" && /^https?:\/\//i.test(u))
+    .filter((u, idx, arr) => arr.indexOf(u) === idx)
+    .slice(0, 15);
+
+  if (!images.length) return { skipped: true, reason: "no_images" };
+
+  try {
+    let productId = Number(raw.product_id || raw.ozon_product_id || 0);
+    if (!productId) {
+      const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: [String(row.offer_id)] }, { storeId: row.store_id, userId: row.user_id });
+      productId = Number((info?.items || [])[0]?.id || 0);
+    }
+    if (!productId) return { skipped: true, reason: "product_id_not_ready" };
+
+    const data = await callOzonSellerAPI("/v1/product/pictures/import", { product_id: productId, images }, { storeId: row.store_id, userId: row.user_id });
+    await db.query(
+      `UPDATE app_listing_history
+          SET raw_payload = jsonb_set(
+                jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{picture_applied_at}', to_jsonb(now()::text), true),
+                '{product_id}', to_jsonb($1::bigint), true
+              ),
+              updated_at = now()
+        WHERE task_id = $2 AND user_id = $3`,
+      [productId, String(row.task_id), row.user_id],
+    );
+    console.log(`[listing-pictures] task=${row.task_id} product=${productId} applied images=${images.length}`);
+    return { applied: true, productId, data, count: images.length };
+  } catch (e) {
+    await db.query(
+      `UPDATE app_listing_history
+          SET raw_payload = jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{picture_apply_error}', to_jsonb($1::text), true),
+              updated_at = now()
+        WHERE task_id = $2 AND user_id = $3`,
+      [String(e.message || e), String(row.task_id), row.user_id],
+    );
+    console.warn(`[listing-pictures] task=${row.task_id} apply failed:`, e.message || e);
+    return { applied: false, error: e.message || String(e) };
+  }
+}
+
+function normalizeOzonAttributeForUpdate(attr) {
+  const id = Number(attr?.id ?? attr?.attribute_id);
+  if (!Number.isFinite(id) || id <= 0) return null;
+
+  const rawValues = Array.isArray(attr.values)
+    ? attr.values
+    : (attr.value !== undefined && attr.value !== null ? [{ value: attr.value, dictionary_value_id: attr.dictionary_value_id }] : []);
+  const values = rawValues
+    .map(v => {
+      const out = {};
+      const value = v?.value ?? v?.name ?? v;
+      const dictId = Number(v?.dictionary_value_id ?? v?.dictionaryValueId ?? 0);
+      if (dictId > 0) out.dictionary_value_id = dictId;
+      if (value !== undefined && value !== null && String(value).trim() !== "") out.value = String(value).trim();
+      return out;
+    })
+    .filter(v => Object.keys(v).length > 0);
+
+  if (!values.length) return null;
+  return {
+    id,
+    ...(Number(attr?.complex_id) > 0 ? { complex_id: Number(attr.complex_id) } : {}),
+    values,
+  };
+}
+
+async function applyListingAttributesAfterImport(row) {
+  if (!db || !row?.task_id || !row?.user_id || !row?.offer_id) return { skipped: true, reason: "missing_context" };
+  const raw = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
+  if (raw.attribute_applied_at) return { skipped: true, reason: "already_applied" };
+
+  const item = raw.item && typeof raw.item === "object" ? raw.item : {};
+  const sourceItem = raw.source_item && typeof raw.source_item === "object" ? raw.source_item : {};
+  const attributes = [
+    ...(Array.isArray(item.attributes) ? item.attributes : []),
+    ...(Array.isArray(sourceItem.attributes) ? sourceItem.attributes : []),
+  ]
+    .map(normalizeOzonAttributeForUpdate)
+    .filter(Boolean);
+
+  const attrById = new Map();
+  for (const attr of attributes) {
+    const key = `${attr.complex_id || 0}:${attr.id}`;
+    if (!attrById.has(key)) attrById.set(key, attr);
+  }
+  const normalizedAttributes = [...attrById.values()].slice(0, 100);
+
+  if (!normalizedAttributes.length) return { skipped: true, reason: "no_valid_attributes" };
+
+  try {
+    let productId = Number(raw.product_id || raw.ozon_product_id || 0);
+    if (!productId) {
+      const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: [String(row.offer_id)] }, { storeId: row.store_id, userId: row.user_id });
+      productId = Number((info?.items || [])[0]?.id || 0);
+    }
+    if (!productId) return { skipped: true, reason: "product_id_not_ready" };
+
+    const payload = { items: [{ product_id: productId, attributes: normalizedAttributes }] };
+    const data = await callOzonSellerAPI("/v1/product/attributes/update", payload, { storeId: row.store_id, userId: row.user_id });
+    await db.query(
+      `UPDATE app_listing_history
+          SET raw_payload = jsonb_set(
+                jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{attribute_applied_at}', to_jsonb(now()::text), true),
+                '{product_id}', to_jsonb($1::bigint), true
+              ),
+              updated_at = now()
+        WHERE task_id = $2 AND user_id = $3`,
+      [productId, String(row.task_id), row.user_id],
+    );
+    console.log(`[listing-attributes] task=${row.task_id} product=${productId} applied attrs=${normalizedAttributes.length}`);
+    return { applied: true, productId, data, count: normalizedAttributes.length };
+  } catch (e) {
+    await db.query(
+      `UPDATE app_listing_history
+          SET raw_payload = jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{attribute_apply_error}', to_jsonb($1::text), true),
+              updated_at = now()
+        WHERE task_id = $2 AND user_id = $3`,
+      [String(e.message || e), String(row.task_id), row.user_id],
+    );
+    console.warn(`[listing-attributes] task=${row.task_id} apply failed:`, e.message || e);
+    return { applied: false, error: e.message || String(e) };
+  }
+}
+
 // 后台 polling: 扫所有非终态 task, 调 Ozon 更新到 DB
 const POLL_INTERVAL_MS = 60 * 1000;
 const POLL_BATCH = 50;
@@ -3592,7 +3781,7 @@ async function pollPendingListingTasks() {
   if (!db) return;
   try {
     const r = await db.query(
-      `SELECT task_id, store_id, user_id, offer_id FROM app_listing_history
+      `SELECT task_id, store_id, user_id, offer_id, main_image, raw_payload FROM app_listing_history
        WHERE status IN ('processing', 'pending')
          AND created_at > now() - interval '7 days'
        ORDER BY created_at DESC LIMIT $1`,
@@ -3610,6 +3799,11 @@ async function pollPendingListingTasks() {
         const statusMap = { imported: "imported", failed: "failed", processing: "processing", moderating: "moderating", pending: "processing" };
         const localStatus = statusMap[ozonStatus] || ozonStatus;
         if (["imported", "failed"].includes(localStatus)) {
+          if (localStatus === "imported") {
+            await applyListingPicturesAfterImport(row);
+            await applyListingAttributesAfterImport(row);
+            await applyListingStocksAfterImport(row);
+          }
           await db.query(
             `UPDATE app_listing_history SET status = $1, errors_json = $2::jsonb, updated_at = now() WHERE task_id = $3 AND user_id = $4`,
             [localStatus, JSON.stringify(errors), row.task_id, row.user_id],
@@ -3952,6 +4146,54 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     }
     const item = { ...rawItem };
     const offerId = String(item.offer_id || item.sku || "").trim();
+    const sourceSku = Number(item.source_sku || item.sourceSku || item.ozon_sku || item.ozonSku || 0);
+    const importMode = String(item.import_mode || item.importMode || "").trim().toLowerCase();
+
+    // v2.2.9.12: 跟卖优先走 Ozon 官方按 SKU 创建接口.
+    // /v3/product/import 需要本系统自己拼完整类目/属性, 容易出现必填属性缺失或信息不一致;
+    // /v1/product/import-by-sku 让 Ozon 按源 SKU 复制/关联原卡片, 更接近 MY ERP 的批量跟卖.
+    if (sourceSku > 0 && importMode !== "v3") {
+      if (!item.name || !offerId) {
+        return res.status(400).json({ success: false, error: "按 SKU 跟卖需要 source_sku/name/offer_id" });
+      }
+      const skuItem = {
+        sku: sourceSku,
+        name: String(item.name || "").replace(/\s+/g, " ").trim().slice(0, 200),
+        offer_id: offerId,
+        currency_code: String(item.currency_code || "CNY"),
+        old_price: String(item.old_price || item.price || "0"),
+        price: String(item.price || "0"),
+        premium_price: String(item.premium_price || item.price || "0"),
+        vat: String(item.vat || "0"),
+      };
+      const ozonPayload = { items: [skuItem] };
+      const data = await callOzonSellerAPI("/v1/product/import-by-sku", ozonPayload, { storeId, userId: req.user.id });
+      const taskId = data?.result?.task_id || data?.task_id || "";
+
+      if (db && req.user?.id && taskId) {
+        try {
+          await db.query(
+            `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+             ON CONFLICT (task_id) DO NOTHING`,
+            [
+              req.user.id,
+              storeId || null,
+              String(taskId),
+              String(skuItem.offer_id || ""),
+              String(skuItem.name || ""),
+              String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
+              skuItem.price ? Number(skuItem.price) : null,
+              JSON.stringify({ item, ozon_item: skuItem, source_sku: sourceSku, import_mode: "sku", stocks: rawStocks || [], submitted_at: new Date().toISOString() }),
+            ],
+          );
+        } catch (e) { console.error("[listing-history] insert import-by-sku failed:", e.message); }
+      }
+
+      res.json({ success: true, data, taskId, importMode: "sku" });
+      return;
+    }
+
     // v0.6.1: category_id 透传 - 支持 description_category_id (Ozon 原始) 或 category_id (前端简化)
     const categoryId = item.description_category_id || item.category_id;
     const typeId = item.type_id;
@@ -4070,7 +4312,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         .map(s => ({
           offer_id: String(s.offer_id),
           stock: parseInt(s.stock ?? s.stocks ?? 0, 10),
-          ...(s.warehouse_id ? { warehouse_id: String(s.warehouse_id) } : {}),
+          ...(Number(s.warehouse_id) > 0 ? { warehouse_id: Number(s.warehouse_id) } : {}),
         }))
         .filter(s => s.stock >= 0);
     }
@@ -4138,7 +4380,7 @@ app.post("/api/seller/products/import-stocks", requireAuth, async (req, res) => 
       .map(s => ({
         offer_id: String(s.offer_id),
         stock: parseInt(s.stock ?? s.stocks, 10),
-        ...(s.warehouse_id ? { warehouse_id: String(s.warehouse_id) } : {}),
+        ...(Number(s.warehouse_id) > 0 ? { warehouse_id: Number(s.warehouse_id) } : {}),
       }));
     if (!norm.length) return res.status(400).json({ success: false, error: "stocks 全无效" });
 

@@ -108,7 +108,10 @@ window.BatchUploadView = {
       }, kind === 'collect.request' ? 120000 : 15000);
     });
 
-    const pingExtension = () => sendToExtension('ping.request').then(d => d?.ok === true);
+    const pingExtension = () => sendToExtension('ping.request').then(d => d?.ok ? d : null);
+    const formatPluginVersion = (d) => d?.background_version
+      ? `background v${d.background_version}`
+      : (d?.version ? `bridge v${d.version}` : '版本未知');
 
     // v2.1.9: type_id 是上架 Ozon 必需但采集不到, 让用户在表中手动填一次
     //   并 localStorage 缓存 (key=sku). 注意: 必须在 parsePaste 等任何调它的地方
@@ -291,10 +294,10 @@ window.BatchUploadView = {
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(async () => {
         if (extensionConnected.value) { clearInterval(pollTimer); pollTimer = null; return; }
-        const ok = await pingExtension();
-        if (ok) {
+        const ping = await pingExtension();
+        if (ping) {
           extensionConnected.value = true;
-          appendLog('✅ 采集插件已连接', 'success');
+          appendLog(`✅ 采集插件已连接 (${formatPluginVersion(ping)})`, 'success');
           const st = await checkSellerStatus();
           sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
           appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
@@ -306,10 +309,10 @@ window.BatchUploadView = {
     Vue.onMounted(async () => {
       fetchStores();
       loadConfig();
-      const ok = await pingExtension();
-      if (ok) {
+      const ping = await pingExtension();
+      if (ping) {
         extensionConnected.value = true;
-        appendLog('✅ 采集插件已连接', 'success');
+        appendLog(`✅ 采集插件已连接 (${formatPluginVersion(ping)})`, 'success');
         const st = await checkSellerStatus();
         sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
         appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
@@ -324,11 +327,12 @@ window.BatchUploadView = {
       // v2.1.6 fix: 不要在这里覆盖 extensionConnected.value = ok. 之前 pingExtension
       //   返回 false (15s timeout) 会直接把 ready handler 已经设上的 true 覆盖成
       //   false. ready handler 是 ground truth, refreshStatus 应该 trust 它.
-      const ok = await pingExtension();
-      if (ok || extensionConnected.value) {
+      const ping = await pingExtension();
+      if (ping || extensionConnected.value) {
         const st = await checkSellerStatus();
         sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
-        appendLog(sellerTabReady.value ? '刷新成功: 插件+seller 均已连接' : '刷新成功: 插件已连接, seller 待登录', 'success');
+        const versionTip = ping ? ` (${formatPluginVersion(ping)})` : '';
+        appendLog(sellerTabReady.value ? `刷新成功: 插件+seller 均已连接${versionTip}` : `刷新成功: 插件已连接${versionTip}, seller 待登录`, 'success');
       } else {
         appendLog('刷新: 仍未检测到插件, 继续轮询...', 'warn');
         if (!pollTimer) startPolling();
@@ -579,6 +583,10 @@ window.BatchUploadView = {
         description_category_id: d.descriptionCategoryId, type_id: d.typeId,
         primary_image: images[0] || '',
         service_type: 'IS_CODE_SERVICE', complex_attributes: [],
+        // 跟卖优先走 Ozon /v1/product/import-by-sku, 让 Ozon 按源 SKU 复制/关联原卡片.
+        // 这样比手工拼 /v3/product/import 的类目和必填属性更接近 MY ERP, 也更少出现属性不一致.
+        source_sku: Number(row.sku) || 0,
+        import_mode: 'sku',
       };
       if(opts.brand) item.scraped_brand = opts.brand;
       if(row.minPrice>0) item.min_price = row.minPrice.toFixed(2);
