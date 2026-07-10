@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.14";
+const VERSION = "2.2.9.15";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -74,18 +74,36 @@ async function collectSku(sku, storeIds = []) {
   }
   if (!result && lastRaw) console.warn(`[SW ${VERSION}]   polling 15 次都失败, 最后 raw: ${lastRaw}`);
 
-  // 4. 关闭 tab
-  await safeRemoveTab(tab.id);
-  
   if (!result) {
+    await safeRemoveTab(tab.id);
     throw new Error("executeScript 返回空 (可能商品页是空或被 Ozon 屏蔽)");
   }
   if (!result.name) {
+    await safeRemoveTab(tab.id);
     throw new Error(`未提取到商品名. raw=${JSON.stringify(result).slice(0, 300)}`);
   }
 
+  // v2.2.9.15: 优先复用 Seller 后台“复制商品”链路拿完整跟卖源包。
+  // 公开页/OPI 只能兜底，My ERP 的完整属性、尺寸、富内容主要来自这个 bundle item。
+  try {
+    const bundle = await enrichFromSellerPortalBundle(result, sku, tab.id);
+    result._seller_bundle_enriched = Boolean(bundle);
+    if (bundle) {
+      console.log(`[SW ${VERSION}]   Seller bundle: attrs=${bundle.attrCount} images=${bundle.imageCount} dims=${result.depth}x${result.width}x${result.height} weight=${result.weight}`);
+    } else {
+      console.log(`[SW ${VERSION}]   Seller bundle: 未找到可复制源包, 继续用公开页/OPI 兜底`);
+    }
+  } catch (e) {
+    result._seller_bundle_enriched = false;
+    result._seller_bundle_error = e.message || String(e);
+    console.warn(`[SW ${VERSION}]   Seller bundle 增强失败 (非致命): ${result._seller_bundle_error}`);
+  }
+
+  // 4. 关闭 tab
+  await safeRemoveTab(tab.id);
+
   // v2.1: 辅源 - Ozon Seller API 找店铺里同款商品复用 attributes
-  if (storeIds && storeIds.length > 0 && result.description_category_id) {
+  if (storeIds && storeIds.length > 0 && result.description_category_id && !result._seller_bundle_enriched) {
     try {
       const enriched = await enrichFromOpi(result, storeIds[0]);
       if (enriched) {
@@ -101,7 +119,7 @@ async function collectSku(sku, storeIds = []) {
       console.warn(`[SW ${VERSION}]   OPI 辅源失败 (非致命): ${e.message}`);
     }
   } else {
-    result._opi_enriched = "skipped";
+    result._opi_enriched = result._seller_bundle_enriched ? "skipped-seller-bundle" : "skipped";
   }
 
   // v2.3.0: 重新启用 category-resolve, 带 type_id + confidence
@@ -211,6 +229,257 @@ function injectRichContentAttr(data) {
   if (!data.attributes.some(a => Number(a?.id ?? a?.attribute_id) === 11254)) {
     data.attributes.push({ id: 11254, name: "JSON Rich Content", value: richContent });
   }
+}
+
+// ========== v2.2.9.15: Seller Portal 复制商品源包 ==========
+// My ERP 批量跟卖实际不是只读公开 PDP，而是先 /api/v1/search 找 variant_id，
+// 再调 /api/site/seller-prototype/create-bundle-by-variant-id 拿完整 bundle item。
+async function getSellerCompanyId() {
+  const cookies = await chrome.cookies.getAll({ url: "https://seller.ozon.ru/", name: "sc_company_id" });
+  const value = cookies.find(c => c?.value)?.value || "";
+  return String(value || "").trim();
+}
+
+async function fetchSellerPortalViaOzonTab(path, body, opts = {}) {
+  const timeoutMs = opts.timeoutMs || 30000;
+  const urlPrefix = opts.urlPrefix !== undefined ? opts.urlPrefix : "/api/v1";
+  const preferTabId = opts.preferTabId || null;
+  const isOzonUrl = (u) => /^https?:\/\/([^/]+\.)?ozon\.ru\//i.test(u || "");
+  let target = null;
+  if (preferTabId) {
+    try {
+      const t = await chrome.tabs.get(preferTabId);
+      if (t && isOzonUrl(t.url)) target = t;
+    } catch {}
+  }
+  if (!target) {
+    const tabs = await chrome.tabs.query({ url: ["*://*.ozon.ru/*"] });
+    target = tabs.find(t => t.status === "complete" && t.active)
+      || tabs.find(t => t.status === "complete")
+      || tabs[0]
+      || null;
+  }
+  if (!target) throw new Error("无可用 ozon.ru 标签页，无法调用 seller portal");
+
+  const doFetch = async (apiPath, reqBody, timeout, prefix) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    try {
+      const resp = await fetch("https://seller.ozon.ru" + (prefix || "/api/v1") + apiPath, {
+        method: "POST",
+        credentials: "include",
+        signal: controller.signal,
+        headers: { "content-type": "text/plain" },
+        body: JSON.stringify(reqBody || {}),
+      });
+      clearTimeout(timer);
+      if (resp.redirected && /\/(signin|login)/i.test(resp.url || "")) {
+        return { ok: false, status: 401, error: "seller 登录态已过期，请重新登录 seller.ozon.ru" };
+      }
+      const text = await resp.text();
+      let json = null;
+      try { json = text ? JSON.parse(text) : null; } catch {}
+      if (!resp.ok) {
+        return { ok: false, status: resp.status, error: `Seller portal HTTP ${resp.status}: ${text.slice(0, 300)}` };
+      }
+      return { ok: true, data: json };
+    } catch (e) {
+      clearTimeout(timer);
+      return { ok: false, error: e.name === "AbortError" ? `请求超时 (${timeout}ms)` : (e.message || String(e)) };
+    }
+  };
+
+  const results = await chrome.scripting.executeScript({
+    target: { tabId: target.id },
+    func: doFetch,
+    args: [path, body, timeoutMs, urlPrefix],
+    world: "MAIN",
+  });
+  const r = results?.[0]?.result;
+  if (!r) throw new Error("seller portal executeScript 未返回结果");
+  if (!r.ok) throw new Error(r.error || "seller portal 请求失败");
+  return r.data;
+}
+
+function normalizeSearchVariantToSv(v) {
+  if (!v) return null;
+  if (Array.isArray(v.attributes) && v.attributes.length > 0) return v;
+  const attributes = [];
+  if (v.description_type_name) attributes.push({ key: "8229", value: v.description_type_name });
+  if (v.brand_name) attributes.push({ key: "85", value: v.brand_name });
+  const productName = v.variant_name || v.title || v.name;
+  if (productName) attributes.push({ key: "4180", value: productName });
+  if (v.description) attributes.push({ key: "4191", value: v.description });
+  if (v.main_image) attributes.push({ key: "4194", value: v.main_image });
+  const secondaries = Array.isArray(v.secondary_images) ? v.secondary_images : [];
+  if (secondaries.length > 0) attributes.push({ key: "4195", collection: secondaries });
+  if (Array.isArray(v.barcodes) && v.barcodes.length > 0) {
+    const gtin = String(v.barcodes[0] || "").trim();
+    if (gtin) attributes.push({ key: "7822", value: gtin });
+  }
+  return {
+    variant_id: v.variant_id || (v.barcodes && v.barcodes[0]) || "",
+    description_category_id: Number(v.description_type_dict_value) || 0,
+    categories: (v.categories || []).map(c => ({
+      id: Number(c.id),
+      level: Number(c.level),
+      name: c.name || "",
+      title: c.title || c.name || "",
+    })),
+    _searchMeta: {
+      skus: v.skus || [],
+      barcodes: v.barcodes || [],
+      brand_id: v.brand_id,
+      is_copy_allowed: v.is_copy_allowed,
+      is_content_copy_allowed: v.is_content_copy_allowed,
+      rating: v.rating,
+    },
+    attributes,
+  };
+}
+
+function addSourceAttr(attrs, key, value, extra = {}) {
+  if (value === undefined || value === null || value === "") return;
+  const exists = attrs.some(a => String(a?.key ?? a?.id ?? a?.attribute_id) === String(key));
+  if (exists) return;
+  attrs.push({ key: String(key), value: String(value), ...extra });
+}
+
+function readBundleAttrValues(attr) {
+  const vals = Array.isArray(attr?.values) ? attr.values : [];
+  return vals
+    .map(v => v && typeof v === "object" ? (v.value ?? v.text ?? v.name ?? "") : v)
+    .map(v => String(v || "").trim())
+    .filter(Boolean);
+}
+
+function buildSourceVariantFromBundle(searchSv, bundleItem) {
+  const sv = searchSv && typeof searchSv === "object" ? { ...searchSv } : { attributes: [] };
+  const attrs = Array.isArray(sv.attributes) ? [...sv.attributes] : [];
+  const existing = new Set(attrs.map(a => String(a?.key ?? a?.id ?? a?.attribute_id)));
+
+  if (Number(bundleItem?.weight) > 0 && !existing.has("4497")) { attrs.push({ key: "4497", value: String(bundleItem.weight) }); existing.add("4497"); }
+  if (Number(bundleItem?.depth) > 0 && !existing.has("9454")) { attrs.push({ key: "9454", value: String(bundleItem.depth) }); existing.add("9454"); }
+  if (Number(bundleItem?.width) > 0 && !existing.has("9455")) { attrs.push({ key: "9455", value: String(bundleItem.width) }); existing.add("9455"); }
+  if (Number(bundleItem?.height) > 0 && !existing.has("9456")) { attrs.push({ key: "9456", value: String(bundleItem.height) }); existing.add("9456"); }
+  if (bundleItem?.barcode && !existing.has("7822")) { attrs.push({ key: "7822", value: String(bundleItem.barcode) }); existing.add("7822"); }
+
+  const bundleComplexAttrs = [];
+  if (Array.isArray(bundleItem?.attributes)) {
+    for (const ba of bundleItem.attributes) {
+      if (ba?.complex_id && String(ba.complex_id) !== "0") {
+        bundleComplexAttrs.push(ba);
+        continue;
+      }
+      const key = String(ba?.attribute_id || ba?.id || "");
+      if (!key || existing.has(key)) continue;
+      const vals = readBundleAttrValues(ba);
+      if (!vals.length) continue;
+      const attr = { key };
+      if (vals.length > 1) attr.collection = vals;
+      else attr.value = vals[0];
+      const dictId = Number(ba?.values?.[0]?.dictionary_value_id || ba?.dictionary_value_id || 0);
+      if (dictId > 0 && vals.length === 1) attr.dictionary_value_id = dictId;
+      attrs.push(attr);
+      existing.add(key);
+    }
+  }
+
+  sv.attributes = attrs;
+  if (bundleComplexAttrs.length) sv._bundleComplexAttrs = bundleComplexAttrs;
+  sv._bundleItem = bundleItem;
+  return sv;
+}
+
+function sourceVariantToFlatAttributes(sourceVariant, currentAttrs) {
+  const attrs = Array.isArray(currentAttrs) ? [...currentAttrs] : [];
+  const existing = new Set(attrs.map(a => String(a?.id ?? a?.attribute_id ?? a?.key ?? "")));
+  for (const a of (sourceVariant?.attributes || [])) {
+    const id = Number(a?.id ?? a?.attribute_id ?? a?.key);
+    if (!Number.isFinite(id) || id <= 0 || existing.has(String(id))) continue;
+    let value = "";
+    if (Array.isArray(a.collection)) value = a.collection.map(v => String(v || "").trim()).filter(Boolean).join(", ");
+    else if (a.value !== undefined && a.value !== null) value = String(a.value);
+    else if (Array.isArray(a.values)) value = readBundleAttrValues(a).join(", ");
+    if (!value) continue;
+    attrs.push({ id, name: a.name || "", value, ...(a.dictionary_value_id ? { dictionary_value_id: Number(a.dictionary_value_id) } : {}) });
+    existing.add(String(id));
+  }
+  return attrs;
+}
+
+function extractImagesFromSourceVariant(sourceVariant) {
+  const images = [];
+  const push = (u) => {
+    if (typeof u === "string" && /^https?:\/\//i.test(u) && !images.includes(u)) images.push(u);
+  };
+  const attrs = Array.isArray(sourceVariant?.attributes) ? sourceVariant.attributes : [];
+  const get = (key) => attrs.find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === String(key));
+  const primary = get("4194");
+  if (primary?.value) push(primary.value);
+  const gallery = get("4195");
+  if (Array.isArray(gallery?.collection)) gallery.collection.forEach(push);
+  if (gallery?.value) push(gallery.value);
+  const bundle = sourceVariant?._bundleItem || {};
+  push(bundle.primary_image);
+  for (const img of (Array.isArray(bundle.images) ? bundle.images : [])) push(typeof img === "string" ? img : (img?.file_name || img?.url || img?.src));
+  return images;
+}
+
+async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
+  const companyId = await getSellerCompanyId();
+  if (!companyId) throw new Error("未找到 sc_company_id cookie，请确认 seller.ozon.ru 已登录并选中店铺");
+  const searchResp = await fetchSellerPortalViaOzonTab("/search", {
+    company_id: String(companyId),
+    need_total: true,
+    filter: {
+      children_nodes: {
+        children_nodes: [{ input_leaf: { sku: { values: [String(sku)] } } }],
+        operator: "AND",
+      },
+    },
+    pagination: { limit: "50" },
+    is_copy_allowed: false,
+  }, { urlPrefix: "/api/v1", timeoutMs: 30000, preferTabId });
+
+  const rawVariants = Array.isArray(searchResp?.variants) ? searchResp.variants
+    : Array.isArray(searchResp?.items) ? searchResp.items
+    : Array.isArray(searchResp?.products) ? searchResp.products
+    : Array.isArray(searchResp) ? searchResp : [];
+  const sv = rawVariants.map(normalizeSearchVariantToSv).find(Boolean);
+  if (!sv?.variant_id) return null;
+
+  const bundleResp = await fetchSellerPortalViaOzonTab("/seller-prototype/create-bundle-by-variant-id", {
+    company_id: String(companyId),
+    variant_id: String(sv.variant_id),
+    source: "SOURCE_UI_COPY_APPAREL",
+  }, { urlPrefix: "/api/site", timeoutMs: 30000, preferTabId });
+  const bundleItem = bundleResp?.item || null;
+  if (!bundleItem) return null;
+
+  const sourceVariant = buildSourceVariantFromBundle(sv, bundleItem);
+  data._sourceVariant = sourceVariant;
+  data.attributes = sourceVariantToFlatAttributes(sourceVariant, data.attributes);
+  const images = extractImagesFromSourceVariant(sourceVariant);
+  if (images.length) {
+    data.images = [...images, ...(Array.isArray(data.images) ? data.images : [])].filter((u, idx, arr) => u && arr.indexOf(u) === idx).slice(0, 15);
+    data.primary_image = data.images[0] || data.primary_image || "";
+  }
+  if (bundleItem.name && !data.name) data.name = String(bundleItem.name);
+  if (bundleItem.description && !data.description) data.description = String(bundleItem.description);
+  if (Number(bundleItem.weight) > 0) data.weight = Number(bundleItem.weight);
+  if (Number(bundleItem.depth) > 0) data.depth = Number(bundleItem.depth);
+  if (Number(bundleItem.width) > 0) data.width = Number(bundleItem.width);
+  if (Number(bundleItem.height) > 0) data.height = Number(bundleItem.height);
+  if (bundleItem.barcode) data.barcode = String(bundleItem.barcode);
+  if (sv.description_category_id && !data.type_id) data.type_id = Number(sv.description_category_id) || data.type_id;
+  data._seller_bundle_source = {
+    company_id: String(companyId),
+    variant_id: String(sv.variant_id),
+    bundle_id: bundleResp?.bundle_id || null,
+    attr_count: Array.isArray(bundleItem.attributes) ? bundleItem.attributes.length : 0,
+  };
+  return { attrCount: data.attributes.length, imageCount: data.images.length };
 }
 
 // ========== v2.1: Ozon Seller API (OPI) 辅源 ==========
@@ -325,7 +594,7 @@ async function enrichFromOpi(data, storeId) {
   //   (跟卖场景中同 SKU 通常已发布过), 拿到 type_id / attributes 兜底补齐
   try {
     const own = await getProductInfo(String(data.sku || ""), creds);
-    if (own && typeof own === "object") {
+    if (own && typeof own === "object" && !data._seller_bundle_enriched) {
       data._sourceVariant = own;
     }
     if (own && own.type_id && !data.type_id) {
@@ -352,7 +621,7 @@ async function enrichFromOpi(data, storeId) {
   console.log(`[SW ${VERSION}]   OPI 辅源: 找到 ${similar.offer_id} (${similar.name?.slice(0,30)})`);
   const detail = await getProductInfo(similar.offer_id, creds);
   if (!detail) return null;
-  data._sourceVariant = detail;
+  if (!data._seller_bundle_enriched) data._sourceVariant = detail;
   // 合并 attributes
   const opiAttrs = detail.attributes || [];
   if (!opiAttrs.length) {
