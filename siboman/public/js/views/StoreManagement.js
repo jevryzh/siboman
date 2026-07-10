@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.7)
+            逐梦 Ozon 采集器 (v2.2.9.8)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.7</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.8</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.8 增强 plugin 采集 debug: 第 1/5/10 次打印 result 类型 + tab.status + URL, 30s 全空时报最后 raw. 让 user 在 chrome://extensions → service worker console 看具体为啥空 (tab 没渲染/extract 函数抛错/executeScript 权限)</li>
             <li>✅ v2.2.9.7 修复 plugin 采集 2906884816 等 SPA 慢加载商品空采集: Chrome 后台 tab JS throttle 严重, polling 5×1s 不够. 改 15×2s, exit 放宽到 name 拿到就 break (不再强求 cat > 0, category-resolve 后续用 candidates 补). executeScript 抛错也打印方便 debug</li>
             <li>✅ v2.2.9.6 attribute 9048 (Название модели 型号名称) 自动兜底: plugin 从商品 name 提取型号 (跳过通用俄文词 + 尺寸/容量, 保留英文 brand+型号), server 端也兜底一次 (plugin 旧版本不会漏). 之前 Ozon 接受商品 (imported) 但 attribute 9048 必填字段空, 商品在 seller 后台无法正常上架. 实测 3678512870 帐篷 → "Cloud Skies Tarp Lite (L)" → Ozon 接受 task 5045289680 ✓</li>
             <li>✅ v2.2.9.5 candidates 排序更智能: server 端 token 集合从 3 扩到 8, 优先俄文 (cyrillic) 降权英文 (商品名常带品牌词 cloud/skies/tarp 等); 排序时 score 相同优先 name 完全等于商品 token 的 (e.g. "Тент" name == "тент" token). 实测 3678512870 大旅行帐篷: candidates #1 = cat=17029010 type_id=93523 "Тент" (天幕), 上架 task 5039550669 接受 ✓</li>

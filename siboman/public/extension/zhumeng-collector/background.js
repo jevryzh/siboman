@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.7";
+const VERSION = "2.2.9.8";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -40,7 +40,9 @@ async function collectSku(sku, storeIds = []) {
   //   1) maxRetries 5 → 15, 间隔 1000ms → 2000ms (最多等 30s)
   //   2) exit 条件放宽: result.name 有就 break (不再强求 cat > 0), 后面 category-resolve 用 candidates 自动补
   //   3) executeScript 抛错时打印, 方便 debug
+  // v2.2.9.8: 增强 debug — 每次 polling 后打印 result 类型 + tab status + 名字, 30s 全空时报最后 raw
   let result = null;
+  let lastRaw = null;
   const maxRetries = 15;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -50,6 +52,7 @@ async function collectSku(sku, storeIds = []) {
         args: [sku],
       });
       result = execResult?.result;
+      if (result) lastRaw = JSON.stringify(result).slice(0, 300);
     } catch (e) {
       console.warn(`[SW ${VERSION}]   attempt ${attempt} executeScript 抛错: ${e.message}`);
     }
@@ -58,8 +61,14 @@ async function collectSku(sku, storeIds = []) {
       if (attempt > 1) console.log(`[SW ${VERSION}]   第 ${attempt} 次 retry 拿到 name="${result.name?.slice(0,40)}" cat=${result.description_category_id || 0} attrs=${result.attributes?.length || 0}`);
       break;
     }
+    // v2.2.9.8: 详细 debug — 第 1/5/10 次打印 result 类型 + tab status, 让 user 在 service worker console 能看到
+    if (attempt === 1 || attempt === 5 || attempt === 10) {
+      const tabInfo = await chrome.tabs.get(tab.id).catch(() => null);
+      console.log(`[SW ${VERSION}]   attempt ${attempt} result=${result ? `object(name=${result.name?.slice(0,30)||'(empty)'})` : 'null'} tab.status=${tabInfo?.status} url=${tabInfo?.url?.slice(0,60)}`);
+    }
     if (attempt < maxRetries) await new Promise(r => setTimeout(r, 2000));
   }
+  if (!result && lastRaw) console.warn(`[SW ${VERSION}]   polling 15 次都失败, 最后 raw: ${lastRaw}`);
 
   // 4. 关闭 tab
   await safeRemoveTab(tab.id);
