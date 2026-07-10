@@ -113,11 +113,11 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.2)
+            逐梦 Ozon 采集器 (v2.2.9.6)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.2</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.6</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
             <li>✅ v2.2.9.6 attribute 9048 (Название модели 型号名称) 自动兜底: plugin 从商品 name 提取型号 (跳过通用俄文词 + 尺寸/容量, 保留英文 brand+型号), server 端也兜底一次 (plugin 旧版本不会漏). 之前 Ozon 接受商品 (imported) 但 attribute 9048 必填字段空, 商品在 seller 后台无法正常上架. 实测 3678512870 帐篷 → "Cloud Skies Tarp Lite (L)" → Ozon 接受 task 5045289680 ✓</li>
