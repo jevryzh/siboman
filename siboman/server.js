@@ -3808,7 +3808,7 @@ async function applyListingAttributesAfterImport(row) {
     }
     if (!productId) return { skipped: true, reason: "product_id_not_ready" };
 
-    const payload = { items: [{ product_id: productId, attributes: normalizedAttributes }] };
+    const payload = { items: [{ product_id: productId, offer_id: String(row.offer_id), attributes: normalizedAttributes }] };
     const data = await callOzonSellerAPI("/v1/product/attributes/update", payload, { storeId: row.store_id, userId: row.user_id });
     await db.query(
       `UPDATE app_listing_history
