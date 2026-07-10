@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.6";
+const VERSION = "2.2.9.7";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -35,10 +35,13 @@ async function collectSku(sku, storeIds = []) {
     throw new Error(`Ozon 商品页加载超时/失败: ${e.message}`);
   }
 
-  // v2.2.9.1: Ozon SPA 异步渲染, status=complete 后 [data-widget="breadCrumbs"] 可能还没出现
-  //   用 polling 调用 executeScript, 最多 5 次 (每 1s 一次), 直到 cat != 0 或超时
+// v2.2.9.1: Ozon SPA 异步渲染, status=complete 后 [data-widget="breadCrumbs"] 可能还没出现
+  // v2.2.9.7: Chrome 后台 tab JS throttle 严重 (lazy-load 元素可能 5-10s 才出现), polling 5×1s 不够
+  //   1) maxRetries 5 → 15, 间隔 1000ms → 2000ms (最多等 30s)
+  //   2) exit 条件放宽: result.name 有就 break (不再强求 cat > 0), 后面 category-resolve 用 candidates 自动补
+  //   3) executeScript 抛错时打印, 方便 debug
   let result = null;
-  const maxRetries = 5;
+  const maxRetries = 15;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       const [execResult] = await chrome.scripting.executeScript({
@@ -48,15 +51,16 @@ async function collectSku(sku, storeIds = []) {
       });
       result = execResult?.result;
     } catch (e) {
-      // executeScript 失败重试
+      console.warn(`[SW ${VERSION}]   attempt ${attempt} executeScript 抛错: ${e.message}`);
     }
-    if (result && result.description_category_id && result.description_category_id > 0) {
-      if (attempt > 1) console.log(`[SW ${VERSION}]   breadcrumb 在第 ${attempt} 次 retry 拿到 cat=${result.description_category_id}`);
+    // v2.2.9.7: 放宽 exit 条件 — name 拿到就 break (cat 可以后续 category-resolve 用 candidates 补)
+    if (result && result.name) {
+      if (attempt > 1) console.log(`[SW ${VERSION}]   第 ${attempt} 次 retry 拿到 name="${result.name?.slice(0,40)}" cat=${result.description_category_id || 0} attrs=${result.attributes?.length || 0}`);
       break;
     }
-    if (attempt < maxRetries) await new Promise(r => setTimeout(r, 1000));
+    if (attempt < maxRetries) await new Promise(r => setTimeout(r, 2000));
   }
-  
+
   // 4. 关闭 tab
   await safeRemoveTab(tab.id);
   
