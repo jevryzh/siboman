@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.13";
+const VERSION = "2.2.9.14";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -185,17 +185,32 @@ async function collectSku(sku, storeIds = []) {
     }
   }
 
-  // v1.0.9: 详细打印每个字段的来源 + 关键数据
-  const dbg = result._debug || {};
+	  // v1.0.9: 详细打印每个字段的来源 + 关键数据
+  injectRichContentAttr(result);
+	  const dbg = result._debug || {};
   console.log(`[SW ${VERSION}] ✓ 采集 ${sku}: ${result.name?.slice(0, 50)}`);
   console.log(`[SW ${VERSION}]   字段: images=${result.images.length} | cat=${result.description_category_id} | type=${result.type_id} | brand=${result.brand || "(空)"} | weight=${result.weight}g | dims=${result.depth}x${result.width}x${result.height} | price=${result.price || "(空)"} | barcode=${result.barcode || "(空)"} | country=${result.country_of_origin || "(空)"}`);
-  console.log(`[SW ${VERSION}]   attributes: ${result.attributes.length} 个, opi=${result._opi_enriched}${result._opi_error ? " (error: "+result._opi_error+")" : ""}`);
+	  console.log(`[SW ${VERSION}]   attributes: ${result.attributes.length} 个, rich=${result.richContent ? result.richContent.length : 0} bytes, opi=${result._opi_enriched}${result._opi_error ? " (error: "+result._opi_error+")" : ""}`);
   if (result.attributes.length > 0) {
     console.log(`[SW ${VERSION}]   attributes 前 3 个: ${JSON.stringify(result.attributes.slice(0, 3))}`);
   }
   console.log(`[SW ${VERSION}]   _debug 详情: ${JSON.stringify(dbg)}`);
 
-  return result;
+	  return result;
+	}
+
+function injectRichContentAttr(data) {
+  const richContent = typeof data?.richContent === "string" ? data.richContent.trim() : "";
+  if (!richContent) return;
+  if (!data._sourceVariant || typeof data._sourceVariant !== "object") data._sourceVariant = { attributes: [] };
+  const attrs = Array.isArray(data._sourceVariant.attributes) ? data._sourceVariant.attributes : [];
+  if (!attrs.some(a => String(a?.key ?? a?.id ?? a?.attribute_id) === "11254")) {
+    data._sourceVariant.attributes = [...attrs, { key: "11254", value: richContent }];
+  }
+  if (!Array.isArray(data.attributes)) data.attributes = [];
+  if (!data.attributes.some(a => Number(a?.id ?? a?.attribute_id) === 11254)) {
+    data.attributes.push({ id: 11254, name: "JSON Rich Content", value: richContent });
+  }
 }
 
 // ========== v2.1: Ozon Seller API (OPI) 辅源 ==========
@@ -430,7 +445,7 @@ async function safeRemoveTab(tabId) {
 // ========== 注入到 Ozon 商品页的提取函数 (IIFE) ==========
 // 这个函数被 executeScript 注入到 www.ozon.ru 商品页, 在 page context 跑
 // v1.0.9 大幅扩展: 把上架需要的全部字段都尝试从页面拿到
-function extractOzonProductData(sku) {
+async function extractOzonProductData(sku) {
   // v2.2.9.10 (fix): 把整个提取逻辑包 try/catch, helper 函数必须在 closure 里
   //   chrome.scripting.executeScript 注入的函数只能引用自己函数体内代码 (跨函数调 ReferenceError)
   try {
@@ -609,7 +624,141 @@ function collectImagesFromText(data, text) {
   while ((m = re.exec(normalizedText)) && data.images.length < 80) {
     addImageUrl(data, m[0]);
   }
-  return data.images.length - before;
+	  return data.images.length - before;
+	}
+
+function parseMaybeJson(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed || !/^[\[{]/.test(trimmed)) return value;
+  try { return JSON.parse(trimmed); } catch { return value; }
+}
+
+function isRichContentDoc(doc) {
+  return Boolean(
+    doc &&
+    typeof doc === "object" &&
+    !Array.isArray(doc) &&
+    Array.isArray(doc.content) &&
+    doc.content.length > 0 &&
+    doc.content.some(block => block && typeof block === "object" && typeof block.widgetName === "string" && block.widgetName.trim())
+  );
+}
+
+function collectRichContentStats(doc) {
+  const stats = { widgetCount: 0, textWidgetCount: 0, layoutWidgetCount: 0, imageCount: 0, textNodeCount: 0, textChars: 0, hasRealText: false };
+  const skipTextKeys = new Set(["widgetName", "align", "size", "color", "type", "src", "srcMobile", "url", "link", "imgLink", "richAnnotationJson", "class", "className", "style", "trackingInfo", "layoutTrackingInfo"]);
+  const looksLikeImageUrl = (text) => /^https?:\/\/.+\.(?:jpg|jpeg|png|webp|gif|avif)(?:[?#].*)?$/i.test(text);
+  const pushText = (value, key) => {
+    if (key && skipTextKeys.has(key)) return;
+    const text = String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+    if (text.length < 2 || /^https?:\/\//i.test(text) || looksLikeImageUrl(text)) return;
+    if (!/[A-Za-zА-Яа-яЁё]/.test(text)) return;
+    stats.textNodeCount += 1;
+    stats.textChars += text.length;
+  };
+  const walk = (node, key, depth) => {
+    if (node == null || depth > 24) return;
+    if (typeof node === "string") { pushText(node, key); return; }
+    if (Array.isArray(node)) { for (const item of node) walk(item, key, depth + 1); return; }
+    if (typeof node !== "object") return;
+    const widgetName = String(node.widgetName || "");
+    if (widgetName) {
+      stats.widgetCount += 1;
+      if (/text|description|annotation/i.test(widgetName)) stats.textWidgetCount += 1;
+      if (/showcase|billboard|roll|tile|media|chess/i.test(widgetName) || /billboard|roll|chess|tile/i.test(String(node.type || ""))) stats.layoutWidgetCount += 1;
+    }
+    if (node.img && typeof node.img === "object") stats.imageCount += 1;
+    for (const imageKey of ["src", "srcMobile", "url", "image", "imageUrl", "coverImage"]) {
+      const raw = node[imageKey];
+      if (typeof raw === "string" && /^https?:\/\//i.test(raw) && looksLikeImageUrl(raw)) stats.imageCount += 1;
+    }
+    for (const childKey of Object.keys(node)) {
+      if (skipTextKeys.has(childKey) && childKey !== "text" && childKey !== "title") continue;
+      walk(node[childKey], childKey, depth + 1);
+    }
+  };
+  walk(doc?.content, "content", 0);
+  stats.hasRealText = stats.textChars >= 12 || stats.textNodeCount >= 2 || stats.textWidgetCount > 0;
+  return stats;
+}
+
+function extractRichContentFromStates(states) {
+  if (!states || typeof states !== "object") return "";
+  const candidates = [];
+  const seenJson = new Set();
+  const seenObjects = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+  const addCandidate = (doc, rawJson) => {
+    if (!isRichContentDoc(doc)) return;
+    const json = typeof rawJson === "string" && rawJson.trim()
+      ? rawJson.trim()
+      : JSON.stringify({ content: doc.content, version: doc.version || 0.3 });
+    if (seenJson.has(json)) return;
+    seenJson.add(json);
+    const stats = collectRichContentStats(doc);
+    candidates.push({
+      json,
+      score:
+        (stats.hasRealText ? 100000 : 0) +
+        stats.textWidgetCount * 12000 +
+        stats.layoutWidgetCount * 600 +
+        stats.textChars * 40 +
+        stats.textNodeCount * 500 +
+        stats.widgetCount * 80 +
+        stats.imageCount * 20 +
+        Math.min(json.length, 20000) / 20000 -
+        candidates.length / 1000,
+    });
+  };
+  const walk = (node, depth) => {
+    if (node == null || depth > 24) return;
+    const parsed = parseMaybeJson(node);
+    if (!parsed || typeof parsed !== "object") return;
+    if (seenObjects) {
+      if (seenObjects.has(parsed)) return;
+      seenObjects.add(parsed);
+    }
+    if (typeof parsed.richAnnotationJson === "string" && parsed.richAnnotationJson.trim()) {
+      addCandidate(parseMaybeJson(parsed.richAnnotationJson), parsed.richAnnotationJson);
+    }
+    if (isRichContentDoc(parsed)) addCandidate(parsed, null);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) walk(item, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(parsed)) walk(parsed[key], depth + 1);
+  };
+  walk(states, 0);
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.json || "";
+}
+
+async function collectRichContentFromOzonPage() {
+  const path = `${location.pathname}${location.search || ""}`;
+  const endpoints = [
+    `/api/entrypoint-api.bx/page/json/v2?url=${encodeURIComponent(path)}`,
+    `/api/composer-api.bx/page/json/v2?url=${encodeURIComponent(path)}`,
+  ];
+  let best = "";
+  for (const url of endpoints) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const resp = await fetch(url, {
+        credentials: "include",
+        headers: { "x-o3-app-name": "dweb_client", "accept": "application/json" },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!resp.ok) continue;
+      const payload = await resp.json();
+      const rich = extractRichContentFromStates(payload?.widgetStates || {});
+      if (rich && rich.length > best.length) best = rich;
+    } catch (e) {
+      clearTimeout(timer);
+    }
+  }
+  return best;
 }
 
 
@@ -924,15 +1073,28 @@ function collectImagesFromText(data, text) {
   }
 
   // ========== 9. 提取 country_of_origin (原产国) ==========
-  if (!data.country_of_origin && data.attributes.length > 0) {
-    const countryAttr = data.attributes.find(a => {
-      const n = a.name.toLowerCase();
-      return n.includes("страна") || n.includes("country") || n.includes("产地") || n.includes("国家");
-    });
-    if (countryAttr) data.country_of_origin = countryAttr.value;
+	  if (!data.country_of_origin && data.attributes.length > 0) {
+	    const countryAttr = data.attributes.find(a => {
+	      const n = a.name.toLowerCase();
+	      return n.includes("страна") || n.includes("country") || n.includes("产地") || n.includes("国家");
+	    });
+	    if (countryAttr) data.country_of_origin = countryAttr.value;
+	  }
+
+  // ========== 9.5. 提取 Ozon 富内容 JSON (attribute 11254) ==========
+  try {
+    const richContent = await collectRichContentFromOzonPage();
+    if (richContent) {
+      data.richContent = richContent;
+      data.attributes.push({ id: 11254, name: "JSON Rich Content", value: richContent });
+      dbg.richContentBytes = richContent.length;
+      dbg.attributeSources.push("rich-content.11254");
+    }
+  } catch (e) {
+    dbg.richContentError = e.message || String(e);
   }
 
-  // ========== 10. 调试信息 ==========
+	  // ========== 10. 调试信息 ==========
   // 截断 attributes 数组, 避免 _debug 太大
   dbg.attributesFound = data.attributes.length;
   dbg.attributesFirst3 = data.attributes.slice(0, 3);
