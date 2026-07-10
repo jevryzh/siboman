@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.8";
+const VERSION = "2.2.9.9";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -55,6 +55,10 @@ async function collectSku(sku, storeIds = []) {
       if (result) lastRaw = JSON.stringify(result).slice(0, 300);
     } catch (e) {
       console.warn(`[SW ${VERSION}]   attempt ${attempt} executeScript 抛错: ${e.message}`);
+    }
+    // v2.2.9.8: extract 函数本身 try/catch 抛错时会在 result._error 字段, 这里打印到 SW console (user 能看)
+    if (result && result._error) {
+      console.error(`[SW ${VERSION}]   attempt ${attempt} extract 内部抛错: ${result._error} | stack=${result._stack}`);
     }
     // v2.2.9.7: 放宽 exit 条件 — name 拿到就 break (cat 可以后续 category-resolve 用 candidates 补)
     if (result && result.name) {
@@ -423,6 +427,28 @@ async function safeRemoveTab(tabId) {
 // 这个函数被 executeScript 注入到 www.ozon.ru 商品页, 在 page context 跑
 // v1.0.9 大幅扩展: 把上架需要的全部字段都尝试从页面拿到
 function extractOzonProductData(sku) {
+  // v2.2.9.8: 整个函数包 try/catch, 任何抛错都 log 到 page console + return minimal data
+  //   之前 plugin 报"executeScript 返回空"但 user console 完全看不到原因 — 抛错被 chrome.scripting.executeScript 吞了
+  //   现在把异常信息 log 到 page console, user 在该 tab DevTools 能看到, 还能 attach _error 到返回 data 里
+  try {
+    return extractOzonProductDataInner(sku);
+  } catch (e) {
+    console.error("[zhumeng-extract] FATAL 抛错:", e.message, e.stack);
+    return {
+      sku: String(sku || ""),
+      name: "",
+      description_category_id: 0,
+      type_id: 0,
+      images: [],
+      attributes: [],
+      _error: e.message,
+      _stack: (e.stack || "").slice(0, 500),
+      raw_url: location.href,
+    };
+  }
+}
+
+function extractOzonProductDataInner(sku) {
   const data = {
     sku: String(sku || ""),
     name: "",
