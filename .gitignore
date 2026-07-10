@@ -1,5 +1,6 @@
 # 敏感配置文件 (不入库, 单独交付)
 .env
+.env.*
 env/
 *.env
 **/.env
@@ -9,6 +10,7 @@ deploy-prod.sh
 # 运行时产物
 node_modules/
 **/node_modules/
+/data/
 *.log
 __pycache__/
 .DS_Store
