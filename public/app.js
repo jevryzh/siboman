@@ -118,9 +118,22 @@ function formatTime(v) {
   return d.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" });
 }
 function statusBadge(status) {
-  const map = { running:["green","运行中"], paused:["amber","已暂停"], done:["green","完成"], claimed:["blue","已领取"], queued:["gray","排队中"], error:["red","失败"], canceled:["gray","已停止"] };
+  const map = { running:["green","运行中"], paused:["amber","已暂停"], exporting:["blue","正在导出"], done:["green","完成"], claimed:["blue","已领取"], queued:["gray","排队中"], error:["red","失败"], canceled:["gray","已停止"] };
   const [cls, label] = map[status] || ["gray", status || "—"];
   return `<span class="badge ${cls}">${escapeHtml(label)}</span>`;
+}
+
+function renderJobProgress(it = {}) {
+  const processed = Number(it.processed || 0);
+  const total = Number(it.total || 0);
+  const exporting = it.status === "exporting";
+  const percent = total > 0 ? Math.max(0, Math.min(100, Math.round((processed / total) * 100))) : (exporting ? 80 : 0);
+  const label = exporting ? `正在导出 · ${processed} / ${total || "?"}` : `${processed} / ${total || 0}`;
+  return `
+    <div class="muted">${escapeHtml(label)}</div>
+    <div style="width:140px;max-width:100%;height:8px;background:#eef2ed;border-radius:999px;overflow:hidden;margin-top:6px">
+      <div style="height:100%;width:${percent}%;background:${exporting ? "#2563eb" : "#2f7d5c"};transition:width .25s"></div>
+    </div>`;
 }
 
 async function postJson(url, payload) {
@@ -941,7 +954,7 @@ async function restoreActiveJob(scope = "single") {
   if (!job || ["done", "error", "canceled"].includes(job.status)) {
     const history = await getJson("/api/history").catch(() => null);
     const wantedKind = scope === "batch" ? "batch-ozon" : "run";
-    const activeStatuses = new Set(["queued", "claimed", "running", "paused"]);
+    const activeStatuses = new Set(["queued", "claimed", "running", "paused", "exporting"]);
     const item = (history?.items || []).find((it) => it.kind === wantedKind && activeStatuses.has(it.status));
     if (item?.id) {
       const data = await getJson(`/api/jobs/${item.id}`);
@@ -965,13 +978,18 @@ async function actOnCurrentJob(action, jobId = state.currentJobId) {
     const data = await postJson(`/api/jobs/${jobId}/${action}`, {});
     if (data.job) renderPolledJob(data.job);
     if (data.downloadUrl) toast("Excel 已生成，可以下载。", "success");
+    else if (data.exporting) toast("已进入后台导出，可在历史与下载查看进度。", "success");
     else toast(`${labels[action] || "操作"}成功`, "success");
     if (action === "resume") {
       state.currentJobId = jobId;
       localStorage.setItem("currentJobId", jobId);
       startJobPolling();
     }
-    if (action === "finish" || action === "cancel") {
+    if (action === "finish" && data.exporting) {
+      state.currentJobId = jobId;
+      localStorage.setItem("currentJobId", jobId);
+      startJobPolling();
+    } else if (action === "finish" || action === "cancel") {
       clearInterval(state.pollTimer);
       localStorage.removeItem("currentJobId");
     }
@@ -988,6 +1006,7 @@ async function loadHistoryIfVisible() {
 function updateJobControlButtons(status) {
   const active = ["queued", "claimed", "running"].includes(status);
   const paused = status === "paused";
+  const exporting = status === "exporting";
   const terminal = ["done", "error", "canceled"].includes(status);
   const run = $("#runBtn") || $("#batchRunBtn");
   const pause = $("#pauseBtn") || $("#batchPauseBtn");
@@ -997,8 +1016,8 @@ function updateJobControlButtons(status) {
   if (run) run.disabled = active;
   if (pause) pause.disabled = !active;
   if (resume) resume.disabled = !paused;
-  if (finish) finish.disabled = terminal || (!active && !paused);
-  if (cancel) cancel.disabled = terminal;
+  if (finish) finish.disabled = terminal || exporting || (!active && !paused);
+  if (cancel) cancel.disabled = terminal || exporting;
 }
 
 function renderPolledJob(job) {
@@ -3312,11 +3331,12 @@ async function loadHistory() {
     const items = data.items || [];
     const body = $("#historyBody");
     if (!items.length) { body.innerHTML = `<tr><td colspan="6" class="empty">还没有历史任务</td></tr>`; return; }
+    const hasLiveJob = items.some((it) => ["queued", "claimed", "running", "paused", "exporting"].includes(it.status));
     body.innerHTML = items.slice(0, 50).map((it) => `
       <tr>
         <td class="wrap"><div>${escapeHtml(it.kind === "batch-ozon" ? "批量采集" : "单品找货")}</div><span class="muted">${escapeHtml((it.id || "").slice(0, 8))}</span></td>
         <td>${statusBadge(it.status)}${it.phase ? `<div class="muted">${escapeHtml(it.phase)}</div>` : ""}</td>
-        <td>${it.processed || 0} / ${it.total || 0}</td>
+        <td>${renderJobProgress(it)}</td>
         <td><span class="muted">${escapeHtml(formatTime(it.updatedAt))}</span></td>
         <td>${renderHistoryActions(it)}</td>
         <td>${it.downloadUrl ? `<a class="button small" href="${escapeAttr(it.downloadUrl)}">下载 Excel</a>` : ""}</td>
@@ -3329,18 +3349,23 @@ async function loadHistory() {
         await actOnCurrentJob(action, id);
       });
     });
+    if (hasLiveJob && $("#historyBody")) {
+      clearTimeout(state.historyRefreshTimer);
+      state.historyRefreshTimer = setTimeout(() => loadHistory().catch(() => {}), 2000);
+    }
   } catch (e) { toast(e.message, "error"); }
 }
 
 function renderHistoryActions(it) {
   const active = ["queued", "claimed", "running"].includes(it.status);
   const paused = it.status === "paused";
+  const exporting = it.status === "exporting";
   const terminal = ["done", "error", "canceled"].includes(it.status);
   const id = escapeAttr(it.id || "");
   const parts = [];
   if (active) parts.push(`<button class="button small" data-job-action="pause" data-job-id="${id}">暂停</button>`);
   if (paused) parts.push(`<button class="button small" data-job-action="resume" data-job-id="${id}">继续</button>`);
-  if (!terminal) parts.push(`<button class="button small" data-job-action="finish" data-job-id="${id}">结束并导出</button>`);
+  if (!terminal && !exporting) parts.push(`<button class="button small" data-job-action="finish" data-job-id="${id}">结束并导出</button>`);
   if (active || paused) parts.push(`<button class="button small danger" data-job-action="cancel" data-job-id="${id}">停止</button>`);
   return parts.length ? `<div style="display:flex;gap:6px;flex-wrap:wrap">${parts.join("")}</div>` : "";
 }

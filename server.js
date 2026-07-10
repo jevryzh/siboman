@@ -2609,29 +2609,21 @@ app.post("/api/jobs/:id/finish", async (req, res, next) => {
         res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl });
         return;
       }
-      const job = {
-        ...existing,
-        id: existing.id,
-        kind: existing.kind,
-        status: "done",
-        phase: "已结束并生成 Excel",
-        logs: [...(existing.logs || []), makeLogEntry("已手动结束任务，并按当前已采集结果生成 Excel。", "warn")],
-        results: Array.isArray(existing.results) ? existing.results : [],
-      };
-      await processWorkerCompletionResults(job, existing);
-      const kind = existing.kind === "batch-ozon" ? "batch-ozon" : "run";
-      const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, job, "");
+      if (existing.status === "exporting") {
+        res.json({ success: true, job: existing, exporting: true });
+        return;
+      }
+      const logs = [...(existing.logs || []), makeLogEntry("已手动结束任务，开始后台生成 Excel。", "warn")];
       const updated = await updateDbJob(req.params.id, {
-        status: "done",
-        phase: "已结束并生成 Excel",
-        processed: job.results.length || existing.processed || 0,
-        total: existing.total || existing.sourceTotal || job.results.length || 0,
-        logs: job.logs,
-        results: job.results,
+        status: "exporting",
+        phase: "正在生成 Excel，请稍候",
+        logs,
         error: "",
-        downloadUrl,
       });
-      res.json({ success: true, job: updated, downloadUrl });
+      finishDbJobExport(req.params.id, req.user).catch((error) => {
+        console.error("[job-finish-export]", req.params.id, error);
+      });
+      res.json({ success: true, job: updated, exporting: true });
       return;
     }
     const job = jobs.get(req.params.id) || await loadStoredJob(req.params.id);
@@ -2649,6 +2641,43 @@ app.post("/api/jobs/:id/finish", async (req, res, next) => {
     next(error);
   }
 });
+
+async function finishDbJobExport(jobId, user) {
+  const existing = await getDbJobForUser(jobId, user);
+  if (!existing || (existing.status === "done" && existing.downloadUrl)) return existing;
+  const job = {
+    ...existing,
+    id: existing.id,
+    kind: existing.kind,
+    status: "done",
+    phase: "已结束并生成 Excel",
+    logs: [...(existing.logs || []), makeLogEntry("正在整理已采集结果、图片和 AI 审核数据。")],
+    results: Array.isArray(existing.results) ? existing.results : [],
+  };
+  try {
+    await processWorkerCompletionResults(job, existing);
+    const kind = existing.kind === "batch-ozon" ? "batch-ozon" : "run";
+    const downloadUrl = await saveWorkerArtifacts(jobId, kind, job, "");
+    return await updateDbJob(jobId, {
+      status: "done",
+      phase: "已结束并生成 Excel",
+      processed: job.results.length || existing.processed || 0,
+      total: existing.total || existing.sourceTotal || job.results.length || 0,
+      logs: [...job.logs, makeLogEntry("Excel 已生成，可以下载。")],
+      results: job.results,
+      error: "",
+      downloadUrl,
+    });
+  } catch (error) {
+    await updateDbJob(jobId, {
+      status: "error",
+      phase: "导出失败",
+      logs: [...job.logs, makeLogEntry(`导出失败：${error.message || String(error)}`, "error")],
+      error: error.message || String(error),
+    }).catch(() => {});
+    throw error;
+  }
+}
 
 app.get("/api/jobs/:id/download", async (req, res, next) => {
   try {
@@ -2808,12 +2837,12 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
-    if (["paused", "canceled", "done"].includes(existing.status)) {
+    if (["paused", "canceled", "done", "exporting"].includes(existing.status)) {
       res.json({ success: true, job: existing });
       return;
     }
     const updates = normalizeWorkerJobUpdate(req.body || {}, existing);
-    if (["paused", "canceled", "done"].includes(existing.status) && updates.status && ![existing.status, "done", "error"].includes(updates.status)) {
+    if (["paused", "canceled", "done", "exporting"].includes(existing.status) && updates.status && ![existing.status, "done", "error"].includes(updates.status)) {
       delete updates.status;
     }
     const job = Object.keys(updates).length ? await updateDbJob(req.params.id, updates) : existing;
@@ -2841,7 +2870,7 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
-    if (["paused", "canceled", "done"].includes(existing.status)) {
+    if (["paused", "canceled", "done", "exporting"].includes(existing.status)) {
       res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl || "" });
       return;
     }
@@ -3665,12 +3694,13 @@ async function scrapeOzonBuyerCnyPrices(page) {
     };
     const parseCnyPrice = (text) => {
       const value = String(text || "");
+      const MIN_VALID_OZON_CNY = 3;
       const prices = [];
       const addPrice = (raw, index) => {
         const before = value.slice(Math.max(0, index - 4), index);
         if (/\+\s*$/.test(before)) return;
         const number = Number(String(raw || "").replace(/\s/g, "").replace(",", "."));
-        if (Number.isFinite(number) && number > 0) prices.push(number);
+        if (Number.isFinite(number) && number >= MIN_VALID_OZON_CNY) prices.push(number);
       };
       for (const match of value.matchAll(/(\d{1,6}(?:[\s.,]\d{1,2})?)\s*(?:CN¥|CNY|¥|￥|人民币|元)/gi)) {
         addPrice(match[1], match.index);
@@ -3689,7 +3719,7 @@ async function scrapeOzonBuyerCnyPrices(page) {
     };
     const parseCnyNumber = (value) => {
       const number = Number(String(value || "").replace(/\s/g, "").replace(",", "."));
-      return Number.isFinite(number) && number > 0 ? number : null;
+      return Number.isFinite(number) && number >= 3 ? number : null;
     };
     const isDarkColor = (color) => {
       const match = String(color || "").match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
@@ -3840,7 +3870,7 @@ async function scrapeOzonBuyerCnyPrices(page) {
     const bodyText = document.body?.innerText || "";
     const currencyReady = /(?:CNY|人民币|中国.*元|¥|￥)/i.test(bodyText);
     if (!currencyReady) notes.push("页面未确认切换到人民币/CNY");
-    if (!current && !selectedBlack) notes.push("未识别到绿标价下方黑标价");
+    if (!current && !selectedBlack) notes.push("未识别到有效绿标价下方黑标价（低于 3 元的疑似误识别已忽略）");
     if (seller?.price && current && seller.price.value < current.value) notes.push("Ozon产品黑标价按外层低价推荐取最低值");
     if (!seller?.count) notes.push("未识别到跟卖数量");
 
@@ -4157,7 +4187,7 @@ async function searchOffersByImageId(imageId, cookieState) {
       title,
       price: data.priceInfo?.price || data.price || "",
       image: normalizeUrl(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || ""),
-      link: normalizeUrl(data.linkUrl || data.sameDesignUrl || (offerId ? `https://detail.1688.com/offer/${offerId}.html` : "")),
+      link: normalize1688OfferLink(data),
       shopName: data.shop?.text || data.shopAddition?.text || data.loginId || data.sellerName || "",
       moq: moqItem?.text || "1件起批",
       minOrderQuantity: moqItem?.text || "1件起批",
@@ -4197,6 +4227,33 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
       const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
       const pick = (...values) => values.map(clean).find(Boolean) || "";
       const unwrap = (value) => (value && typeof value === "object" && value.fields ? value.fields : value);
+      const normalizeFreightInPage = (value) => {
+        if (value == null) return "";
+        if (typeof value === "object") {
+          const candidates = [
+            value.totalCost, value.postFeeValue, value.price, value.fee, value.amount,
+            value.displayText, value.text, value.value, value.freight, value.freightFee,
+          ];
+          for (const item of candidates) {
+            const parsed = normalizeFreightInPage(item);
+            if (parsed !== "") return parsed;
+          }
+          return "";
+        }
+        const text = clean(value);
+        if (!text) return "";
+        if (/包邮|免运费|free\s*shipping/i.test(text)) return "0";
+        const match = text.match(/(\d+(?:[.,]\d+)?)/);
+        if (!match) return "";
+        const number = Number(match[1].replace(",", "."));
+        return Number.isFinite(number) && number >= 0 ? String(number) : "";
+      };
+      const parseShippingFromText = (value) => {
+        const body = clean(value);
+        if (/包邮|免运费|free\s*shipping/i.test(body)) return "0";
+        const match = body.match(/(?:运费|物流费用|快递费|邮费|配送费|freight|shipping)[^\d¥￥]{0,20}[¥￥]?\s*(\d+(?:[.,]\d+)?)/i);
+        return match ? normalizeFreightInPage(match[1]) : "";
+      };
       const normalizeWeightGramsInPage = (value) => {
         const text = clean(value);
         if (!text) return null;
@@ -4370,7 +4427,7 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
         : attrDimension;
 
       const shipping = unwrap(raw.shippingServices || {});
-      const freightInfo = shipping.freightInfo || {};
+      const freightInfo = shipping.freightInfo || raw.freightInfo || raw.offerFreightInfo || {};
       const skuWeight = freightInfo.skuWeight && typeof freightInfo.skuWeight === "object"
         ? Object.values(freightInfo.skuWeight).find(Boolean)
         : "";
@@ -4386,11 +4443,14 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
       const weightText = weightGrams ? `${weightGrams} g` : "";
 
       const shippingFee = pick(
-        freightInfo.totalCost,
-        freightInfo.postFeeValue,
-        shipping.totalCost,
-        shipping.postFeeValue,
-        getAttr("运费", "物流费用", "快递费"),
+        normalizeFreightInPage(freightInfo.totalCost),
+        normalizeFreightInPage(freightInfo.postFeeValue),
+        normalizeFreightInPage(freightInfo.freightFee),
+        normalizeFreightInPage(shipping.totalCost),
+        normalizeFreightInPage(shipping.postFeeValue),
+        normalizeFreightInPage(shipping.freightFee),
+        normalizeFreightInPage(getAttr("运费", "物流费用", "快递费", "邮费", "配送费")),
+        parseShippingFromText(bodyText),
       );
 
       const title = pick(
@@ -5905,6 +5965,7 @@ function formatOzonCnyForExport(value) {
   if (!match) return text;
   const number = Number(match[1].replace(",", "."));
   if (!Number.isFinite(number)) return text;
+  if (number < 3) return "";
   return `${formatPriceNumber(number)} ¥`;
 }
 
@@ -6464,7 +6525,7 @@ async function claimNextDbJob(user, workerName = "") {
 
 function normalizeWorkerStatus(status) {
   const value = String(status || "").trim();
-  return ["queued", "claimed", "running", "paused", "done", "error", "canceled"].includes(value) ? value : "";
+  return ["queued", "claimed", "running", "paused", "exporting", "done", "error", "canceled"].includes(value) ? value : "";
 }
 
 function normalizeWorkerJobUpdate(input = {}, existing = {}) {
@@ -7085,7 +7146,18 @@ function normalizeUrl(value) {
   const text = String(value || "").trim();
   if (!text) return "";
   if (text.startsWith("//")) return `https:${text}`;
+  if (text.startsWith("/")) return `https://www.1688.com${text}`;
   return text;
+}
+
+function normalize1688OfferLink(data = {}) {
+  const directId = String(data.offerId || data.skuId || data.offer_id || data.id || "").match(/\d{6,}/)?.[0] || "";
+  if (directId) return `https://detail.1688.com/offer/${directId}.html`;
+  const raw = normalizeUrl(data.sameDesignUrl || data.detailUrl || data.linkUrl || "");
+  const match = raw.match(/(?:offer\/|offerId=|offerid=|id=)(\d{6,})/i);
+  if (match) return `https://detail.1688.com/offer/${match[1]}.html`;
+  if (/dj\.1688\.com/i.test(raw)) return "";
+  return raw;
 }
 
 function columnName(index) {

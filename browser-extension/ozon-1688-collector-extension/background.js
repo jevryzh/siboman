@@ -329,7 +329,7 @@ async function searchOffersByImageId(imageId, cookieState) {
       title,
       price: data.priceInfo?.price || data.price || "",
       image: normalizeUrl(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || ""),
-      link: normalizeUrl(data.linkUrl || data.sameDesignUrl || (offerId ? `https://detail.1688.com/offer/${offerId}.html` : "")),
+      link: normalize1688OfferLink(data),
       shopName: data.shop?.text || data.shopAddition?.text || data.loginId || data.sellerName || "",
       moq: moqItem?.text || "1件起批",
       minOrderQuantity: moqItem?.text || "1件起批",
@@ -379,6 +379,33 @@ async function scrape1688CandidateDetails(candidate) {
           return Math.round(number);
         };
         const raw = window.__INIT_DATA?.data || window.context?.result?.data || window.iDetailData || {};
+        const normalizeFreight = (value) => {
+          if (value == null) return "";
+          if (typeof value === "object") {
+            const candidates = [
+              value.totalCost, value.postFeeValue, value.price, value.fee, value.amount,
+              value.displayText, value.text, value.value, value.freight, value.freightFee,
+            ];
+            for (const item of candidates) {
+              const parsed = normalizeFreight(item);
+              if (parsed !== "") return parsed;
+            }
+            return "";
+          }
+          const text = clean(value);
+          if (!text) return "";
+          if (/包邮|免运费|free\s*shipping/i.test(text)) return "0";
+          const match = text.match(/(\d+(?:[.,]\d+)?)/);
+          if (!match) return "";
+          const number = Number(match[1].replace(",", "."));
+          return Number.isFinite(number) && number >= 0 ? String(number) : "";
+        };
+        const parseShippingFromText = (value) => {
+          const body = clean(value);
+          if (/包邮|免运费|free\s*shipping/i.test(body)) return "0";
+          const match = body.match(/(?:运费|物流费用|快递费|邮费|配送费|freight|shipping)[^\d¥￥]{0,20}[¥￥]?\s*(\d+(?:[.,]\d+)?)/i);
+          return match ? normalizeFreight(match[1]) : "";
+        };
         const attrs = {};
         const addPair = (key, value) => {
           const k = clean(key).replace(/[:：]$/, "");
@@ -432,6 +459,8 @@ async function scrape1688CandidateDetails(candidate) {
           .filter((value) => Number.isFinite(value) && value > 0)
           .sort((a, b) => a - b);
         const bodyText = clean(document.body?.innerText || "");
+        const shipping = unwrap(raw.shippingServices || raw.shipping || raw.delivery || {});
+        const freightInfo = shipping.freightInfo || raw.freightInfo || raw.offerFreightInfo || {};
         const moqFromPriceRange = priceRanges
           .map((item) => Number(item.beginAmount))
           .filter((value) => Number.isFinite(value) && value > 0)
@@ -460,7 +489,16 @@ async function scrape1688CandidateDetails(candidate) {
           priceDetails,
           minOrderQuantity,
           moq: minOrderQuantity,
-          shippingFee: pick(getAttr("运费", "物流费用", "快递费")),
+          shippingFee: pick(
+            normalizeFreight(freightInfo.totalCost),
+            normalizeFreight(freightInfo.postFeeValue),
+            normalizeFreight(freightInfo.freightFee),
+            normalizeFreight(shipping.totalCost),
+            normalizeFreight(shipping.postFeeValue),
+            normalizeFreight(shipping.freightFee),
+            normalizeFreight(getAttr("运费", "物流费用", "快递费", "邮费", "配送费")),
+            parseShippingFromText(bodyText),
+          ),
           dimensionsText,
           weightText: weightGrams ? `${weightGrams} g` : weightRaw,
           weightGrams: weightGrams || "",
@@ -538,25 +576,33 @@ async function scrapeOzonProduct(url) {
       func: () => {
         const text = document.body?.innerText || "";
         const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+        const MIN_VALID_OZON_CNY = 3;
+        const isValidOzonPrice = (value) => Number.isFinite(Number(value)) && Number(value) >= MIN_VALID_OZON_CNY;
         const parsePrice = (value) => {
-          const match = String(value || "").replace(/\s+/g, "").match(/(\d+(?:[.,]\d+)?)\s*[¥￥₽руб]/i);
-          return match ? Number(match[1].replace(",", ".")) : null;
+          const match = String(value || "").replace(/\s+/g, "").match(/(\d+(?:[.,]\d+)?)(¥|￥|₽|руб)/i);
+          if (!match) return null;
+          const raw = Number(match[1].replace(",", "."));
+          if (!Number.isFinite(raw) || raw <= 0) return null;
+          const currency = match[2].toLowerCase();
+          const cny = /₽|руб/.test(currency) ? Number((raw * 0.0862).toFixed(2)) : raw;
+          return isValidOzonPrice(cny) ? cny : null;
         };
         const prices = Array.from(text.matchAll(/(\d+(?:[.,]\d+)?)\s*[¥￥]/g))
           .map((match) => Number(match[1].replace(",", ".")))
-          .filter((value) => Number.isFinite(value) && value > 0);
+          .filter((value) => isValidOzonPrice(value));
         const rubPrices = Array.from(text.matchAll(/(\d+(?:[.,]\d+)?)\s*(?:₽|руб)/gi))
           .map((match) => Number(match[1].replace(",", ".")))
           .filter((value) => Number.isFinite(value) && value > 0)
           .map((value) => Number((value * 0.0862).toFixed(2)));
-        const cnyPrices = prices.length ? prices : rubPrices;
+        const validRubPrices = rubPrices.filter((value) => isValidOzonPrice(value));
+        const cnyPrices = prices.length ? prices : validRubPrices;
         const priceWidgets = Array.from(document.querySelectorAll('[data-widget*="webPrice"], [data-widget*="price"], [class*="price"]'))
           .map((node) => clean(node.innerText))
           .filter(Boolean);
         const currentPriceText = priceWidgets.find((value) => /[¥￥₽]/.test(value)) || "";
         const currentBlackPriceCny = parsePrice(currentPriceText) || cnyPrices[0] || null;
         const lowPriceMatch = text.match(/(?:低价推荐|Есть дешевле|дешевле)[\s\S]{0,80}?(\d+(?:[.,]\d+)?)\s*[¥￥₽]/i);
-        const lowPriceValue = lowPriceMatch ? Number(lowPriceMatch[1].replace(",", ".")) : null;
+        const lowPriceValue = lowPriceMatch ? parsePrice(lowPriceMatch[0]) : null;
         const sellerCountMatch = text.match(/(?:低价推荐|Есть дешевле|дешевле)[\s\S]{0,120}?(\d{1,4})(?:\s*(?:个|件|предлож|seller|offer))/i);
         const weightMatch = text.match(/(?:重量|Вес|weight)[^\n]{0,50}?(\d+(?:[.,]\d+)?)\s*(кг|kg|г|g|克)/i)
           || text.match(/(\d+(?:[.,]\d+)?)\s*(кг|kg|г|g|克)(?!\s*[xх*×]\s*\d)/i);
@@ -598,7 +644,7 @@ async function scrapeOzonProduct(url) {
           finalBlackPriceCny: finalBlackPrice,
           displayPrice: currentPriceText,
           sellerOfferCount: sellerCountMatch ? Number(sellerCountMatch[1]) : "",
-          ozonPriceNote: currentBlackPriceCny ? "" : "插件未稳定识别到绿标价下方黑标价",
+          ozonPriceNote: currentBlackPriceCny ? "" : "插件未稳定识别到有效绿标价下方黑标价（低于 3 元的疑似误识别已忽略）",
           weightGrams: normalizeWeight(weightMatch) || "",
           weightSource: weightMatch ? "页面文本" : "",
           weightEvidence: weightMatch ? clean(weightMatch[0]) : "",
@@ -708,6 +754,16 @@ function normalizeUrl(value) {
   if (text.startsWith("//")) return `https:${text}`;
   if (text.startsWith("/")) return `https://www.1688.com${text}`;
   return text;
+}
+
+function normalize1688OfferLink(data = {}) {
+  const directId = String(data.offerId || data.skuId || data.offer_id || data.id || "").match(/\d{6,}/)?.[0] || "";
+  if (directId) return `https://detail.1688.com/offer/${directId}.html`;
+  const raw = normalizeUrl(data.sameDesignUrl || data.detailUrl || data.linkUrl || "");
+  const match = raw.match(/(?:offer\/|offerId=|offerid=|id=)(\d{6,})/i);
+  if (match) return `https://detail.1688.com/offer/${match[1]}.html`;
+  if (/dj\.1688\.com/i.test(raw)) return "";
+  return raw;
 }
 
 function merge1688CandidateDetails(candidate, details = {}) {
@@ -983,6 +1039,7 @@ async function updateProgress(jobId, phase, processed, total, state, status = "r
   if (!response.ok || !data.success) throw new Error(data.error || `更新任务进度失败：HTTP ${response.status}`);
   if (data.job?.status === "canceled") throwCanceled();
   if (data.job?.status === "paused") throwPaused();
+  if (data.job?.status === "exporting") throwCanceled();
   return data.job;
 }
 
@@ -1009,6 +1066,7 @@ async function ensureJobRunnable(jobId, state) {
   if (data.job?.status === "canceled") throwCanceled();
   if (data.job?.status === "paused") throwPaused();
   if (data.job?.status === "done") throwCanceled();
+  if (data.job?.status === "exporting") throwCanceled();
 }
 
 function throwCanceled() {
