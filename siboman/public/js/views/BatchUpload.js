@@ -40,6 +40,27 @@ window.BatchUploadView = {
       info: m => (window.ElementPlus?.ElMessage || console).info?.(m),
     };
     const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : '');
+    const resolveStoreId = (value) => {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      const byId = allStores.value.find(s => String(s.id) === raw);
+      if (byId) return byId.id;
+      const byName = allStores.value.find(s => String(s.name) === raw);
+      return byName ? byName.id : raw;
+    };
+    const normalizeSelectedStores = () => {
+      if (!Array.isArray(selectedStores.value) || !allStores.value.length) return;
+      const validIds = new Set(allStores.value.map(s => String(s.id)));
+      const next = [];
+      for (const value of selectedStores.value) {
+        const id = resolveStoreId(value);
+        if (validIds.has(String(id)) && !next.includes(id)) next.push(id);
+      }
+      if (JSON.stringify(next) !== JSON.stringify(selectedStores.value)) {
+        selectedStores.value = next;
+        saveConfig();
+      }
+    };
 
     // ========== 插件中继协议 (保留) ==========
     const PROTO = "__zhumeng_proto";
@@ -926,7 +947,11 @@ window.BatchUploadView = {
 
     // ========== 店铺列表 (保留) ==========
     const fetchStores = async () => {
-      try { const res = await axios.get('/api/seller/shops'); allStores.value = res.data.shops||[]; } catch {}
+      try {
+        const res = await axios.get('/api/seller/shops');
+        allStores.value = res.data.shops||[];
+        normalizeSelectedStores();
+      } catch {}
     };
 
     // v2.2.6: 仓库选择 — 选店铺后自动拉这家店的 FBS 仓库, 每店选一个
@@ -934,6 +959,7 @@ window.BatchUploadView = {
     const selectedWarehousesByStore = Vue.ref({});  // {storeId: warehouse_id}
     const fetchingWarehouses = Vue.ref({});  // {storeId: true/false}
     const fetchWarehousesForStore = async (storeId) => {
+      storeId = resolveStoreId(storeId);
       if (!storeId) return;
       if (warehousesByStore.value[storeId]) {
         const current = selectedWarehousesByStore.value[storeId];
@@ -964,7 +990,9 @@ window.BatchUploadView = {
     };
     // 选店铺变化时, 自动 fetch 没拉过的仓库
     Vue.watch(selectedStores, async (newStores, oldStores) => {
-      const added = (newStores || []).filter(s => !(oldStores || []).includes(s));
+      normalizeSelectedStores();
+      const currentStores = selectedStores.value || [];
+      const added = currentStores.filter(s => !(oldStores || []).includes(s));
       for (const sid of added) await fetchWarehousesForStore(sid);
     }, { deep: true });
 

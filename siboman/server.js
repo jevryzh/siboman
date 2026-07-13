@@ -951,6 +951,10 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
     if (res.rows[0]) {
       clientId = res.rows[0].client_id;
       apiKey = res.rows[0].api_key;
+    } else {
+      const error = new Error("未找到该店铺或无权限，请重新选择目标店铺。");
+      error.statusCode = 404;
+      throw error;
     }
   }
 
