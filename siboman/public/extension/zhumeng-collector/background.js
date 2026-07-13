@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.18";
+const VERSION = "2.2.9.19";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -236,9 +236,36 @@ function injectRichContentAttr(data) {
 // My ERP 批量跟卖实际不是只读公开 PDP，而是先 /api/v1/search 找 variant_id，
 // 再调 /api/site/seller-prototype/create-bundle-by-variant-id 拿完整 bundle item。
 async function getSellerCompanyId() {
-  const cookies = await chrome.cookies.getAll({ url: "https://seller.ozon.ru/", name: "sc_company_id" });
-  const value = cookies.find(c => c?.value)?.value || "";
-  return String(value || "").trim();
+  const readCookieValue = (cookies) => String((cookies || []).find(c => c?.name === "sc_company_id" && c?.value)?.value || "").trim();
+
+  // v2.2.9.19: Chrome 有时按 url 读不到 sc_company_id，但按 name 或页面 document.cookie 能读到。
+  // My ERP 也会从 seller 页面 cookie 兜底；这里保持一致，避免已登录却误报未登录。
+  let value = readCookieValue(await chrome.cookies.getAll({ url: "https://seller.ozon.ru/", name: "sc_company_id" }));
+  if (value) return value;
+
+  value = readCookieValue(await chrome.cookies.getAll({ name: "sc_company_id" }));
+  if (value) return value;
+
+  const tabs = await chrome.tabs.query({ url: ["https://seller.ozon.ru/*", "https://*.ozon.ru/*"] }).catch(() => []);
+  const sellerTabs = [
+    ...tabs.filter(t => /^https:\/\/seller\.ozon\.ru\//i.test(t.url || "")),
+    ...tabs.filter(t => /^https:\/\/([^/]+\.)?ozon\.ru\//i.test(t.url || "") && !/^https:\/\/seller\.ozon\.ru\//i.test(t.url || "")),
+  ];
+  for (const tab of sellerTabs) {
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: () => {
+          const m = String(document.cookie || "").split(";").map(s => s.trim()).find(s => s.startsWith("sc_company_id="));
+          return m ? decodeURIComponent(m.slice("sc_company_id=".length)) : "";
+        },
+      });
+      value = String(res?.result || "").trim();
+      if (value) return value;
+    } catch {}
+  }
+  return "";
 }
 
 async function fetchSellerPortalViaOzonTab(path, body, opts = {}) {

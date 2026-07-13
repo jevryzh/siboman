@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.18)
+            逐梦 Ozon 采集器 (v2.2.9.19)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.18</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.19</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.19 修复已登录 seller 仍提示 sc_company_id 缺失: company_id 读取增加全域 cookie 与 seller/ozon 页面 document.cookie 兜底, 对齐 My ERP 的读取方式。</li>
             <li>✅ v2.2.9.18 Seller bundle 失败原因细化: /search 找不到 variant_id、create-bundle 不返回 item、bundle attributes 为空都会在批量上架日志里显示具体原因, 不再只显示“未拿到完整源包”。</li>
             <li>✅ v2.2.9.17 修复首轮类目候选慢导致“未解析”: category-resolve 首次加载 Ozon 类目树可能超过 15s, 插件等待时间放宽到 45s, 避免服务端已经算出候选但前端先超时。</li>
             <li>✅ v2.2.9.16 批量上架增加完整源包保护: 采集结果没有 _sourceVariant / Seller bundle 时直接拦截上架, 并在日志和 payload 里记录插件版本、bundle 成功状态和失败原因, 防止继续生成属性缺失商品。</li>
