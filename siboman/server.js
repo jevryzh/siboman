@@ -3549,6 +3549,36 @@ async function getCategoryTreeForStore(storeId, userId) {
   return tree;
 }
 
+async function findCategoryByTypeId(storeId, userId, typeId) {
+  const wanted = Number(typeId || 0);
+  if (!wanted) return null;
+  const tree = await getCategoryTreeForStore(storeId, userId);
+  let found = null;
+  const walk = (nodes, parentCat = null, breadcrumb = []) => {
+    if (found) return;
+    for (const n of nodes || []) {
+      const catId = Number(n.description_category_id || 0);
+      const type = Number(n.type_id || 0);
+      const name = n.category_name || n.type_name || "";
+      const currentParent = catId ? { id: catId, name } : parentCat;
+      if (type === wanted && parentCat?.id) {
+        found = {
+          description_category_id: Number(parentCat.id),
+          type_id: wanted,
+          type_name: name,
+          category_name: parentCat.name || "",
+          breadcrumb: [...breadcrumb, name].filter(Boolean).join(" › "),
+        };
+        return;
+      }
+      walk(n.children || [], currentParent, [...breadcrumb, name]);
+      if (found) return;
+    }
+  };
+  walk(tree, null, []);
+  return found;
+}
+
 // ========== v0.6.2: 类目树缓存 + 校验 + 后台 polling ==========
 const categoryTreeCache = new Map();   // storeId -> { validIds: Set<number>, nameById: Map<number,string>, fetchedAt: number }
 const CATEGORY_TTL_MS = 24 * 3600 * 1000;
@@ -4054,6 +4084,28 @@ app.post("/api/seller/products/category-resolve", requireAuth, async (req, res, 
       }
     }
 
+    // 3b. Ozon tree 精确 type_id 反查父类目。
+    // Seller /search 的 description_type_dict_value 实际是 type_id; 有它时比商品名关键词更可靠。
+    if (typeId) {
+      try {
+        const typeHit = await findCategoryByTypeId(storeId, userId, typeId);
+        if (typeHit?.description_category_id) {
+          return res.json({
+            success: true,
+            confidence: "high",
+            source: "ozon-tree-type-id",
+            description_category_id: typeHit.description_category_id,
+            type_id: typeHit.type_id,
+            name: typeHit.type_name || "",
+            category_name: typeHit.category_name || "",
+            breadcrumb: typeHit.breadcrumb || "",
+          });
+        }
+      } catch (e) {
+        console.warn("[category-resolve] type_id tree lookup fail:", e.message);
+      }
+    }
+
     // 4. 同店名字相似 - 找同店铺商品名相似商品复用其类目
     if (productName && productName.length >= 3 && db) {
       try {
@@ -4323,8 +4375,28 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     }
 
     // v0.6.1: category_id 透传 - 支持 description_category_id (Ozon 原始) 或 category_id (前端简化)
-    const categoryId = item.description_category_id || item.category_id;
-    const typeId = item.type_id;
+    let categoryId = item.description_category_id || item.category_id;
+    let typeId = item.type_id;
+    const sourceVariantTypeId = Number(
+      typeId ||
+      sourceVariant?.type_id ||
+      sourceVariant?.typeId ||
+      (Number(sourceVariant?.description_category_id || 0) > 0 && Number(sourceVariant?.description_category_id || 0) < 100000
+        ? sourceVariant.description_category_id
+        : 0)
+    );
+    if (sourceVariantTypeId > 0) {
+      try {
+        const typeHit = await findCategoryByTypeId(storeId, req.user.id, sourceVariantTypeId);
+        if (typeHit?.description_category_id && Number(categoryId) !== Number(typeHit.description_category_id)) {
+          console.log(`[v2.2.9.22 import] type_id=${sourceVariantTypeId} 修正类目 ${categoryId || 0} → ${typeHit.description_category_id} (${typeHit.breadcrumb || typeHit.type_name || ""})`);
+          categoryId = typeHit.description_category_id;
+          typeId = sourceVariantTypeId;
+        }
+      } catch (e) {
+        console.warn("[v2.2.9.22 import] type_id 类目修正失败:", e.message);
+      }
+    }
     if (!item.name || !offerId || !categoryId) {
       return res.status(400).json({ success: false, error: "标题/货号/类目ID不能为空 (需要 description_category_id)" });
     }

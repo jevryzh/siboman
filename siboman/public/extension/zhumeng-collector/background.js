@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.21";
+const VERSION = "2.2.9.22";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -345,15 +345,17 @@ function normalizeSearchVariantToSv(v) {
     const gtin = String(v.barcodes[0] || "").trim();
     if (gtin) attributes.push({ key: "7822", value: gtin });
   }
+  const categories = (v.categories || []).map(c => ({
+    id: Number(c.id),
+    level: Number(c.level),
+    name: c.name || "",
+    title: c.title || c.name || "",
+  })).filter(c => c.id);
   return {
     variant_id: v.variant_id || (v.barcodes && v.barcodes[0]) || "",
-    description_category_id: Number(v.description_type_dict_value) || 0,
-    categories: (v.categories || []).map(c => ({
-      id: Number(c.id),
-      level: Number(c.level),
-      name: c.name || "",
-      title: c.title || c.name || "",
-    })),
+    type_id: Number(v.description_type_dict_value) || 0,
+    description_category_id: categories.length ? Number(categories[categories.length - 1].id) : 0,
+    categories,
     _searchMeta: {
       skus: v.skus || [],
       barcodes: v.barcodes || [],
@@ -515,7 +517,8 @@ async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
   if (Number(bundleItem.width) > 0) data.width = Number(bundleItem.width);
   if (Number(bundleItem.height) > 0) data.height = Number(bundleItem.height);
   if (bundleItem.barcode) data.barcode = String(bundleItem.barcode);
-  if (sv.description_category_id && !data.type_id) data.type_id = Number(sv.description_category_id) || data.type_id;
+  if (sv.type_id && !data.type_id) data.type_id = Number(sv.type_id) || data.type_id;
+  if (sv.description_category_id && !data.description_category_id) data.description_category_id = Number(sv.description_category_id) || data.description_category_id;
   data._seller_bundle_source = {
     company_id: String(companyId),
     variant_id: String(sv.variant_id),

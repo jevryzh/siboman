@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.21)
+            逐梦 Ozon 采集器 (v2.2.9.22)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.21</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.22</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.22 修复 Seller bundle 类目误判: /search 的 description_type_dict_value 按 type_id 处理, 后端 category-resolve/import 会用 type_id 从 Ozon tree 精确反查父类目, 避免 Смеситель 被关键词误分到 Души и душевые кабины 导致 description_category_invalid。</li>
             <li>✅ v2.2.9.21 修复批量跟卖图片重复与富内容漏采: 后端按 Ozon 图片文件指纹去重, 优先使用源商品 4194/4195 图册并过滤 cms/评价图; 插件富内容采集增加标准商品路径和 PDP nextPage 追踪, 提高 attribute 11254 JSON 命中率。</li>
             <li>✅ v2.2.9.20 修复 Ozon 卡片图片重复和枚举属性错误: 图片属性 4194/4195 不再作为 attributes 提交, 只走 images/补图; Seller bundle 的 dictionary_value_id 保留并提交, 避免颜色/特征/车型等枚举属性被当作文本。</li>
             <li>✅ v2.2.9.19 修复已登录 seller 仍提示 sc_company_id 缺失: company_id 读取增加全域 cookie 与 seller/ozon 页面 document.cookie 兜底, 对齐 My ERP 的读取方式。</li>
