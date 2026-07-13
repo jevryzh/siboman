@@ -92,6 +92,16 @@
       }
       return;
     }
+
+    if (kind === "portalImport.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "portalImport", items: data.items || [] });
+        replyToMain(reqId, "portalImport.response", resp);
+      } catch (e) {
+        replyToMain(reqId, "portalImport.response", { ok: false, error: e.message });
+      }
+      return;
+    }
   });
 
   // 持续 broadcast ready

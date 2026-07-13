@@ -44,7 +44,7 @@ window.BatchUploadView = {
     // ========== 插件中继协议 (保留) ==========
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const REQUIRED_BACKGROUND_VERSION = "2.2.9.27";
+    const REQUIRED_BACKGROUND_VERSION = "2.2.9.28";
     const extensionConnected = Vue.ref(false);
     const sellerTabReady = Vue.ref(false);
 
@@ -175,6 +175,10 @@ window.BatchUploadView = {
     }).then(d => {
       try { console.log('[collectViaExtension resolved]', JSON.stringify(d)); } catch (e) {}
       return d || { ok: false, error: '采集超时 (120s)' };
+    });
+    const portalImportViaExtension = (items) => sendToExtension('portalImport.request', { items }).then(d => {
+      try { console.log('[portalImportViaExtension resolved]', JSON.stringify(d)); } catch (e) {}
+      return d || { ok: false, error: 'portal 发布超时' };
     });
 
     // v2.2.2: 候选类目选择器状态. pickingRow 持当前要选类目的行, 选择后写回 row.distilled
@@ -816,26 +820,63 @@ window.BatchUploadView = {
           continue;
         }
 
-        // v2.2.7: 逐个提交 (Ozon /v3/product/import 一次只接受一个 items 比较稳; 我们的 server 也只接受单 item)
-        //   stocks 全部并到每个请求, Ozon 服务端会自动按 offer_id 匹配
-        for (const { row, item } of storeItems) {
+        // v2.2.9.28: Seller portal 复制草稿发布只能代表浏览器当前 seller 店铺。
+        // 因此只在单店铺时启用, 多店铺继续走后端 API, 防止串店。
+        const canUsePortal = selectedStores.value.length === 1 && storeItems.every(x => x.item?._sourceVariant?._bundleItem);
+        if (canUsePortal) {
           try {
-            const res = await axios.post('/api/seller/products/import', {
+            appendLog(`  ℹ [${storeName}] 单店铺模式: 使用 Seller portal 复制草稿发布`, 'info');
+            const resp = await portalImportViaExtension(storeItems.map(x => x.item));
+            if (!resp?.ok) throw new Error(resp?.error || 'Seller portal 发布失败');
+            const tid = resp.result?.task_id || resp.result?.upload_task_id || '?';
+            await axios.post('/api/seller/import/portal-record', {
               store_id: storeId,
-              item,
-              stocks: storeStocks.filter(s => s.offer_id === item.offer_id),  // 只发当前这个 offer 的 stock
-            }, { timeout: 60000 });
-            const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
-            // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
-            appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${whId && defaultStock > 0 ? ` + stock=${defaultStock} → wh=${whId}` : ''}`, 'info');
-            // 后台 polling 每 60s 同步 Ozon 真实状态
-            totalOk++;
+              task_id: tid,
+              bundle_id: resp.result?.bundle_id || '',
+              company_id: resp.result?.company_id || '',
+              items: storeItems.map(({ row, item }) => ({
+                source_sku: row.sku,
+                offer_id: item.offer_id,
+                name: item.name,
+                image: item.primary_image || item.images?.[0] || '',
+                price: item.price,
+                item,
+                stocks: storeStocks.filter(s => s.offer_id === item.offer_id),
+              })),
+            }, { timeout: 30000 }).catch(e => appendLog(`  ⚠ portal 历史记录写入失败: ${e.response?.data?.error || e.message}`, 'warn'));
+            for (const { row } of storeItems) {
+              appendLog(`  ✓ #${row.index} SKU ${row.sku} → portal 已提交 upload_task_id=${tid}${whId && defaultStock > 0 ? ` + stock=${defaultStock} → wh=${whId}` : ''}`, 'info');
+              totalOk++;
+            }
           } catch(e) {
-            // v2.2.0: 只有本地校验失败 (商品字段缺失) 才会报错
-            // 类目等问题让 Ozon 处理, 不再前端拦截
             const errMsg = e.response?.data?.error || e.message;
-            appendLog(`  ✗ #${row.index} SKU ${row.sku} → 提交失败: ${errMsg}`, 'error');
-            totalFail++;
+            for (const { row } of storeItems) {
+              appendLog(`  ✗ #${row.index} SKU ${row.sku} → portal 提交失败: ${errMsg}`, 'error');
+              totalFail++;
+            }
+          }
+        } else {
+          // v2.2.7: 逐个提交 (Ozon /v3/product/import 一次只接受一个 items 比较稳; 我们的 server 也只接受单 item)
+          //   stocks 全部并到每个请求, Ozon 服务端会自动按 offer_id 匹配
+          for (const { row, item } of storeItems) {
+            try {
+              const res = await axios.post('/api/seller/products/import', {
+                store_id: storeId,
+                item,
+                stocks: storeStocks.filter(s => s.offer_id === item.offer_id),  // 只发当前这个 offer 的 stock
+              }, { timeout: 60000 });
+              const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
+              // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
+              appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${whId && defaultStock > 0 ? ` + stock=${defaultStock} → wh=${whId}` : ''}`, 'info');
+              // 后台 polling 每 60s 同步 Ozon 真实状态
+              totalOk++;
+            } catch(e) {
+              // v2.2.0: 只有本地校验失败 (商品字段缺失) 才会报错
+              // 类目等问题让 Ozon 处理, 不再前端拦截
+              const errMsg = e.response?.data?.error || e.message;
+              appendLog(`  ✗ #${row.index} SKU ${row.sku} → 提交失败: ${errMsg}`, 'error');
+              totalFail++;
+            }
           }
         }
 

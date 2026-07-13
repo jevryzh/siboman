@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.27";
+const VERSION = "2.2.9.28";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -338,6 +338,120 @@ async function fetchSellerPortalViaOzonTab(path, body, opts = {}) {
   if (!r) throw new Error("seller portal executeScript 未返回结果");
   if (!r.ok) throw new Error(r.error || "seller portal 请求失败");
   return r.data;
+}
+
+function clonePlain(value) {
+  return JSON.parse(JSON.stringify(value || null));
+}
+
+async function portalCreateBundle(companyId, preferTabId) {
+  const resp = await fetchSellerPortalViaOzonTab("/seller-prototype/create-bundle", {
+    company_id: String(companyId),
+  }, { urlPrefix: "/api/site", timeoutMs: 30000, preferTabId });
+  const bundleId = resp?.bundle_id;
+  if (!bundleId) throw new Error("Seller portal create-bundle 未返回 bundle_id");
+  return String(bundleId);
+}
+
+async function portalUpdateBundleItems(bundleId, companyId, items, preferTabId) {
+  return fetchSellerPortalViaOzonTab("/seller-prototype/update-bundle-items", {
+    bundle_id: String(bundleId),
+    company_id: String(companyId),
+    source: "SOURCE_MERGED",
+    description_category_lvl3_name: "",
+    items,
+  }, { urlPrefix: "/api/site", timeoutMs: 60000, preferTabId });
+}
+
+async function portalUploadBundle(bundleId, companyId, preferTabId) {
+  const resp = await fetchSellerPortalViaOzonTab("/seller-prototype/upload-bundle", {
+    bundle_id: String(bundleId),
+    company_id: String(companyId),
+    strict: true,
+  }, { urlPrefix: "/api/site", timeoutMs: 60000, preferTabId });
+  const taskId = resp?.upload_task_id || resp?.task_id;
+  if (!taskId) throw new Error("Seller portal upload-bundle 未返回 upload_task_id");
+  return String(taskId);
+}
+
+function ensurePortalAttr(item, attributeId, values) {
+  const id = String(attributeId);
+  if (!Array.isArray(item.attributes)) item.attributes = [];
+  const normalizedValues = (Array.isArray(values) ? values : [values])
+    .filter(v => v !== undefined && v !== null && String(v).trim() !== "")
+    .map((v, idx) => ({
+      value: String(v).trim(),
+      sequence: String(idx),
+      is_default: idx === 0,
+      complex_sequence: "0",
+      dictionary_value_id: "0",
+    }));
+  if (!normalizedValues.length) return;
+  const existing = item.attributes.find(a => String(a?.attribute_id || a?.id || "") === id && String(a?.complex_id || "0") === "0");
+  if (existing) {
+    existing.values = normalizedValues;
+  } else {
+    item.attributes.push({ attribute_id: id, complex_id: "0", values: normalizedValues });
+  }
+}
+
+function buildPortalItemFromImportItem(importItem) {
+  if (!importItem || typeof importItem !== "object") throw new Error("portalImport 缺少 item");
+  const sourceVariant = importItem._sourceVariant && typeof importItem._sourceVariant === "object" ? importItem._sourceVariant : null;
+  const sourceBundleItem = sourceVariant?._bundleItem && typeof sourceVariant._bundleItem === "object" ? sourceVariant._bundleItem : null;
+  if (!sourceBundleItem) throw new Error("portalImport 需要 Seller bundle 源包 (_sourceVariant._bundleItem)");
+
+  const item = clonePlain(sourceBundleItem);
+  const images = Array.isArray(importItem.images) ? importItem.images.filter(u => typeof u === "string" && /^https?:\/\//i.test(u)) : [];
+  item.id = "0";
+  item.item_id = "0";
+  item.sku = "0";
+  item.deleted = false;
+  item.unmerged = false;
+  item.offer_id = String(importItem.offer_id || "").trim();
+  item.name = String(importItem.name || item.name || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  item.price = String(importItem.price || item.price || "");
+  item.old_price = String(importItem.old_price || item.old_price || importItem.price || "");
+  item.currency = String(importItem.currency_code || importItem.currency || item.currency || "CNY");
+  item.description_category_id = String(importItem.description_category_id || item.description_category_id || sourceVariant.description_category_id || "");
+  item.new_description_category_id = "0";
+  item.weight = Number(importItem.weight || item.weight || 0);
+  item.depth = Number(importItem.depth || item.depth || 0);
+  item.width = Number(importItem.width || item.width || 0);
+  item.height = Number(importItem.height || item.height || 0);
+  item.barcode = String(importItem.barcode || item.barcode || "");
+  if (images.length) {
+    item.images = images;
+    item.primary_image = images[0];
+    ensurePortalAttr(item, 4194, images[0]);
+    ensurePortalAttr(item, 4195, images.slice(1));
+  }
+  if (item.name) ensurePortalAttr(item, 4180, item.name);
+  if (item.weight) ensurePortalAttr(item, 4497, item.weight);
+  if (item.depth) ensurePortalAttr(item, 9454, item.depth);
+  if (item.width) ensurePortalAttr(item, 9455, item.width);
+  if (item.height) ensurePortalAttr(item, 9456, item.height);
+  if (item.barcode) ensurePortalAttr(item, 23524, item.barcode);
+  if (importItem.richContent) ensurePortalAttr(item, 11254, importItem.richContent);
+  return item;
+}
+
+async function portalImportItems(importItems, preferTabId) {
+  const companyId = await getSellerCompanyId();
+  if (!companyId) throw new Error("未找到 sc_company_id cookie，请确认 seller.ozon.ru 已登录并选中目标店铺");
+  const items = (Array.isArray(importItems) ? importItems : [importItems]).map(buildPortalItemFromImportItem);
+  if (!items.length) throw new Error("portalImport 没有可提交商品");
+  const bundleId = await portalCreateBundle(companyId, preferTabId);
+  await portalUpdateBundleItems(bundleId, companyId, items, preferTabId);
+  const taskId = await portalUploadBundle(bundleId, companyId, preferTabId);
+  return {
+    viaPortal: true,
+    company_id: companyId,
+    bundle_id: bundleId,
+    task_id: taskId,
+    upload_task_id: taskId,
+    items: items.map(i => ({ offer_id: i.offer_id, name: i.name, image: i.primary_image || (i.images || [])[0] || "" })),
+  };
 }
 
 function normalizeSearchVariantToSv(v) {
@@ -1696,6 +1810,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const failCount = Object.keys(errors).length;
       console.log(`[SW ${VERSION}] collectSkus 完成: ${okCount} 成功, ${failCount} 失败`);
       sendResponse({ ok: true, results, errors });
+    })();
+    return true;
+  }
+
+  if (msg.action === "portalImport") {
+    (async () => {
+      try {
+        const result = await portalImportItems(msg.items || [], sender?.tab?.id || null);
+        sendResponse({ ok: true, result });
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message || String(e), version: VERSION });
+      }
     })();
     return true;
   }

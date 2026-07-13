@@ -3037,6 +3037,56 @@ app.get("/api/seller/import/history", requireAuth, async (req, res, next) => {
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+app.post("/api/seller/import/portal-record", requireAuth, async (req, res) => {
+  try {
+    if (!db || !req.user?.id) return res.json({ success: true, skipped: true });
+    const storeId = req.body?.store_id || req.body?.storeId || null;
+    const portalTaskId = String(req.body?.task_id || req.body?.taskId || "").trim();
+    const bundleId = String(req.body?.bundle_id || req.body?.bundleId || "").trim();
+    const companyId = String(req.body?.company_id || req.body?.companyId || "").trim();
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!portalTaskId) return res.status(400).json({ success: false, error: "缺少 portal task_id" });
+    if (!items.length) return res.status(400).json({ success: false, error: "缺少 items" });
+
+    let count = 0;
+    for (const it of items) {
+      const offerId = String(it?.offer_id || it?.item?.offer_id || "").trim();
+      if (!offerId) continue;
+      const historyTaskId = `portal-${portalTaskId}-${offerId}`.slice(0, 180);
+      const rawPayload = {
+        via_portal: true,
+        portal_task_id: portalTaskId,
+        bundle_id: bundleId,
+        company_id: companyId,
+        source_sku: it?.source_sku || null,
+        item: it?.item || null,
+        stocks: Array.isArray(it?.stocks) ? it.stocks : [],
+        submitted_at: new Date().toISOString(),
+      };
+      await db.query(
+        `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, status, raw_payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'processing',$8::jsonb)
+         ON CONFLICT (task_id) DO UPDATE
+            SET updated_at = now(), raw_payload = EXCLUDED.raw_payload, status = EXCLUDED.status`,
+        [
+          req.user.id,
+          storeId || null,
+          historyTaskId,
+          offerId,
+          String(it?.name || it?.item?.name || ""),
+          String(it?.image || it?.item?.primary_image || (Array.isArray(it?.item?.images) ? it.item.images[0] : "") || ""),
+          it?.price ? Number(it.price) : null,
+          JSON.stringify(rawPayload),
+        ],
+      );
+      count++;
+    }
+    res.json({ success: true, count, portalTaskId, bundleId });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
 // 强制同步 Ozon 任务状态
 app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => {
   try {
@@ -4110,6 +4160,39 @@ async function pollPendingListingTasks() {
     let updated = 0, gc = 0;
     for (const row of r.rows) {
       try {
+        const rawPayload = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
+        if (rawPayload.via_portal === true || rawPayload.via_portal === "true") {
+          if (row.status === "imported") {
+            await applyListingStocksAfterImport(row);
+            updated++;
+            continue;
+          }
+          const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: [String(row.offer_id)] }, { storeId: row.store_id, userId: row.user_id });
+          const productId = Number((info?.items || [])[0]?.id || 0);
+          if (!productId) {
+            await db.query(
+              `UPDATE app_listing_history SET updated_at = now() WHERE task_id = $1 AND user_id = $2`,
+              [row.task_id, row.user_id],
+            );
+            continue;
+          }
+          const portalRow = {
+            ...row,
+            raw_payload: { ...rawPayload, product_id: productId },
+          };
+          await db.query(
+            `UPDATE app_listing_history
+                SET status = 'imported',
+                    raw_payload = jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{product_id}', to_jsonb($1::bigint), true),
+                    updated_at = now()
+              WHERE task_id = $2 AND user_id = $3`,
+            [productId, row.task_id, row.user_id],
+          );
+          await applyListingStocksAfterImport(portalRow);
+          console.log(`[poll-pending] portal task=${row.task_id} offer=${row.offer_id} → imported product=${productId}`);
+          updated++;
+          continue;
+        }
         if (row.status === "imported") {
           await applyListingPicturesAfterImport(row);
           await applyListingAttributesAfterImport(row);
