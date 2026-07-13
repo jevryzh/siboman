@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.17";
+const VERSION = "2.2.9.18";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -448,7 +448,9 @@ async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
     : Array.isArray(searchResp?.products) ? searchResp.products
     : Array.isArray(searchResp) ? searchResp : [];
   const sv = rawVariants.map(normalizeSearchVariantToSv).find(Boolean);
-  if (!sv?.variant_id) return null;
+  if (!sv?.variant_id) {
+    throw new Error(`Seller /search 未找到 SKU ${sku} 的 variant_id (variants=${rawVariants.length})`);
+  }
 
   const bundleResp = await fetchSellerPortalViaOzonTab("/seller-prototype/create-bundle-by-variant-id", {
     company_id: String(companyId),
@@ -456,7 +458,12 @@ async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
     source: "SOURCE_UI_COPY_APPAREL",
   }, { urlPrefix: "/api/site", timeoutMs: 30000, preferTabId });
   const bundleItem = bundleResp?.item || null;
-  if (!bundleItem) return null;
+  if (!bundleItem) {
+    throw new Error(`Seller create-bundle-by-variant-id 未返回 item (variant_id=${sv.variant_id})`);
+  }
+  if (!Array.isArray(bundleItem.attributes) || bundleItem.attributes.length === 0) {
+    throw new Error(`Seller bundle 返回空 attributes (variant_id=${sv.variant_id}, bundle_id=${bundleResp?.bundle_id || ""})`);
+  }
 
   const sourceVariant = buildSourceVariantFromBundle(sv, bundleItem);
   data._sourceVariant = sourceVariant;
