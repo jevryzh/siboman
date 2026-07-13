@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.26";
+const VERSION = "2.2.9.27";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1249,8 +1249,13 @@ async function collectRichContentFromOzonPage(sku) {
       okCount += 1;
       const payload = await resp.json();
       const states = payload?.widgetStates || {};
-      for (const nextPage of collectOzonRichContentPagePaths(states, currentPath || cleanPath || skuPath)) enqueuePath(nextPage);
-      const rich = extractRichContentFromStates(states);
+      // Ozon occasionally moves rich-content widgets or pagination hints outside
+      // widgetStates. Scan the full page json as a fallback so we do not miss
+      // 11254 when the public PDP shape changes.
+      for (const root of [states, payload]) {
+        for (const nextPage of collectOzonRichContentPagePaths(root, currentPath || cleanPath || skuPath)) enqueuePath(nextPage);
+      }
+      const rich = extractRichContentFromStates(states) || extractRichContentFromStates(payload);
       if (rich) {
         const hasText = richContentHasText(rich);
         if (!best || (!bestHasText && hasText) || (hasText === bestHasText && rich.length > best.length)) {

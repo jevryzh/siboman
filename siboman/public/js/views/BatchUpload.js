@@ -44,7 +44,7 @@ window.BatchUploadView = {
     // ========== 插件中继协议 (保留) ==========
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const REQUIRED_BACKGROUND_VERSION = "2.2.9.16";
+    const REQUIRED_BACKGROUND_VERSION = "2.2.9.27";
     const extensionConnected = Vue.ref(false);
     const sellerTabReady = Vue.ref(false);
 
