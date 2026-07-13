@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.16";
+const VERSION = "2.2.9.17";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -656,7 +656,9 @@ async function resolveSellerCategory(sku, storeId, typeId, breadcrumbCatId, name
   if ((!sku && !typeId) || !storeId) return null;
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
+    // v2.2.9.17: 首次加载 Ozon category tree 时服务端可能需要 18-25s。
+    // 之前 15s 会先 abort，导致后端明明算出 candidates，前端仍显示“未解析”。
+    const timer = setTimeout(() => ctrl.abort(), 45000);
     const res = await fetch(`${ERP_BACKEND_ORIGIN}/api/seller/products/category-resolve`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

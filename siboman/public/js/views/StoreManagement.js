@@ -113,13 +113,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.16)
+            逐梦 Ozon 采集器 (v2.2.9.17)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.16</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.17</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.17 修复首轮类目候选慢导致“未解析”: category-resolve 首次加载 Ozon 类目树可能超过 15s, 插件等待时间放宽到 45s, 避免服务端已经算出候选但前端先超时。</li>
             <li>✅ v2.2.9.16 批量上架增加完整源包保护: 采集结果没有 _sourceVariant / Seller bundle 时直接拦截上架, 并在日志和 payload 里记录插件版本、bundle 成功状态和失败原因, 防止继续生成属性缺失商品。</li>
             <li>✅ v2.2.9.15 对齐 My ERP 复制商品链路: 插件先走 seller /api/v1/search 找真实 variant_id, 再走 create-bundle-by-variant-id 拿完整 bundle item, 把源商品属性、尺寸重量、条码、图片与 _sourceVariant 一起提交, 避免跟卖后只剩少量属性或 100x100x100 兜底尺寸。</li>
             <li>✅ v2.2.9.14 对齐 My ERP 富内容: 采集 Ozon PDP 的 entrypoint/composer widgetStates, 抽取 richAnnotationJson / Rich Content JSON 并作为 attribute 11254 随批量上架提交, 保留 Seller 后台「JSON 富内容」。</li>
