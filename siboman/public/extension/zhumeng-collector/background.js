@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.30";
+const VERSION = "2.2.9.31";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -255,25 +255,58 @@ function looksLikeRichContentDoc(raw) {
 function synthesizeRichContentFromImages(images) {
   const urls = [];
   const seen = new Set();
+  const normalize = (raw) => {
+    const url = String(raw || "").trim().split(/[?#]/)[0];
+    if (!/^https?:\/\//i.test(url)) return "";
+    if (/\/wc\d+\//i.test(url)) return "";
+    if (!/(ir-\d+\.ozonru\.cn|ir\.ozone\.ru)\/s3\/multimedia/i.test(url)) return "";
+    return url;
+  };
+  const keyFor = (url) => {
+    try {
+      const parsed = new URL(url);
+      const path = decodeURIComponent(parsed.pathname || "").replace(/\/wc\d+\//gi, "/");
+      return (path.split("/").filter(Boolean).pop() || path).toLowerCase();
+    } catch {
+      return String(url || "").toLowerCase();
+    }
+  };
   for (const raw of Array.isArray(images) ? images : []) {
-    const url = String(raw || "").trim();
-    if (!/^https?:\/\//i.test(url)) continue;
-    const key = url.split(/[?#]/)[0].toLowerCase();
+    const url = normalize(raw);
+    if (!url) continue;
+    const key = keyFor(url);
     if (seen.has(key)) continue;
     seen.add(key);
     urls.push(url);
-    if (urls.length >= 15) break;
+    if (urls.length >= 8) break;
   }
   if (!urls.length) return "";
-  return JSON.stringify({
-    content: [{
+  const block = (src) => ({
+    imgLink: "",
+    img: {
+      src,
+      srcMobile: src,
+      alt: "",
+      position: "width_full",
+      positionMobile: "width_full",
+      widthMobile: 800,
+      heightMobile: 800,
+    },
+  });
+  const content = [{
+    widgetName: "raShowcase",
+    type: "billboard",
+    blocks: [block(urls[0])],
+  }];
+  if (urls.length > 1) {
+    content.push({
       widgetName: "raShowcase",
-      type: "billboard",
-      blocks: urls.map(src => ({
-        imgLink: "",
-        img: { src, srcMobile: src },
-      })),
-    }],
+      type: "roll",
+      blocks: urls.slice(1).map(block),
+    });
+  }
+  return JSON.stringify({
+    content,
     version: 0.3,
   });
 }

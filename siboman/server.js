@@ -3836,7 +3836,10 @@ function normalizeOzonAttributeForUpdate(attr) {
   const values = rawValues
     .map(v => {
       const out = {};
-      const value = v?.value ?? v?.name ?? v;
+      let value = v?.value ?? v?.name ?? v;
+      if (id === 11254 && typeof value === "string") {
+        value = normalizeOzonRichContentForSubmit(value);
+      }
       const dictId = Number(v?.dictionary_value_id ?? v?.dictionaryValueId ?? 0);
       if (dictId > 0) out.dictionary_value_id = dictId;
       if (value !== undefined && value !== null && String(value).trim() !== "") out.value = String(value).trim();
@@ -3984,12 +3987,85 @@ function pickSourceRichContent(...sources) {
   return "";
 }
 
+function normalizeOzonRichContentForSubmit(raw) {
+  const text = typeof raw === "string" ? raw.trim() : "";
+  if (!text) return "";
+  let doc = null;
+  try { doc = JSON.parse(text); } catch { return text; }
+  if (!doc || typeof doc !== "object" || !Array.isArray(doc.content)) return text;
+
+  const widgets = doc.content.filter(w => w && typeof w === "object");
+  const allShowcase = widgets.length > 0 && widgets.every(w => String(w.widgetName || "") === "raShowcase");
+  if (!allShowcase) return text;
+
+  const urls = [];
+  const seen = new Set();
+  const keyFor = (url) => {
+    try {
+      const parsed = new URL(url);
+      const path = decodeURIComponent(parsed.pathname || "").replace(/\/wc\d+\//gi, "/");
+      return (path.split("/").filter(Boolean).pop() || path).toLowerCase();
+    } catch {
+      return String(url || "").toLowerCase();
+    }
+  };
+  const normalize = (rawUrl) => {
+    const url = String(rawUrl || "").trim().split(/[?#]/)[0];
+    if (!/^https?:\/\//i.test(url)) return "";
+    if (/\/wc\d+\//i.test(url)) return "";
+    if (!/(ir-\d+\.ozonru\.cn|ir\.ozone\.ru)\/s3\/multimedia/i.test(url)) return "";
+    return url;
+  };
+  const walk = (node) => {
+    if (!node) return;
+    if (typeof node === "string") {
+      const url = normalize(node);
+      if (url) {
+        const key = keyFor(url);
+        if (!seen.has(key)) {
+          seen.add(key);
+          urls.push(url);
+        }
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (typeof node === "object") {
+      for (const key of ["src", "srcMobile", "url", "image", "imageUrl"]) walk(node[key]);
+      for (const value of Object.values(node)) {
+        if (urls.length >= 8) break;
+        if (value && typeof value === "object") walk(value);
+      }
+    }
+  };
+  walk(widgets);
+  if (!urls.length) return text;
+  const block = (src) => ({
+    imgLink: "",
+    img: {
+      src,
+      srcMobile: src,
+      alt: "",
+      position: "width_full",
+      positionMobile: "width_full",
+      widthMobile: 800,
+      heightMobile: 800,
+    },
+  });
+  const content = [{ widgetName: "raShowcase", type: "billboard", blocks: [block(urls[0])] }];
+  if (urls.length > 1) content.push({ widgetName: "raShowcase", type: "roll", blocks: urls.slice(1).map(block) });
+  return JSON.stringify({ content, version: doc.version || 0.3 });
+}
+
 function hasImportAttribute(attributes, attrId) {
   return Array.isArray(attributes) && attributes.some(a => Number(a?.id ?? a?.attribute_id) === Number(attrId));
 }
 
 function injectRichContentAttribute(item, sourceVariant = null) {
-  const richContent = pickSourceRichContent(item, sourceVariant);
+  const richContent = normalizeOzonRichContentForSubmit(pickSourceRichContent(item, sourceVariant));
   if (!richContent) return false;
   if (!Array.isArray(item.attributes)) item.attributes = [];
   if (!hasImportAttribute(item.attributes, 11254)) {
