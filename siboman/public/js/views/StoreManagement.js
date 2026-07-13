@@ -76,7 +76,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.29';
+      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.30';
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -142,13 +142,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.29)
+            逐梦 Ozon 采集器 (v2.2.9.30)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.29</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.30</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.30 富内容兜底: 真实 richAnnotationJson 抓不到时, 用源商品完整图册生成 11254 JSON, 避免 Seller 后台富内容为空。</li>
             <li>✅ v2.2.9.29 修复 Seller portal 草稿图片字段重复: 图片只走 top-level images, 提交前去重属性。</li>
             <li>✅ v2.2.9.28 新增单店铺 Seller portal 复制草稿发布实验路径, 用于验证富文本保留。</li>
             <li>✅ v2.2.9.27 扩大 Ozon 富文本 JSON 扫描范围; 同步要求批量上架页使用最新插件。</li>

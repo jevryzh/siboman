@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.29";
+const VERSION = "2.2.9.30";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -215,7 +215,11 @@ async function collectSku(sku, storeIds = []) {
     }
   }
 
-	  // v1.0.9: 详细打印每个字段的来源 + 关键数据
+  // v2.2.9.30: Ozon 公开 composer 偶发不给 richAnnotationJson。
+  // 保留真实富文本优先; 抓不到时用源商品图册生成合法 11254，避免 Seller 后台富内容为空。
+  ensureSyntheticRichContent(result);
+
+  // v1.0.9: 详细打印每个字段的来源 + 关键数据
   injectRichContentAttr(result);
 	  const dbg = result._debug || {};
   console.log(`[SW ${VERSION}] ✓ 采集 ${sku}: ${result.name?.slice(0, 50)}`);
@@ -241,6 +245,53 @@ function injectRichContentAttr(data) {
   if (!data.attributes.some(a => Number(a?.id ?? a?.attribute_id) === 11254)) {
     data.attributes.push({ id: 11254, name: "JSON Rich Content", value: richContent });
   }
+}
+
+function looksLikeRichContentDoc(raw) {
+  const doc = parseMaybeJson(raw);
+  return isRichContentDoc(doc);
+}
+
+function synthesizeRichContentFromImages(images) {
+  const urls = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(images) ? images : []) {
+    const url = String(raw || "").trim();
+    if (!/^https?:\/\//i.test(url)) continue;
+    const key = url.split(/[?#]/)[0].toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    urls.push(url);
+    if (urls.length >= 15) break;
+  }
+  if (!urls.length) return "";
+  return JSON.stringify({
+    content: [{
+      widgetName: "raShowcase",
+      type: "billboard",
+      blocks: urls.map(src => ({
+        imgLink: "",
+        img: { src, srcMobile: src },
+      })),
+    }],
+    version: 0.3,
+  });
+}
+
+function ensureSyntheticRichContent(data) {
+  if (!data || typeof data !== "object") return false;
+  const existing = typeof data.richContent === "string" ? data.richContent.trim() : "";
+  if (existing && looksLikeRichContentDoc(existing)) return false;
+  const rich = synthesizeRichContentFromImages(data.images);
+  if (!rich) return false;
+  data.richContent = rich;
+  data._synthetic_rich_content = true;
+  if (data._debug && typeof data._debug === "object") {
+    data._debug.syntheticRichContentBytes = rich.length;
+    if (!Array.isArray(data._debug.attributeSources)) data._debug.attributeSources = [];
+    data._debug.attributeSources.push("rich-content.11254.synthetic-images");
+  }
+  return true;
 }
 
 // ========== v2.2.9.15: Seller Portal 复制商品源包 ==========
