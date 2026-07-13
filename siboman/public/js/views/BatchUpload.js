@@ -1268,6 +1268,7 @@ window.BatchUploadView = {
                 <div v-for="storeId in selectedStores" :key="storeId" style="display:flex; align-items:center; gap:6px; margin-bottom:4px; font-size:11px">
                   <span style="min-width:80px; color:#475569; font-weight:600">{{ allStores.find(s=>s.id===storeId)?.name || storeId.slice(0,8) }}</span>
                   <el-select
+                    :key="'warehouse-select-' + storeId"
                     v-model="selectedWarehousesByStore[storeId]"
                     size="small"
                     style="flex:1"
@@ -1277,8 +1278,8 @@ window.BatchUploadView = {
                     @change="saveConfig">
                     <el-option
                       v-for="w in (warehousesByStore[storeId] || [])"
-                      :key="w.warehouse_id"
-                      :label="w.name"
+                      :key="storeId + '-' + w.warehouse_id"
+                      :label="w.name + ' · ' + String(w.warehouse_id).slice(-4)"
                       :value="w.warehouse_id" />
                   </el-select>
                   <span v-if="!(warehousesByStore[storeId] || []).length && !fetchingWarehouses[storeId]" style="color:#dc2626; font-size:10px">⚠ 无</span>
