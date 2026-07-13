@@ -2501,7 +2501,7 @@ app.post("/api/seller/products/collect-competitor", requireAuth, async (req, res
  */
 app.post("/api/images/watermark", requireAuth, async (req, res) => {
   try {
-    const images = Array.isArray(req.body?.images) ? req.body.images.filter(Boolean) : [];
+    const images = normalizeImportImageList(Array.isArray(req.body?.images) ? req.body.images.filter(Boolean) : []);
     const text = String(req.body?.text || "逐梦ERP");
     if (!images.length) return res.status(400).json({ success: false, error: "images 为空" });
 
@@ -3930,10 +3930,55 @@ function injectRichContentAttribute(item, sourceVariant = null) {
 }
 
 function getRequestPublicBaseUrl(req) {
+  const configured = String(process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "").replace(/\/+$/, "");
+  if (configured) return configured;
   const proto = String(req.get("x-forwarded-proto") || req.protocol || "http").split(",")[0].trim() || "http";
   const host = String(req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
   if (host) return `${proto}://${host}`.replace(/\/+$/, "");
-  return String(process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "").replace(/\/+$/, "");
+  return "";
+}
+
+async function listStoreWarehouses(storeId, userId) {
+  if (!storeId || !userId) return [];
+  const data = await callOzonSellerAPI("/v2/warehouse/list", {}, { storeId, userId });
+  return (data?.warehouses || data?.result || []).map(w => ({
+    warehouse_id: Number(w.warehouse_id),
+    name: w.name || `WH-${w.warehouse_id}`,
+    status: w.status || "active",
+    is_rfbs: w.is_rfbs === true,
+  })).filter(w => Number.isFinite(w.warehouse_id) && w.warehouse_id > 0);
+}
+
+async function normalizeStocksForStore(rawStocks, storeId, userId) {
+  const stocks = Array.isArray(rawStocks) ? rawStocks : [];
+  if (!stocks.length) return [];
+
+  let warehouses = [];
+  try {
+    warehouses = await listStoreWarehouses(storeId, userId);
+  } catch (e) {
+    console.warn(`[stocks] 拉店铺仓库失败 store=${storeId}: ${e.message}`);
+  }
+  const preferred = warehouses.find(w => w.status === "created" && w.is_rfbs) || warehouses.find(w => w.is_rfbs) || warehouses[0] || null;
+  const validIds = new Set(warehouses.map(w => String(w.warehouse_id)));
+
+  return stocks
+    .filter(s => s && s.offer_id)
+    .map(s => {
+      const requestedWh = Number(s.warehouse_id);
+      let warehouseId = Number.isFinite(requestedWh) && requestedWh > 0 ? requestedWh : 0;
+      if (warehouseId && validIds.size && !validIds.has(String(warehouseId))) {
+        const replacement = preferred?.warehouse_id || 0;
+        console.warn(`[stocks] warehouse_id=${warehouseId} 不属于 store=${storeId}, 自动改为 ${replacement || "空"}`);
+        warehouseId = replacement;
+      }
+      return {
+        offer_id: String(s.offer_id),
+        stock: parseInt(s.stock ?? s.stocks ?? 0, 10),
+        ...(warehouseId > 0 ? { warehouse_id: warehouseId } : {}),
+      };
+    })
+    .filter(s => Number.isFinite(s.stock) && s.stock >= 0 && (!validIds.size || !s.warehouse_id || validIds.has(String(s.warehouse_id))));
 }
 
 function canonicalImportImageKey(url) {
@@ -4541,7 +4586,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
       }
       const itemImages = Array.isArray(item.images) ? item.images : [];
       const itemHasUploads = itemImages.some(u => typeof u === "string" && /\/uploads\//i.test(u));
-      const mergedImages = normalizeImportImageList(itemHasUploads ? [...itemImages, ...sourceImages] : [...sourceImages, ...itemImages]);
+      const mergedImages = normalizeImportImageList(itemHasUploads ? itemImages : [...sourceImages, ...itemImages]);
       if (mergedImages.length) item.images = mergedImages;
       const sourceAttr = (key) => (sourceVariant.attributes || []).find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === String(key));
       const readInt = (key) => {
@@ -4630,14 +4675,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v2.2.7: 顶层 stocks 数组 (跟 MY 一样, 一次原子提交)
     let ozonStocks = null;
     if (rawStocks && rawStocks.length) {
-      ozonStocks = rawStocks
-        .filter(s => s && s.offer_id)
-        .map(s => ({
-          offer_id: String(s.offer_id),
-          stock: parseInt(s.stock ?? s.stocks ?? 0, 10),
-          ...(Number(s.warehouse_id) > 0 ? { warehouse_id: Number(s.warehouse_id) } : {}),
-        }))
-        .filter(s => s.stock >= 0);
+      ozonStocks = await normalizeStocksForStore(rawStocks, storeId, req.user.id);
     }
 
     const ozonPayload = { items: [item] };
