@@ -3681,18 +3681,33 @@ async function applyListingStocksAfterImport(row) {
   if (!normalizedStocks.length) return { skipped: true, reason: "no_valid_stocks" };
 
   try {
-    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: normalizedStocks }, { storeId: row.store_id, userId: row.user_id });
+    let productId = Number(raw.product_id || raw.ozon_product_id || 0);
+    if (!productId) {
+      const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: [String(row.offer_id || item.offer_id)] }, { storeId: row.store_id, userId: row.user_id });
+      productId = Number((info?.items || [])[0]?.id || 0);
+    }
+    const stocksPayload = normalizedStocks.map(s => ({
+      ...s,
+      ...(productId > 0 ? { product_id: productId } : {}),
+    }));
+    const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: stocksPayload }, { storeId: row.store_id, userId: row.user_id });
     await db.query(
       `UPDATE app_listing_history
           SET raw_payload = jsonb_set(
-                jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{stock_applied_at}', to_jsonb(now()::text), true),
-                '{stocks}', $3::jsonb, true
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{stock_applied_at}', to_jsonb(now()::text), true),
+                    '{stocks}', $3::jsonb, true
+                  ),
+                  '{stock_apply_response}', $4::jsonb, true
+                ),
+                '{product_id}', to_jsonb($5::bigint), true
               ),
               updated_at = now()
         WHERE task_id = $1 AND user_id = $2`,
-      [String(row.task_id), row.user_id, JSON.stringify(normalizedStocks)],
+      [String(row.task_id), row.user_id, JSON.stringify(stocksPayload), JSON.stringify(data || {}), productId || 0],
     );
-    console.log(`[listing-stocks] task=${row.task_id} applied stocks=${normalizedStocks.length}`);
+    console.log(`[listing-stocks] task=${row.task_id} product=${productId || "(unknown)"} applied stocks=${stocksPayload.length}`);
     return { applied: true, data, count: normalizedStocks.length };
   } catch (e) {
     await db.query(

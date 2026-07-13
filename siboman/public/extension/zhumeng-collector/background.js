@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.25";
+const VERSION = "2.2.9.26";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -475,6 +475,83 @@ function extractImagesFromSourceVariant(sourceVariant) {
   return images;
 }
 
+function parseMaybeJsonForSellerBundle(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed || !/^[\[{]/.test(trimmed)) return value;
+  try { return JSON.parse(trimmed); } catch { return value; }
+}
+
+function isSellerBundleRichContentDoc(doc) {
+  return Boolean(
+    doc &&
+    typeof doc === "object" &&
+    !Array.isArray(doc) &&
+    Array.isArray(doc.content) &&
+    doc.content.length > 0 &&
+    doc.content.some(block => block && typeof block === "object" && typeof block.widgetName === "string" && block.widgetName.trim())
+  );
+}
+
+function scoreSellerBundleRichContent(doc, json) {
+  let widgetCount = 0;
+  let textChars = 0;
+  let imageCount = 0;
+  const skipKeys = new Set(["widgetName", "align", "size", "color", "type", "src", "srcMobile", "url", "link", "imgLink", "richAnnotationJson", "style", "trackingInfo"]);
+  const walk = (node, key, depth) => {
+    if (node == null || depth > 24) return;
+    if (typeof node === "string") {
+      const text = node.replace(/\s+/g, " ").trim();
+      if (!skipKeys.has(key) && text.length > 2 && !/^https?:\/\//i.test(text) && /[A-Za-zА-Яа-яЁё]/.test(text)) textChars += text.length;
+      if (/^https?:\/\/.+\.(?:jpg|jpeg|png|webp|gif|avif)(?:[?#].*)?$/i.test(text)) imageCount += 1;
+      return;
+    }
+    if (Array.isArray(node)) { for (const item of node) walk(item, key, depth + 1); return; }
+    if (typeof node !== "object") return;
+    if (node.widgetName) widgetCount += 1;
+    for (const childKey of Object.keys(node)) walk(node[childKey], childKey, depth + 1);
+  };
+  walk(doc.content, "content", 0);
+  return widgetCount * 1000 + textChars * 20 + imageCount * 30 + Math.min(String(json || "").length, 20000) / 20000;
+}
+
+function extractRichContentFromSellerBundleStates(states) {
+  if (!states || typeof states !== "object") return "";
+  const candidates = [];
+  const seenJson = new Set();
+  const seenObjects = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+  const addCandidate = (doc, rawJson) => {
+    if (!isSellerBundleRichContentDoc(doc)) return;
+    const json = typeof rawJson === "string" && rawJson.trim()
+      ? rawJson.trim()
+      : JSON.stringify({ content: doc.content, version: doc.version || 0.3 });
+    if (seenJson.has(json)) return;
+    seenJson.add(json);
+    candidates.push({ json, score: scoreSellerBundleRichContent(doc, json) - candidates.length / 1000 });
+  };
+  const walk = (node, depth) => {
+    if (node == null || depth > 28) return;
+    const parsed = parseMaybeJsonForSellerBundle(node);
+    if (!parsed || typeof parsed !== "object") return;
+    if (seenObjects) {
+      if (seenObjects.has(parsed)) return;
+      seenObjects.add(parsed);
+    }
+    if (typeof parsed.richAnnotationJson === "string" && parsed.richAnnotationJson.trim()) {
+      addCandidate(parseMaybeJsonForSellerBundle(parsed.richAnnotationJson), parsed.richAnnotationJson);
+    }
+    if (isSellerBundleRichContentDoc(parsed)) addCandidate(parsed, null);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) walk(item, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(parsed)) walk(parsed[key], depth + 1);
+  };
+  walk(states, 0);
+  candidates.sort((a, b) => b.score - a.score);
+  return candidates[0]?.json || "";
+}
+
 async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
   const companyId = await getSellerCompanyId();
   if (!companyId) throw new Error("未找到 sc_company_id cookie，请确认 seller.ozon.ru 已登录并选中店铺");
@@ -516,7 +593,7 @@ async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
   const sourceVariant = buildSourceVariantFromBundle(sv, bundleItem);
   data._sourceVariant = sourceVariant;
   data.attributes = sourceVariantToFlatAttributes(sourceVariant, data.attributes);
-  const bundleRichContent = extractRichContentFromStates(bundleResp) || extractRichContentFromStates(bundleItem);
+  const bundleRichContent = extractRichContentFromSellerBundleStates(bundleResp) || extractRichContentFromSellerBundleStates(bundleItem);
   if (bundleRichContent && !data.richContent) {
     data.richContent = bundleRichContent;
   }
