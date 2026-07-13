@@ -2514,6 +2514,7 @@ app.post("/api/images/watermark", requireAuth, async (req, res) => {
     }
 
     const uploadDir = await ensureUploadDir();
+    const publicBaseUrl = getRequestPublicBaseUrl(req);
 
     const watermarkedUrls = [];
     for (const url of images) {
@@ -2531,23 +2532,27 @@ app.post("/api/images/watermark", requireAuth, async (req, res) => {
           watermarkedUrls.push(url); continue;
         }
 
-        // 加水印文字 (右下角, 半透明)
+        // 加水印文字 (右下角, 提高可见度)
         const font = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
         const textW = Jimp.measureText(font, text);
         const textH = Jimp.measureTextHeight(font, text);
         const x = image.bitmap.width - textW - 20;
         const y = image.bitmap.height - textH - 20;
-        // 半透明黑色背景条
-        image.scan(x - 8, y - 4, textW + 16, textH + 8, (xx, yy, idx) => {
-          image.bitmap.data[idx + 3] = 160;  // alpha
-        });
+        const bgX = Math.max(0, x - 12);
+        const bgY = Math.max(0, y - 8);
+        const bgW = Math.min(image.bitmap.width - bgX, textW + 24);
+        const bgH = Math.min(image.bitmap.height - bgY, textH + 16);
+        const overlay = new Jimp(bgW, bgH, 0x00000099);
+        image.composite(overlay, bgX, bgY);
+        image.print(font, Math.max(0, x + 2), Math.max(0, y + 2), text);
         image.print(font, x, y, text);
 
         const hashName = crypto.randomBytes(16).toString("hex") + ".jpg";
         const localPath = path.join(uploadDir, hashName);
         await image.quality(85).writeAsync(localPath);
-        watermarkedUrls.push(`/uploads/${hashName}`);
-        console.log(`[watermark] ✓ ${url.slice(0, 50)}... → /uploads/${hashName}`);
+        const publicUrl = `${publicBaseUrl}/uploads/${hashName}`;
+        watermarkedUrls.push(publicUrl);
+        console.log(`[watermark] ✓ ${url.slice(0, 50)}... → ${publicUrl}`);
       } catch (e) {
         console.warn("[watermark] 单图失败:", e.message);
         watermarkedUrls.push(url);
@@ -3872,16 +3877,19 @@ function normalizeImportImageUrl(raw) {
     .replace(/&amp;/g, "&");
   if (u.startsWith("//")) u = `https:${u}`;
   if (!/^https?:\/\//i.test(u)) return "";
-  if (!/(ozone\.ru|ozonru\.cn|ozonusercontent\.com)/i.test(u)) return "";
-  if (/(payments-cdn|marketing-api|seller-edu|cdn-cgi|static|assets|banner|promo|advert|logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
-  if (/\.(svg|gif)(?:[?#]|$)/i.test(u)) return "";
-  if (/\/s3\/(?:cms|rp-photo|cdn-cgi|certificate|payments-cdn|marketing-api)\//i.test(u)) return "";
-  if (/(banner|promo|advert|avatar|review|feedback)/i.test(u)) return "";
-  if (/(logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
   try {
     const parsed = new URL(u);
     parsed.hash = "";
     parsed.search = "";
+    if (/^\/uploads\/[^/]+\.(?:jpg|jpeg|png|webp)$/i.test(parsed.pathname)) {
+      return parsed.toString();
+    }
+    if (!/(ozone\.ru|ozonru\.cn|ozonusercontent\.com)/i.test(parsed.hostname)) return "";
+    if (/(payments-cdn|marketing-api|seller-edu|cdn-cgi|static|assets|banner|promo|advert|logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
+    if (/\.(svg|gif)(?:[?#]|$)/i.test(u)) return "";
+    if (/\/s3\/(?:cms|rp-photo|cdn-cgi|certificate|payments-cdn|marketing-api)\//i.test(parsed.pathname)) return "";
+    if (/(banner|promo|advert|avatar|review|feedback)/i.test(u)) return "";
+    if (/(logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
     return parsed.toString();
   } catch {
     return u.split(/[?#]/)[0];
@@ -3919,6 +3927,13 @@ function injectRichContentAttribute(item, sourceVariant = null) {
   }
   item.richContent = richContent;
   return true;
+}
+
+function getRequestPublicBaseUrl(req) {
+  const proto = String(req.get("x-forwarded-proto") || req.protocol || "http").split(",")[0].trim() || "http";
+  const host = String(req.get("x-forwarded-host") || req.get("host") || "").split(",")[0].trim();
+  if (host) return `${proto}://${host}`.replace(/\/+$/, "");
+  return String(process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "").replace(/\/+$/, "");
 }
 
 function canonicalImportImageKey(url) {
@@ -4524,7 +4539,9 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
           }
         }
       }
-      const mergedImages = normalizeImportImageList([...sourceImages, ...(Array.isArray(item.images) ? item.images : [])]);
+      const itemImages = Array.isArray(item.images) ? item.images : [];
+      const itemHasUploads = itemImages.some(u => typeof u === "string" && /\/uploads\//i.test(u));
+      const mergedImages = normalizeImportImageList(itemHasUploads ? [...itemImages, ...sourceImages] : [...sourceImages, ...itemImages]);
       if (mergedImages.length) item.images = mergedImages;
       const sourceAttr = (key) => (sourceVariant.attributes || []).find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === String(key));
       const readInt = (key) => {
