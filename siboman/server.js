@@ -3631,7 +3631,13 @@ async function applyListingStocksAfterImport(row) {
   if (!db || !row?.task_id || !row?.user_id) return { skipped: true, reason: "missing_context" };
   const raw = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
   if (raw.stock_applied_at) return { skipped: true, reason: "already_applied" };
-  const stocks = Array.isArray(raw.stocks) ? raw.stocks : [];
+  const item = raw.item && typeof raw.item === "object" ? raw.item : {};
+  const fallbackStock = Number(item._stock ?? item.stock ?? item.default_stock ?? 0);
+  const fallbackWarehouseId = Number(item._warehouse_id ?? item.warehouse_id ?? 0);
+  const fallbackStocks = fallbackStock > 0 && fallbackWarehouseId > 0 && (row.offer_id || item.offer_id)
+    ? [{ offer_id: row.offer_id || item.offer_id, stock: fallbackStock, warehouse_id: fallbackWarehouseId }]
+    : [];
+  const stocks = Array.isArray(raw.stocks) && raw.stocks.length ? raw.stocks : fallbackStocks;
   const normalizedStocks = stocks
     .filter(s => s && s.offer_id && Number(s.stock ?? s.stocks) >= 0)
     .map(s => ({
@@ -3647,10 +3653,13 @@ async function applyListingStocksAfterImport(row) {
     const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: normalizedStocks }, { storeId: row.store_id, userId: row.user_id });
     await db.query(
       `UPDATE app_listing_history
-          SET raw_payload = jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{stock_applied_at}', to_jsonb(now()::text), true),
+          SET raw_payload = jsonb_set(
+                jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{stock_applied_at}', to_jsonb(now()::text), true),
+                '{stocks}', $3::jsonb, true
+              ),
               updated_at = now()
         WHERE task_id = $1 AND user_id = $2`,
-      [String(row.task_id), row.user_id],
+      [String(row.task_id), row.user_id, JSON.stringify(normalizedStocks)],
     );
     console.log(`[listing-stocks] task=${row.task_id} applied stocks=${normalizedStocks.length}`);
     return { applied: true, data, count: normalizedStocks.length };
@@ -4568,7 +4577,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             String(item.name || ""),
             String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
             item.price ? Number(item.price) : null,
-            JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, submitted_at: new Date().toISOString() }),
+            JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, stocks: ozonStocks || rawStocks || [], submitted_at: new Date().toISOString() }),
           ],
         );
       } catch (e) { console.error("[listing-history] insert failed:", e.message); }

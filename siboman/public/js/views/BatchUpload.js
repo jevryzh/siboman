@@ -718,6 +718,7 @@ window.BatchUploadView = {
         const storeItems = [];
         const storeStocks = [];
         const whId = selectedWarehousesByStore.value[storeId];  // v2.2.6 每店仓库, v2.2.7 仍按店走
+        const defaultStock = Math.max(0, Math.floor(Number(config.defaultStock || 0)));
         for(const row of rows){
           // v2.2.4: 拦截 confidence='none' 且 to=0 的行 (URL 面包屑 ID 不是 Seller API 的)
           //   Ozon 必拒 levels_category_not_found, 前端必须拦住不让提交
@@ -739,17 +740,23 @@ window.BatchUploadView = {
           }
           const built = buildV3Item(row, {
             vat: config.vat, currencyCode: config.currency,
-            brand: config.brand, defaultStock: config.defaultStock,
+            brand: config.brand, defaultStock,
           });
           if(!built.ok){ appendLog(`  ✗ #${row.index} ${built.error}`, 'error'); totalFail++; continue; }
+          if (whId && defaultStock > 0) {
+            built.item._warehouse_id = whId;
+            built.item._stock = defaultStock;
+          }
           storeItems.push({ row, item: built.item });
           // v2.2.7: stocks 跟 items 同发 (Ozon 原子处理), 默认库存用 defaultStock
-          if (whId && (config.defaultStock || 0) > 0) {
+          if (whId && defaultStock > 0) {
             storeStocks.push({
               offer_id: built.item.offer_id,
-              stock: config.defaultStock,
+              stock: defaultStock,
               warehouse_id: whId,
             });
+          } else if (defaultStock > 0) {
+            appendLog(`  ⚠ #${row.index} SKU ${row.sku}: 已填库存 ${defaultStock}, 但未读到目标仓库, 本次不会写库存`, 'warn');
           }
         }
 
@@ -769,7 +776,7 @@ window.BatchUploadView = {
             }, { timeout: 60000 });
             const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
             // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
-            appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${whId ? ` + stock=${config.defaultStock} → wh=${whId}` : ''}`, 'info');
+            appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${whId && defaultStock > 0 ? ` + stock=${defaultStock} → wh=${whId}` : ''}`, 'info');
             // 后台 polling 每 60s 同步 Ozon 真实状态
             totalOk++;
           } catch(e) {
