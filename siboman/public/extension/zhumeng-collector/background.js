@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.19";
+const VERSION = "2.2.9.20";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -403,7 +403,15 @@ function buildSourceVariantFromBundle(searchSv, bundleItem) {
       if (!key || existing.has(key)) continue;
       const vals = readBundleAttrValues(ba);
       if (!vals.length) continue;
-      const attr = { key };
+      const rawValues = Array.isArray(ba.values)
+        ? ba.values
+            .filter(v => v && v.value != null && String(v.value).trim() !== "")
+            .map(v => ({
+              value: String(v.value).trim(),
+              ...(Number(v.dictionary_value_id || 0) > 0 ? { dictionary_value_id: Number(v.dictionary_value_id) } : {}),
+            }))
+        : [];
+      const attr = { key, ...(rawValues.length ? { values: rawValues } : {}) };
       if (vals.length > 1) attr.collection = vals;
       else attr.value = vals[0];
       const dictId = Number(ba?.values?.[0]?.dictionary_value_id || ba?.dictionary_value_id || 0);

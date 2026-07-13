@@ -3733,13 +3733,29 @@ function sourceVariantAttributesToImportAttrs(sourceVariant) {
   for (const attr of attrs) {
     const id = Number(attr?.id ?? attr?.attribute_id ?? attr?.key);
     if (!Number.isFinite(id) || id <= 0) continue;
-    const raw = getAttrRawValue(attr);
-    const rawValues = Array.isArray(raw) ? raw : (raw ? [raw] : []);
-    if (!rawValues.length) continue;
+    // 4194/4195 are Ozon image attributes. We submit media through images /
+    // pictures/import; sending these attributes too makes Ozon reject as duplicate.
+    if (id === 4194 || id === 4195) continue;
+    const dictValues = Array.isArray(attr.values)
+      ? attr.values
+          .map(v => {
+            const value = (v && typeof v === "object") ? (v.value ?? v.name ?? v.text ?? "") : v;
+            const dictId = Number(v?.dictionary_value_id ?? v?.dictionaryValueId ?? 0);
+            if (value === undefined || value === null || String(value).trim() === "") return null;
+            return {
+              value: String(value).trim(),
+              ...(dictId > 0 ? { dictionary_value_id: dictId } : {}),
+            };
+          })
+          .filter(Boolean)
+      : [];
+    const raw = dictValues.length ? "" : getAttrRawValue(attr);
+    const rawValues = dictValues.length ? [] : (Array.isArray(raw) ? raw : (raw ? [raw] : []));
+    if (!dictValues.length && !rawValues.length) continue;
     out.push({
       id,
       ...(Number(attr?.complex_id) > 0 ? { complex_id: Number(attr.complex_id) } : {}),
-      values: rawValues.map(value => {
+      values: dictValues.length ? dictValues : rawValues.map(value => {
         const v = { value: String(value) };
         const dictId = Number(attr?.dictionary_value_id ?? attr?.dictionaryValueId ?? 0);
         if (dictId > 0 && rawValues.length === 1) v.dictionary_value_id = dictId;
@@ -3789,7 +3805,7 @@ async function applyListingAttributesAfterImport(row) {
     ...sourceVariantAttributesToImportAttrs(sourceItem),
   ]
     .map(normalizeOzonAttributeForUpdate)
-    .filter(Boolean);
+    .filter(attr => attr && attr.id !== 4194 && attr.id !== 4195);
 
   const attrById = new Map();
   for (const attr of attributes) {
@@ -4352,7 +4368,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             }))
           : (a.value !== undefined ? [{ value: String(a.value), ...(dictId ? { dictionary_value_id: dictId } : {}) }] : []);
         return { id: aId, values };
-      }).filter(a => a.id && a.values.length);
+      }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && a.values.length);
     }
     delete item._sourceVariant;
     delete item._collect_meta;
