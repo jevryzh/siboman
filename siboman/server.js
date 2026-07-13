@@ -3645,9 +3645,9 @@ async function applyListingPicturesAfterImport(row) {
   const item = raw.item && typeof raw.item === "object" ? raw.item : {};
   const sourceItem = raw.source_item && typeof raw.source_item === "object" ? raw.source_item : {};
   const images = normalizeImportImageList([
-    ...(Array.isArray(item.images) ? item.images : []),
-    ...(Array.isArray(sourceItem.images) ? sourceItem.images : []),
     ...extractSourceVariantImages(sourceItem),
+    ...(Array.isArray(sourceItem.images) ? sourceItem.images : []),
+    ...(Array.isArray(item.images) ? item.images : []),
     row.main_image || item.primary_image || sourceItem.primary_image || "",
   ]);
 
@@ -3785,11 +3785,58 @@ function extractSourceVariantImages(sourceVariant) {
 }
 
 function normalizeImportImageList(images) {
-  return (Array.isArray(images) ? images : [])
-    .map(u => typeof u === "string" ? u : (u?.file_name || u?.url || u?.src || ""))
-    .filter(u => typeof u === "string" && /^https?:\/\//i.test(u))
-    .filter((u, idx, arr) => arr.indexOf(u) === idx)
-    .slice(0, 15);
+  const normalized = [];
+  const seen = new Set();
+  for (const raw of (Array.isArray(images) ? images : [])) {
+    const url = normalizeImportImageUrl(raw);
+    if (!url) continue;
+    const key = canonicalImportImageKey(url);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push(url);
+    if (normalized.length >= 15) break;
+  }
+  return normalized;
+}
+
+function normalizeImportImageUrl(raw) {
+  let u = typeof raw === "string" ? raw : (raw?.file_name || raw?.url || raw?.src || raw?.image || "");
+  if (typeof u !== "string") return "";
+  u = u.trim()
+    .replace(/\\u002F/g, "/")
+    .replace(/\\\//g, "/")
+    .replace(/&amp;/g, "&");
+  if (u.startsWith("//")) u = `https:${u}`;
+  if (!/^https?:\/\//i.test(u)) return "";
+  if (!/(ozone\.ru|ozonru\.cn|ozonusercontent\.com)/i.test(u)) return "";
+  if (/\.(svg|gif)(?:[?#]|$)/i.test(u)) return "";
+  if (/\/s3\/(?:cms|rp-photo|cdn-cgi|certificate)\//i.test(u)) return "";
+  if (/(banner|promo|advert|avatar|review|feedback)/i.test(u)) return "";
+  if (/(logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
+  try {
+    const parsed = new URL(u);
+    parsed.hash = "";
+    parsed.search = "";
+    return parsed.toString();
+  } catch {
+    return u.split(/[?#]/)[0];
+  }
+}
+
+function canonicalImportImageKey(url) {
+  const lower = String(url || "").toLowerCase();
+  try {
+    const u = new URL(lower);
+    let path = decodeURIComponent(u.pathname || "")
+      .replace(/\/(?:wc|c)\d+\//g, "/")
+      .replace(/\/+/g, "/");
+    const file = path.split("/").filter(Boolean).pop() || path;
+    if (/\/s3\/(?:multimedia|rp-photo)[^/]*\//i.test(path) && file) return `ozon:${file}`;
+    if (/\/s3\/cms\//i.test(path)) return `drop:${path}`;
+    return `${u.hostname.replace(/^ir-\d+\.ozonru\.cn$/, "ir.ozone.ru")}:${path}`;
+  } catch {
+    return lower.replace(/[?#].*$/, "").replace(/\/(?:wc|c)\d+\//g, "/");
+  }
 }
 
 async function applyListingAttributesAfterImport(row) {
@@ -4337,7 +4384,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
           }
         }
       }
-      const mergedImages = normalizeImportImageList([...(Array.isArray(item.images) ? item.images : []), ...sourceImages]);
+      const mergedImages = normalizeImportImageList([...sourceImages, ...(Array.isArray(item.images) ? item.images : [])]);
       if (mergedImages.length) item.images = mergedImages;
       const sourceAttr = (key) => (sourceVariant.attributes || []).find(a => String(a?.key ?? a?.id ?? a?.attribute_id) === String(key));
       const readInt = (key) => {

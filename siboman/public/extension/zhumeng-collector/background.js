@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.20";
+const VERSION = "2.2.9.21";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -960,8 +960,8 @@ function isRichContentDoc(doc) {
 }
 
 function collectRichContentStats(doc) {
-  const stats = { widgetCount: 0, textWidgetCount: 0, layoutWidgetCount: 0, imageCount: 0, textNodeCount: 0, textChars: 0, hasRealText: false };
-  const skipTextKeys = new Set(["widgetName", "align", "size", "color", "type", "src", "srcMobile", "url", "link", "imgLink", "richAnnotationJson", "class", "className", "style", "trackingInfo", "layoutTrackingInfo"]);
+  const stats = { widgetCount: 0, textWidgetCount: 0, layoutWidgetCount: 0, chessWidgetCount: 0, imageCount: 0, textNodeCount: 0, textChars: 0, hasRealText: false };
+  const skipTextKeys = new Set(["widgetName", "align", "size", "color", "type", "src", "srcMobile", "url", "link", "imgLink", "richAnnotationJson", "class", "className", "style", "trackingInfo", "layoutTrackingInfo", "gifUrl", "videoUrl", "previewUrl", "backgroundColor", "theme", "padding", "margin", "id", "reff", "fontColor", "borderColor", "position", "positionMobile"]);
   const looksLikeImageUrl = (text) => /^https?:\/\/.+\.(?:jpg|jpeg|png|webp|gif|avif)(?:[?#].*)?$/i.test(text);
   const pushText = (value, key) => {
     if (key && skipTextKeys.has(key)) return;
@@ -977,10 +977,12 @@ function collectRichContentStats(doc) {
     if (Array.isArray(node)) { for (const item of node) walk(item, key, depth + 1); return; }
     if (typeof node !== "object") return;
     const widgetName = String(node.widgetName || "");
+    const type = String(node.type || "");
     if (widgetName) {
       stats.widgetCount += 1;
       if (/text|description|annotation/i.test(widgetName)) stats.textWidgetCount += 1;
-      if (/showcase|billboard|roll|tile|media|chess/i.test(widgetName) || /billboard|roll|chess|tile/i.test(String(node.type || ""))) stats.layoutWidgetCount += 1;
+      if (/chess/i.test(widgetName) || /chess/i.test(type)) stats.chessWidgetCount += 1;
+      if (/showcase|billboard|roll|tile|media|chess/i.test(widgetName) || /billboard|roll|chess|tile/i.test(type)) stats.layoutWidgetCount += 1;
     }
     if (node.img && typeof node.img === "object") stats.imageCount += 1;
     for (const imageKey of ["src", "srcMobile", "url", "image", "imageUrl", "coverImage"]) {
@@ -1014,6 +1016,7 @@ function extractRichContentFromStates(states) {
       json,
       score:
         (stats.hasRealText ? 100000 : 0) +
+        stats.chessWidgetCount * 20000 +
         stats.textWidgetCount * 12000 +
         stats.layoutWidgetCount * 600 +
         stats.textChars * 40 +
@@ -1047,16 +1050,95 @@ function extractRichContentFromStates(states) {
   return candidates[0]?.json || "";
 }
 
-async function collectRichContentFromOzonPage() {
-  const path = `${location.pathname}${location.search || ""}`;
-  const endpoints = [
-    `/api/entrypoint-api.bx/page/json/v2?url=${encodeURIComponent(path)}`,
-    `/api/composer-api.bx/page/json/v2?url=${encodeURIComponent(path)}`,
-  ];
+function normalizeOzonProductInnerPath(value) {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  try {
+    const url = new URL(raw, "https://www.ozon.ru");
+    return (url.pathname || "") + (url.search || "");
+  } catch {
+    const noHash = raw.split("#")[0];
+    return noHash.startsWith("/") ? noHash : `/${noHash}`;
+  }
+}
+
+function ozonProductPathKey(value) {
+  return normalizeOzonProductInnerPath(value).split("?")[0].replace(/\/+$/, "");
+}
+
+function ozonProductIdFromPath(value) {
+  const match = ozonProductPathKey(value).match(/\/product\/(?:[^/?#]*-)?(\d+)$/i);
+  return match ? match[1] : "";
+}
+
+function collectOzonRichContentPagePaths(states, currentPath) {
+  const out = [];
+  const seenPaths = new Set();
+  const seenObjects = typeof WeakSet !== "undefined" ? new WeakSet() : null;
+  const currentProductKey = ozonProductPathKey(currentPath);
+  const currentProductId = ozonProductIdFromPath(currentPath);
+  const push = (candidate) => {
+    const pagePath = normalizeOzonProductInnerPath(candidate);
+    if (!pagePath || !/[?&]layout_container=pdpPage2column(?:&|$)/.test(pagePath)) return;
+    const productKey = ozonProductPathKey(pagePath);
+    const productId = ozonProductIdFromPath(pagePath);
+    if (currentProductId && productId && currentProductId !== productId) return;
+    if ((!currentProductId || !productId) && currentProductKey && productKey && productKey !== currentProductKey) return;
+    if (seenPaths.has(pagePath)) return;
+    seenPaths.add(pagePath);
+    out.push(pagePath);
+  };
+  const walk = (node, depth) => {
+    if (node == null || depth > 18) return;
+    const parsed = parseMaybeJson(node);
+    if (!parsed || typeof parsed !== "object") return;
+    if (seenObjects) {
+      if (seenObjects.has(parsed)) return;
+      seenObjects.add(parsed);
+    }
+    if (typeof parsed.nextPage === "string") push(parsed.nextPage);
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) walk(item, depth + 1);
+      return;
+    }
+    for (const key of Object.keys(parsed)) walk(parsed[key], depth + 1);
+  };
+  walk(states, 0);
+  return out;
+}
+
+function richContentHasText(raw) {
+  const doc = parseMaybeJson(raw);
+  return isRichContentDoc(doc) && collectRichContentStats(doc).hasRealText;
+}
+
+async function collectRichContentFromOzonPage(sku) {
+  const currentPath = normalizeOzonProductInnerPath(`${location.pathname}${location.search || ""}`);
+  const cleanPath = normalizeOzonProductInnerPath(location.pathname);
+  const skuPath = sku ? `/product/${sku}/` : "";
+  const paths = [currentPath, cleanPath, skuPath].filter(Boolean);
+  const endpoints = [];
+  const seenEndpoints = new Set();
+  const enqueuePath = (path) => {
+    const normalized = normalizeOzonProductInnerPath(path);
+    if (!normalized) return;
+    for (const url of [
+      `/api/entrypoint-api.bx/page/json/v2?url=${encodeURIComponent(normalized)}`,
+      `/api/composer-api.bx/page/json/v2?url=${encodeURIComponent(normalized)}`,
+    ]) {
+      if (seenEndpoints.has(url)) continue;
+      seenEndpoints.add(url);
+      endpoints.push(url);
+    }
+  };
+  for (const path of paths) enqueuePath(path);
   let best = "";
-  for (const url of endpoints) {
+  let bestHasText = false;
+  let okCount = 0;
+  for (let i = 0; i < endpoints.length; i += 1) {
+    const url = endpoints[i];
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 8000);
+    const timer = setTimeout(() => controller.abort(), 12000);
     try {
       const resp = await fetch(url, {
         credentials: "include",
@@ -1065,13 +1147,24 @@ async function collectRichContentFromOzonPage() {
       });
       clearTimeout(timer);
       if (!resp.ok) continue;
+      okCount += 1;
       const payload = await resp.json();
-      const rich = extractRichContentFromStates(payload?.widgetStates || {});
-      if (rich && rich.length > best.length) best = rich;
+      const states = payload?.widgetStates || {};
+      for (const nextPage of collectOzonRichContentPagePaths(states, currentPath || cleanPath || skuPath)) enqueuePath(nextPage);
+      const rich = extractRichContentFromStates(states);
+      if (rich) {
+        const hasText = richContentHasText(rich);
+        if (!best || (!bestHasText && hasText) || (hasText === bestHasText && rich.length > best.length)) {
+          best = rich;
+          bestHasText = hasText;
+        }
+      }
     } catch (e) {
       clearTimeout(timer);
     }
   }
+  if (best) console.log(`[zhumeng-extract] rich content 11254 found bytes=${best.length} text=${bestHasText} endpointsOk=${okCount}/${endpoints.length}`);
+  else console.warn(`[zhumeng-extract] rich content 11254 not found endpointsOk=${okCount}/${endpoints.length}`);
   return best;
 }
 
@@ -1397,7 +1490,7 @@ async function collectRichContentFromOzonPage() {
 
   // ========== 9.5. 提取 Ozon 富内容 JSON (attribute 11254) ==========
   try {
-    const richContent = await collectRichContentFromOzonPage();
+    const richContent = await collectRichContentFromOzonPage(sku);
     if (richContent) {
       data.richContent = richContent;
       data.attributes.push({ id: 11254, name: "JSON Rich Content", value: richContent });
