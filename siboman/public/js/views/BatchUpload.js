@@ -970,7 +970,7 @@ window.BatchUploadView = {
 
     const saveConfig = () => {
       localStorage.setItem('batch_config', JSON.stringify({
-        selectedStores: selectedStores.value,
+        // 店铺选择不跨刷新记忆，避免用户上次多选后刷新页面误发多店铺。
         selectedWarehousesByStore: selectedWarehousesByStore.value,
         ...config,
       }));
@@ -978,8 +978,9 @@ window.BatchUploadView = {
     const loadConfig = () => {
       try {
         const s = JSON.parse(localStorage.getItem('batch_config')||'{}');
+        delete s.selectedStores;
         Object.assign(config, s);
-        if (s.selectedStores) selectedStores.value = s.selectedStores;
+        selectedStores.value = [];
         if (s.selectedWarehousesByStore) selectedWarehousesByStore.value = s.selectedWarehousesByStore;
       } catch {}
     };
