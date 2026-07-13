@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.24";
+const VERSION = "2.2.9.25";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -138,7 +138,8 @@ async function collectSku(sku, storeIds = []) {
         Number(result.description_category_id) || 0,  // 5位 breadcrumb
         result.name,  // v2.2.9.3: 让 server candidates 能用 name 关键词匹配
       );
-      if (resolved && resolved.success) {
+      const hasSellerBundleCategory = !!(result._seller_bundle_source?.description_category_id || result._seller_bundle_source?.type_id);
+      if (resolved && resolved.success && !hasSellerBundleCategory) {
         result.description_category_id = resolved.description_category_id;
         if (resolved.type_id && !result.type_id) result.type_id = resolved.type_id;
         result._category_resolved = {
@@ -148,7 +149,7 @@ async function collectSku(sku, storeIds = []) {
           confidence: resolved.confidence || 'high',
         };
         console.log(`[SW ${VERSION}]   类目解析: ${oldCat} → ${resolved.description_category_id} (${resolved.source}, confidence=${resolved.confidence})`);
-      } else if (resolved) {
+      } else if (resolved && !hasSellerBundleCategory) {
         // v2.2.9.1: 不再清零 plugin 已抓到的 cat (5位 breadcrumb)
         // v2.2.9.2: 自动应用 candidates 第一个 (按商品 name 关键词匹配的最高分 cat)
         // v2.2.9.3: 关键修复 — plugin 抓的 5位 breadcrumb 跟 Ozon Seller API 8位 cat 是两套体系
@@ -198,6 +199,16 @@ async function collectSku(sku, storeIds = []) {
           warning: autoWarning,
         };
         console.log(`[SW ${VERSION}]   类目自动填上: cat=${result.description_category_id} type_id=${autoType || '(待补)'} (${autoSource}, confidence=${autoConfidence})`);
+      } else if (resolved && hasSellerBundleCategory) {
+        result._category_resolved = {
+          from: oldCat,
+          to: result.description_category_id,
+          source: 'seller-bundle-trusted',
+          confidence: 'high',
+          candidates: resolved.candidates || [],
+          warning: '已使用 Seller bundle 的源类目/类型, 跳过公开页名称候选纠偏',
+        };
+        console.log(`[SW ${VERSION}]   类目解析: 保留 Seller bundle cat=${result.description_category_id} type=${result.type_id || '(空)'}, 跳过候选覆盖`);
       }
     } catch (e) {
       console.warn(`[SW ${VERSION}]   category-resolve 调用失败 (非致命, 用 URL cat 上传): ${e.message}`);
@@ -521,13 +532,17 @@ async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
   if (Number(bundleItem.width) > 0) data.width = Number(bundleItem.width);
   if (Number(bundleItem.height) > 0) data.height = Number(bundleItem.height);
   if (bundleItem.barcode) data.barcode = String(bundleItem.barcode);
-  if (sv.type_id && !data.type_id) data.type_id = Number(sv.type_id) || data.type_id;
-  if (sv.description_category_id && !data.description_category_id) data.description_category_id = Number(sv.description_category_id) || data.description_category_id;
+  const sellerTypeId = Number(sv.type_id || sourceVariant?.type_id || 0);
+  const sellerCategoryId = Number(sv.description_category_id || sourceVariant?.description_category_id || 0);
+  if (sellerTypeId > 0) data.type_id = sellerTypeId;
+  if (sellerCategoryId > 0) data.description_category_id = sellerCategoryId;
   data._seller_bundle_source = {
     company_id: String(companyId),
     variant_id: String(sv.variant_id),
     bundle_id: bundleResp?.bundle_id || null,
     attr_count: Array.isArray(bundleItem.attributes) ? bundleItem.attributes.length : 0,
+    type_id: sellerTypeId || null,
+    description_category_id: sellerCategoryId || null,
   };
   return { attrCount: data.attributes.length, imageCount: data.images.length };
 }

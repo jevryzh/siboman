@@ -4076,7 +4076,10 @@ async function pollPendingListingTasks() {
            OR (
              status = 'imported'
              AND (
-               NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'picture_applied_at')
+               (
+                 NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'picture_applied_at')
+                 AND NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'picture_apply_error')
+               )
                OR NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'attribute_applied_at')
                OR (
                  jsonb_array_length(COALESCE(raw_payload->'stocks', '[]'::jsonb)) > 0
@@ -4530,24 +4533,34 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v0.6.1: category_id 透传 - 支持 description_category_id (Ozon 原始) 或 category_id (前端简化)
     let categoryId = item.description_category_id || item.category_id;
     let typeId = item.type_id;
-    const sourceVariantTypeId = Number(
-      typeId ||
-      sourceVariant?.type_id ||
-      sourceVariant?.typeId ||
-      (Number(sourceVariant?.description_category_id || 0) > 0 && Number(sourceVariant?.description_category_id || 0) < 100000
-        ? sourceVariant.description_category_id
-        : 0)
-    );
-    if (sourceVariantTypeId > 0) {
+    const sourceVariantCategoryId = Number(sourceVariant?.description_category_id || sourceVariant?.category_id || 0);
+    const sourceVariantTypeId = Number(sourceVariant?.type_id || sourceVariant?.typeId || 0);
+    const itemTypeId = Number(typeId || 0);
+    if (sourceVariantCategoryId > 0 && sourceVariantCategoryId >= 100000 && Number(categoryId) !== sourceVariantCategoryId) {
+      console.log(`[v2.2.9.25 import] Seller bundle 源类目优先 ${categoryId || 0} → ${sourceVariantCategoryId}`);
+      categoryId = sourceVariantCategoryId;
+    }
+    if (sourceVariantTypeId > 0 && itemTypeId !== sourceVariantTypeId) {
+      console.log(`[v2.2.9.25 import] Seller bundle 源 type_id 优先 ${itemTypeId || 0} → ${sourceVariantTypeId}`);
+      typeId = sourceVariantTypeId;
+    }
+    const trustedTypeId = Number(sourceVariantTypeId || itemTypeId || 0);
+    if (trustedTypeId > 0) {
       try {
-        const typeHit = await findCategoryByTypeId(storeId, req.user.id, sourceVariantTypeId);
-        if (typeHit?.description_category_id && Number(categoryId) !== Number(typeHit.description_category_id)) {
-          console.log(`[v2.2.9.22 import] type_id=${sourceVariantTypeId} 修正类目 ${categoryId || 0} → ${typeHit.description_category_id} (${typeHit.breadcrumb || typeHit.type_name || ""})`);
+        const typeHit = await findCategoryByTypeId(storeId, req.user.id, trustedTypeId);
+        const typeHitCategoryId = Number(typeHit?.description_category_id || 0);
+        const canApplyTypeCategory = typeHitCategoryId > 0
+          && (!sourceVariantCategoryId || sourceVariantCategoryId === typeHitCategoryId || Number(categoryId) < 100000);
+        if (canApplyTypeCategory && Number(categoryId) !== typeHitCategoryId) {
+          console.log(`[v2.2.9.25 import] type_id=${trustedTypeId} 修正类目 ${categoryId || 0} → ${typeHit.description_category_id} (${typeHit.breadcrumb || typeHit.type_name || ""})`);
           categoryId = typeHit.description_category_id;
-          typeId = sourceVariantTypeId;
+          typeId = trustedTypeId;
+        } else if (typeHitCategoryId > 0 && sourceVariantCategoryId > 0 && sourceVariantCategoryId !== typeHitCategoryId) {
+          console.warn(`[v2.2.9.25 import] type_id=${trustedTypeId} 映射类目 ${typeHitCategoryId} 与 Seller bundle 源类目 ${sourceVariantCategoryId} 不一致, 保留源类目`);
+          typeId = trustedTypeId;
         }
       } catch (e) {
-        console.warn("[v2.2.9.22 import] type_id 类目修正失败:", e.message);
+        console.warn("[v2.2.9.25 import] type_id 类目修正失败:", e.message);
       }
     }
     if (!item.name || !offerId || !categoryId) {
