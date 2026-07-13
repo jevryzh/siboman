@@ -4163,6 +4163,7 @@ async function pollPendingListingTasks() {
         const rawPayload = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
         if (rawPayload.via_portal === true || rawPayload.via_portal === "true") {
           if (row.status === "imported") {
+            await applyListingAttributesAfterImport(row);
             await applyListingStocksAfterImport(row);
             updated++;
             continue;
@@ -4188,6 +4189,7 @@ async function pollPendingListingTasks() {
               WHERE task_id = $2 AND user_id = $3`,
             [productId, row.task_id, row.user_id],
           );
+          await applyListingAttributesAfterImport(portalRow);
           await applyListingStocksAfterImport(portalRow);
           console.log(`[poll-pending] portal task=${row.task_id} offer=${row.offer_id} → imported product=${productId}`);
           updated++;
