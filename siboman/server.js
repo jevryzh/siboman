@@ -3741,6 +3741,14 @@ async function applyListingStocksAfterImport(row) {
       ...(productId > 0 ? { product_id: productId } : {}),
     }));
     const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: stocksPayload }, { storeId: row.store_id, userId: row.user_id });
+    const stockResults = Array.isArray(data?.result) ? data.result : [];
+    const failedStock = stockResults.find(r => r?.updated === false || (Array.isArray(r?.errors) && r.errors.length));
+    if (failedStock) {
+      const err = Array.isArray(failedStock.errors) && failedStock.errors[0]
+        ? `${failedStock.errors[0].code || "stock_update_failed"}: ${failedStock.errors[0].message || ""}`.trim()
+        : "stock_update_failed";
+      throw new Error(err);
+    }
     await db.query(
       `UPDATE app_listing_history
           SET raw_payload = jsonb_set(
@@ -4175,20 +4183,38 @@ async function applyListingAttributesAfterImport(row) {
     }
     if (!productId) return { skipped: true, reason: "product_id_not_ready" };
 
-    const payload = { items: [{ product_id: productId, offer_id: String(row.offer_id), attributes: normalizedAttributes }] };
-    const data = await callOzonSellerAPI("/v1/product/attributes/update", payload, { storeId: row.store_id, userId: row.user_id });
+    const richAttributes = normalizedAttributes.filter(attr => Number(attr.id) === 11254).slice(0, 1);
+    const regularAttributes = normalizedAttributes.filter(attr => Number(attr.id) !== 11254);
+    let regularData = null;
+    let richData = null;
+    if (regularAttributes.length) {
+      const payload = { items: [{ product_id: productId, offer_id: String(row.offer_id), attributes: regularAttributes }] };
+      regularData = await callOzonSellerAPI("/v1/product/attributes/update", payload, { storeId: row.store_id, userId: row.user_id });
+    }
+    // Ozon accepts 11254 mixed with other attributes but often does not persist it.
+    // Sending rich content alone matches Seller UI behavior more reliably.
+    if (richAttributes.length) {
+      const richPayload = { items: [{ product_id: productId, offer_id: String(row.offer_id), attributes: richAttributes }] };
+      richData = await callOzonSellerAPI("/v1/product/attributes/update", richPayload, { storeId: row.store_id, userId: row.user_id });
+    }
     await db.query(
       `UPDATE app_listing_history
           SET raw_payload = jsonb_set(
-                jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{attribute_applied_at}', to_jsonb(now()::text), true),
+                jsonb_set(
+                  jsonb_set(
+                    jsonb_set(COALESCE(raw_payload, '{}'::jsonb), '{attribute_applied_at}', to_jsonb(now()::text), true),
+                    '{attribute_apply_response}', $4::jsonb, true
+                  ),
+                  '{rich_attribute_apply_response}', $5::jsonb, true
+                ),
                 '{product_id}', to_jsonb($1::bigint), true
               ),
               updated_at = now()
         WHERE task_id = $2 AND user_id = $3`,
-      [productId, String(row.task_id), row.user_id],
+      [productId, String(row.task_id), row.user_id, JSON.stringify(regularData || {}), JSON.stringify(richData || {})],
     );
-    console.log(`[listing-attributes] task=${row.task_id} product=${productId} applied attrs=${normalizedAttributes.length}`);
-    return { applied: true, productId, data, count: normalizedAttributes.length };
+    console.log(`[listing-attributes] task=${row.task_id} product=${productId} applied attrs=${regularAttributes.length}${richAttributes.length ? " + rich11254" : ""}`);
+    return { applied: true, productId, data: { regular: regularData, rich: richData }, count: normalizedAttributes.length };
   } catch (e) {
     await db.query(
       `UPDATE app_listing_history
