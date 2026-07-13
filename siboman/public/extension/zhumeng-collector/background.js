@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.31";
+const VERSION = "2.2.9.32";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -248,8 +248,21 @@ function injectRichContentAttr(data) {
 }
 
 function looksLikeRichContentDoc(raw) {
-  const doc = parseMaybeJson(raw);
-  return isRichContentDoc(doc);
+  const doc = parseMaybeJsonForSyntheticRich(raw);
+  return Boolean(
+    doc &&
+    typeof doc === "object" &&
+    !Array.isArray(doc) &&
+    Array.isArray(doc.content) &&
+    doc.content.some(block => block && typeof block === "object" && typeof block.widgetName === "string")
+  );
+}
+
+function parseMaybeJsonForSyntheticRich(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  if (!trimmed || !/^[\[{]/.test(trimmed)) return value;
+  try { return JSON.parse(trimmed); } catch { return value; }
 }
 
 function synthesizeRichContentFromImages(images) {
