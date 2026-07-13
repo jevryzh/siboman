@@ -972,7 +972,7 @@ window.BatchUploadView = {
       }
       fetchingWarehouses.value = { ...fetchingWarehouses.value, [storeId]: true };
       try {
-        const res = await axios.get(`/api/seller/warehouses?storeId=${encodeURIComponent(storeId)}`);
+        const res = await axios.get('/api/seller/warehouses', { params: { storeId } });
         const list = (res.data?.warehouses || []).filter(w => w.status === 'created' && w.is_rfbs);
         warehousesByStore.value = { ...warehousesByStore.value, [storeId]: list };
         const current = selectedWarehousesByStore.value[storeId];

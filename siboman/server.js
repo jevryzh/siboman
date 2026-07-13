@@ -1157,7 +1157,7 @@ function mapOzonStatus(info) {
  */
 app.get("/api/seller/warehouses", requireAuth, async (req, res) => {
   try {
-    const storeId = req.query?.store_id || req.query?.storeId;
+    const storeId = req.query?.storeId || req.query?.store_id;
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     const data = await callOzonSellerAPI("/v2/warehouse/list", {}, { storeId, userId: req.user.id });
     const warehouses = (data?.warehouses || data?.result || []).map(w => ({
