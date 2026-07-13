@@ -145,7 +145,7 @@ app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const result = await db.query(
-      "SELECT id, name, client_id, active FROM app_stores WHERE user_id = $1 ORDER BY updated_at DESC",
+      "SELECT id, name, client_id, active, watermark_enabled, watermark_text FROM app_stores WHERE user_id = $1 ORDER BY updated_at DESC",
       [req.user.id]
     );
     res.json({ success: true, shops: result.rows });
@@ -156,16 +156,38 @@ app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const { name, client_id, api_key } = req.body;
+    const watermarkEnabled = req.body?.watermark_enabled === true;
+    const watermarkText = String(req.body?.watermark_text || name || "逐梦ERP").trim().slice(0, 80);
     if (!name || !client_id || !api_key) {
       return res.status(400).json({ success: false, error: "请填写完整信息" });
     }
     const result = await db.query(
-      `INSERT INTO app_stores (user_id, name, client_id, api_key)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (user_id, client_id) DO UPDATE SET name = $2, api_key = $4, updated_at = now()
-       RETURNING id, name, client_id`,
-      [req.user.id, name, client_id, api_key]
+      `INSERT INTO app_stores (user_id, name, client_id, api_key, watermark_enabled, watermark_text)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (user_id, client_id) DO UPDATE
+         SET name = $2, api_key = $4, watermark_enabled = $5, watermark_text = $6, updated_at = now()
+       RETURNING id, name, client_id, watermark_enabled, watermark_text`,
+      [req.user.id, name, client_id, api_key, watermarkEnabled, watermarkText]
     );
+    res.json({ success: true, shop: result.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.patch("/api/seller/shops/:id/settings", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const watermarkEnabled = req.body?.watermark_enabled === true;
+    const watermarkText = String(req.body?.watermark_text || "").trim().slice(0, 80);
+    const result = await db.query(
+      `UPDATE app_stores
+          SET watermark_enabled = $1,
+              watermark_text = COALESCE(NULLIF($2, ''), name),
+              updated_at = now()
+        WHERE id = $3 AND user_id = $4
+        RETURNING id, name, client_id, active, watermark_enabled, watermark_text`,
+      [watermarkEnabled, watermarkText, req.params.id, req.user.id],
+    );
+    if (!result.rows[0]) return res.status(404).json({ success: false, error: "店铺不存在" });
     res.json({ success: true, shop: result.rows[0] });
   } catch (error) { next(error); }
 });
@@ -495,6 +517,8 @@ async function initDatabase() {
         name TEXT NOT NULL,
         client_id TEXT NOT NULL,
         api_key TEXT NOT NULL,
+        watermark_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        watermark_text TEXT NOT NULL DEFAULT '',
         active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -599,6 +623,9 @@ async function initDatabase() {
 
     // 2. 字段扩展 (DDL 迁移)
     await db.query(`
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS watermark_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS watermark_text TEXT NOT NULL DEFAULT '';
+
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS price_rub NUMERIC(12,2);
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS weight INTEGER;
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS depth INTEGER;

@@ -329,8 +329,9 @@ window.BatchUploadView = {
     };
 
     Vue.onMounted(async () => {
-      fetchStores();
+      await fetchStores();
       loadConfig();
+      for (const sid of (selectedStores.value || [])) await fetchWarehousesForStore(sid);
       const ping = await pingExtension();
       if (ping) {
         extensionConnected.value = true;
@@ -655,26 +656,34 @@ window.BatchUploadView = {
     };
 
     // ========== AI 重写 (保留) ==========
-    const aiRewriteAll = async () => {
-      const rows = items.value.filter(r=>r.valid && r.distilled);
-      if(!rows.length) return notify.warning('请先采集');
-      config.aiRewrite = true;
-      appendLog(`AI 重写开始 (${rows.length} 个商品)...`, 'info');
+    const rewriteRowsWithAi = async (rows, storeId = '') => {
+      const targets = (rows || []).filter(r=>r.valid && r.distilled);
+      if(!targets.length) return 0;
+      appendLog(`AI 重写开始 (${targets.length} 个商品)...`, 'info');
       let ok=0;
-      for(const row of rows){
+      for(const row of targets){
         try {
           const res = await axios.post('/api/ai/analyze', {
-            title: row.distilled.name, images: row.distilled.images.slice(0,2), target_market:'ozon',
-          });
+            store_id: storeId,
+            title: row.distilled.name, images: (row.distilled.images || []).slice(0,2), target_market:'ozon',
+          }, { timeout: 130000 });
           const d = res.data?.data||{};
           if(d.title_ru) row.distilled.name = d.title_ru;
           if(d.selling_points?.length) row.distilled.description = d.selling_points.join('\n');
           ok++;
-          appendLog(`  ✓ #${row.index} ${d.title_ru?.slice(0,30)||''}`, 'success');
-        } catch(e) { appendLog(`  ✗ #${row.index} AI重写失败`, 'error'); }
+          appendLog(`  ✓ #${row.index} AI 重写: ${d.title_ru?.slice(0,40)||row.distilled.name?.slice(0,40)||''}`, 'success');
+        } catch(e) {
+          appendLog(`  ✗ #${row.index} AI 重写失败: ${e.response?.data?.error || e.message}`, 'error');
+        }
       }
-      appendLog(`AI 重写完成: ${ok}/${rows.length}`, 'success');
-      config.aiRewrite = false;
+      appendLog(`AI 重写完成: ${ok}/${targets.length}`, ok ? 'success' : 'warn');
+      return ok;
+    };
+
+    const aiRewriteAll = async () => {
+      const rows = items.value.filter(r=>r.valid && r.distilled);
+      if(!rows.length) return notify.warning('请先采集');
+      await rewriteRowsWithAi(rows, selectedStores.value[0] || '');
     };
 
     // ========== 批量加水印 (保留) ==========
@@ -694,6 +703,24 @@ window.BatchUploadView = {
       appendLog(`水印完成: ${ok}/${rows.length}`, 'success');
     };
 
+    const applyStoreWatermark = async (item, shop) => {
+      if (!config.watermark || !shop?.watermark_enabled || !Array.isArray(item.images) || !item.images.length) return item;
+      const text = String(shop.watermark_text || shop.name || '逐梦ERP').trim();
+      if (!text) return item;
+      const res = await axios.post('/api/images/watermark', {
+        images: item.images,
+        text,
+      }, { timeout: 120000 });
+      const images = Array.isArray(res.data?.images) ? res.data.images.filter(Boolean) : [];
+      if (!images.length) return item;
+      return {
+        ...item,
+        images,
+        primary_image: images[0] || item.primary_image || '',
+        _watermark_text: text,
+      };
+    };
+
     // ========== 多店铺扇出发布 (保留) ==========
     const publishBatch = async () => {
       const rows = items.value.filter(r=>r.valid && r.distilled);
@@ -708,10 +735,12 @@ window.BatchUploadView = {
       logLines.value = [];
       appendLog(`========== 批量跟卖开始 ==========`, 'info');
       appendLog(`商品: ${rows.length} 个 | 店铺: ${selectedStores.value.length} 个`, 'info');
+      if (config.aiRewrite) await rewriteRowsWithAi(rows, selectedStores.value[0] || '');
 
       let totalOk=0, totalFail=0, totalSkipped=0;
       for(const storeId of selectedStores.value){
-        const storeName = allStores.value.find(s=>s.id===storeId)?.name || storeId;
+        const shop = allStores.value.find(s=>s.id===storeId) || {};
+        const storeName = shop.name || storeId;
         appendLog(`\n--- [${storeName}] 开始 ---`, 'info');
         // v2.2.7: 收集本店铺本轮所有有效商品, 一次性 POST 给 /api/seller/products/import
         //   (server 现在接收顶层 stocks, 跟 MY 一样原子提交 items + stocks 给 Ozon /v3/product/import)
@@ -743,15 +772,24 @@ window.BatchUploadView = {
             brand: config.brand, defaultStock,
           });
           if(!built.ok){ appendLog(`  ✗ #${row.index} ${built.error}`, 'error'); totalFail++; continue; }
-          if (whId && defaultStock > 0) {
-            built.item._warehouse_id = whId;
-            built.item._stock = defaultStock;
+          let itemForStore = built.item;
+          if (config.watermark && shop.watermark_enabled) {
+            try {
+              itemForStore = await applyStoreWatermark(itemForStore, shop);
+              appendLog(`  ✓ #${row.index} ${storeName}: 已加水印「${itemForStore._watermark_text || shop.watermark_text || storeName}」`, 'success');
+            } catch (e) {
+              appendLog(`  ✗ #${row.index} ${storeName}: 水印失败, 使用原图继续: ${e.response?.data?.error || e.message}`, 'warn');
+            }
           }
-          storeItems.push({ row, item: built.item });
+          if (whId && defaultStock > 0) {
+            itemForStore._warehouse_id = whId;
+            itemForStore._stock = defaultStock;
+          }
+          storeItems.push({ row, item: itemForStore });
           // v2.2.7: stocks 跟 items 同发 (Ozon 原子处理), 默认库存用 defaultStock
           if (whId && defaultStock > 0) {
             storeStocks.push({
-              offer_id: built.item.offer_id,
+              offer_id: itemForStore.offer_id,
               stock: defaultStock,
               warehouse_id: whId,
             });
@@ -975,10 +1013,10 @@ window.BatchUploadView = {
         <button @click="publishBatch" :loading="publishLoading" :disabled="!items.filter(r=>r.valid&&r.distilled).length || !!items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence==='none'&&!r._category_resolved.to).length" style="padding:8px 18px; background:linear-gradient(135deg,#10b981,#059669); border:none; border-radius:8px; color:#fff; cursor:pointer; font-size:14px; font-weight:700; box-shadow:0 2px 6px rgba(16,185,129,0.3)">🚀 开始批采 + 上架 ({{ items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence!=='none').length }})</button>
       </header>
 
-      <main class="bu-body" style="display:grid; grid-template-columns:1fr 360px; gap:16px; padding:20px; align-items:start">
+      <main class="bu-body" style="display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:16px; padding:20px; align-items:start; max-width:100%; overflow-x:hidden">
 
         <!-- ========== 左列 ========== -->
-        <div class="bu-col-main" style="display:flex; flex-direction:column; gap:16px">
+        <div class="bu-col-main" style="display:flex; flex-direction:column; gap:16px; min-width:0">
 
           <!-- 粘贴批量数据 -->
           <section class="bu-card" style="background:#fff; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.05); overflow:hidden">
@@ -989,7 +1027,7 @@ window.BatchUploadView = {
               </div>
               <button @click="clearAll" style="background:transparent; border:none; color:#64748b; cursor:pointer; font-size:12px">🗑️ 清空</button>
             </div>
-            <div style="padding:16px 20px; display:grid; grid-template-columns:1fr 280px; gap:16px">
+            <div style="padding:16px 20px; display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:16px">
               <div style="display:flex; flex-direction:column; gap:6px; min-width:0; height:100%">
                 <textarea v-model="pasteText" class="bu-paste-area" spellcheck="false" placeholder="每行一条，格式如下：
 1234567890,99.9
@@ -1022,19 +1060,19 @@ window.BatchUploadView = {
             <div style="padding:14px 20px; border-bottom:1px solid #f1f5f9; font-weight:700; font-size:14px; color:#0f172a; background:linear-gradient(90deg,#f8fafc,#fff)">
               📊 解析预览 ({{ items.length }} 行)
             </div>
-            <div style="overflow-x:auto">
-              <table style="width:100%; border-collapse:collapse; font-size:13px">
+            <div style="overflow-x:auto; max-width:100%">
+              <table style="width:100%; min-width:1040px; border-collapse:collapse; font-size:13px; table-layout:fixed">
                 <thead>
                   <tr style="background:#f8fafc; color:#475569; font-weight:700; font-size:11px; text-transform:uppercase">
                     <th style="padding:10px 12px; text-align:left; width:50px">#</th>
-                    <th style="padding:10px 12px; text-align:left">SKU</th>
-                    <th style="padding:10px 12px; text-align:right">售价</th>
-                    <th style="padding:10px 12px; text-align:left">货号</th>
-                    <th style="padding:10px 12px; text-align:right">重量g</th>
-                    <th style="padding:10px 12px; text-align:right">三维 L×W×H</th>
-                    <th style="padding:10px 12px; text-align:left">格式</th>
-                    <th style="padding:10px 12px; text-align:left; min-width:200px">类目 (含自动 type_id)</th>
-                    <th style="padding:10px 12px; text-align:left">问题/状态</th>
+                    <th style="padding:10px 12px; text-align:left; width:130px">SKU</th>
+                    <th style="padding:10px 12px; text-align:right; width:90px">售价</th>
+                    <th style="padding:10px 12px; text-align:left; width:120px">货号</th>
+                    <th style="padding:10px 12px; text-align:right; width:70px">重量g</th>
+                    <th style="padding:10px 12px; text-align:right; width:120px">三维 L×W×H</th>
+                    <th style="padding:10px 12px; text-align:left; width:80px">格式</th>
+                    <th style="padding:10px 12px; text-align:left; width:260px">类目 (含自动 type_id)</th>
+                    <th style="padding:10px 12px; text-align:left; width:120px">问题/状态</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1051,11 +1089,7 @@ window.BatchUploadView = {
                     <td style="padding:10px 12px">
                       <span :style="{ padding:'2px 8px', borderRadius:'10px', fontSize:'10px', fontWeight:600, background: row.valid ? '#dbeafe' : '#fee2e2', color: row.valid ? '#1e40af' : '#991b1b' }">{{ FORMAT_LABELS[row.formatHint] || '?' }}</span>
                     </td>
-                    <td style="padding:10px 12px; font-size:12px">
-                      <!-- v2.2.5: type_id 折叠进类目 cell, 用户完全不感知. 选完类目后自动反查 type_id -->
-                      <input v-if="false" v-model="row.typeIdInput" @change="saveTypeIdCache(row)" :placeholder="row.distilled?.typeId ? String(row.distilled.typeId) : '必填'" style="width:90px; padding:4px 6px; border:1px solid #cbd5e1; border-radius:4px; font-size:12px; font-family:monospace; text-align:right" />
-                    </td>
-                    <td style="padding:10px 12px; font-size:12px; min-width:200px">
+                    <td style="padding:10px 12px; font-size:12px; min-width:0">
                       <!-- v2.2.2: 类目置信度列 (含 type_id 自动反查结果显示) — high/medium/none/manual -->
                       <template v-if="row._category_resolved">
                         <div v-if="row._category_resolved.confidence === 'high'" style="display:flex; flex-direction:column; gap:2px">

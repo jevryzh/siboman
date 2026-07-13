@@ -1,4 +1,12 @@
 const statusEl = document.getElementById("status");
+const versionEl = document.getElementById("version");
+
+try {
+  const manifest = chrome.runtime.getManifest();
+  if (versionEl) versionEl.textContent = `v${manifest.version}`;
+} catch {
+  if (versionEl) versionEl.textContent = "v?";
+}
 
 async function checkStatus() {
   try {
