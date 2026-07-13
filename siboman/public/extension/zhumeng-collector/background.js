@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.28";
+const VERSION = "2.2.9.29";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -395,6 +395,27 @@ function ensurePortalAttr(item, attributeId, values) {
   }
 }
 
+function normalizePortalAttributes(item, opts = {}) {
+  const removeIds = new Set((opts.removeIds || []).map(id => String(id)));
+  const attrs = Array.isArray(item?.attributes) ? item.attributes : [];
+  const byKey = new Map();
+  for (const attr of attrs) {
+    const id = String(attr?.attribute_id ?? attr?.id ?? "").trim();
+    if (!id || removeIds.has(id)) continue;
+    const complexId = String(attr?.complex_id ?? "0");
+    const key = `${id}:${complexId}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, attr);
+      continue;
+    }
+    const current = byKey.get(key);
+    const currentValues = Array.isArray(current?.values) ? current.values : [];
+    const nextValues = Array.isArray(attr?.values) ? attr.values : [];
+    if (!currentValues.length && nextValues.length) byKey.set(key, attr);
+  }
+  item.attributes = Array.from(byKey.values());
+}
+
 function buildPortalItemFromImportItem(importItem) {
   if (!importItem || typeof importItem !== "object") throw new Error("portalImport 缺少 item");
   const sourceVariant = importItem._sourceVariant && typeof importItem._sourceVariant === "object" ? importItem._sourceVariant : null;
@@ -423,8 +444,6 @@ function buildPortalItemFromImportItem(importItem) {
   if (images.length) {
     item.images = images;
     item.primary_image = images[0];
-    ensurePortalAttr(item, 4194, images[0]);
-    ensurePortalAttr(item, 4195, images.slice(1));
   }
   if (item.name) ensurePortalAttr(item, 4180, item.name);
   if (item.weight) ensurePortalAttr(item, 4497, item.weight);
@@ -433,6 +452,9 @@ function buildPortalItemFromImportItem(importItem) {
   if (item.height) ensurePortalAttr(item, 9456, item.height);
   if (item.barcode) ensurePortalAttr(item, 23524, item.barcode);
   if (importItem.richContent) ensurePortalAttr(item, 11254, importItem.richContent);
+  // 图片在 seller-prototype bundle 里走 top-level images/primary_image。
+  // 同时带 4194/4195 会被 Ozon 判定“图片字段重复”。
+  normalizePortalAttributes(item, { removeIds: [4194, 4195] });
   return item;
 }
 
