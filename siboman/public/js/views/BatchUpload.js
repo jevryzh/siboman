@@ -497,6 +497,7 @@ window.BatchUploadView = {
                   weight: d.weight, depth: d.depth, width: d.width, height: d.height,
                   descriptionCategoryId: d.description_category_id, typeId: d.type_id,
                   barcode: d.barcode, description: d.description, brand: d.brand,
+                  richContent: d.richContent || '',
                   attributes: d.attributes || [],
                   _sourceVariant: d._sourceVariant || d.variantData || null,
                   _pluginVersion: d._plugin_version || d.version || '',
@@ -612,6 +613,7 @@ window.BatchUploadView = {
         vat: opts.vat||'0', currency_code: opts.currencyCode||'CNY',
         images, weight, weight_unit:'g', depth, width, height, dimension_unit:'mm',
         barcode: d.barcode||'', description: d.description||name,
+        richContent: d.richContent || '',
         description_category_id: d.descriptionCategoryId, type_id: d.typeId,
         primary_image: images[0] || '',
         service_type: 'IS_CODE_SERVICE', complex_attributes: [],
@@ -742,11 +744,22 @@ window.BatchUploadView = {
         const shop = allStores.value.find(s=>s.id===storeId) || {};
         const storeName = shop.name || storeId;
         appendLog(`\n--- [${storeName}] 开始 ---`, 'info');
+        await fetchWarehousesForStore(storeId);
         // v2.2.7: 收集本店铺本轮所有有效商品, 一次性 POST 给 /api/seller/products/import
         //   (server 现在接收顶层 stocks, 跟 MY 一样原子提交 items + stocks 给 Ozon /v3/product/import)
         const storeItems = [];
         const storeStocks = [];
-        const whId = selectedWarehousesByStore.value[storeId];  // v2.2.6 每店仓库, v2.2.7 仍按店走
+        const storeWarehouses = warehousesByStore.value[storeId] || [];
+        let whId = selectedWarehousesByStore.value[storeId];  // v2.2.6 每店仓库, v2.2.7 仍按店走
+        const whValid = whId && storeWarehouses.some(w => String(w.warehouse_id) === String(whId));
+        if (whId && !whValid) {
+          const fallbackWh = storeWarehouses[0]?.warehouse_id || "";
+          const fallbackName = storeWarehouses[0]?.name || fallbackWh || "无可用仓库";
+          whId = fallbackWh;
+          selectedWarehousesByStore.value = { ...selectedWarehousesByStore.value, [storeId]: fallbackWh };
+          appendLog(`  ⚠ [${storeName}] 已忽略不属于该店铺的旧仓库配置, 自动切换为 ${fallbackName}`, 'warn');
+          saveConfig();
+        }
         const defaultStock = Math.max(0, Math.floor(Number(config.defaultStock || 0)));
         for(const row of rows){
           // v2.2.4: 拦截 confidence='none' 且 to=0 的行 (URL 面包屑 ID 不是 Seller API 的)
@@ -880,15 +893,27 @@ window.BatchUploadView = {
     const selectedWarehousesByStore = Vue.ref({});  // {storeId: warehouse_id}
     const fetchingWarehouses = Vue.ref({});  // {storeId: true/false}
     const fetchWarehousesForStore = async (storeId) => {
-      if (!storeId || warehousesByStore.value[storeId]) return;  // 已有缓存
+      if (!storeId) return;
+      if (warehousesByStore.value[storeId]) {
+        const current = selectedWarehousesByStore.value[storeId];
+        const list = warehousesByStore.value[storeId] || [];
+        if (current && !list.some(w => String(w.warehouse_id) === String(current))) {
+          selectedWarehousesByStore.value = { ...selectedWarehousesByStore.value, [storeId]: list[0]?.warehouse_id || "" };
+          saveConfig();
+        }
+        return;
+      }
       fetchingWarehouses.value = { ...fetchingWarehouses.value, [storeId]: true };
       try {
         const res = await axios.get(`/api/seller/warehouses?storeId=${encodeURIComponent(storeId)}`);
         const list = (res.data?.warehouses || []).filter(w => w.status === 'created' && w.is_rfbs);
         warehousesByStore.value = { ...warehousesByStore.value, [storeId]: list };
-        // 默认选第一个
-        if (!selectedWarehousesByStore.value[storeId] && list.length) {
+        const current = selectedWarehousesByStore.value[storeId];
+        const currentValid = current && list.some(w => String(w.warehouse_id) === String(current));
+        // 默认选第一个；保存过的旧仓库若不属于当前店铺, 也要纠正
+        if ((!current || !currentValid) && list.length) {
           selectedWarehousesByStore.value = { ...selectedWarehousesByStore.value, [storeId]: list[0].warehouse_id };
+          saveConfig();
         }
       } catch (e) {
         appendLog(`  ⚠ 拉仓库失败 (${storeId.slice(0,8)}…): ${e.message}`, 'warn');

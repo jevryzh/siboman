@@ -4,7 +4,7 @@ import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import crypto from "node:crypto";
 import multer from "multer";
 import fs from "node:fs/promises";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, constants as fsConstants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -19,9 +19,8 @@ const __dirname = path.dirname(__filename);
 const upload = multer({
   storage: multer.diskStorage({
     destination: (req, file, cb) => {
-      const uploadDir = path.join(process.cwd(), "public", "uploads");
-      fs.mkdir(uploadDir, { recursive: true })
-        .then(() => cb(null, uploadDir))
+      ensureUploadDir()
+        .then((uploadDir) => cb(null, uploadDir))
         .catch((err) => cb(err));   // ✅ 必须回调 err, 否则 promise reject 会冒泡 uncaught 崩进程
     },
     filename: (req, file, cb) => {
@@ -2514,8 +2513,7 @@ app.post("/api/images/watermark", requireAuth, async (req, res) => {
       return res.status(503).json({ success: false, error: "jimp 未安装, 请 npm install jimp" });
     }
 
-    const uploadDir = path.join(PUBLIC_DIR, "uploads");
-    await fs.mkdir(uploadDir, { recursive: true });
+    const uploadDir = await ensureUploadDir();
 
     const watermarkedUrls = [];
     for (const url of images) {
@@ -3875,8 +3873,9 @@ function normalizeImportImageUrl(raw) {
   if (u.startsWith("//")) u = `https:${u}`;
   if (!/^https?:\/\//i.test(u)) return "";
   if (!/(ozone\.ru|ozonru\.cn|ozonusercontent\.com)/i.test(u)) return "";
+  if (/(payments-cdn|marketing-api|seller-edu|cdn-cgi|static|assets|banner|promo|advert|logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
   if (/\.(svg|gif)(?:[?#]|$)/i.test(u)) return "";
-  if (/\/s3\/(?:cms|rp-photo|cdn-cgi|certificate)\//i.test(u)) return "";
+  if (/\/s3\/(?:cms|rp-photo|cdn-cgi|certificate|payments-cdn|marketing-api)\//i.test(u)) return "";
   if (/(banner|promo|advert|avatar|review|feedback)/i.test(u)) return "";
   if (/(logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
   try {
@@ -3887,6 +3886,39 @@ function normalizeImportImageUrl(raw) {
   } catch {
     return u.split(/[?#]/)[0];
   }
+}
+
+function pickSourceRichContent(...sources) {
+  for (const source of sources) {
+    if (!source || typeof source !== "object") continue;
+    for (const key of ["richContent", "rich_content", "richAnnotationJson", "jsonRichContent"]) {
+      const value = source[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    const attrs = Array.isArray(source.attributes) ? source.attributes : [];
+    for (const attr of attrs) {
+      const id = String(attr?.id ?? attr?.attribute_id ?? attr?.key ?? "");
+      if (id !== "11254") continue;
+      const value = getAttrRawValue(attr);
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+  }
+  return "";
+}
+
+function hasImportAttribute(attributes, attrId) {
+  return Array.isArray(attributes) && attributes.some(a => Number(a?.id ?? a?.attribute_id) === Number(attrId));
+}
+
+function injectRichContentAttribute(item, sourceVariant = null) {
+  const richContent = pickSourceRichContent(item, sourceVariant);
+  if (!richContent) return false;
+  if (!Array.isArray(item.attributes)) item.attributes = [];
+  if (!hasImportAttribute(item.attributes, 11254)) {
+    item.attributes.push({ id: 11254, values: [{ value: richContent }] });
+  }
+  item.richContent = richContent;
+  return true;
 }
 
 function canonicalImportImageKey(url) {
@@ -4506,6 +4538,9 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
       if (!Number(item.height)) item.height = readInt("9456") || item.height;
       if (!item.barcode) item.barcode = getAttrRawValue(sourceAttr("23524")) || getAttrRawValue(sourceAttr("7822")) || item.barcode;
     }
+    item.images = normalizeImportImageList(item.images);
+    item.primary_image = item.images[0] || item.primary_image || "";
+    injectRichContentAttribute(item, sourceVariant);
 
     // v2.2.8 (回退 attributes 逻辑): 用扁平化 attributes, 尽量补 dictionary_value_id
     if (Array.isArray(item.attributes)) {
@@ -4525,9 +4560,6 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         return { id: aId, values };
       }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && a.values.length);
     }
-    delete item._sourceVariant;
-    delete item._collect_meta;
-
     // v2.2.9.6: attribute 9048 (Название модели) 兜底
     //   Ozon 17029010 (天幕) 等类目必填 attribute 9048, 不填 Ozon 接受商品但报 error_attribute_values_empty
     //   plugin v2.2.9.5+ 应该从 name 提取, 这里 server 端再兜底一次 (plugin 旧版本也不会漏)
@@ -4551,6 +4583,9 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
       }
     }
     delete item._sourceVariant;
+    item.images = normalizeImportImageList(item.images);
+    item.primary_image = item.images[0] || item.primary_image || "";
+    injectRichContentAttribute(item, sourceVariant);
     if (Array.isArray(item.attributes)) {
       item.attributes = item.attributes.map(a => {
         const aId = Number(a.id ?? a.attribute_id);
@@ -4566,9 +4601,14 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             }))
           : (a.value !== undefined ? [{ value: String(a.value), ...(dictId ? { dictionary_value_id: dictId } : {}) }] : []);
         return { id: aId, values };
-      }).filter(a => a.id && a.values.length);
+      }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && a.values.length);
     }
     delete item._sourceVariant;
+    delete item._collect_meta;
+    delete item.richContent;
+    delete item.rich_content;
+    delete item.richAnnotationJson;
+    if (!item.images.length) return res.status(400).json({ success: false, error: "过滤后没有可提交的商品图片" });
 
     // v2.2.7: 顶层 stocks 数组 (跟 MY 一样, 一次原子提交)
     let ozonStocks = null;
@@ -9962,12 +10002,27 @@ async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true });
 }
 
+async function ensureWritableDir(dir) {
+  await fs.mkdir(dir, { recursive: true });
+  await fs.access(dir, fsConstants.W_OK);
+  return dir;
+}
+
+async function ensureUploadDir() {
+  return ensureWritableDir(path.join(PUBLIC_DIR, "uploads"));
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 await ensureDir(DATA_DIR);
 await ensureDir(JOBS_DIR);
+try {
+  await ensureUploadDir();
+} catch (e) {
+  console.warn(`[uploads] 目录不可写，图片上传/水印会失败: ${e.message}`);
+}
 await initDatabase();
 
 // SPA catch-all
