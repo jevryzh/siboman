@@ -3668,7 +3668,7 @@ async function applyListingStocksAfterImport(row) {
     ? [{ offer_id: row.offer_id || item.offer_id, stock: fallbackStock, warehouse_id: fallbackWarehouseId }]
     : [];
   const stocks = Array.isArray(raw.stocks) && raw.stocks.length ? raw.stocks : fallbackStocks;
-  const normalizedStocks = stocks
+  const requestedStocks = stocks
     .filter(s => s && s.offer_id && Number(s.stock ?? s.stocks) >= 0)
     .map(s => ({
       offer_id: String(s.offer_id),
@@ -3676,6 +3676,7 @@ async function applyListingStocksAfterImport(row) {
       ...(Number(s.warehouse_id) > 0 ? { warehouse_id: Number(s.warehouse_id) } : {}),
     }))
     .filter(s => Number.isFinite(s.stock) && s.stock >= 0);
+  const normalizedStocks = await normalizeStocksForStore(requestedStocks, row.store_id, row.user_id);
 
   if (!normalizedStocks.length) return { skipped: true, reason: "no_valid_stocks" };
 
@@ -3713,12 +3714,16 @@ async function applyListingPicturesAfterImport(row) {
 
   const item = raw.item && typeof raw.item === "object" ? raw.item : {};
   const sourceItem = raw.source_item && typeof raw.source_item === "object" ? raw.source_item : {};
-  const images = normalizeImportImageList([
-    ...extractSourceVariantImages(sourceItem),
-    ...(Array.isArray(sourceItem.images) ? sourceItem.images : []),
-    ...(Array.isArray(item.images) ? item.images : []),
-    row.main_image || item.primary_image || sourceItem.primary_image || "",
-  ]);
+  const itemImages = Array.isArray(item.images) ? item.images : [];
+  const itemHasUploads = itemImages.some(u => typeof u === "string" && /\/uploads\//i.test(u));
+  const images = normalizeImportImageList(itemHasUploads
+    ? itemImages
+    : [
+        ...extractSourceVariantImages(sourceItem),
+        ...(Array.isArray(sourceItem.images) ? sourceItem.images : []),
+        ...itemImages,
+        row.main_image || item.primary_image || sourceItem.primary_image || "",
+      ]);
 
   if (!images.length) return { skipped: true, reason: "no_images" };
 
@@ -4064,9 +4069,22 @@ async function pollPendingListingTasks() {
   if (!db) return;
   try {
     const r = await db.query(
-      `SELECT task_id, store_id, user_id, offer_id, main_image, raw_payload FROM app_listing_history
-       WHERE status IN ('processing', 'pending')
-         AND created_at > now() - interval '7 days'
+      `SELECT task_id, store_id, user_id, offer_id, main_image, status, raw_payload FROM app_listing_history
+       WHERE created_at > now() - interval '7 days'
+         AND (
+           status IN ('processing', 'pending')
+           OR (
+             status = 'imported'
+             AND (
+               NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'picture_applied_at')
+               OR NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'attribute_applied_at')
+               OR (
+                 jsonb_array_length(COALESCE(raw_payload->'stocks', '[]'::jsonb)) > 0
+                 AND NOT (COALESCE(raw_payload, '{}'::jsonb) ? 'stock_applied_at')
+               )
+             )
+           )
+         )
        ORDER BY created_at DESC LIMIT $1`,
       [POLL_BATCH],
     );
@@ -4074,6 +4092,13 @@ async function pollPendingListingTasks() {
     let updated = 0, gc = 0;
     for (const row of r.rows) {
       try {
+        if (row.status === "imported") {
+          await applyListingPicturesAfterImport(row);
+          await applyListingAttributesAfterImport(row);
+          await applyListingStocksAfterImport(row);
+          updated++;
+          continue;
+        }
         const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(row.task_id) }, { storeId: row.store_id, userId: row.user_id });
         const it = (data?.result?.items || [])[0];
         if (!it) continue;

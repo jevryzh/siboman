@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.23";
+const VERSION = "2.2.9.24";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -505,6 +505,10 @@ async function enrichFromSellerPortalBundle(data, sku, preferTabId) {
   const sourceVariant = buildSourceVariantFromBundle(sv, bundleItem);
   data._sourceVariant = sourceVariant;
   data.attributes = sourceVariantToFlatAttributes(sourceVariant, data.attributes);
+  const bundleRichContent = extractRichContentFromStates(bundleResp) || extractRichContentFromStates(bundleItem);
+  if (bundleRichContent && !data.richContent) {
+    data.richContent = bundleRichContent;
+  }
   const images = extractImagesFromSourceVariant(sourceVariant);
   if (images.length) {
     data.images = [...images, ...(Array.isArray(data.images) ? data.images : [])].filter((u, idx, arr) => u && arr.indexOf(u) === idx).slice(0, 15);

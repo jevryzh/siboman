@@ -76,7 +76,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.23';
+      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.24';
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -142,13 +142,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.23)
+            逐梦 Ozon 采集器 (v2.2.9.24)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.23</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.24</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.24 修复水印/库存/富内容补偿: imported 任务若缺图片、属性或库存会继续后台重试; 水印图存在时补图只提交水印后的 /uploads 图片; Seller bundle 递归提取 richAnnotationJson/富内容 JSON。</li>
             <li>✅ v2.2.9.23 修复插件弹窗版本号显示: popup 改为读取 manifest 版本, 店铺管理增加店铺水印配置; 批量上架支持发布前按店铺自动水印与 AI 重写, 并优化解析预览表格不再撑宽页面。</li>
             <li>✅ v2.2.9.22 修复 Seller bundle 类目误判: /search 的 description_type_dict_value 按 type_id 处理, 后端 category-resolve/import 会用 type_id 从 Ozon tree 精确反查父类目, 避免 Смеситель 被关键词误分到 Души и душевые кабины 导致 description_category_invalid。</li>
             <li>✅ v2.2.9.21 修复批量跟卖图片重复与富内容漏采: 后端按 Ozon 图片文件指纹去重, 优先使用源商品 4194/4195 图册并过滤 cms/评价图; 插件富内容采集增加标准商品路径和 PDP nextPage 追踪, 提高 attribute 11254 JSON 命中率。</li>
