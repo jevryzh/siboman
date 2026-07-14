@@ -74,6 +74,7 @@ const DETAIL_DELAY_MAX_MS = Number(process.env.DETAIL_DELAY_MAX_MS || 6500);
 const DETAIL_BROWSE_MODE = process.env.DETAIL_BROWSE_MODE || "balanced";
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = Number(process.env.DEFAULT_MAX_CONSECUTIVE_FAILURES || 3);
 const DISABLE_SERVER_SCRAPER = /^(1|true|yes)$/i.test(process.env.DISABLE_SERVER_SCRAPER || "");
+const WORKER_ONLINE_WINDOW_MS = Number(process.env.WORKER_ONLINE_WINDOW_MS || 45000);
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const INITIAL_USERS = process.env.INITIAL_USERS || "";
 const USER_AGENT =
@@ -706,6 +707,7 @@ async function initDatabase() {
     // 5. 索引与约束 (依赖前面字段已上线)
     await db.query(`
       CREATE INDEX IF NOT EXISTS idx_app_jobs_user_updated ON app_jobs(user_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_jobs_status_updated ON app_jobs(status, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collect_items_user_status ON collect_items(user_id, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collect_items_store_offer ON collect_items(store_id, linked_offer_id);
       CREATE INDEX IF NOT EXISTS idx_order_notes_store ON order_notes(store_id, updated_at DESC);
@@ -723,6 +725,23 @@ async function initDatabase() {
           ALTER TABLE app_listing_history ADD CONSTRAINT app_listing_history_task_id_unique UNIQUE(task_id);
         END IF;
       END $$;
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_worker_heartbeats (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        worker_name TEXT NOT NULL,
+        platform TEXT NOT NULL DEFAULT '',
+        hostname TEXT NOT NULL DEFAULT '',
+        profile_dir TEXT NOT NULL DEFAULT '',
+        current_job_id UUID REFERENCES app_jobs(id) ON DELETE SET NULL,
+        current_phase TEXT NOT NULL DEFAULT '',
+        last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(user_id, worker_name)
+      );
+      CREATE INDEX IF NOT EXISTS idx_app_worker_heartbeats_user_seen ON app_worker_heartbeats(user_id, last_seen_at DESC);
     `);
 
     await seedInitialUsers();
@@ -5589,8 +5608,104 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
       return;
     }
-    const job = await claimNextDbJob(req.user, req.body?.workerName || req.headers["x-worker-name"] || "");
+    const workerName = req.body?.workerName || req.headers["x-worker-name"] || "";
+    await upsertWorkerHeartbeat(req.user, workerName, {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentPhase: req.body?.currentPhase || "本机采集端在线，可领取任务",
+    });
+    const job = await claimNextDbJob(req.user, workerName);
+    if (job) {
+      await upsertWorkerHeartbeat(req.user, workerName, {
+        platform: req.body?.platform,
+        hostname: req.body?.hostname,
+        profileDir: req.body?.profileDir,
+        currentJobId: job.id,
+        currentPhase: job.phase || "已领取任务",
+      });
+    }
     res.json({ success: true, job });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/worker/status", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
+      return;
+    }
+    const workersResult = await db.query(
+      `SELECT worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+       FROM app_worker_heartbeats
+       WHERE user_id = $1
+       ORDER BY last_seen_at DESC
+       LIMIT 10`,
+      [req.user?.id || ""],
+    );
+    const queueResult = await db.query(
+      `SELECT
+         count(*) FILTER (WHERE status = 'queued')::int AS queued,
+         count(*) FILTER (WHERE status IN ('claimed','running'))::int AS active
+       FROM app_jobs
+       WHERE user_id = $1`,
+      [req.user?.id || ""],
+    );
+    const now = Date.now();
+    const onlineWindow = Math.max(30000, WORKER_ONLINE_WINDOW_MS);
+    const workers = workersResult.rows.map((row) => {
+      const lastSeenAt = row.last_seen_at ? new Date(row.last_seen_at).toISOString() : "";
+      const ageMs = lastSeenAt ? now - new Date(lastSeenAt).getTime() : Infinity;
+      const currentPhase = row.current_phase || "";
+      const canClaimJobs = !/预览版|暂不领取|不领取任务|未开启领取任务/i.test(currentPhase);
+      return {
+        workerName: row.worker_name,
+        platform: row.platform || "",
+        hostname: row.hostname || "",
+        profileDir: row.profile_dir || "",
+        currentJobId: row.current_job_id || "",
+        currentPhase,
+        canClaimJobs,
+        lastSeenAt,
+        online: ageMs <= onlineWindow,
+        ageSeconds: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null,
+      };
+    });
+    res.json({
+      success: true,
+      workers,
+      queue: queueResult.rows[0] || { queued: 0, active: 0 },
+      onlineWindowSeconds: Math.round(onlineWindow / 1000),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/worker/heartbeat", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
+      return;
+    }
+    await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentPhase: req.body?.currentPhase || "本机采集端在线",
+      currentJobId: req.body?.currentJobId,
+    });
+    const queueResult = await db.query(
+      `SELECT
+         count(*) FILTER (WHERE status = 'queued')::int AS queued,
+         count(*) FILTER (WHERE status IN ('claimed','running'))::int AS active
+       FROM app_jobs
+       WHERE user_id = $1`,
+      [req.user?.id || ""],
+    );
+    res.json({ success: true, queue: queueResult.rows[0] || { queued: 0, active: 0 } });
   } catch (error) {
     next(error);
   }
@@ -5607,6 +5722,13 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
+    await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentJobId: req.params.id,
+      currentPhase: req.body?.phase || existing.phase || "采集中",
+    });
     const updates = normalizeWorkerJobUpdate(req.body || {}, existing);
     if (existing.status === "canceled" && updates.status && !["canceled", "done", "error"].includes(updates.status)) {
       delete updates.status;
@@ -9171,6 +9293,30 @@ async function createQueuedDbJob(user, job, payload) {
     ],
   );
   return dbRowToJob(result.rows[0]);
+}
+
+async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
+  if (!db || !user?.id) return;
+  const workerLabel = String(workerName || "").trim().slice(0, 80) || "本机采集端";
+  const platform = String(meta.platform || "").trim().slice(0, 40);
+  const hostname = String(meta.hostname || "").trim().slice(0, 120);
+  const profileDir = String(meta.profileDir || "").trim().slice(0, 500);
+  const currentPhase = String(meta.currentPhase || "").trim().slice(0, 200);
+  const currentJobId = isSafeJobId(meta.currentJobId) ? meta.currentJobId : null;
+  await db.query(
+    `INSERT INTO app_worker_heartbeats (
+       user_id, worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+     ON CONFLICT (user_id, worker_name)
+     DO UPDATE SET
+       platform = EXCLUDED.platform,
+       hostname = EXCLUDED.hostname,
+       profile_dir = EXCLUDED.profile_dir,
+       current_job_id = COALESCE(EXCLUDED.current_job_id, app_worker_heartbeats.current_job_id),
+       current_phase = COALESCE(NULLIF(EXCLUDED.current_phase, ''), app_worker_heartbeats.current_phase),
+       last_seen_at = now()`,
+    [user.id, workerLabel, platform, hostname, profileDir, currentJobId, currentPhase],
+  );
 }
 
 async function claimNextDbJob(user, workerName = "") {

@@ -21,6 +21,12 @@ const WORKER_NAME = process.env.COLLECTOR_WORKER_NAME || `${os.hostname()}-${pro
 const POLL_MS = Math.max(2000, Number(process.env.COLLECTOR_POLL_SECONDS || 5) * 1000);
 const PROGRESS_MS = Math.max(1500, Number(process.env.COLLECTOR_PROGRESS_SECONDS || 4) * 1000);
 const ONCE = /^(1|true|yes)$/i.test(process.env.COLLECTOR_ONCE || "");
+const workerMeta = () => ({
+  workerName: WORKER_NAME,
+  platform: os.platform(),
+  hostname: os.hostname(),
+  profileDir: path.join(__dirname, "data", "browser-profile"),
+});
 
 let cookieHeader = "";
 let lastProgressSignature = "";
@@ -37,7 +43,7 @@ async function main() {
     try {
       const { job } = await apiJson("/api/worker/jobs/next", {
         method: "POST",
-        body: { workerName: WORKER_NAME },
+        body: { ...workerMeta(), currentPhase: "本机采集端在线，可领取任务" },
       });
       if (!job) {
         console.log(`[collector] 暂无任务，${Math.round(POLL_MS / 1000)} 秒后继续检查。`);
@@ -187,6 +193,7 @@ async function syncProgress(job, force = false) {
         logs: job.logs,
         results: job.results,
         error: job.error || "",
+        ...workerMeta(),
       }),
     });
     if (data.job?.status === "canceled" && !job.cancelRequested) {
@@ -212,6 +219,7 @@ async function uploadComplete(job) {
     body: {
       job: stripLocalBuffers(localJob || job),
       excelBase64,
+      ...workerMeta(),
     },
   });
 }
