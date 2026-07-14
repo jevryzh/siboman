@@ -5930,10 +5930,12 @@ async function finalizeWorkerRunJob(existing, job) {
   const payload = existing?.payload && typeof existing.payload === "object" ? existing.payload : {};
   const options = payload.options && typeof payload.options === "object" ? payload.options : payload;
   const enableAI = options.enableAI !== false;
+  const jobId = existing?.id || job.id || "";
   job.logs = Array.isArray(job.logs) ? job.logs : [];
   for (const result of job.results) {
     if (!result || result.error) continue;
     result.ozon = normalizePluginOzonResult(result.ozon || {});
+    await hydrateWorkerRunResultImages(jobId, result);
     if (Array.isArray(result.candidates) && result.candidates.length) {
       result.candidates = result.candidates.map((candidate) => annotateCandidateQuantity(candidate, result.ozon));
       if (enableAI && shouldReviewWorkerResultWithAi(result)) {
@@ -5948,6 +5950,66 @@ async function finalizeWorkerRunJob(existing, job) {
       }
     }
   }
+}
+
+async function hydrateWorkerRunResultImages(jobId, result) {
+  if (!jobId || !isSafeJobId(jobId) || !result) return;
+  const sourceRow = result.sourceRow || extractOzonProductId(result.url || result.ozon?.sourceUrl || "") || "0";
+  const ozonUrl = result.ozon?.mainImageUrl || result.ozon?.mainImage?.url || "";
+  if (ozonUrl && !result.ozon?.mainImage?.filePath) {
+    try {
+      result.ozon.mainImage = await downloadArtifactImageByUrl({
+        jobId,
+        prefix: `ozon_${String(sourceRow).padStart(3, "0")}`,
+        url: ozonUrl,
+        referer: result.url || result.ozon?.sourceUrl || "https://www.ozon.ru/",
+      });
+    } catch (error) {
+      result.ozon.mainImageDownloadError = error.message;
+    }
+  }
+  if (!Array.isArray(result.candidates)) return;
+  for (const candidate of result.candidates) {
+    const imageUrl = candidate?.image || candidate?.imageUrl || candidate?.localImage?.url || "";
+    if (!imageUrl || candidate?.localImage?.filePath) continue;
+    try {
+      candidate.localImage = await downloadArtifactImageByUrl({
+        jobId,
+        prefix: `1688_${String(sourceRow).padStart(3, "0")}_${String(candidate.rank || 0).padStart(2, "0")}`,
+        url: imageUrl,
+        referer: candidate.link || "https://www.1688.com/",
+      });
+    } catch (error) {
+      candidate.imageDownloadError = error.message;
+    }
+  }
+}
+
+async function downloadArtifactImageByUrl({ jobId, prefix, url, referer }) {
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(45000),
+    headers: { Referer: referer || "", "User-Agent": USER_AGENT },
+  });
+  if (!response.ok) {
+    throw new Error(`图片下载失败 ${response.status}：${url}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  const ext = extensionFromContentType(contentType, url);
+  const safePrefix = String(prefix || "image").replace(/[^a-z0-9_-]+/gi, "_").slice(0, 80);
+  const filename = `${safePrefix}.${ext}`;
+  const dir = path.join(JOBS_DIR, jobId, "images");
+  await ensureDir(dir);
+  const filePath = path.join(dir, filename);
+  await fs.writeFile(filePath, buffer);
+  return {
+    url,
+    filePath,
+    publicUrl: `/artifacts/jobs/${jobId}/images/${filename}`,
+    contentType,
+    buffer,
+  };
 }
 
 function normalizePluginOzonResult(ozon = {}) {
@@ -8515,8 +8577,9 @@ function applyAiReview(result) {
 }
 
 function chooseFinalCandidate(result) {
+  if (result.aiReview?.decision === "none") return null;
   const selected = result.candidates.find((candidate) => candidate.aiSelected);
-  if (selected && !isAvoidedCandidate(selected)) return markFinalCandidate(selected, result.aiReview.decision, result.aiReview.reason);
+  if (selected) return markFinalCandidate(selected, result.aiReview.decision, result.aiReview.reason);
 
   const reviews = new Map((result.aiReview?.candidate_reviews || []).map((item) => [Number(item.rank), item]));
   const reviewedCandidates = result.candidates
