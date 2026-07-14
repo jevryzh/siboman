@@ -76,7 +76,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.36';
+      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.37';
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -142,13 +142,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.36)
+            逐梦 Ozon 采集器 (v2.2.9.37)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.36</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.37</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.37 修复单品找货导出缺字段: Ozon 重量/价格增加兜底映射, 1688 标题过滤公司名并补价格明细。</li>
             <li>✅ v2.2.9.36 增强单品找货 1688 详情解析: 从页面初始化数据读取标题、阶梯价、起批、尺寸、重量、运费和商品属性。</li>
             <li>✅ v2.2.9.35 修复 1688 搜图 token 获取: 插件会主动预热 MTOP cookie, 已登录 1688 时可自动拿到 _m_h5_tk。</li>
             <li>✅ v2.2.9.34 修复单品找货插件授权: ERP 页面会把当前账号的短期授权同步给插件, 插件可显示在线并领取排队任务。</li>

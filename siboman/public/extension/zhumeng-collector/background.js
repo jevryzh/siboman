@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.36";
+const VERSION = "2.2.9.37";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -362,6 +362,8 @@ function extractOzonSkuFromUrl(url) {
 function normalizeOzonForSourcing(data, url, sourceRow) {
   const images = Array.isArray(data.images) ? data.images.filter(Boolean) : [];
   const mainImageUrl = images[0] || "";
+  const weightGrams = Number(data.weight || data.weightGrams || 0) || "";
+  const priceText = data.price || data.currentBlackPriceCny || data.currentBlackPrice || "";
   return {
     sourceUrl: url,
     sku: data.sku || data.product_id || extractOzonSkuFromUrl(url),
@@ -371,7 +373,12 @@ function normalizeOzonForSourcing(data, url, sourceRow) {
     brand: data.brand || "",
     description_category_id: data.description_category_id || 0,
     type_id: data.type_id || 0,
-    currentBlackPriceCny: data.price || "",
+    currentBlackPriceCny: priceText,
+    currentBlackPriceCnyValue: parseFloat(String(priceText).replace(/[^\d.,]/g, "").replace(",", ".")) || "",
+    weightGrams,
+    weightText: weightGrams ? `${weightGrams} g` : (data.weightText || ""),
+    weightSource: weightGrams ? "ozon-plugin" : "",
+    weightEvidence: weightGrams ? String(data.weight || data.weightGrams) : "",
     mainImageUrl,
     mainImage: mainImageUrl ? { url: mainImageUrl, publicUrl: mainImageUrl, contentType: "image/jpeg" } : null,
     images,
@@ -661,10 +668,22 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState) {
   return offers.map((item, index) => {
     const data = item.data || {};
     const offerId = data.offerId || data.skuId || "";
+    const cleanTitle = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const isCompanyTitle = (value) => /(?:有限公司|有限责任公司|商行|工厂|厂|经营部|贸易商|旗舰店|专营店)\s*$/.test(cleanTitle(value));
+    const titleCandidates = [
+      data.title,
+      data.subject,
+      data.offerTitle,
+      data.shortTitle,
+      data.simpleSubject,
+      data.name,
+      data.itemTitle,
+      data.productTitle,
+    ].map(cleanTitle).filter(Boolean);
     const moqItem = Array.isArray(data.afterPriceList)
       ? data.afterPriceList.find((entry) => entry.matKey === "quantity_begin")
       : null;
-    const title = data.title || data.subject || "";
+    const title = titleCandidates.find((value) => !isCompanyTitle(value)) || titleCandidates[0] || "";
     const promotionText = collectPromotionTextFromValueInPlugin(data);
     const pack = inferPackQuantityFromTextInPlugin([title, promotionText].join(" "));
     return {
@@ -709,6 +728,13 @@ async function scrape1688CandidateDetailsInPlugin(candidate) {
 function extract1688DetailData(fallback) {
   const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   const pick = (...values) => values.map(clean).find(Boolean) || "";
+  const isCompanyName = (value) => /(?:有限公司|有限责任公司|商行|工厂|厂|经营部|贸易商|旗舰店|专营店)\s*$/.test(clean(value));
+  const pickProductTitle = (...values) => {
+    const cleaned = values.map(clean).filter(Boolean)
+      .map((value) => value.replace(/\s*[-_]\s*阿里巴巴.*$/i, "").replace(/\s*1688\.com.*$/i, "").trim())
+      .filter((value) => value && value.length >= 4 && !isCompanyName(value));
+    return cleaned[0] || pick(...values);
+  };
   const unwrap = (value) => (value && typeof value === "object" && value.fields ? value.fields : value);
   const asArray = (value) => (Array.isArray(value) ? value : []);
   const normalizeWeightGrams = (value) => {
@@ -861,18 +887,32 @@ function extract1688DetailData(fallback) {
   const weightRaw = pick(firstScale[colMap.weight], firstScale.weight, packInfo.unitWeight, shipping.unitWeight, skuWeight, getAttr("重量", "克重", "毛重", "净重", "weight"));
   const weightGrams = normalizeWeightGrams(weightRaw);
   const shippingFee = pick(freightInfo.totalCost, freightInfo.postFeeValue, shipping.totalCost, shipping.postFeeValue, getAttr("运费", "物流费用", "快递费"), /包邮|免运费/.test(rawText) ? "0" : "");
-  const title = pick(
+  const selectorTitle = pick(
+    document.querySelector('[class*="title-text"]')?.innerText,
+    document.querySelector('[class*="titleText"]')?.innerText,
+    document.querySelector('[class*="offer-title"]')?.innerText,
+    document.querySelector('[class*="detail-title"]')?.innerText,
+    document.querySelector('[class*="mod-detail-title"]')?.innerText,
+    document.querySelector(".d-title")?.innerText,
+  );
+  const title = pickProductTitle(
     raw.productTitle?.fields?.title,
     raw.productTitle?.title,
+    raw.offerDetail?.subject,
+    raw.offerDetail?.title,
+    raw.subject,
+    raw.title,
+    selectorTitle,
     document.querySelector('meta[property="og:title"]')?.content,
     document.querySelector("h1")?.innerText,
+    document.title,
     fallback.title,
   );
 
   return {
     title,
     price,
-    priceDetails,
+    priceDetails: priceDetails || (price ? `1件起 ¥${price}` : ""),
     minOrderQuantity,
     moq: minOrderQuantity,
     shippingFee,
@@ -2604,6 +2644,18 @@ async function collectRichContentFromOzonPage(sku) {
           break;
         }
       }
+    }
+  }
+  if (!data.price) {
+    const bodyText = document.body?.innerText || "";
+    const priceMatches = Array.from(bodyText.matchAll(/(\d[\d\s]{1,12}(?:[,.]\d{1,2})?)\s*(?:₽|руб|RUB|¥|￥)/gi))
+      .map((m) => m[1].replace(/\s/g, "").replace(",", "."))
+      .map(Number)
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .sort((a, b) => a - b);
+    if (priceMatches.length) {
+      data.price = String(priceMatches[0]);
+      dbg.attributeSources.push("price.bodyText");
     }
   }
 
