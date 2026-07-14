@@ -5766,6 +5766,9 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};
     const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon" ? "batch-ozon" : "run";
+    if (kind === "run") {
+      await finalizeWorkerRunJob(existing, job);
+    }
     const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, job, req.body?.excelBase64 || "");
     const updates = normalizeWorkerJobUpdate({ ...job, downloadUrl }, existing);
     updates.status = normalizeWorkerStatus(job.status) || "done";
@@ -5920,6 +5923,62 @@ async function runJob(job, options) {
     await writeJobArtifacts(job);
   }
   touch(job);
+}
+
+async function finalizeWorkerRunJob(existing, job) {
+  if (!job || !Array.isArray(job.results) || !job.results.length) return;
+  const payload = existing?.payload && typeof existing.payload === "object" ? existing.payload : {};
+  const options = payload.options && typeof payload.options === "object" ? payload.options : payload;
+  const enableAI = options.enableAI !== false;
+  job.logs = Array.isArray(job.logs) ? job.logs : [];
+  for (const result of job.results) {
+    if (!result || result.error) continue;
+    result.ozon = normalizePluginOzonResult(result.ozon || {});
+    if (Array.isArray(result.candidates) && result.candidates.length) {
+      result.candidates = result.candidates.map((candidate) => annotateCandidateQuantity(candidate, result.ozon));
+      if (enableAI && shouldReviewWorkerResultWithAi(result)) {
+        job.logs.push(makeLogEntry(`服务器 AI 审核第 ${result.sourceRow || ""} 行候选。`));
+        result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
+        applyAiReview(result);
+      } else if (!result.selectedCandidate && !hasStrictNoneAiDecision(result)) {
+        const fallback = findBestFallbackCandidate(result.candidates);
+        if (fallback) {
+          result.selectedCandidate = markFinalCandidate(fallback, "approximate", "未进行 AI 审核，返回非引流候选供人工确认。");
+        }
+      }
+    }
+  }
+}
+
+function normalizePluginOzonResult(ozon = {}) {
+  const blackText = getOzonBestBlackPriceText(ozon);
+  const blackValue = getOzonBestBlackPriceValue(ozon);
+  const weight = inferOzonWeight(ozon);
+  return {
+    ...ozon,
+    currentBlackPriceCny: ozon.currentBlackPriceCny || blackText || ozon.price || "",
+    currentBlackPriceCnyValue: Number.isFinite(Number(ozon.currentBlackPriceCnyValue))
+      ? Number(ozon.currentBlackPriceCnyValue)
+      : (Number.isFinite(blackValue) ? blackValue : ""),
+    currentGreenPriceCny: ozon.currentGreenPriceCny || ozon.price || ozon.currentBlackPriceCny || "",
+    weightGrams: ozon.weightGrams || weight.weightGrams || "",
+    weightText: ozon.weightText || (weight.weightGrams ? `${weight.weightGrams} g` : ""),
+    weightSource: ozon.weightSource || weight.source || "",
+    weightEvidence: ozon.weightEvidence || weight.evidence || "",
+  };
+}
+
+function shouldReviewWorkerResultWithAi(result) {
+  if (!result?.candidates?.length) return false;
+  const decision = String(result.aiReview?.decision || "");
+  if (!result.aiReview) return true;
+  if (["needs_review", "pending", "approximate"].includes(decision)) return true;
+  if (!["exact", "none"].includes(decision)) return true;
+  return !Array.isArray(result.aiReview?.candidate_reviews) || !result.aiReview.candidate_reviews.length;
+}
+
+function hasStrictNoneAiDecision(result) {
+  return result?.aiReview?.decision === "none" && !result.aiReview?.selected_rank;
 }
 
 async function runBatchOzonJob(job, options) {
@@ -8872,8 +8931,9 @@ async function writeJobArtifacts(job) {
   for (const result of job.results) {
     const ozon = result.ozon || {};
     const fallbackCandidate = findBestFallbackCandidate(result.candidates || []);
+    const aiSaysNoCandidate = result.aiReview?.decision === "none" && !result.aiReview?.selected_rank;
     const finalCandidate = result.selectedCandidate ||
-      (fallbackCandidate ? markFinalCandidate(fallbackCandidate, "approximate", "未进行 AI 最终选择，返回候选中最靠前的非引流/非促销结果供人工确认。") : null);
+      (!aiSaysNoCandidate && fallbackCandidate ? markFinalCandidate(fallbackCandidate, "approximate", "未进行 AI 最终选择，返回候选中最靠前的非引流/非促销结果供人工确认。") : null);
     const ozonDisplayPrice = getOzonDisplayPriceText(ozon);
     const ozonBlackPrice = getOzonBestBlackPriceText(ozon);
     const ozonWeightGrams = formatNumberForSheet(ozon.weightGrams || normalizeWeightGrams(ozon.weightText));
@@ -9663,7 +9723,7 @@ function applyBatchOzonFilters(ozon = {}, filters = {}) {
 }
 
 function getOzonDisplayPriceText(ozon = {}) {
-  return formatOzonCnyForExport(ozon.currentGreenPriceCny || "");
+  return formatOzonCnyForExport(ozon.currentGreenPriceCny || "") || getOzonBestBlackPriceText(ozon);
 }
 
 function getOzonBestBlackPriceValue(ozon = {}) {
