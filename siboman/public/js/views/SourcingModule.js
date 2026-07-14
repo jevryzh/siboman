@@ -148,11 +148,7 @@ window.SourcingModuleView = {
         ElementPlus.ElMessage.warning('请先粘贴 Ozon 商品链接');
         return;
       }
-      await fetchCollectorStatus();
-      if (!canRun.value) {
-        ElementPlus.ElMessage.error('当前没有可领取任务的本机采集端在线，请先启动采集端');
-        return;
-      }
+      fetchCollectorStatus().catch(() => {});
       creating.value = true;
       try {
         const res = await axios.post('/api/jobs', {
@@ -168,8 +164,8 @@ window.SourcingModuleView = {
         });
         currentJobId.value = res.data.jobId;
         localStorage.setItem('singleSourcingJobId', res.data.jobId);
-        job.value = { id: res.data.jobId, status: res.data.queued ? 'queued' : 'running', phase: res.data.queued ? '等待本机采集端领取' : '已启动', logs: [] };
-        ElementPlus.ElMessage.success('单品找货任务已创建');
+        job.value = { id: res.data.jobId, status: res.data.queued ? 'queued' : 'running', phase: res.data.queued ? '等待采集插件/采集端领取' : '已启动', logs: [] };
+        ElementPlus.ElMessage.success(canRun.value ? '单品找货任务已创建' : '任务已创建，等待采集插件/采集端领取');
         startPolling();
       } catch (error) {
         ElementPlus.ElMessage.error(apiError(error));
@@ -386,18 +382,25 @@ window.SourcingModuleView = {
             <el-card shadow="never" v-loading="collectorLoading">
               <template #header>
                 <div style="display:flex; justify-content:space-between; align-items:center">
-                  <strong>采集端状态</strong>
-                  <el-tag :type="canRun ? 'success' : 'warning'">{{ canRun ? '可采集' : '未就绪' }}</el-tag>
+                  <strong>采集插件 / 采集端</strong>
+                  <el-tag :type="canRun ? 'success' : 'info'">{{ canRun ? '已检测到' : '未检测到' }}</el-tag>
                 </div>
               </template>
               <div style="margin-bottom:10px; color:#606266; font-size:13px">
                 排队 {{ collectorStatus.queue?.queued || 0 }} · 执行 {{ collectorStatus.queue?.active || 0 }}
               </div>
               <el-alert v-if="collectorStatus.error" :title="collectorStatus.error" type="error" :closable="false" style="margin-bottom:10px" />
-              <el-empty v-if="!(collectorStatus.workers || []).length" description="还没有检测到采集端" :image-size="80" />
+              <el-alert
+                v-if="!(collectorStatus.workers || []).length"
+                title="没有检测到在线采集端也可以先创建任务；采集插件/采集端上线后会按当前账号领取任务。"
+                type="info"
+                :closable="false"
+                style="margin-bottom:10px"
+              />
+              <el-empty v-if="!(collectorStatus.workers || []).length" description="暂无在线采集插件/采集端" :image-size="80" />
               <div v-for="worker in collectorStatus.workers" :key="worker.workerName" style="border:1px solid #ebeef5; border-radius:6px; padding:10px; margin-bottom:10px">
                 <div style="display:flex; justify-content:space-between; gap:8px">
-                  <strong>{{ worker.workerName || '本机采集端' }}</strong>
+                  <strong>{{ worker.workerName || '采集插件/采集端' }}</strong>
                   <el-tag size="small" :type="worker.online ? 'success' : 'info'">{{ worker.online ? '在线' : '离线' }}</el-tag>
                 </div>
                 <div style="color:#909399; font-size:12px; margin-top:5px">
