@@ -76,7 +76,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.34';
+      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.35';
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -142,13 +142,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.34)
+            逐梦 Ozon 采集器 (v2.2.9.35)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.34</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.35</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.35 修复 1688 搜图 token 获取: 插件会主动预热 MTOP cookie, 已登录 1688 时可自动拿到 _m_h5_tk。</li>
             <li>✅ v2.2.9.34 修复单品找货插件授权: ERP 页面会把当前账号的短期授权同步给插件, 插件可显示在线并领取排队任务。</li>
             <li>✅ v2.2.9.33 单品找货接入逐梦采集插件: 插件可按当前登录账号领取任务, 采集 Ozon 商品并通过 1688 搜图返回候选货源。</li>
             <li>✅ v2.2.9.32 修复采集端富内容兜底作用域错误, 避免 parseMaybeJson 未定义导致采集失败。</li>

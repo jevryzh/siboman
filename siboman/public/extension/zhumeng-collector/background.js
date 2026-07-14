@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.34";
+const VERSION = "2.2.9.35";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -533,13 +533,17 @@ async function fetchImageAsBase64(url) {
 }
 
 async function get1688CookieStateInPlugin() {
-  const urls = ["https://www.1688.com/", "https://s.1688.com/", "https://h5api.m.1688.com/"];
+  const urls = ["https://www.1688.com/", "https://s.1688.com/", "https://m.1688.com/", "https://h5api.m.1688.com/"];
   const map = new Map();
   for (const url of urls) {
     const cookies = await chrome.cookies.getAll({ url }).catch(() => []);
     for (const cookie of cookies) map.set(cookie.name, cookie);
   }
-  const tokenCookie = map.get("_m_h5_tk");
+  for (const domain of [".1688.com", "1688.com", ".m.1688.com", "h5api.m.1688.com"]) {
+    const cookies = await chrome.cookies.getAll({ domain }).catch(() => []);
+    for (const cookie of cookies) map.set(`${cookie.domain}:${cookie.name}`, cookie);
+  }
+  const tokenCookie = Array.from(map.values()).find((cookie) => cookie.name === "_m_h5_tk");
   const token = tokenCookie?.value?.split("_")[0] || "";
   return {
     token,
@@ -550,14 +554,37 @@ async function get1688CookieStateInPlugin() {
 async function ensure1688CookieStateInPlugin(forceRefresh = false) {
   let state = await get1688CookieStateInPlugin();
   if (state.token && !forceRefresh) return state;
-  const tab = await chrome.tabs.create({ url: "https://www.1688.com/", active: false });
+  await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 失败: ${e.message}`));
+  state = await get1688CookieStateInPlugin();
+  if (state.token && !forceRefresh) return state;
+  const tab = await chrome.tabs.create({ url: "https://h5api.m.1688.com/", active: false });
   try {
     await waitForTabComplete(tab.id, 30000).catch(() => {});
-    await sleep(1800);
+    await sleep(2500);
   } finally {
     await safeRemoveTab(tab.id);
   }
+  await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed retry 失败: ${e.message}`));
   return get1688CookieStateInPlugin();
+}
+
+async function seed1688MtopTokenInPlugin() {
+  const dataStr = JSON.stringify({ appId: 32517, params: JSON.stringify({ beginPage: 1, pageSize: 1, method: "imageOfferSearchService" }) });
+  const timestamp = String(Date.now());
+  const url = buildMtopUrlInPlugin({
+    t: timestamp,
+    sign: signMtopInPlugin("", timestamp, dataStr),
+    type: "jsonp",
+    callback: "mtopjsonpreqSeed",
+    dataType: "jsonp",
+    data: dataStr,
+  });
+  await fetch(url, {
+    method: "GET",
+    headers: build1688HeadersInPlugin("", { Referer: "https://s.1688.com/" }),
+    credentials: "include",
+  }).catch(() => null);
+  await sleep(600);
 }
 
 async function uploadImageTo1688InPlugin(base64Image, cookieState) {
