@@ -5609,13 +5609,16 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       return;
     }
     const workerName = req.body?.workerName || req.headers["x-worker-name"] || "";
+    const kinds = Array.isArray(req.body?.kinds)
+      ? req.body.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
+      : [];
     await upsertWorkerHeartbeat(req.user, workerName, {
       platform: req.body?.platform,
       hostname: req.body?.hostname,
       profileDir: req.body?.profileDir,
       currentPhase: req.body?.currentPhase || "本机采集端在线，可领取任务",
     });
-    const job = await claimNextDbJob(req.user, workerName);
+    const job = await claimNextDbJob(req.user, workerName, { kinds });
     if (job) {
       await upsertWorkerHeartbeat(req.user, workerName, {
         platform: req.body?.platform,
@@ -9319,19 +9322,23 @@ async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
   );
 }
 
-async function claimNextDbJob(user, workerName = "") {
+async function claimNextDbJob(user, workerName = "", options = {}) {
   const client = await db.connect();
   const workerLabel = String(workerName || "").trim().slice(0, 80) || "本机采集端";
+  const kinds = Array.isArray(options.kinds)
+    ? options.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
+    : [];
   try {
     await client.query("BEGIN");
     const selected = await client.query(
       `SELECT j.*
        FROM app_jobs j
        WHERE j.user_id = $1 AND j.status = 'queued'
+         AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
        ORDER BY j.created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`,
-      [user?.id || ""],
+      [user?.id || "", kinds],
     );
     if (!selected.rowCount) {
       await client.query("COMMIT");
@@ -9392,7 +9399,7 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
   if (!isSafeJobId(id)) throw new Error("任务 ID 不合法");
   const dir = path.join(JOBS_DIR, id);
   await ensureDir(dir);
-  const downloadUrl = excelBase64 ? `/api/history/${id}/download` : "";
+  let downloadUrl = excelBase64 ? `/api/history/${id}/download` : "";
   const jobJson = {
     ...job,
     id,
@@ -9404,6 +9411,23 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
   if (excelBase64) {
     const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
     await fs.writeFile(path.join(dir, excelName), Buffer.from(String(excelBase64), "base64"));
+  } else if (kind !== "batch-ozon" && Array.isArray(jobJson.results)) {
+    const artifactJob = {
+      id,
+      kind,
+      status: jobJson.status || "done",
+      phase: jobJson.phase || "已完成",
+      total: jobJson.total || jobJson.results.length,
+      processed: jobJson.processed || jobJson.results.length,
+      logs: Array.isArray(jobJson.logs) ? jobJson.logs : [],
+      results: jobJson.results,
+      downloadUrl: "",
+      cancelRequested: false,
+    };
+    await writeJobArtifacts(artifactJob);
+    downloadUrl = artifactJob.downloadUrl || `/api/history/${id}/download`;
+    jobJson.downloadUrl = downloadUrl;
+    await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
   }
   return downloadUrl;
 }

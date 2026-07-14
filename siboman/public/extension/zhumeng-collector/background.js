@@ -12,11 +12,15 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.32";
+const VERSION = "2.2.9.33";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
 const ERP_BACKEND_ORIGIN = "http://test.renwz.cn";  // ERP 后端 (拿凭证)
+const MTOP_URL = "https://h5api.m.1688.com/h5/mtop.relationrecommend.wirelessrecommend.recommend/2.0/";
+const MTOP_APP_KEY = "12574478";
+const WORKER_NAME = `zhumeng-plugin-${chrome.runtime.id.slice(0, 8)}`;
+let sourcingBusy = false;
 
 // ========== 采集核心: 打开 Ozon 商品前端页 + executeScript 提取 ==========
 async function collectSku(sku, storeIds = []) {
@@ -245,6 +249,678 @@ function injectRichContentAttr(data) {
   if (!data.attributes.some(a => Number(a?.id ?? a?.attribute_id) === 11254)) {
     data.attributes.push({ id: 11254, name: "JSON Rich Content", value: richContent });
   }
+}
+
+function makeLog(message, level = "info") {
+  return { at: new Date().toISOString(), level, message };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function randomInt(min, max) {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+async function erpApi(path, { method = "GET", body } = {}) {
+  const headers = { Accept: "application/json" };
+  const init = { method, headers, credentials: "include" };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const resp = await fetch(`${ERP_BACKEND_ORIGIN}${path}`, init);
+  const text = await resp.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!resp.ok || data.success === false) {
+    throw new Error(data.error || `ERP ${resp.status}: ${text.slice(0, 200)}`);
+  }
+  return data;
+}
+
+function workerMeta(currentPhase = "") {
+  return {
+    workerName: WORKER_NAME,
+    platform: "chrome-extension",
+    hostname: "Chrome",
+    profileDir: chrome.runtime.id,
+    currentPhase,
+  };
+}
+
+async function reportSourcingProgress(job, extra = {}) {
+  try {
+    const data = await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/progress`, {
+      method: "POST",
+      body: {
+        status: job.status,
+        phase: job.phase,
+        processed: job.processed,
+        total: job.total,
+        logs: job.logs,
+        results: job.results,
+        error: job.error || "",
+        ...workerMeta(job.phase),
+        ...extra,
+      },
+    });
+    if (data.job?.status === "canceled") job.cancelRequested = true;
+    return data;
+  } catch (e) {
+    console.warn(`[SW ${VERSION}] 单品找货进度回传失败: ${e.message}`);
+    return null;
+  }
+}
+
+async function completeSourcingJob(job) {
+  await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/complete`, {
+    method: "POST",
+    body: {
+      job: {
+        id: job.id,
+        kind: "run",
+        status: job.status,
+        phase: job.phase,
+        total: job.total,
+        processed: job.processed,
+        logs: job.logs,
+        results: job.results,
+        error: job.error || "",
+      },
+      excelBase64: "",
+      ...workerMeta(job.phase),
+    },
+  });
+}
+
+function extractOzonSkuFromUrl(url) {
+  const text = String(url || "").trim();
+  const match = text.match(/(?:product\/[^/?#]*-)?(\d{6,})(?:[/?#]|$)/i) || text.match(/(\d{6,})/);
+  return match ? match[1] : "";
+}
+
+function normalizeOzonForSourcing(data, url, sourceRow) {
+  const images = Array.isArray(data.images) ? data.images.filter(Boolean) : [];
+  const mainImageUrl = images[0] || "";
+  return {
+    sourceUrl: url,
+    sku: data.sku || data.product_id || extractOzonSkuFromUrl(url),
+    title: data.name || "",
+    description: data.description || "",
+    attributes: data.attributes || [],
+    brand: data.brand || "",
+    description_category_id: data.description_category_id || 0,
+    type_id: data.type_id || 0,
+    currentBlackPriceCny: data.price || "",
+    mainImageUrl,
+    mainImage: mainImageUrl ? { url: mainImageUrl, publicUrl: mainImageUrl, contentType: "image/jpeg" } : null,
+    images,
+    raw: data,
+    sourceRow,
+  };
+}
+
+async function runQueuedSourcingJob(remoteJob) {
+  const payload = remoteJob.payload || {};
+  const options = payload.options || {};
+  const rows = Array.isArray(payload.urlRows) && payload.urlRows.length
+    ? payload.urlRows
+    : (Array.isArray(payload.urls) ? payload.urls.map((url, index) => ({ url, sourceRow: index + 1 })) : []);
+  const job = {
+    id: remoteJob.id,
+    status: "running",
+    phase: "插件已领取，准备单品找货",
+    total: rows.length,
+    processed: Number(remoteJob.processed || 0),
+    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
+    results: Array.isArray(remoteJob.results) ? remoteJob.results : [],
+    error: "",
+    cancelRequested: false,
+  };
+  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取单品找货任务。`));
+  await reportSourcingProgress(job);
+
+  const maxCandidates = Math.max(1, Math.min(20, Number(options.maxCandidates || 5)));
+  const enable1688 = options.enable1688 !== false;
+  const delayMinMs = Math.max(1000, Number(options.delayMinMs || 8000));
+  const delayMaxMs = Math.max(delayMinMs, Number(options.delayMaxMs || 20000));
+
+  for (let index = job.processed; index < rows.length; index += 1) {
+    if (job.cancelRequested) break;
+    const row = rows[index] || {};
+    const url = row.url || row;
+    const sourceRow = Number(row.sourceRow || index + 1);
+    const sku = extractOzonSkuFromUrl(url);
+    const result = { url, sourceRow, ozon: null, candidates: [], selectedCandidate: null, aiReview: null };
+    try {
+      if (!sku) throw new Error("没有识别到 Ozon SKU");
+      job.phase = `采集 Ozon 第 ${sourceRow} 行`;
+      job.logs.push(makeLog(`开始采集 Ozon SKU ${sku}`));
+      await reportSourcingProgress(job);
+      const ozonRaw = await collectSku(sku, []);
+      result.ozon = normalizeOzonForSourcing(ozonRaw, url, sourceRow);
+
+      if (enable1688 && result.ozon.mainImageUrl) {
+        job.phase = `1688 搜图 第 ${sourceRow} 行`;
+        job.logs.push(makeLog(`用主图搜索 1688 候选，最多 ${maxCandidates} 个。`));
+        await reportSourcingProgress(job);
+        const searchResult = await search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates);
+        if (searchResult.success) {
+          result.candidates = searchResult.candidates;
+          result.selectedCandidate = result.candidates[0] || null;
+          result.aiReview = {
+            decision: result.selectedCandidate ? "needs_review" : "no_match",
+            reason: "插件端已完成 1688 搜图和详情采集，AI 严格审核待接入后端评估。",
+          };
+          job.logs.push(makeLog(`1688 找到 ${result.candidates.length} 个候选。`));
+        } else {
+          result.searchError = searchResult.error;
+          job.logs.push(makeLog(`1688 搜图失败：${searchResult.error}`, "warn"));
+        }
+      } else if (enable1688) {
+        result.searchError = "Ozon 主图为空，无法 1688 搜图";
+        job.logs.push(makeLog(result.searchError, "warn"));
+      }
+    } catch (e) {
+      result.error = e.message || String(e);
+      job.logs.push(makeLog(`第 ${sourceRow} 行失败：${result.error}`, "error"));
+    }
+    job.results.push(result);
+    job.processed = index + 1;
+    job.phase = `已完成 ${job.processed}/${job.total}`;
+    await reportSourcingProgress(job);
+    if (index < rows.length - 1) await sleep(randomInt(delayMinMs, delayMaxMs));
+  }
+
+  job.status = job.cancelRequested ? "canceled" : (job.results.some(r => !r.error) ? "done" : "error");
+  job.phase = job.status === "done" ? "已完成，正在生成 Excel" : (job.status === "canceled" ? "已停止" : "全部失败");
+  job.error = job.status === "error" ? "单品找货全部失败" : "";
+  job.logs.push(makeLog(job.status === "done" ? "单品找货完成。" : job.phase, job.status === "error" ? "error" : "info"));
+  await completeSourcingJob(job);
+}
+
+async function pollSourcingQueueOnce() {
+  if (sourcingBusy) return;
+  sourcingBusy = true;
+  try {
+    const data = await erpApi("/api/worker/jobs/next", {
+      method: "POST",
+      body: { ...workerMeta("逐梦插件在线，可领取单品找货任务"), kinds: ["run"] },
+    });
+    if (data.job) {
+      console.log(`[SW ${VERSION}] 领取单品找货任务: ${data.job.id}`);
+      await runQueuedSourcingJob(data.job);
+    }
+  } catch (e) {
+    const msg = e.message || String(e);
+    if (!/请先登录|401/.test(msg)) console.warn(`[SW ${VERSION}] 单品找货轮询失败: ${msg}`);
+  } finally {
+    sourcingBusy = false;
+  }
+}
+
+function startSourcingQueueLoop() {
+  chrome.alarms.create("zhumeng-single-sourcing", { periodInMinutes: 1 });
+  setTimeout(() => pollSourcingQueueOnce(), 1500);
+}
+
+async function search1688ByImageInPlugin(imageUrl, maxCandidates) {
+  try {
+    const base64Image = await fetchImageAsBase64(imageUrl);
+    let cookieState = await ensure1688CookieStateInPlugin();
+    if (!cookieState.token) {
+      return { success: false, error: "没有拿到 1688 搜图 token，请先在 Chrome 登录 1688.com" };
+    }
+    try {
+      return { success: true, candidates: await collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) };
+    } catch (e) {
+      if (/FAIL_SYS_TOKEN|_m_h5_tk|token|令牌/i.test(e.message || "")) {
+        cookieState = await ensure1688CookieStateInPlugin(true);
+        if (cookieState.token) {
+          return { success: true, candidates: await collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) };
+        }
+      }
+      return { success: false, error: e.message || String(e) };
+    }
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+}
+
+async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) {
+  const imageId = await uploadImageTo1688InPlugin(base64Image, cookieState);
+  await sleep(randomInt(1200, 2800));
+  const candidates = (await searchOffersByImageIdInPlugin(imageId, cookieState)).slice(0, maxCandidates);
+  const enriched = [];
+  for (const [index, candidate] of candidates.entries()) {
+    if (index > 0) await sleep(randomInt(2500, 6500));
+    const details = await scrape1688CandidateDetailsInPlugin(candidate);
+    enriched.push(addTrafficBaitAssessmentInPlugin(merge1688CandidateDetailsInPlugin(candidate, details)));
+  }
+  return enriched;
+}
+
+async function fetchImageAsBase64(url) {
+  const resp = await fetch(url, { credentials: "omit", headers: { Referer: "https://www.ozon.ru/" } });
+  if (!resp.ok) throw new Error(`主图下载失败 ${resp.status}`);
+  const buffer = await resp.arrayBuffer();
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+async function get1688CookieStateInPlugin() {
+  const urls = ["https://www.1688.com/", "https://s.1688.com/", "https://h5api.m.1688.com/"];
+  const map = new Map();
+  for (const url of urls) {
+    const cookies = await chrome.cookies.getAll({ url }).catch(() => []);
+    for (const cookie of cookies) map.set(cookie.name, cookie);
+  }
+  const tokenCookie = map.get("_m_h5_tk");
+  const token = tokenCookie?.value?.split("_")[0] || "";
+  return {
+    token,
+    cookieHeader: Array.from(map.values()).map(c => `${c.name}=${c.value}`).join("; "),
+  };
+}
+
+async function ensure1688CookieStateInPlugin(forceRefresh = false) {
+  let state = await get1688CookieStateInPlugin();
+  if (state.token && !forceRefresh) return state;
+  const tab = await chrome.tabs.create({ url: "https://www.1688.com/", active: false });
+  try {
+    await waitForTabComplete(tab.id, 30000).catch(() => {});
+    await sleep(1800);
+  } finally {
+    await safeRemoveTab(tab.id);
+  }
+  return get1688CookieStateInPlugin();
+}
+
+async function uploadImageTo1688InPlugin(base64Image, cookieState) {
+  const uploadParams = {
+    appId: 32517,
+    params: JSON.stringify({
+      beginPage: 1,
+      pageSize: 60,
+      searchScene: "pcImageSearch",
+      method: "uploadBase64WithRequest",
+      appName: "pctusou",
+      imageBase64: base64Image,
+      tab: "imageSearch",
+      spm: "a26352.b28411319/2508.imagesearch.upload",
+      sortType: "normal",
+    }),
+  };
+  const dataStr = JSON.stringify(uploadParams);
+  const timestamp = String(Date.now());
+  const url = buildMtopUrlInPlugin({
+    t: timestamp,
+    sign: signMtopInPlugin(cookieState.token, timestamp, dataStr),
+    type: "originaljson",
+    dataType: "jsonp",
+    jsonpIncPrefix: "reqTppId_32517_getOfferList",
+  });
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: build1688HeadersInPlugin(cookieState.cookieHeader, { "Content-Type": "application/x-www-form-urlencoded" }),
+    credentials: "include",
+    body: `data=${encodeURIComponent(dataStr)}`,
+  });
+  const json = parseMtopTextInPlugin(await resp.text());
+  assertMtopSuccessInPlugin(json, "上传图片失败");
+  const imageId = json.data?.data?.imageId || json.data?.imageId || json.data?.result?.[0]?.imageId;
+  if (!imageId) throw new Error(`上传成功但没有 imageId: ${JSON.stringify(json).slice(0, 300)}`);
+  return imageId;
+}
+
+async function searchOffersByImageIdInPlugin(imageId, cookieState) {
+  const searchParams = {
+    appId: 32517,
+    params: JSON.stringify({
+      beginPage: 1,
+      pageSize: 60,
+      method: "imageOfferSearchService",
+      searchScene: "pcImageSearch",
+      appName: "pctusou",
+      tab: "imageSearch",
+      imageId,
+      imageIdList: imageId,
+      sortType: "normal",
+    }),
+  };
+  const dataStr = JSON.stringify(searchParams);
+  const timestamp = String(Date.now());
+  const url = buildMtopUrlInPlugin({
+    t: timestamp,
+    sign: signMtopInPlugin(cookieState.token, timestamp, dataStr),
+    type: "jsonp",
+    callback: "mtopjsonpreqTppId_32517_getOfferList2",
+    dataType: "jsonp",
+    jsonpIncPrefix: "reqTppId_32517_getOfferList",
+    data: dataStr,
+  });
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: build1688HeadersInPlugin(cookieState.cookieHeader),
+    credentials: "include",
+  });
+  const json = parseMtopTextInPlugin(await resp.text());
+  assertMtopSuccessInPlugin(json, "搜索 1688 失败");
+  const offers = json.data?.data?.OFFER?.items || [];
+  return offers.map((item, index) => {
+    const data = item.data || {};
+    const offerId = data.offerId || data.skuId || "";
+    const moqItem = Array.isArray(data.afterPriceList)
+      ? data.afterPriceList.find((entry) => entry.matKey === "quantity_begin")
+      : null;
+    const title = data.title || data.subject || "";
+    const promotionText = collectPromotionTextFromValueInPlugin(data);
+    const pack = inferPackQuantityFromTextInPlugin([title, promotionText].join(" "));
+    return {
+      rank: index + 1,
+      title,
+      price: data.priceInfo?.price || data.price || "",
+      image: normalizeUrlInPlugin(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || ""),
+      link: normalizeUrlInPlugin(data.linkUrl || data.sameDesignUrl || (offerId ? `https://detail.1688.com/offer/${offerId}.html` : "")),
+      shopName: data.shop?.text || data.shopAddition?.text || data.loginId || data.sellerName || "",
+      moq: moqItem?.text || "1件起批",
+      minOrderQuantity: moqItem?.text || "1件起批",
+      promotionText,
+      packQuantity: pack.quantity,
+      packQuantityEvidence: pack.evidence,
+      shippingFee: "",
+      dimensionsText: "",
+      weightText: "",
+      priceDetails: "",
+    };
+  });
+}
+
+async function scrape1688CandidateDetailsInPlugin(candidate) {
+  if (!candidate.link) return { detailError: "没有候选链接" };
+  const tab = await chrome.tabs.create({ url: candidate.link, active: false });
+  try {
+    await waitForTabComplete(tab.id, 70000);
+    await sleep(randomInt(3500, 8000));
+    const [execResult] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: extract1688DetailData,
+      args: [candidate],
+    });
+    return execResult?.result || {};
+  } catch (e) {
+    return { detailError: e.message || String(e) };
+  } finally {
+    await safeRemoveTab(tab.id);
+  }
+}
+
+function extract1688DetailData(fallback) {
+  const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
+  const pick = (...values) => values.map(clean).find(Boolean) || "";
+  const normalizePrice = (value) => {
+    const match = String(value || "").match(/(\d+(?:[.,]\d+)?)/);
+    return match ? match[1].replace(",", ".") : "";
+  };
+  const rawText = document.body?.innerText || "";
+  const title = pick(document.querySelector("h1")?.innerText, document.title, fallback.title);
+  const priceText = pick(
+    document.querySelector('[class*="price"]')?.innerText,
+    rawText.match(/¥\s*\d+(?:[.,]\d+)?/)?.[0],
+    fallback.price,
+  );
+  const moq = pick(rawText.match(/(\d+)\s*(?:件|个|只|套|箱|包)\s*起批/)?.[0], fallback.moq);
+  const shippingFee = /包邮|免运费/.test(rawText) ? "0" : (rawText.match(/(?:运费|物流|快递|邮费)[^\d¥￥]{0,20}[¥￥]?\s*(\d+(?:[.,]\d+)?)/)?.[1] || "");
+  const dimensionsText = rawText.match(/(\d+(?:[.,]\d+)?)\s*[x×*х]\s*(\d+(?:[.,]\d+)?)\s*[x×*х]\s*(\d+(?:[.,]\d+)?)(?:\s*(?:cm|厘米|см))?/i)?.[0] || "";
+  const weightMatch = rawText.match(/(\d+(?:[.,]\d+)?)\s*(kg|公斤|千克|кг|g|克|г|гр)/i);
+  let weightGrams = null;
+  if (weightMatch) {
+    const n = Number(weightMatch[1].replace(",", "."));
+    const u = weightMatch[2].toLowerCase();
+    if (Number.isFinite(n)) weightGrams = /kg|公斤|千克|кг/i.test(u) ? Math.round(n * 1000) : Math.round(n);
+  }
+  return {
+    title,
+    price: normalizePrice(priceText),
+    priceDetails: priceText,
+    minOrderQuantity: moq,
+    moq,
+    shippingFee,
+    dimensionsText,
+    weightText: weightGrams ? `${weightGrams} g` : "",
+    weightGrams,
+    promotionText: rawText.split(/\n+/).map(clean).filter(line => /优惠|券|促销|折扣|首单|新人|限时/.test(line)).slice(0, 12).join("；"),
+  };
+}
+
+function normalize1688PriceOnlyInPage(value) {
+  const match = String(value || "").match(/(\d+(?:[.,]\d+)?)/);
+  return match ? match[1].replace(",", ".") : "";
+}
+
+function buildMtopUrlInPlugin(params) {
+  const url = new URL(MTOP_URL);
+  const defaults = {
+    jsv: "2.7.2",
+    appKey: MTOP_APP_KEY,
+    api: "mtop.relationrecommend.wirelessrecommend.recommend",
+    v: "2.0",
+    timeout: "20000",
+  };
+  for (const [key, value] of Object.entries({ ...defaults, ...params })) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  return url.toString();
+}
+
+function signMtopInPlugin(token, timestamp, dataStr) {
+  return md5(`${token}&${timestamp}&${MTOP_APP_KEY}&${dataStr}`);
+}
+
+function build1688HeadersInPlugin(_cookieHeader, extra = {}) {
+  return {
+    Accept: "application/json,text/plain,*/*",
+    Referer: "https://s.1688.com/",
+    Origin: "https://s.1688.com",
+    ...extra,
+  };
+}
+
+function parseMtopTextInPlugin(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const match = String(text || "").match(/^[^(]*\(([\s\S]*)\)\s*;?$/);
+    if (!match) throw new Error(`接口返回不是 JSON：${String(text || "").slice(0, 300)}`);
+    return JSON.parse(match[1]);
+  }
+}
+
+function assertMtopSuccessInPlugin(json, message) {
+  const ret = Array.isArray(json?.ret) ? json.ret.join("; ") : "";
+  if (!ret.includes("SUCCESS")) {
+    throw new Error(`${message}：${ret || JSON.stringify(json).slice(0, 500)}`);
+  }
+}
+
+function normalizeUrlInPlugin(url) {
+  const text = String(url || "").trim();
+  if (!text) return "";
+  if (text.startsWith("//")) return `https:${text}`;
+  if (text.startsWith("/")) return `https://www.1688.com${text}`;
+  return text;
+}
+
+function collectPromotionTextFromValueInPlugin(value, snippets = [], depth = 0) {
+  if (snippets.length >= 24 || depth > 5 || value == null) return snippets.join("；");
+  const pattern = /首单|首件|新人|新客|优惠|优惠券|券后|立减|满减|补贴|特价|限时|促销|折扣|discount|coupon/i;
+  if (typeof value === "string" || typeof value === "number") {
+    const text = String(value).replace(/\s+/g, " ").trim();
+    if (pattern.test(text) && text.length <= 220) snippets.push(text);
+  } else if (Array.isArray(value)) {
+    value.slice(0, 80).forEach(v => collectPromotionTextFromValueInPlugin(v, snippets, depth + 1));
+  } else if (typeof value === "object") {
+    Object.entries(value).slice(0, 120).forEach(([key, child]) => {
+      if (pattern.test(key)) snippets.push(String(key));
+      collectPromotionTextFromValueInPlugin(child, snippets, depth + 1);
+    });
+  }
+  return Array.from(new Set(snippets.filter(Boolean))).slice(0, 24).join("；");
+}
+
+function inferPackQuantityFromTextInPlugin(text) {
+  const body = String(text || "");
+  const patterns = [
+    /(\d+)\s*(?:шт|pcs|pieces|件|个|只|套|pack|упак)/i,
+    /(?:набор|комплект|set)\s*(?:из)?\s*(\d+)/i,
+    /(\d+)\s*(?:предмет|штук)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = body.match(pattern);
+    const quantity = match ? Number(match[1]) : 0;
+    if (quantity > 1 && quantity <= 100) return { quantity, evidence: match[0] };
+  }
+  return { quantity: 1, evidence: "" };
+}
+
+function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
+  const pack = details.packQuantity || candidate.packQuantity || inferPackQuantityFromTextInPlugin([details.title, candidate.title].join(" ")).quantity;
+  return {
+    ...candidate,
+    ...details,
+    title: details.title || candidate.title,
+    price: normalize1688PriceOnlyInPlugin(details.priceDetails || candidate.priceDetails || details.price || candidate.price),
+    minOrderQuantity: details.minOrderQuantity || candidate.minOrderQuantity || candidate.moq,
+    moq: details.moq || details.minOrderQuantity || candidate.moq,
+    shippingFee: details.shippingFee || candidate.shippingFee || "",
+    dimensionsText: details.dimensionsText || candidate.dimensionsText || "",
+    weightText: details.weightText || candidate.weightText || "",
+    weightGrams: details.weightGrams || candidate.weightGrams || normalizeWeightGramsInPlugin(details.weightText || candidate.weightText),
+    priceDetails: details.priceDetails || candidate.priceDetails || "",
+    promotionText: [candidate.promotionText, details.promotionText].filter(Boolean).join("；"),
+    packQuantity: pack,
+    packQuantityEvidence: details.packQuantityEvidence || candidate.packQuantityEvidence || "",
+    detailError: details.detailError || "",
+  };
+}
+
+function addTrafficBaitAssessmentInPlugin(candidate) {
+  const unitPriceRmb = extract1688MinimumTierUnitPriceInPlugin(candidate.priceDetails || candidate.price);
+  const values = extractRmbValuesInPlugin([candidate.price, candidate.priceDetails, candidate.minOrderQuantity, candidate.moq].join(" "));
+  const positive = values.filter(v => v > 0).sort((a, b) => a - b);
+  const minPriceRmb = positive[0] ?? null;
+  const maxPriceRmb = positive[positive.length - 1] ?? null;
+  const trafficBaitRisk = (minPriceRmb !== null && minPriceRmb < 1) ||
+    (minPriceRmb !== null && maxPriceRmb !== null && maxPriceRmb >= 10 && maxPriceRmb / Math.max(minPriceRmb, 0.01) >= 10);
+  return {
+    ...candidate,
+    price: unitPriceRmb !== null ? formatPriceNumberInPlugin(unitPriceRmb) : normalize1688PriceOnlyInPlugin(candidate.price || candidate.priceDetails),
+    unitPriceRmb,
+    minPriceRmb,
+    maxPriceRmb,
+    trafficBaitRisk,
+    trafficBaitReason: trafficBaitRisk ? "价格过低或价格跨度异常，可能是引流 SKU" : "",
+    avoidForSourcing: trafficBaitRisk,
+  };
+}
+
+function normalize1688PriceOnlyInPlugin(value) {
+  const tier = extract1688MinimumTierUnitPriceInPlugin(value);
+  if (tier !== null) return formatPriceNumberInPlugin(tier);
+  const match = String(value || "").match(/(\d+(?:[.,]\d+)?)/);
+  return match ? match[1].replace(",", ".") : "";
+}
+
+function extract1688MinimumTierUnitPriceInPlugin(value) {
+  const values = extractRmbValuesInPlugin(value);
+  const positive = values.filter(v => v > 0).sort((a, b) => a - b);
+  return positive.length ? positive[0] : null;
+}
+
+function extractRmbValuesInPlugin(value) {
+  const matches = String(value || "").matchAll(/(?:¥|￥)?\s*(\d+(?:[.,]\d+)?)/g);
+  return Array.from(matches).map(m => Number(m[1].replace(",", "."))).filter(Number.isFinite);
+}
+
+function normalizeWeightGramsInPlugin(value) {
+  const text = String(value || "");
+  const match = text.match(/(\d+(?:[.,]\d+)?)\s*(kg|公斤|千克|кг|g|克|г|гр)/i);
+  if (!match) return null;
+  const n = Number(match[1].replace(",", "."));
+  if (!Number.isFinite(n)) return null;
+  return /kg|公斤|千克|кг/i.test(match[2]) ? Math.round(n * 1000) : Math.round(n);
+}
+
+function formatPriceNumberInPlugin(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? String(Number(n.toFixed(2))) : "";
+}
+
+function md5(input) {
+  function cmn(q, a, b, x, s, t) { a = add32(add32(a, q), add32(x, t)); return add32((a << s) | (a >>> (32 - s)), b); }
+  function ff(a, b, c, d, x, s, t) { return cmn((b & c) | ((~b) & d), a, b, x, s, t); }
+  function gg(a, b, c, d, x, s, t) { return cmn((b & d) | (c & (~d)), a, b, x, s, t); }
+  function hh(a, b, c, d, x, s, t) { return cmn(b ^ c ^ d, a, b, x, s, t); }
+  function ii(a, b, c, d, x, s, t) { return cmn(c ^ (b | (~d)), a, b, x, s, t); }
+  function md5cycle(x, k) {
+    let [a, b, c, d] = x;
+    a = ff(a, b, c, d, k[0], 7, -680876936); d = ff(d, a, b, c, k[1], 12, -389564586);
+    c = ff(c, d, a, b, k[2], 17, 606105819); b = ff(b, c, d, a, k[3], 22, -1044525330);
+    a = ff(a, b, c, d, k[4], 7, -176418897); d = ff(d, a, b, c, k[5], 12, 1200080426);
+    c = ff(c, d, a, b, k[6], 17, -1473231341); b = ff(b, c, d, a, k[7], 22, -45705983);
+    a = ff(a, b, c, d, k[8], 7, 1770035416); d = ff(d, a, b, c, k[9], 12, -1958414417);
+    c = ff(c, d, a, b, k[10], 17, -42063); b = ff(b, c, d, a, k[11], 22, -1990404162);
+    a = ff(a, b, c, d, k[12], 7, 1804603682); d = ff(d, a, b, c, k[13], 12, -40341101);
+    c = ff(c, d, a, b, k[14], 17, -1502002290); b = ff(b, c, d, a, k[15], 22, 1236535329);
+    a = gg(a, b, c, d, k[1], 5, -165796510); d = gg(d, a, b, c, k[6], 9, -1069501632);
+    c = gg(c, d, a, b, k[11], 14, 643717713); b = gg(b, c, d, a, k[0], 20, -373897302);
+    a = gg(a, b, c, d, k[5], 5, -701558691); d = gg(d, a, b, c, k[10], 9, 38016083);
+    c = gg(c, d, a, b, k[15], 14, -660478335); b = gg(b, c, d, a, k[4], 20, -405537848);
+    a = gg(a, b, c, d, k[9], 5, 568446438); d = gg(d, a, b, c, k[14], 9, -1019803690);
+    c = gg(c, d, a, b, k[3], 14, -187363961); b = gg(b, c, d, a, k[8], 20, 1163531501);
+    a = gg(a, b, c, d, k[13], 5, -1444681467); d = gg(d, a, b, c, k[2], 9, -51403784);
+    c = gg(c, d, a, b, k[7], 14, 1735328473); b = gg(b, c, d, a, k[12], 20, -1926607734);
+    a = hh(a, b, c, d, k[5], 4, -378558); d = hh(d, a, b, c, k[8], 11, -2022574463);
+    c = hh(c, d, a, b, k[11], 16, 1839030562); b = hh(b, c, d, a, k[14], 23, -35309556);
+    a = hh(a, b, c, d, k[1], 4, -1530992060); d = hh(d, a, b, c, k[4], 11, 1272893353);
+    c = hh(c, d, a, b, k[7], 16, -155497632); b = hh(b, c, d, a, k[10], 23, -1094730640);
+    a = hh(a, b, c, d, k[13], 4, 681279174); d = hh(d, a, b, c, k[0], 11, -358537222);
+    c = hh(c, d, a, b, k[3], 16, -722521979); b = hh(b, c, d, a, k[6], 23, 76029189);
+    a = hh(a, b, c, d, k[9], 4, -640364487); d = hh(d, a, b, c, k[12], 11, -421815835);
+    c = hh(c, d, a, b, k[15], 16, 530742520); b = hh(b, c, d, a, k[2], 23, -995338651);
+    a = ii(a, b, c, d, k[0], 6, -198630844); d = ii(d, a, b, c, k[7], 10, 1126891415);
+    c = ii(c, d, a, b, k[14], 15, -1416354905); b = ii(b, c, d, a, k[5], 21, -57434055);
+    a = ii(a, b, c, d, k[12], 6, 1700485571); d = ii(d, a, b, c, k[3], 10, -1894986606);
+    c = ii(c, d, a, b, k[10], 15, -1051523); b = ii(b, c, d, a, k[1], 21, -2054922799);
+    a = ii(a, b, c, d, k[8], 6, 1873313359); d = ii(d, a, b, c, k[15], 10, -30611744);
+    c = ii(c, d, a, b, k[6], 15, -1560198380); b = ii(b, c, d, a, k[13], 21, 1309151649);
+    a = ii(a, b, c, d, k[4], 6, -145523070); d = ii(d, a, b, c, k[11], 10, -1120210379);
+    c = ii(c, d, a, b, k[2], 15, 718787259); b = ii(b, c, d, a, k[9], 21, -343485551);
+    x[0] = add32(a, x[0]); x[1] = add32(b, x[1]); x[2] = add32(c, x[2]); x[3] = add32(d, x[3]);
+  }
+  function md5blk(s) { const a = []; for (let i = 0; i < 64; i += 4) a[i >> 2] = s.charCodeAt(i) + (s.charCodeAt(i + 1) << 8) + (s.charCodeAt(i + 2) << 16) + (s.charCodeAt(i + 3) << 24); return a; }
+  function md51(s) {
+    const n = s.length; const state = [1732584193, -271733879, -1732584194, 271733878]; let i;
+    for (i = 64; i <= n; i += 64) md5cycle(state, md5blk(s.substring(i - 64, i)));
+    s = s.substring(i - 64);
+    const tail = Array(16).fill(0);
+    for (i = 0; i < s.length; i++) tail[i >> 2] |= s.charCodeAt(i) << ((i % 4) << 3);
+    tail[i >> 2] |= 0x80 << ((i % 4) << 3);
+    if (i > 55) { md5cycle(state, tail); tail.fill(0); }
+    tail[14] = n * 8;
+    md5cycle(state, tail);
+    return state;
+  }
+  function rhex(n) { let s = ""; for (let j = 0; j < 4; j++) s += ((n >> (j * 8 + 4)) & 0x0f).toString(16) + ((n >> (j * 8)) & 0x0f).toString(16); return s; }
+  function hex(x) { return x.map(rhex).join(""); }
+  function add32(a, b) { return (a + b) & 0xffffffff; }
+  return hex(md51(unescape(encodeURIComponent(String(input)))));
 }
 
 function looksLikeRichContentDoc(raw) {
@@ -1969,6 +2645,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 });
+
+chrome.runtime.onInstalled.addListener(() => {
+  startSourcingQueueLoop();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  startSourcingQueueLoop();
+});
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm?.name === "zhumeng-single-sourcing") {
+    pollSourcingQueueOnce();
+  }
+});
+
+startSourcingQueueLoop();
 
 console.log(`[逐梦采集器 v${VERSION}] Service Worker 已加载 (${new Date().toISOString()}) - 新策略: 采集 www.ozon.ru 商品前端页 DOM`);
 

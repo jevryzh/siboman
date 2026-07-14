@@ -76,7 +76,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.32';
+      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.33';
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -142,13 +142,14 @@ window.StoreManagementView = {
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
           <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.32)
+            逐梦 Ozon 采集器 (v2.2.9.33)
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.32</el-tag></p>
+          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.33</el-tag></p>
           <p>更新内容：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.33 单品找货接入逐梦采集插件: 插件可按当前登录账号领取任务, 采集 Ozon 商品并通过 1688 搜图返回候选货源。</li>
             <li>✅ v2.2.9.32 修复采集端富内容兜底作用域错误, 避免 parseMaybeJson 未定义导致采集失败。</li>
             <li>✅ v2.2.9.31 对齐 MyERP 富内容结构: 图册型 11254 使用 billboard + roll + width_full 格式, 并过滤重复大图, 确保 Ozon 真正保存 JSON 富内容。</li>
             <li>✅ v2.2.9.30 富内容兜底: 真实 richAnnotationJson 抓不到时, 用源商品完整图册生成 11254 JSON, 避免 Seller 后台富内容为空。</li>
