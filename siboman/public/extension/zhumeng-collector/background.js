@@ -12,15 +12,16 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.33";
+const VERSION = "2.2.9.34";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
-const ERP_BACKEND_ORIGIN = "http://test.renwz.cn";  // ERP 后端 (拿凭证)
+const ERP_BACKEND_ORIGIN = "https://test.renwz.cn";  // ERP 后端 (拿凭证)
 const MTOP_URL = "https://h5api.m.1688.com/h5/mtop.relationrecommend.wirelessrecommend.recommend/2.0/";
 const MTOP_APP_KEY = "12574478";
 const WORKER_NAME = `zhumeng-plugin-${chrome.runtime.id.slice(0, 8)}`;
 let sourcingBusy = false;
+let workerAuthToken = "";
 
 // ========== 采集核心: 打开 Ozon 商品前端页 + executeScript 提取 ==========
 async function collectSku(sku, storeIds = []) {
@@ -264,7 +265,12 @@ function randomInt(min, max) {
 }
 
 async function erpApi(path, { method = "GET", body } = {}) {
+  if (!workerAuthToken) {
+    const stored = await chrome.storage.local.get(["workerAuthToken"]).catch(() => ({}));
+    workerAuthToken = stored.workerAuthToken || "";
+  }
   const headers = { Accept: "application/json" };
+  if (workerAuthToken) headers.Authorization = `Bearer ${workerAuthToken}`;
   const init = { method, headers, credentials: "include" };
   if (body !== undefined) {
     headers["Content-Type"] = "application/json";
@@ -278,6 +284,18 @@ async function erpApi(path, { method = "GET", body } = {}) {
     throw new Error(data.error || `ERP ${resp.status}: ${text.slice(0, 200)}`);
   }
   return data;
+}
+
+async function configureWorkerAuth(token) {
+  workerAuthToken = String(token || "").trim();
+  if (!workerAuthToken) {
+    await chrome.storage.local.remove(["workerAuthToken", "workerAuthUpdatedAt"]);
+    return { ok: false, error: "插件 token 为空", version: VERSION };
+  }
+  await chrome.storage.local.set({ workerAuthToken, workerAuthUpdatedAt: Date.now() });
+  startSourcingQueueLoop();
+  await pollSourcingQueueOnce();
+  return { ok: true, version: VERSION, workerName: WORKER_NAME };
 }
 
 function workerMeta(currentPhase = "") {
@@ -2582,6 +2600,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (e) { diag.tabError = e.message; }
       console.log(`[SW ${VERSION}] diagnose:`, JSON.stringify(diag));
       sendResponse({ ok: true, diag });
+    })();
+    return true;
+  }
+
+  if (msg.action === "configureWorkerAuth") {
+    (async () => {
+      try {
+        const result = await configureWorkerAuth(msg.token || "");
+        sendResponse(result);
+      } catch (e) {
+        sendResponse({ ok: false, error: e.message || String(e), version: VERSION });
+      }
     })();
     return true;
   }

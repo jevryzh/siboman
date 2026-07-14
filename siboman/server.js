@@ -303,7 +303,8 @@ function safeEqual(left, right) {
 }
 
 async function getAuthenticatedUser(req) {
-  const token = parseCookies(req)[AUTH_COOKIE] || "";
+  const bearer = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i)?.[1] || "";
+  const token = bearer || parseCookies(req)[AUTH_COOKIE] || "";
   const [userId, expiresAtText, signature] = token.split(".");
   const expiresAt = Number(expiresAtText);
   if (!userId || !Number.isFinite(expiresAt) || expiresAt < Date.now() || !signature) return null;
@@ -5685,6 +5686,15 @@ app.get("/api/worker/status", async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+app.get("/api/worker/plugin-token", async (req, res) => {
+  res.json({
+    success: true,
+    token: createAuthToken(req.user.id),
+    userId: req.user.id,
+    expiresIn: Math.floor(AUTH_MAX_AGE_MS / 1000),
+  });
 });
 
 app.post("/api/worker/heartbeat", async (req, res, next) => {

@@ -64,6 +64,16 @@
       return;
     }
 
+    if (kind === "workerAuth.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "configureWorkerAuth", token: data.token || "" });
+        replyToMain(reqId, "workerAuth.response", resp);
+      } catch (e) {
+        replyToMain(reqId, "workerAuth.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
     if (kind === "diagnose.request") {
       try {
         const resp = await chrome.runtime.sendMessage({ action: "diagnose" });

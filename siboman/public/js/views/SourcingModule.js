@@ -30,6 +30,61 @@ window.SourcingModuleView = {
     let collectorTimer = null;
 
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
+    const PROTO = "__zhumeng_proto";
+    const PROTO_VAL = "zhumeng-v1";
+    window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
+
+    const handleExtensionMessage = (event) => {
+      const d = event.data;
+      if (!d || typeof d !== 'object' || d[PROTO] !== PROTO_VAL) return;
+      if (typeof d.kind === 'string' && d.kind.endsWith('.request')) return;
+      const resolver = window.__zhumeng_pending__[d.reqId];
+      if (resolver) {
+        delete window.__zhumeng_pending__[d.reqId];
+        resolver(d);
+      }
+    };
+    window.addEventListener('message', handleExtensionMessage);
+
+    const sendToExtension = (kind, extra = {}, timeoutMs = 8000) => new Promise((resolve) => {
+      const reqId = `${kind.split('.')[0]}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      let resolved = false;
+      window.__zhumeng_pending__[reqId] = (data) => {
+        if (resolved) return;
+        resolved = true;
+        delete window.__zhumeng_pending__[reqId];
+        resolve(data);
+      };
+      try {
+        window.postMessage(JSON.parse(JSON.stringify({ [PROTO]: PROTO_VAL, reqId, kind, ...extra })), '*');
+      } catch (error) {
+        resolved = true;
+        delete window.__zhumeng_pending__[reqId];
+        resolve({ ok: false, error: error.message });
+        return;
+      }
+      setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        delete window.__zhumeng_pending__[reqId];
+        resolve(null);
+      }, timeoutMs);
+    });
+
+    const authorizePluginWorker = async () => {
+      try {
+        const res = await axios.get('/api/worker/plugin-token');
+        if (!res.data?.token) return false;
+        const reply = await sendToExtension('workerAuth.request', { token: res.data.token }, 10000);
+        if (reply?.ok) {
+          setTimeout(fetchCollectorStatus, 1200);
+          return true;
+        }
+      } catch (error) {
+        console.warn('[single-sourcing] 插件授权失败:', apiError(error));
+      }
+      return false;
+    };
 
     const fetchData = async () => {
       if (activeTab.value === 'single') return;
@@ -148,6 +203,7 @@ window.SourcingModuleView = {
         ElementPlus.ElMessage.warning('请先粘贴 Ozon 商品链接');
         return;
       }
+      authorizePluginWorker().catch(() => {});
       fetchCollectorStatus().catch(() => {});
       creating.value = true;
       try {
@@ -219,6 +275,7 @@ window.SourcingModuleView = {
     Vue.onMounted(() => {
       activeTab.value = detectTabFromHash();
       fetchData();
+      authorizePluginWorker().catch(() => {});
       fetchCollectorStatus();
       restoreActiveJob();
       collectorTimer = setInterval(fetchCollectorStatus, 10000);
@@ -226,6 +283,7 @@ window.SourcingModuleView = {
     Vue.onBeforeUnmount(() => {
       stopPolling();
       if (collectorTimer) clearInterval(collectorTimer);
+      window.removeEventListener('message', handleExtensionMessage);
       window.removeEventListener('shop-changed', onShopChanged);
     });
 
