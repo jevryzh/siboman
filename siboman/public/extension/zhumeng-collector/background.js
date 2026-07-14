@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.35";
+const VERSION = "2.2.9.36";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -709,38 +709,178 @@ async function scrape1688CandidateDetailsInPlugin(candidate) {
 function extract1688DetailData(fallback) {
   const clean = (value) => String(value ?? "").replace(/\s+/g, " ").trim();
   const pick = (...values) => values.map(clean).find(Boolean) || "";
-  const normalizePrice = (value) => {
-    const match = String(value || "").match(/(\d+(?:[.,]\d+)?)/);
-    return match ? match[1].replace(",", ".") : "";
+  const unwrap = (value) => (value && typeof value === "object" && value.fields ? value.fields : value);
+  const asArray = (value) => (Array.isArray(value) ? value : []);
+  const normalizeWeightGrams = (value) => {
+    const text = clean(value);
+    if (!text) return null;
+    const match = text.match(/(\d+(?:[.,]\d+)?)\s*(кг|kg|公斤|千克|килограмм(?:а|ов)?|г|g|克|гр|грамм(?:а|ов)?|мг|mg|毫克)(?=$|[\s,.;，。；、/)\]}])/i);
+    if (match) {
+      const number = Number(match[1].replace(",", "."));
+      const unit = match[2].toLowerCase();
+      if (!Number.isFinite(number) || number <= 0) return null;
+      if (/^(кг|kg|公斤|千克)|килограмм/i.test(unit)) return Math.round(number * 1000);
+      if (/^(мг|mg|毫克)/i.test(unit)) return Math.max(1, Math.round(number / 1000));
+      return Math.round(number);
+    }
+    if (/^\d+(?:[.,]\d+)?$/.test(text)) {
+      const number = Number(text.replace(",", "."));
+      if (!Number.isFinite(number) || number <= 0) return null;
+      if (number < 1) return Math.round(number * 1000);
+      if (number < 30 && !Number.isInteger(number)) return Math.round(number * 1000);
+      return Math.round(number);
+    }
+    return null;
   };
+  const addPair = (attrs, key, value) => {
+    const k = clean(key).replace(/[:：]$/, "");
+    const v = clean(value);
+    if (k && v && k !== v && k.length <= 80 && v.length <= 300) attrs[k] = v;
+  };
+
+  const promotionPattern = /首单|首件|首购|新人|新客|新用户|新人价|新客价|首单价|首单减|首购价|立减|满减|优惠|优惠券|券后|领券|补贴|到手价|特价|限时|促销|专享|折扣|discount|coupon|new\s*user|first\s*order/i;
+  const raw = window.__INIT_DATA?.data || window.context?.result?.data || window.iDetailData || {};
   const rawText = document.body?.innerText || "";
-  const title = pick(document.querySelector("h1")?.innerText, document.title, fallback.title);
-  const priceText = pick(
-    document.querySelector('[class*="price"]')?.innerText,
-    rawText.match(/¥\s*\d+(?:[.,]\d+)?/)?.[0],
-    fallback.price,
-  );
-  const moq = pick(rawText.match(/(\d+)\s*(?:件|个|只|套|箱|包)\s*起批/)?.[0], fallback.moq);
-  const shippingFee = /包邮|免运费/.test(rawText) ? "0" : (rawText.match(/(?:运费|物流|快递|邮费)[^\d¥￥]{0,20}[¥￥]?\s*(\d+(?:[.,]\d+)?)/)?.[1] || "");
-  const dimensionsText = rawText.match(/(\d+(?:[.,]\d+)?)\s*[x×*х]\s*(\d+(?:[.,]\d+)?)\s*[x×*х]\s*(\d+(?:[.,]\d+)?)(?:\s*(?:cm|厘米|см))?/i)?.[0] || "";
-  const weightMatch = rawText.match(/(\d+(?:[.,]\d+)?)\s*(kg|公斤|千克|кг|g|克|г|гр)/i);
-  let weightGrams = null;
-  if (weightMatch) {
-    const n = Number(weightMatch[1].replace(",", "."));
-    const u = weightMatch[2].toLowerCase();
-    if (Number.isFinite(n)) weightGrams = /kg|公斤|千克|кг/i.test(u) ? Math.round(n * 1000) : Math.round(n);
+  const bodyText = clean(rawText);
+
+  const attrs = {};
+  const productAttrs = unwrap(raw.productAttributes || {});
+  if (productAttrs?.product_attributes) {
+    for (const [key, value] of Object.entries(productAttrs.product_attributes)) addPair(attrs, key, value);
+  } else if (productAttrs && typeof productAttrs === "object") {
+    for (const [key, value] of Object.entries(productAttrs)) {
+      if (typeof value === "string" || typeof value === "number") addPair(attrs, key, value);
+    }
   }
+  const featureAttrs = raw.offerDetail?.featureAttributes || [];
+  if (Array.isArray(featureAttrs)) {
+    for (const item of featureAttrs) addPair(attrs, item?.name, item?.value);
+  }
+  for (const row of document.querySelectorAll("dt")) {
+    const dd = row.nextElementSibling;
+    if (dd) addPair(attrs, row.innerText, dd.innerText);
+  }
+  for (const row of document.querySelectorAll("tr")) {
+    const cells = Array.from(row.children).map((cell) => clean(cell.innerText)).filter(Boolean);
+    if (cells.length >= 2) addPair(attrs, cells[0], cells.slice(1).join(" "));
+  }
+  const getAttr = (...names) => {
+    const normalized = names.map((name) => String(name).toLowerCase());
+    for (const [key, value] of Object.entries(attrs)) {
+      const lower = key.toLowerCase();
+      if (normalized.some((name) => lower.includes(name))) return value;
+    }
+    return "";
+  };
+
+  const mainPrice = unwrap(raw.mainPrice || {});
+  const orderParamModel = unwrap(raw.orderParamModel || {});
+  const orderParam = orderParamModel.orderParam || {};
+  const skuParam = orderParam.skuParam || {};
+  const trade = mainPrice.finalPriceModel?.tradeWithoutPromotion || {};
+  const priceRanges = [
+    ...asArray(skuParam.skuRangePrices),
+    ...asArray(trade.offerPriceRanges),
+  ].map((item) => ({
+    beginAmount: item.beginAmount ?? item.startAmount ?? item.quantity ?? "",
+    price: item.price ?? item.discountPrice ?? item.value ?? "",
+  })).filter((item) => item.price !== "");
+
+  const skuModel = unwrap(raw.skuModel || raw.rawFusion?.skuSelection || {});
+  const skuPrices = Object.values(skuModel.skuInfoMap || {})
+    .map((item) => item?.price ?? item?.originalPrice ?? item?.salePrice)
+    .filter((value) => value !== undefined && value !== null && value !== "");
+  const priceDetails = priceRanges.length
+    ? priceRanges.map((item) => `${item.beginAmount || 1}件起 ¥${item.price}`).join("; ")
+    : "";
+  const rangePrices = priceRanges
+    .map((item) => Number(String(item.price).replace(/[^\d.]/g, "")))
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const minPrice = [...rangePrices, ...skuPrices.map(Number).filter((value) => Number.isFinite(value) && value > 0)]
+    .sort((a, b) => a - b)[0];
+  const domPrice = bodyText.match(/¥\s*(\d+(?:[.,]\d+)?)/)?.[1] || "";
+  const price = pick(minPrice ? String(minPrice) : "", domPrice, /^\s*\d+(?:\.\d+)?\s*$/.test(String(fallback.price || "")) ? fallback.price : "");
+
+  const promotionLines = rawText.split(/\n+/)
+    .map(clean)
+    .filter((line) => promotionPattern.test(line) && line.length <= 220)
+    .slice(0, 16);
+  const collectPromotionSnippets = (value, snippets = [], depth = 0) => {
+    if (snippets.length >= 24 || depth > 5 || value == null) return snippets;
+    if (typeof value === "string" || typeof value === "number") {
+      const text = clean(value);
+      if (promotionPattern.test(text) && text.length <= 220) snippets.push(text);
+    } else if (Array.isArray(value)) {
+      for (const item of value.slice(0, 80)) collectPromotionSnippets(item, snippets, depth + 1);
+    } else if (typeof value === "object") {
+      for (const [key, child] of Object.entries(value).slice(0, 120)) {
+        if (promotionPattern.test(key)) snippets.push(clean(`${key}: ${typeof child === "object" ? "" : child}`));
+        collectPromotionSnippets(child, snippets, depth + 1);
+      }
+    }
+    return snippets;
+  };
+  const promotionText = Array.from(new Set([...promotionLines, ...collectPromotionSnippets(raw)].filter(Boolean))).slice(0, 24).join("；");
+
+  const moqFromPriceRange = priceRanges
+    .map((item) => Number(item.beginAmount))
+    .filter((value) => Number.isFinite(value) && value > 0)
+    .sort((a, b) => a - b)[0];
+  const moqFromDom = bodyText.match(/(\d+)\s*(?:件|个|只|套|箱|包)\s*起批/);
+  const minOrderQuantity = pick(moqFromPriceRange ? `${moqFromPriceRange}件起批` : "", moqFromDom ? `${moqFromDom[1]}件起批` : "", fallback.moq);
+
+  const packInfo = unwrap(raw.productPackInfo || raw.pieceWeightScale || raw.offerDetail?.pieceWeightScale || {});
+  const pieceWeightScale = packInfo.pieceWeightScale || packInfo;
+  const scaleInfoList = asArray(pieceWeightScale.pieceWeightScaleInfo || packInfo.pieceWeightScaleInfo);
+  const columnList = asArray(pieceWeightScale.columnList || packInfo.columnList);
+  const colMap = {};
+  for (const col of columnList) {
+    const label = clean(col.label || col.title || col.name);
+    const name = col.name || col.field || col.key;
+    if (!name) continue;
+    if (/长|length/i.test(label)) colMap.length = name;
+    if (/宽|width/i.test(label)) colMap.width = name;
+    if (/高|height/i.test(label)) colMap.height = name;
+    if (/重|weight/i.test(label)) colMap.weight = name;
+  }
+  const firstScale = scaleInfoList.find((item) => item && (
+    item[colMap.length] || item.length || item[colMap.width] || item.width ||
+    item[colMap.height] || item.height || item[colMap.weight] || item.weight
+  )) || {};
+  const length = pick(firstScale[colMap.length], firstScale.length, firstScale.long, getAttr("长", "length"));
+  const width = pick(firstScale[colMap.width], firstScale.width, getAttr("宽", "width"));
+  const height = pick(firstScale[colMap.height], firstScale.height, getAttr("高", "height"));
+  const attrDimension = getAttr("尺寸", "规格尺寸", "包装尺寸", "产品尺寸");
+  const dimensionsText = length || width || height ? `${length || "-"} x ${width || "-"} x ${height || "-"} cm` : attrDimension;
+
+  const shipping = unwrap(raw.shippingServices || {});
+  const freightInfo = shipping.freightInfo || {};
+  const skuWeight = freightInfo.skuWeight && typeof freightInfo.skuWeight === "object"
+    ? Object.values(freightInfo.skuWeight).find(Boolean)
+    : "";
+  const weightRaw = pick(firstScale[colMap.weight], firstScale.weight, packInfo.unitWeight, shipping.unitWeight, skuWeight, getAttr("重量", "克重", "毛重", "净重", "weight"));
+  const weightGrams = normalizeWeightGrams(weightRaw);
+  const shippingFee = pick(freightInfo.totalCost, freightInfo.postFeeValue, shipping.totalCost, shipping.postFeeValue, getAttr("运费", "物流费用", "快递费"), /包邮|免运费/.test(rawText) ? "0" : "");
+  const title = pick(
+    raw.productTitle?.fields?.title,
+    raw.productTitle?.title,
+    document.querySelector('meta[property="og:title"]')?.content,
+    document.querySelector("h1")?.innerText,
+    fallback.title,
+  );
+
   return {
     title,
-    price: normalizePrice(priceText),
-    priceDetails: priceText,
-    minOrderQuantity: moq,
-    moq,
+    price,
+    priceDetails,
+    minOrderQuantity,
+    moq: minOrderQuantity,
     shippingFee,
     dimensionsText,
     weightText: weightGrams ? `${weightGrams} g` : "",
     weightGrams,
-    promotionText: rawText.split(/\n+/).map(clean).filter(line => /优惠|券|促销|折扣|首单|新人|限时/.test(line)).slice(0, 12).join("；"),
+    promotionText,
+    detailAttributes: attrs,
   };
 }
 
@@ -835,7 +975,11 @@ function inferPackQuantityFromTextInPlugin(text) {
 }
 
 function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
-  const pack = details.packQuantity || candidate.packQuantity || inferPackQuantityFromTextInPlugin([details.title, candidate.title].join(" ")).quantity;
+  const detailAttrText = Object.entries(details.detailAttributes || {})
+    .map(([key, value]) => `${key}: ${value}`)
+    .join(" ");
+  const inferredPack = inferPackQuantityFromTextInPlugin([details.title, candidate.title, detailAttrText].join(" "));
+  const pack = details.packQuantity || candidate.packQuantity || inferredPack.quantity;
   return {
     ...candidate,
     ...details,
@@ -850,7 +994,7 @@ function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
     priceDetails: details.priceDetails || candidate.priceDetails || "",
     promotionText: [candidate.promotionText, details.promotionText].filter(Boolean).join("；"),
     packQuantity: pack,
-    packQuantityEvidence: details.packQuantityEvidence || candidate.packQuantityEvidence || "",
+    packQuantityEvidence: details.packQuantityEvidence || candidate.packQuantityEvidence || inferredPack.evidence || "",
     detailError: details.detailError || "",
   };
 }
