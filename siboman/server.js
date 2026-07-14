@@ -9469,7 +9469,8 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
   if (!isSafeJobId(id)) throw new Error("任务 ID 不合法");
   const dir = path.join(JOBS_DIR, id);
   await ensureDir(dir);
-  let downloadUrl = excelBase64 ? `/api/history/${id}/download` : "";
+  const shouldUseWorkerExcel = kind === "batch-ozon" && excelBase64;
+  let downloadUrl = shouldUseWorkerExcel ? `/api/history/${id}/download` : "";
   const jobJson = {
     ...job,
     id,
@@ -9478,7 +9479,7 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
     updatedAt: new Date().toISOString(),
   };
   await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
-  if (excelBase64) {
+  if (shouldUseWorkerExcel) {
     const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
     await fs.writeFile(path.join(dir, excelName), Buffer.from(String(excelBase64), "base64"));
   } else if (kind !== "batch-ozon" && Array.isArray(jobJson.results)) {
