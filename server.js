@@ -3033,6 +3033,131 @@ async function runJob(job, options) {
   touch(job);
 }
 
+async function finalizeWorkerRunJob(existing, job) {
+  if (!job || !Array.isArray(job.results) || !job.results.length) return;
+  const payload = existing?.payload && typeof existing.payload === "object" ? existing.payload : {};
+  const options = payload.options && typeof payload.options === "object" ? payload.options : payload;
+  const enableAI = options.enableAI !== false;
+  const jobId = existing?.id || job.id || "";
+  job.logs = Array.isArray(job.logs) ? job.logs : [];
+  for (const result of job.results) {
+    if (!result || result.error) continue;
+    result.ozon = normalizePluginOzonResult(result.ozon || {});
+    await hydrateWorkerRunResultImages(jobId, result);
+    if (Array.isArray(result.candidates) && result.candidates.length) {
+      result.candidates = result.candidates.map((candidate) => annotateCandidateQuantity(candidate, result.ozon));
+      if (enableAI && shouldReviewWorkerResultWithAi(result)) {
+        job.logs.push(makeLogEntry(`服务器 AI 审核第 ${result.sourceRow || ""} 行候选。`));
+        result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
+        applyAiReview(result);
+      } else if (!result.selectedCandidate && !hasStrictNoneAiDecision(result)) {
+        const fallback = findBestFallbackCandidate(result.candidates);
+        if (fallback) {
+          result.selectedCandidate = markFinalCandidate(fallback, "approximate", "未进行 AI 审核，返回非引流候选供人工确认。");
+        }
+      }
+    } else if (enableAI && !result.aiSkipLogged) {
+      const rowLabel = result.sourceRow || "";
+      result.aiSkipReason = result.searchError
+        ? `1688 搜图失败，跳过 AI 审核：${result.searchError}`
+        : "没有 1688 候选，跳过 AI 审核。";
+      job.logs.push(makeLogEntry(`第 ${rowLabel} 行${result.aiSkipReason}`));
+      result.aiSkipLogged = true;
+    }
+  }
+}
+
+async function hydrateWorkerRunResultImages(jobId, result) {
+  if (!jobId || !isSafeJobId(jobId) || !result) return;
+  const sourceRow = result.sourceRow || extractOzonProductId(result.url || result.ozon?.sourceUrl || "") || "0";
+  const ozonUrl = result.ozon?.mainImageUrl || result.ozon?.mainImage?.url || "";
+  if (ozonUrl && !result.ozon?.mainImage?.filePath) {
+    try {
+      result.ozon.mainImage = await downloadArtifactImageByUrl({
+        jobId,
+        prefix: `ozon_${String(sourceRow).padStart(3, "0")}`,
+        url: ozonUrl,
+        referer: result.url || result.ozon?.sourceUrl || "https://www.ozon.ru/",
+      });
+    } catch (error) {
+      result.ozon.mainImageDownloadError = error.message;
+    }
+  }
+  if (!Array.isArray(result.candidates)) return;
+  for (const candidate of result.candidates) {
+    const imageUrl = candidate?.image || candidate?.imageUrl || candidate?.localImage?.url || "";
+    if (!imageUrl || candidate?.localImage?.filePath) continue;
+    try {
+      candidate.localImage = await downloadArtifactImageByUrl({
+        jobId,
+        prefix: `1688_${String(sourceRow).padStart(3, "0")}_${String(candidate.rank || 0).padStart(2, "0")}`,
+        url: imageUrl,
+        referer: candidate.link || "https://www.1688.com/",
+      });
+    } catch (error) {
+      candidate.imageDownloadError = error.message;
+    }
+  }
+}
+
+async function downloadArtifactImageByUrl({ jobId, prefix, url, referer }) {
+  const response = await fetch(url, {
+    signal: AbortSignal.timeout(45000),
+    headers: { Referer: referer || "", "User-Agent": USER_AGENT },
+  });
+  if (!response.ok) {
+    throw new Error(`图片下载失败 ${response.status}：${url}`);
+  }
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  const ext = extensionFromContentType(contentType, url);
+  const safePrefix = String(prefix || "image").replace(/[^a-z0-9_-]+/gi, "_").slice(0, 80);
+  const filename = `${safePrefix}.${ext}`;
+  const dir = path.join(JOBS_DIR, jobId, "images");
+  await ensureDir(dir);
+  const filePath = path.join(dir, filename);
+  await fs.writeFile(filePath, buffer);
+  return {
+    url,
+    filePath,
+    publicUrl: `/artifacts/jobs/${jobId}/images/${filename}`,
+    contentType,
+    buffer,
+  };
+}
+
+function normalizePluginOzonResult(ozon = {}) {
+  const blackText = getOzonBestBlackPriceText(ozon);
+  const blackValue = getOzonBestBlackPriceValue(ozon);
+  const weight = inferOzonWeight(ozon);
+  return {
+    ...ozon,
+    currentBlackPriceCny: ozon.currentBlackPriceCny || blackText || ozon.price || "",
+    currentBlackPriceCnyValue: Number.isFinite(Number(ozon.currentBlackPriceCnyValue))
+      ? Number(ozon.currentBlackPriceCnyValue)
+      : (Number.isFinite(blackValue) ? blackValue : ""),
+    currentGreenPriceCny: ozon.currentGreenPriceCny || ozon.price || ozon.currentBlackPriceCny || "",
+    weightGrams: ozon.weightGrams || weight.weightGrams || "",
+    weightText: ozon.weightText || (weight.weightGrams ? `${weight.weightGrams} g` : ""),
+    weightSource: ozon.weightSource || weight.source || "",
+    weightEvidence: ozon.weightEvidence || weight.evidence || "",
+  };
+}
+
+function shouldReviewWorkerResultWithAi(result) {
+  if (!result?.candidates?.length) return false;
+  const decision = String(result.aiReview?.decision || "");
+  if (!result.aiReview) return true;
+  if (["needs_review", "pending", "approximate"].includes(decision)) return true;
+  if (!["exact", "none"].includes(decision)) return true;
+  return !Array.isArray(result.aiReview?.candidate_reviews) || !result.aiReview.candidate_reviews.length;
+}
+
+function hasStrictNoneAiDecision(result) {
+  return result?.aiReview?.decision === "none" && !result.aiReview?.selected_rank;
+}
+
 async function runBatchOzonJob(job, options) {
   await ensureDir(JOBS_DIR);
   await ensureDir(path.join(JOBS_DIR, job.id, "images"));
@@ -6053,7 +6178,7 @@ async function writeJobArtifacts(job) {
       "AI最终结果": finalCandidate?.finalMatchType === "exact" ? "完全一致" : finalCandidate ? "近似匹配" : "无候选",
       "AI选中候选": finalCandidate?.rank || result.aiReview?.selected_rank || "",
       "AI最终置信度": result.aiReview?.confidence ?? "",
-      "AI最终原因": result.aiReview?.reason || "",
+      "AI最终原因": result.aiReview?.reason || result.aiSkipReason || result.searchError || "",
       "AI模型": result.aiReview?.model || "",
       "AI思考模式": formatAiThinkingModeForSheet(result.aiReview?.thinkingMode),
       "AI耗时秒": result.aiReview?.aiElapsedMs ? Number((result.aiReview.aiElapsedMs / 1000).toFixed(2)) : "",
