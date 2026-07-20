@@ -144,6 +144,28 @@ app.use(express.static(PUBLIC_DIR));
    多店铺管理 API
    ============================================================ */
 
+async function validateOzonCredentials(clientId, apiKey) {
+  const response = await fetch(`${OZON_SELLER_BASE_URL}/v3/product/list`, {
+    method: "POST",
+    headers: {
+      "Client-Id": String(clientId),
+      "Api-Key": String(apiKey),
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify({ filter: { visibility: "ALL" }, last_id: "", limit: 1 }),
+  });
+  const text = await response.text();
+  let payload = null;
+  try { payload = text ? JSON.parse(text) : null; } catch { payload = { message: text }; }
+  if (!response.ok) {
+    const error = new Error(payload?.message || payload?.error || `Ozon 凭证验证失败 (${response.status})`);
+    error.statusCode = response.status === 401 || response.status === 403 ? 400 : 502;
+    throw error;
+  }
+  return payload;
+}
+
 app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -164,12 +186,13 @@ app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
     if (!name || !client_id || !api_key) {
       return res.status(400).json({ success: false, error: "请填写完整信息" });
     }
+    await validateOzonCredentials(client_id, api_key);
     const result = await db.query(
       `INSERT INTO app_stores (user_id, name, client_id, api_key, watermark_enabled, watermark_text)
        VALUES ($1, $2, $3, $4, $5, $6)
        ON CONFLICT (user_id, client_id) DO UPDATE
-         SET name = $2, api_key = $4, watermark_enabled = $5, watermark_text = $6, updated_at = now()
-       RETURNING id, name, client_id, watermark_enabled, watermark_text`,
+         SET name = $2, api_key = $4, active = TRUE, watermark_enabled = $5, watermark_text = $6, updated_at = now()
+       RETURNING id, name, client_id, active, watermark_enabled, watermark_text`,
       [req.user.id, name, client_id, api_key, watermarkEnabled, watermarkText]
     );
     res.json({ success: true, shop: result.rows[0] });
@@ -198,8 +221,12 @@ app.patch("/api/seller/shops/:id/settings", requireAuth, async (req, res, next) 
 app.delete("/api/seller/shops/:id", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
-    await db.query("DELETE FROM app_stores WHERE id = $1 AND user_id = $2", [req.params.id, req.user.id]);
-    res.json({ success: true });
+    const result = await db.query(
+      "UPDATE app_stores SET active = FALSE, updated_at = now() WHERE id = $1 AND user_id = $2 RETURNING id",
+      [req.params.id, req.user.id],
+    );
+    if (!result.rowCount) return res.status(404).json({ success: false, error: "店铺不存在" });
+    res.json({ success: true, deactivated: true });
   } catch (error) { next(error); }
 });
 
@@ -2804,14 +2831,20 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     // 2. 并行调每个店铺的 Ozon 订单 API (今日 + 7 日 + 待打包 + 待发货 + 退货)
     const fetchStoreOrders = async (store, since, to, status) => {
       try {
-        const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
-          dir: "DESC",
-          filter: { since, to, ...(status && status !== "all" ? { status } : {}) },
-          limit: 100,
-          offset: 0,
-          with: { financial_data: true },
-        }, { storeId: store.id, userId });
-        return data?.result?.postings || [];
+        const postings = [];
+        for (let offset = 0; offset < 5000; offset += 100) {
+          const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
+            dir: "DESC",
+            filter: { since, to, ...(status && status !== "all" ? { status } : {}) },
+            limit: 100,
+            offset,
+            with: { financial_data: true },
+          }, { storeId: store.id, userId });
+          const page = data?.result?.postings || [];
+          postings.push(...page);
+          if (page.length < 100 || data?.result?.has_next === false) break;
+        }
+        return postings;
       } catch (e) {
         console.warn(`[dashboard] store=${store.name} orders fetch fail:`, e.message);
         return [];
@@ -2822,7 +2855,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     // GMV = Σ(pd.price × qty)  按币种转 CNY
     // Payout = Σ(fd.payout × qty)  卖家到手 (已扣佣金/物流)
     // Profit = Payout_CNY - Purchase_Price_CNY (从 app_products 查)
-    //         若 purchase_price_cny 为空, 回退 Payout × 0.2 (利润约占到手 20%)
+    //         若 purchase_price_cny 为空, 不猜测利润，并明确返回待补成本数量。
     const calcOrderMetrics = (posting) => {
       let gmvCny = 0;
       let payoutCny = 0;
@@ -2859,8 +2892,8 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const fetchPurchasePrices = async (offerIds, storeId) => {
       if (!offerIds.length) return new Map();
       const r = await db.query(
-        `SELECT offer_id, purchase_price_cny FROM app_products WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
-        [storeId, offerIds],
+        `SELECT offer_id, purchase_price_cny FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+        [userId, storeId, offerIds],
       );
       return new Map(r.rows.map(x => [x.offer_id, Number(x.purchase_price_cny) || 0]));
     };
@@ -2963,17 +2996,17 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
            COUNT(*) FILTER (WHERE stock < 5 AND status != 'IN_ACTIVE') as stock_warning,
            COUNT(*) as total_products,
            MAX(updated_at) as last_sync
-         FROM app_products WHERE store_id = $1`,
-        [store.id]
+         FROM app_products WHERE user_id = $1 AND store_id = $2`,
+        [userId, store.id]
       );
       const pr = prodRes.rows[0] || {};
       const warningRes = await db.query(
         `SELECT offer_id, name, image, stock
            FROM app_products
-          WHERE store_id = $1 AND stock < 10 AND status != 'IN_ACTIVE'
+          WHERE user_id = $1 AND store_id = $2 AND stock < 10 AND status != 'IN_ACTIVE'
           ORDER BY stock ASC, updated_at DESC
           LIMIT 20`,
-        [store.id],
+        [userId, store.id],
       );
 
       const recentOrders = weekOrders.slice(0, 15).map(order => {
@@ -3079,8 +3112,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       weekly_gmv: Math.round(storeData.reduce((s, x) => s + x.weekly_gmv, 0) * 100) / 100,
       weekly_payout: Math.round(storeData.reduce((s, x) => s + x.weekly_payout, 0) * 100) / 100,
       weekly_profit: Math.round(storeData.reduce((s, x) => s + x.weekly_profit, 0) * 100) / 100,
+      profit_complete: storeData.every((item) => item.profit_complete),
+      cost_missing_count: storeData.reduce((sum, item) => sum + item.cost_missing_count, 0),
       return_rate: (() => {
-        const totalReturns = storeData.reduce((s, x) => s + x.arbitration + (x._returns7d || 0), 0);
+        const totalReturns = storeData.reduce((s, x) => s + (x._returns7d || 0), 0);
         const totalWeek = storeData.reduce((s, x) => s + x.weekly_orders, 0);
         return totalWeek > 0 ? Math.round((totalReturns / totalWeek) * 10000) / 100 : 0;
       })(),

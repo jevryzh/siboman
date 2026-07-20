@@ -7,6 +7,12 @@ const main = fs.readFileSync('public/js/main.js', 'utf8');
 const html = fs.readFileSync('public/index.html', 'utf8');
 
 assert.match(server, /WHERE active = TRUE AND user_id = \$1/);
+assert.match(server, /offset < 5000/);
+assert.match(server, /profit_complete: storeData\.every/);
+assert.match(server, /totalReturns = storeData\.reduce\(\(s, x\) => s \+ \(x\._returns7d \|\| 0\), 0\)/);
+assert.match(server, /async function validateOzonCredentials/);
+assert.match(server, /active = FALSE/);
+assert.match(server, /api_key = \$4, active = TRUE/);
 assert.match(view, /\/api\/seller\/dashboard/);
 assert.match(view, /\/api\/seller\/analytics\/categories/);
 assert.match(view, /\/api\/seller\/analytics\/bestsellers/);

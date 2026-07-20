@@ -11,6 +11,7 @@ window.DashboardView = {
       active_products: 0, stock_warning: 0,
       today_returns: 0, arbitration: 0,
       weekly_gmv: 0, weekly_payout: 0, weekly_profit: 0, weekly_orders: 0,
+      profit_complete: false, cost_missing_count: 0,
       return_rate: 0,
     });
     const storeComparison = Vue.ref([]);
@@ -66,6 +67,8 @@ window.DashboardView = {
             weekly_payout: num(s.weekly_payout),
             weekly_profit: num(s.weekly_profit),
             weekly_orders: num(s.weekly_orders),
+            profit_complete: s.profit_complete === true,
+            cost_missing_count: num(s.cost_missing_count),
             return_rate: num(s.return_rate),
           };
           storeComparison.value = (res.data.store_comparison || []).map(sc => ({
@@ -218,7 +221,10 @@ window.DashboardView = {
           <div style="font-size: 13px; color: #909399; margin-bottom: 8px">本周累计 GMV</div>
           <div style="font-size: 32px; font-weight: 800; color: #67c23a; line-height: 1">{{ fmtMoney0(summary.weekly_gmv) }}</div>
           <div style="margin-top: 10px; font-size: 12px; color: #909399">
-            7日 {{ summary.weekly_orders }} 单 · 利润 {{ fmtMoney(summary.weekly_profit) }}
+            7日 {{ summary.weekly_orders }} 单 · 已核算利润 {{ fmtMoney(summary.weekly_profit) }}
+            <el-tooltip v-if="!summary.profit_complete" :content="summary.cost_missing_count + ' 行商品缺少采购成本，未计入利润'">
+              <el-tag size="small" type="warning" style="margin-left:6px">待补 {{ summary.cost_missing_count }} 行成本</el-tag>
+            </el-tooltip>
           </div>
         </div>
       </div>
