@@ -3865,7 +3865,7 @@ app.post("/api/seller/import/portal-record", requireAuth, async (req, res) => {
 // 强制同步 Ozon 任务状态
 app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => {
   try {
-    const { taskId } = req.body || {};
+    const taskId = req.body?.taskId || req.body?.task_id;
     if (!taskId) { res.status(400).json({ success: false, error: "需要 taskId" }); return; }
 
     // v0.6.2: 优先用请求体里的 store_id (前端知道是哪个店铺)
@@ -3911,6 +3911,31 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
     res.json({ success: true, ozonStatus, localStatus, errors });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
+
+function translateOzonListingError(error) {
+  const source = `${error?.code || ""} ${error?.message || error?.description || ""}`.toLowerCase();
+  const rules = [
+    [/attribute.*(?:empty|required)|error_attribute_values_empty|missing.*attribute/, "缺少必填商品属性，请检查错误代码对应的属性 ID。"],
+    [/category.*(?:not found|invalid)|levels_category_not_found|description_category/, "商品类目无效或与类型不匹配，请重新选择 Ozon Seller 类目。"],
+    [/type[_ ]?id|product type/, "商品类型不正确，请核对类目下允许的 type_id。"],
+    [/image.*(?:download|load|fetch)|picture.*(?:download|invalid)/, "Ozon 无法下载或识别商品图片，请确认图片是公开 HTTPS 地址且格式合规。"],
+    [/duplicate.*offer|offer.*already|offer_id.*exist/, "货号已存在或重复，请使用当前店铺内唯一的 offer_id。"],
+    [/barcode.*(?:invalid|exist|duplicate)/, "条形码无效、重复或已被其他商品占用。"],
+    [/price.*(?:invalid|minimum|maximum|too low|too high)/, "商品价格不符合 Ozon 限制，请检查售价、最低价和划线价。"],
+    [/(?:weight|dimension|height|width|depth).*(?:invalid|required|limit)/, "重量或包装尺寸不符合要求，请检查单位和数值范围。"],
+    [/name.*(?:invalid|required|length)|title.*(?:invalid|required|length)/, "商品标题为空、过长或包含不允许的内容。"],
+    [/rich.*content|11254/, "富文本内容格式不正确，请检查富内容 JSON。"],
+  ];
+  const match = rules.find(([pattern]) => pattern.test(source));
+  return match ? match[1] : "请根据 Ozon 原始错误检查对应字段；若错误持续，可在 Seller 后台查看该商品的审核详情。";
+}
+
+function enrichListingErrors(errors) {
+  return (Array.isArray(errors) ? errors : []).map((error) => ({
+    ...error,
+    message_zh: error?.message_zh || translateOzonListingError(error),
+  }));
+}
 
 // v2.1.9: 上架历史列表 (含统计) - 用户在前端"上架记录"页用
 app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
@@ -3981,7 +4006,7 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
       success: true,
       items: listRes.rows.map(r => ({
         ...r,
-        errors_json: r.errors_json || [],
+        errors_json: enrichListingErrors(r.errors_json),
       })),
       total: Number(stats.total || 0),
       stats: {
@@ -3997,6 +4022,93 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
   } catch (e) {
     console.error("[listing-history]", e.message);
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/api/seller/listing-history/export", requireAuth, async (req, res) => {
+  try {
+    const conditions = ["lh.user_id = $1"];
+    const params = [req.user.id];
+    const storeId = String(req.body?.store_id || "").trim();
+    const status = String(req.body?.status || "").trim();
+    const sku = String(req.body?.sku || "").trim();
+    const startDate = String(req.body?.start_date || "").trim();
+    const endDate = String(req.body?.end_date || "").trim();
+    if (storeId) { params.push(storeId); conditions.push(`lh.store_id = $${params.length}`); }
+    if (status && status !== "all") {
+      if (status === "processing") conditions.push("lh.status IN ('processing','pending')");
+      else { params.push(status); conditions.push(`lh.status = $${params.length}`); }
+    }
+    if (sku) { params.push(`%${sku}%`); conditions.push(`(lh.offer_id ILIKE $${params.length} OR lh.product_name ILIKE $${params.length} OR lh.task_id ILIKE $${params.length})`); }
+    if (startDate) { params.push(startDate); conditions.push(`lh.created_at >= $${params.length}`); }
+    if (endDate) { params.push(endDate); conditions.push(`lh.created_at < ($${params.length}::date + interval '1 day')`); }
+    const rows = await db.query(
+      `SELECT lh.task_id, lh.offer_id, lh.product_name, s.name AS store_name, lh.status,
+              lh.price_rub, lh.errors_json, lh.created_at, lh.updated_at
+         FROM app_listing_history lh
+         LEFT JOIN app_stores s ON s.id = lh.store_id
+        WHERE ${conditions.join(" AND ")}
+        ORDER BY lh.created_at DESC LIMIT 5000`,
+      params,
+    );
+    const csvCell = (value) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+    const header = ["任务ID", "货号", "商品标题", "店铺", "状态", "售价", "Ozon原始错误", "中文解释", "创建时间", "更新时间"];
+    const lines = rows.rows.map((row) => {
+      const errors = enrichListingErrors(row.errors_json);
+      return [
+        row.task_id, row.offer_id, row.product_name, row.store_name, row.status, row.price_rub,
+        errors.map((error) => `${error.code || ""} ${error.message || error.description || ""}`.trim()).join(" | "),
+        [...new Set(errors.map((error) => error.message_zh).filter(Boolean))].join(" | "),
+        row.created_at?.toISOString?.() || row.created_at,
+        row.updated_at?.toISOString?.() || row.updated_at,
+      ].map(csvCell).join(",");
+    });
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="listing-history-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(`\ufeff${header.map(csvCell).join(",")}\n${lines.join("\n")}`);
+  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+app.post("/api/seller/listing-history/:id/retry", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT * FROM app_listing_history WHERE id = $1 AND user_id = $2 LIMIT 1`,
+      [req.params.id, req.user.id],
+    );
+    const row = result.rows[0];
+    if (!row) return res.status(404).json({ success: false, error: "未找到上架记录" });
+    if (!row.store_id) return res.status(409).json({ success: false, error: "历史记录缺少店铺，无法安全重试" });
+    if (String(row.status) !== 'failed' && !row.partial_success) {
+      return res.status(409).json({ success: false, error: "任务仍在处理中，请先同步状态" });
+    }
+    const raw = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
+    let endpoint;
+    let payload;
+    if (raw.import_mode === "sku" && raw.ozon_item) {
+      endpoint = "/v1/product/import-by-sku";
+      payload = { items: [raw.ozon_item] };
+    } else if (raw.item) {
+      endpoint = "/v3/product/import";
+      payload = { items: [raw.item] };
+      if (Array.isArray(raw.stocks) && raw.stocks.length) payload.stocks = raw.stocks;
+    } else {
+      return res.status(409).json({ success: false, error: "该历史记录没有可重试的原始商品数据" });
+    }
+    const data = await callOzonSellerAPI(endpoint, payload, { storeId: row.store_id, userId: req.user.id });
+    const taskId = String(data?.result?.task_id || data?.task_id || "");
+    if (!taskId) return res.status(502).json({ success: false, error: "Ozon 未返回新的任务 ID", payload: data });
+    const retryPayload = { ...raw, retry_of: row.task_id, retried_at: new Date().toISOString() };
+    const inserted = await db.query(
+      `INSERT INTO app_listing_history (
+         user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, status, raw_payload
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,'processing',$8::jsonb)
+       ON CONFLICT (task_id) DO UPDATE SET updated_at = now()
+       RETURNING id, task_id, status`,
+      [req.user.id, row.store_id, taskId, row.offer_id, row.product_name, row.main_image, row.price_rub, JSON.stringify(retryPayload)],
+    );
+    res.json({ success: true, task: inserted.rows[0], data });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
 });
 

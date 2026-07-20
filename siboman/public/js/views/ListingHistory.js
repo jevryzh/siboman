@@ -17,6 +17,9 @@ window.ListingHistoryView = {
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 50 });
     const detailDialog = Vue.reactive({ visible: false, row: null });
     const syncingTaskId = Vue.ref('');
+    const retryingId = Vue.ref('');
+    const exporting = Vue.ref(false);
+    const lastRefreshAt = Vue.ref('');
     const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
 
     const filter = Vue.reactive({
@@ -44,6 +47,7 @@ window.ListingHistoryView = {
           items.value = r.data.items;
           total.value = r.data.total;
           stats.value = r.data.stats;
+          lastRefreshAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         }
       } catch (e) {
         console.error('[listing-history]', e);
@@ -119,6 +123,44 @@ window.ListingHistoryView = {
       finally { syncingTaskId.value = ''; }
     };
     const showDetail = (row) => { detailDialog.row = row; detailDialog.visible = true; };
+    const retryTask = async (row) => {
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `将使用任务 ${row.task_id} 保存的原始商品数据重新提交到店铺「${row.store_name || '-'}」。确认继续？`,
+          '重试失败的上架任务',
+          { type: 'warning', confirmButtonText: '确认重试', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      retryingId.value = row.id;
+      try {
+        const response = await axios.post(`/api/seller/listing-history/${row.id}/retry`);
+        window.ElementPlus.ElMessage.success(`已创建重试任务 ${response.data?.task?.task_id || ''}`);
+        detailDialog.visible = false;
+        await fetchList();
+      } catch (error) {
+        window.ElementPlus.ElMessage.error('重试失败：' + (error.response?.data?.error || error.message));
+      } finally { retryingId.value = ''; }
+    };
+    const exportHistory = async () => {
+      exporting.value = true;
+      try {
+        const response = await axios.post('/api/seller/listing-history/export', {
+          store_id: getStoreId(),
+          sku: filter.sku,
+          status: filter.status,
+          start_date: filter.start_date,
+          end_date: filter.end_date,
+        }, { responseType: 'blob' });
+        const url = URL.createObjectURL(response.data);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `listing-history-${new Date().toISOString().slice(0, 10)}.csv`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        window.ElementPlus.ElMessage.error('导出失败：' + (error.response?.data?.error || error.message));
+      } finally { exporting.value = false; }
+    };
     const onPageChange = () => fetchList();
     const onSizeChange = () => { pagination.currentPage = 1; fetchList(); };
 
@@ -147,10 +189,10 @@ window.ListingHistoryView = {
     Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return {
-      loading, items, total, stats, filter, selectedIds, pagination, detailDialog, syncingTaskId,
+      loading, items, total, stats, filter, selectedIds, pagination, detailDialog, syncingTaskId, retryingId, exporting, lastRefreshAt,
       fetchList, onQuery, onReset, deleteOne, batchDelete,
       statusBadge, displayStatus, fmtMoney, fmtDate, onSelectionChange,
-      syncTask, showDetail, onPageChange, onSizeChange,
+      syncTask, showDetail, retryTask, exportHistory, onPageChange, onSizeChange,
     };
   },
   template: `
@@ -206,6 +248,7 @@ window.ListingHistoryView = {
           </div>
           <div style="display:flex; gap:8px">
             <el-button v-if="selectedIds.length" type="danger" size="small" @click="batchDelete" icon="Delete">批量删除</el-button>
+            <el-button size="small" :loading="exporting" @click="exportHistory">导出 CSV</el-button>
             <el-button size="small" @click="fetchList" icon="Refresh" :loading="loading">刷新</el-button>
           </div>
         </div>
@@ -270,6 +313,7 @@ window.ListingHistoryView = {
                   <div v-for="(e, i) in row.errors_json" :key="i" style="padding:6px 0; border-bottom:1px dashed #eee">
                     <div v-if="e.code" style="color:#909399; font-family:monospace">{{ e.code }}</div>
                     <div>{{ e.message || e.description }}</div>
+                    <div v-if="e.message_zh" style="color:#e6a23c; margin-top:3px">{{ e.message_zh }}</div>
                   </div>
                 </div>
               </el-popover>
@@ -280,6 +324,7 @@ window.ListingHistoryView = {
             <template #default="{ row }">
               <el-button type="primary" link size="small" @click="showDetail(row)">详情</el-button>
               <el-button v-if="row.status === 'processing' || row.status === 'pending'" type="warning" link size="small" :loading="syncingTaskId === row.task_id" @click="syncTask(row)">同步</el-button>
+              <el-button v-if="row.status === 'failed' || row.partial_success" type="warning" link size="small" :loading="retryingId === row.id" @click="retryTask(row)">重试</el-button>
               <el-button type="danger" link size="small" @click="deleteOne(row)" icon="Delete">删除</el-button>
             </template>
           </el-table-column>
@@ -292,7 +337,7 @@ window.ListingHistoryView = {
         <!-- 提示 -->
         <div style="padding:12px 16px; font-size:11px; color:#909399; display:flex; align-items:center; gap:8px">
           <span style="display:inline-block; width:6px; height:6px; border-radius:50%; background:#10b981; animation:pulse 2s infinite"></span>
-          每 30s 自动刷新 + 后台每 60s 调 Ozon 同步真实状态 · task_id 在 "最后轮询" 列反映 polling 活性
+          每 30s 自动刷新 + 后台每 60s 调 Ozon 同步真实状态 · 最后刷新 {{ lastRefreshAt || '-' }}
         </div>
       </div>
 
@@ -307,9 +352,9 @@ window.ListingHistoryView = {
           </el-descriptions>
           <el-divider>Ozon 返回错误</el-divider>
           <el-empty v-if="!detailDialog.row.errors_json?.length" description="没有错误" :image-size="60" />
-          <el-alert v-for="(error, index) in (detailDialog.row.errors_json || [])" :key="index" type="error" :closable="false" style="margin-bottom:8px" :title="error.message || error.description || error.code || '未知错误'" :description="error.code ? '错误代码：' + error.code : ''" />
+          <el-alert v-for="(error, index) in (detailDialog.row.errors_json || [])" :key="index" type="error" :closable="false" style="margin-bottom:8px" :title="error.message || error.description || error.code || '未知错误'" :description="[error.code ? '错误代码：' + error.code : '', error.message_zh || ''].filter(Boolean).join(' · ')" />
         </template>
-        <template #footer><el-button @click="detailDialog.visible=false">关闭</el-button></template>
+        <template #footer><el-button @click="detailDialog.visible=false">关闭</el-button><el-button v-if="detailDialog.row && (detailDialog.row.status === 'failed' || detailDialog.row.partial_success)" type="warning" :loading="retryingId === detailDialog.row.id" @click="retryTask(detailDialog.row)">重试上架</el-button></template>
       </el-dialog>
     </div>
   `,

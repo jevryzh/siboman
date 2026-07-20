@@ -45,6 +45,13 @@ assert(orders.includes('source_url_1688'), 'orders must expose the product procu
 assert(listing.includes("params.set('store_id', getStoreId())"));
 assert(listing.includes('syncTask'));
 assert(listing.includes('pagination.currentPage'));
+assert(listing.includes('retryTask'));
+assert(listing.includes('exportHistory'));
+assert(listing.includes('message_zh'));
+assert(server.includes('req.body?.taskId || req.body?.task_id'));
+assert(server.includes('translateOzonListingError'));
+assert(server.includes('/api/seller/listing-history/:id/retry'));
+assert(server.includes('/api/seller/listing-history/export'));
 assert(server.includes("lh.task_id ILIKE"));
 assert(server.includes("interval '1 day'"));
 
