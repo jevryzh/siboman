@@ -10,7 +10,9 @@ window.AnalyticsCenterView = {
     const profitRows = Vue.ref([]);
     const financeSettings = Vue.ref({ exchange_rate: 0, exchange_rate_source: '' });
     const costAudit = Vue.ref([]);
-    const storeId = () => window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '';
+    const storeId = () => String(
+      window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '',
+    ).split(',').map(value => value.trim()).find(Boolean) || '';
     const money = value => `¥${Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     const errorText = error => error?.response?.data?.error || error?.message || '请求失败';
 

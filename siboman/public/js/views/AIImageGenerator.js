@@ -7,9 +7,11 @@ window.AIImageGeneratorView = {
     const analyzing = Vue.ref(false);
     const generating = Vue.ref(false);
     const uploading = Vue.ref(false);
+    const materialInput = Vue.ref(null);
     const publishing = Vue.ref(false);
     const resultImages = Vue.ref([]);
     const history = Vue.ref([]);
+    const historyLimit = Vue.ref(20);
     const historyStats = Vue.reactive({ total: 0, total_images: 0, total_cost_usd: 0 });
     const selectedResults = Vue.ref([]);
     const currentRecordId = Vue.ref('');
@@ -41,6 +43,26 @@ window.AIImageGeneratorView = {
       { id: 'moscow-street', name: '莫斯科街景', prompt: 'Premium product photography on a Moscow street, natural winter light, realistic commercial style' },
       { id: 'modern-home', name: '现代家居', prompt: 'Product placed in a bright modern home, natural daylight, realistic lifestyle ecommerce photography' },
       { id: 'detail-closeup', name: '细节特写', prompt: 'Macro close-up product photography, emphasize material, texture and craftsmanship, sharp focus' },
+      { id: 'kitchen', name: '俄式厨房', prompt: 'Product in a bright contemporary Russian kitchen, warm daylight, realistic everyday use' },
+      { id: 'living-room', name: '客厅场景', prompt: 'Product in a refined modern living room, natural scale, soft daylight, realistic lifestyle photo' },
+      { id: 'bedroom', name: '卧室场景', prompt: 'Product in a clean cozy bedroom, soft morning light, calm neutral styling' },
+      { id: 'bathroom', name: '卫浴场景', prompt: 'Product in a clean premium bathroom, realistic moisture resistant surfaces, bright soft light' },
+      { id: 'office', name: '办公桌面', prompt: 'Product on a tidy professional desk, practical work context, realistic soft window light' },
+      { id: 'outdoor', name: '户外使用', prompt: 'Product used outdoors in a believable natural setting, realistic scale and weather, crisp detail' },
+      { id: 'winter', name: '俄罗斯冬季', prompt: 'Product in an authentic Russian winter setting, clean snow, realistic cold daylight' },
+      { id: 'summer', name: '夏日清新', prompt: 'Product in a bright summer setting, fresh natural light, clean commercial lifestyle photo' },
+      { id: 'premium-dark', name: '高端深色棚拍', prompt: 'Premium dark studio product photography, controlled rim light, accurate materials, luxury composition' },
+      { id: 'pastel', name: '柔和马卡龙', prompt: 'Product on a soft pastel studio background, clean balanced composition, accurate product colors' },
+      { id: 'wood-table', name: '原木桌面', prompt: 'Product on a natural wood table, warm daylight, realistic home atmosphere, accurate texture' },
+      { id: 'marble', name: '大理石质感', prompt: 'Product on clean marble, elegant soft studio light, premium ecommerce styling' },
+      { id: 'size-guide', name: '尺寸展示底图', prompt: 'Product centered with generous clean space for later size annotations, orthographic ecommerce view' },
+      { id: 'feature-layout', name: '卖点展示底图', prompt: 'Product centered with clean negative space around it for later feature callouts, no generated text' },
+      { id: 'package', name: '包装组合', prompt: 'Product and its retail package arranged neatly, all included parts visible, accurate quantity and scale' },
+      { id: 'multi-angle', name: '多角度展示', prompt: 'Commercial product photography showing a clear alternate angle, preserve exact design and proportions' },
+      { id: 'hand-scale', name: '手持比例', prompt: 'Product naturally held in a human hand to demonstrate scale, realistic anatomy and product proportions' },
+      { id: 'family', name: '家庭使用', prompt: 'Product in a believable family home context, natural interaction, warm realistic daylight' },
+      { id: 'travel', name: '旅行场景', prompt: 'Product in a practical travel context, luggage and destination setting, realistic scale and use' },
+      { id: 'gift', name: '礼物氛围', prompt: 'Product presented as a tasteful gift, subtle ribbon and clean festive setting, product fully visible' },
     ];
 
     const estimatedCost = Vue.computed(() => (Number(form.count || 0) * 0.03).toFixed(2));
@@ -81,6 +103,36 @@ window.AIImageGeneratorView = {
           await uploadFile(blob);
         }
       }
+    };
+
+    const handleMaterialFiles = async (event) => {
+      const files = [...(event.target.files || [])].slice(0, Math.max(0, 8 - form.material_images.length));
+      event.target.value = '';
+      for (const file of files) await uploadFile(file);
+    };
+
+    const cropMaterial = async (index) => {
+      const source = form.material_images[index];
+      if (!source) return;
+      uploading.value = true;
+      try {
+        const image = new Image();
+        image.crossOrigin = 'anonymous';
+        await new Promise((resolve, reject) => { image.onload = resolve; image.onerror = reject; image.src = source; });
+        const side = Math.min(image.naturalWidth, image.naturalHeight);
+        const canvas = document.createElement('canvas');
+        canvas.width = 1200; canvas.height = 1200;
+        const context = canvas.getContext('2d');
+        context.drawImage(image, (image.naturalWidth - side) / 2, (image.naturalHeight - side) / 2, side, side, 0, 0, 1200, 1200);
+        const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+        if (!blob) throw new Error('裁剪失败');
+        const file = new File([blob], `crop-${Date.now()}.jpg`, { type: 'image/jpeg' });
+        const fd = new FormData(); fd.append('file', file);
+        const response = await axios.post('/api/upload', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+        form.material_images[index] = response.data.url;
+        notify.success('已居中裁剪为 1:1');
+      } catch (e) { notify.error('裁剪失败：' + (e.response?.data?.error || e.message)); }
+      finally { uploading.value = false; }
     };
 
     const removeMaterial = (i) => form.material_images.splice(i, 1);
@@ -128,7 +180,7 @@ window.AIImageGeneratorView = {
 
     const fetchHistory = async () => {
       try {
-        const r = await axios.get('/api/ai-images/history', { params: { store_id: getStoreId(), limit: 20 } });
+        const r = await axios.get('/api/ai-images/history', { params: { store_id: getStoreId(), limit: historyLimit.value } });
         history.value = r.data.items || [];
         Object.assign(historyStats, r.data.stats || {});
       } catch (e) { notify.error('历史记录加载失败：' + (e.response?.data?.error || e.message)); }
@@ -180,6 +232,20 @@ window.AIImageGeneratorView = {
         notify.success('历史记录已删除');
         fetchHistory();
       } catch (e) { notify.error('删除失败：' + (e.response?.data?.error || e.message)); }
+    };
+
+    const loadHistoryResult = (row) => {
+      const urls = Array.isArray(row.image_urls) ? row.image_urls.filter(Boolean) : [];
+      resultImages.value = urls.map((url) => ({ url, loading: false }));
+      selectedResults.value = urls.map((_url, index) => index);
+      currentRecordId.value = row.id;
+      form.offer_id = row.offer_id || form.offer_id;
+      notify.success(`已载入 ${urls.length} 张历史图片`);
+    };
+
+    const loadMoreHistory = async () => {
+      historyLimit.value = Math.min(200, historyLimit.value + 20);
+      await fetchHistory();
     };
 
     const showPreview = (url, i) => {
@@ -239,11 +305,11 @@ window.AIImageGeneratorView = {
     Vue.onMounted(fetchHistory);
 
     return {
-      form, analyzing, generating, uploading, publishing, resultImages, templates, finalPrompt, estimatedCost,
-      history, historyStats, selectedResults, currentRecordId,
+      form, analyzing, generating, uploading, publishing, materialInput, resultImages, templates, finalPrompt, estimatedCost,
+      history, historyStats, historyLimit, selectedResults, currentRecordId,
       previewVisible, previewUrl, previewIndex,
-      handlePaste, removeMaterial, analyzeSellingPoints, generateImages, showPreview, downloadImage,
-      fetchHistory, toggleResult, batchDownload, publishToOzon, deleteHistory,
+      handlePaste, handleMaterialFiles, cropMaterial, removeMaterial, analyzeSellingPoints, generateImages, showPreview, downloadImage,
+      fetchHistory, toggleResult, batchDownload, publishToOzon, deleteHistory, loadHistoryResult, loadMoreHistory,
     };
   },
   template: `
@@ -254,11 +320,14 @@ window.AIImageGeneratorView = {
           <el-form-item label="素材图 (支持 Ctrl+V 粘贴)">
             <div class="paste-upload-area" @paste="handlePaste" tabindex="0">
               <el-icon size="30"><Upload /></el-icon>
-              <div>点击后粘贴图片</div>
+              <div>点击后粘贴图片，或从电脑选择</div>
+              <el-button size="small" style="margin-top:8px" :loading="uploading" @click.stop="materialInput?.click()">选择图片</el-button>
+              <input ref="materialInput" type="file" accept="image/*" multiple style="display:none" @change="handleMaterialFiles" />
             </div>
             <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:8px">
               <div v-for="(u, i) in form.material_images" :key="i" style="position:relative">
                 <el-image :src="u" style="width:60px; height:60px; border-radius:4px" fit="cover" />
+                <el-button link size="small" title="居中裁剪为 1:1" @click="cropMaterial(i)" style="position:absolute;bottom:-3px;left:2px;background:#fff;padding:1px 3px">裁剪</el-button>
                 <el-icon @click="removeMaterial(i)" style="position:absolute; top:-5px; right:-5px; background:#f56c6c; color:#fff; border-radius:50%; cursor:pointer"><Close /></el-icon>
               </div>
             </div>
@@ -342,8 +411,9 @@ window.AIImageGeneratorView = {
           <el-table-column label="费用" width="90"><template #default="{ row }">USD {{ Number(row.estimated_cost_usd || 0).toFixed(2) }}</template></el-table-column>
           <el-table-column label="Ozon 推送" width="120"><template #default="{ row }"><el-tag size="small" :type="row.ozon_sync_status ? 'success' : 'info'">{{ row.ozon_sync_status ? ('已推送 ' + (row.offer_id || '')) : '未推送' }}</el-tag></template></el-table-column>
           <el-table-column label="时间" width="155"><template #default="{ row }">{{ String(row.created_at || '').slice(0, 19).replace('T', ' ') }}</template></el-table-column>
-          <el-table-column label="操作" width="75"><template #default="{ row }"><el-button link type="danger" @click="deleteHistory(row.id)">删除</el-button></template></el-table-column>
+          <el-table-column label="操作" width="120"><template #default="{ row }"><el-button link type="primary" @click="loadHistoryResult(row)">载入</el-button><el-button link type="danger" @click="deleteHistory(row.id)">删除</el-button></template></el-table-column>
         </el-table>
+        <div v-if="history.length < Number(historyStats.total || 0)" style="text-align:center;margin-top:10px"><el-button size="small" @click="loadMoreHistory">加载更多</el-button></div>
       </el-card>
 
       <el-dialog v-model="previewVisible" title="查看生成结果" width="500px">

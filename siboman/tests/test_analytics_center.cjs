@@ -13,6 +13,7 @@ assert.match(server, /totalReturns = storeData\.reduce\(\(s, x\) => s \+ \(x\._r
 assert.match(server, /async function validateOzonCredentials/);
 assert.match(server, /active = FALSE/);
 assert.match(server, /api_key = \$4, active = TRUE/);
+assert.match(server, /FROM app_products WHERE user_id = \$1 AND store_id = \$2 AND offer_id = ANY/);
 assert.match(view, /\/api\/seller\/dashboard/);
 assert.match(view, /\/api\/seller\/analytics\/categories/);
 assert.match(view, /\/api\/seller\/analytics\/bestsellers/);

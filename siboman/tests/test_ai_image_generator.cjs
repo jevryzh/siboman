@@ -30,5 +30,9 @@ assert(server.includes('生成图永久保存失败'));
 assert(server.includes('ozon_sync_status = TRUE'));
 assert(view.includes("publish_mode: 'append'"));
 assert(view.includes('追加到原图册'));
+assert(view.includes('cropMaterial'));
+assert(view.includes('loadHistoryResult'));
+assert(view.includes('loadMoreHistory'));
+assert(view.includes("id: 'gift'"), 'AI image templates should cover a complete ecommerce scene set');
 
 console.log('AI image generator structural checks passed.');

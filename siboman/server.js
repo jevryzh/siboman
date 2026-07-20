@@ -3477,8 +3477,8 @@ app.post("/api/seller/products/collect-competitor", requireAuth, async (req, res
       const r = await db.query(
         `SELECT offer_id, product_id, sku, name, image, images, price, currency_code, brand,
                 weight, depth, width, height, category_name, description_category_id, type_id, country_of_origin, description, vat
-         FROM app_products WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
-        [storeId, offerIds],
+         FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+        [userId, storeId, offerIds],
       );
       items.push(...r.rows);
     }
@@ -3488,8 +3488,8 @@ app.post("/api/seller/products/collect-competitor", requireAuth, async (req, res
       const r = await db.query(
         `SELECT offer_id, product_id, sku, name, image, images, price, currency_code, brand,
                 weight, depth, width, height, category_name, description_category_id, type_id, country_of_origin, description, vat
-         FROM app_products WHERE store_id = $1 AND sku = ANY($2::bigint[])`,
-        [storeId, skus],
+         FROM app_products WHERE user_id = $1 AND store_id = $2 AND sku = ANY($3::bigint[])`,
+        [userId, storeId, skus],
       );
       items.push(...r.rows);
     }
