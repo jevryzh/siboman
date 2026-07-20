@@ -618,6 +618,20 @@ window.ProductListView = {
             </el-col>
           </el-row>
 
+          <el-divider content-position="left">采购信息</el-divider>
+          <el-row :gutter="16">
+            <el-col :span="8">
+              <el-form-item label="采购价 (CNY)">
+                <el-input-number v-model="drawer.form.purchase_price_cny" :min="0" :precision="2" style="width:100%" />
+              </el-form-item>
+            </el-col>
+            <el-col :span="16">
+              <el-form-item label="1688 采购链接">
+                <el-input v-model="drawer.form.source_url_1688" clearable placeholder="https://detail.1688.com/offer/..." />
+              </el-form-item>
+            </el-col>
+          </el-row>
+
           <el-divider content-position="left">商品描述</el-divider>
           <el-form-item label="15. 详细描述 (Description)">
             <el-input v-model="drawer.form.description" type="textarea" :rows="8" placeholder="Ozon 详情页正文" />

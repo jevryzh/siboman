@@ -677,6 +677,7 @@ async function initDatabase() {
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS price_index TEXT DEFAULT '';
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS updated_at_ozon TIMESTAMPTZ;
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS stocks_json JSONB DEFAULT '[]'::jsonb;   -- v0.3.3 分仓库存原始数组
+      ALTER TABLE app_products ADD COLUMN IF NOT EXISTS source_url_1688 TEXT DEFAULT '';
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS description_category_id BIGINT;   -- v0.6.1 Ozon 类目 ID
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS type_id BIGINT;                    -- v0.6.1 Ozon 类目类型 ID
 
@@ -1289,8 +1290,10 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
          barcode = COALESCE($16, barcode),
          image = COALESCE($17, image),
          images = COALESCE($18::jsonb, images),
+         purchase_price_cny = COALESCE($19, purchase_price_cny),
+         source_url_1688 = COALESCE($20, source_url_1688),
          updated_at = now()
-       WHERE offer_id = $19 AND store_id = $20 AND user_id = $21`,
+       WHERE offer_id = $21 AND store_id = $22 AND user_id = $23`,
       [
         b.name ?? null, b.brand ?? null, b.description ?? null, b.country_of_origin ?? null,
         price || null, null,
@@ -1302,6 +1305,8 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
         b.currency_code ?? null, b.vat ?? null,
         b.category_name ?? null, b.barcode ?? null,
         b.image ?? null, Array.isArray(b.images) ? JSON.stringify(b.images) : null,
+        b.purchase_price_cny != null && Number.isFinite(Number(b.purchase_price_cny)) ? Math.max(0, Number(b.purchase_price_cny)) : null,
+        /^https?:\/\/(?:[^/]+\.)?1688\.com\//i.test(String(b.source_url_1688 || "")) ? String(b.source_url_1688).trim() : (b.source_url_1688 === "" ? "" : null),
         offer_id, store_id, userId,
       ]
     );
@@ -2878,7 +2883,7 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
               status, status_name, category_name, price_index,
               product_id, sku, model_id, barcode,
               weight, depth, width, height, dimension_unit, weight_unit,
-              stocks_json,
+              stocks_json, purchase_price_cny, source_url_1688,
               updated_at, updated_at_ozon
        FROM app_products
        WHERE ${where.join(" AND ")}
@@ -3469,11 +3474,16 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     const imageMap = new Map();
     if (allOfferIds.size && db) {
       const joinRows = await db.query(
-        `SELECT offer_id, image, name, purchase_price_cny FROM app_products
-         WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
-        [storeId, Array.from(allOfferIds)],
+        `SELECT offer_id, image, name, purchase_price_cny, source_url_1688 FROM app_products
+         WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+        [req.user.id, storeId, Array.from(allOfferIds)],
       );
-      for (const r of joinRows.rows) imageMap.set(r.offer_id, { image: r.image, name: r.name, purchase_price_cny: Number(r.purchase_price_cny || 0) });
+      for (const r of joinRows.rows) imageMap.set(r.offer_id, {
+        image: r.image,
+        name: r.name,
+        purchase_price_cny: Number(r.purchase_price_cny || 0),
+        source_url_1688: r.source_url_1688 || "",
+      });
     }
 
     // ---- 金额平铺 (v0.3.4 修正: 币种感知, 不再暴力 rubToCny) ----
@@ -3531,6 +3541,7 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
           purchase_cost_cny: Math.round(purchasePriceCny * qty * 100) / 100,
           profit_cny: purchasePriceCny > 0 ? Math.round((payoutCny * qty - purchasePriceCny * qty) * 100) / 100 : null,
           profit_is_estimated: purchasePriceCny <= 0,
+          source_url_1688: localMeta.source_url_1688 || "",
         };
       });
       const totalCny = products.reduce((s, x) => s + (x.subtotal_cny || 0), 0);
@@ -3586,8 +3597,9 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
     if (db && Array.isArray(p.products) && p.products.length) {
       const offerIds = p.products.map(x => x.offer_id).filter(Boolean);
       const r = await db.query(
-        `SELECT offer_id, image, name FROM app_products WHERE store_id=$1 AND offer_id = ANY($2::text[])`,
-        [storeId, offerIds],
+        `SELECT offer_id, image, name, purchase_price_cny, source_url_1688
+           FROM app_products WHERE user_id=$1 AND store_id=$2 AND offer_id = ANY($3::text[])`,
+        [req.user.id, storeId, offerIds],
       );
       const meta = new Map(r.rows.map(x => [x.offer_id, x]));
       p.products = p.products.map(pd => {
@@ -3600,6 +3612,8 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
           ...pd,
           image: localMeta.image || "",
           local_name: localMeta.name || pd.name,
+          purchase_price_cny: Number(localMeta.purchase_price_cny || 0),
+          source_url_1688: localMeta.source_url_1688 || "",
           currency_code: currency,
           price_native: priceNative,
           price_cny: Math.round(priceCny * 100) / 100,

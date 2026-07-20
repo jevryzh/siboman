@@ -35,6 +35,7 @@ assert(orders.includes('exportOrders'));
 assert(orders.includes('printLabels'));
 assert(orders.includes('saveNote'));
 assert(orders.includes("row.status !== 'cancelled'"));
+assert(orders.includes('source_url_1688'), 'orders must expose the product procurement link');
 
 assert(listing.includes("params.set('store_id', getStoreId())"));
 assert(listing.includes('syncTask'));

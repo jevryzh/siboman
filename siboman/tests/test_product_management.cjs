@@ -34,5 +34,7 @@ assert(!server.includes('/api/ai/refine-image'), 'legacy image passthrough stub 
 assert(productView.includes('保存并同步价格/图片'), 'product editor must describe its real sync scope');
 assert(server.includes('sync_results: syncResults'), 'product update must report each downstream sync result');
 assert(server.includes('价格同步失败：'), 'Ozon price errors must not be swallowed');
+assert(productView.includes('source_url_1688'), 'product editor must maintain the procurement URL');
+assert(server.includes('ADD COLUMN IF NOT EXISTS source_url_1688'), 'product schema must store procurement URLs');
 
 console.log('Product management structural checks passed.');

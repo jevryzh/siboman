@@ -312,6 +312,7 @@ window.OrderListView = {
                   <div style="font-size:12px; color:#409eff; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ p.name }}</div>
                   <div style="font-size:11px; color:#999">
                     <code>{{ p.offer_id }}</code> · x <b>{{ p.quantity }}</b>
+                    <a v-if="p.source_url_1688" :href="p.source_url_1688" target="_blank" rel="noopener noreferrer" style="margin-left:8px">1688 采购</a>
                   </div>
                 </div>
               </div>
@@ -414,6 +415,7 @@ window.OrderListView = {
                   <div style="font-size:11px; color:#999">
                     货号 <code>{{ row.offer_id }}</code> · SKU {{ row.sku }}
                   </div>
+                  <a v-if="row.source_url_1688" :href="row.source_url_1688" target="_blank" rel="noopener noreferrer" style="font-size:11px">1688 采购 · ¥{{ Number(row.purchase_price_cny || 0).toFixed(2) }}</a>
                 </template>
               </el-table-column>
               <el-table-column label="数量" prop="quantity" width="70" align="center" />
