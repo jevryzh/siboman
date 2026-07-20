@@ -146,12 +146,18 @@ window.ProductListView = {
       if (!drawer.form.image) return notify.warning('请先上传主图');
       aiImageLoading.value = true;
       try {
-        const res = await axios.post('/api/ai/refine-image', {
+        const res = await axios.post('/api/seller/images/generate', {
           store_id: getStoreId(),
           image: drawer.form.image,
-          instruction: '去除杂物、白底、增强清晰度',
+          prompt: '保持商品主体、颜色、结构和全部细节不变，去除画面杂物，替换为纯白背景，增强清晰度与真实质感，生成适合 Ozon 商品主图的专业电商摄影图。',
+          aspectRatio: '1:1',
+          n: 1,
+          scenePreset: '商品主图优化',
         });
-        if (res.data?.url) { drawer.form.image = res.data.url; notify.success('AI 已优化主图'); }
+        const generated = res.data?.data?.images?.[0];
+        if (!generated) throw new Error('AI 服务未返回图片');
+        drawer.form.image = generated;
+        notify.success('AI 已生成优化主图，保存商品后同步至 Ozon');
       } catch (e) { notify.error('AI 改图失败: ' + (e.response?.data?.error || e.message)); }
       finally { aiImageLoading.value = false; }
     };

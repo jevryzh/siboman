@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { Pool } from "pg";
+import dns from "node:dns/promises";
+import net from "node:net";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2065,36 +2067,78 @@ app.post("/api/ai/product-image-set/generate", requireAuth, async (req, res) => 
 /* ============================================================
    系统工具 - 下载代理 (解决 OSS 跨域下载拦截)
    ============================================================ */
-app.get("/api/utils/download-proxy", async (req, res) => {
+function isPrivateNetworkAddress(address) {
+  const normalized = String(address || "").toLowerCase().replace(/^::ffff:/, "");
+  if (net.isIPv4(normalized)) {
+    const [a, b] = normalized.split(".").map(Number);
+    return a === 10 || a === 127 || a === 0 || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
+  }
+  if (net.isIPv6(normalized)) {
+    return normalized === "::1" || normalized === "::" || normalized.startsWith("fc")
+      || normalized.startsWith("fd") || /^fe[89ab]/.test(normalized);
+  }
+  return true;
+}
+
+async function assertSafeExternalUrl(rawUrl) {
+  let parsed;
+  try { parsed = new URL(String(rawUrl || "")); } catch { throw new Error("下载地址无效"); }
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("仅支持 HTTP/HTTPS 下载地址");
+  if (["localhost", "localhost.localdomain"].includes(parsed.hostname.toLowerCase())) throw new Error("不允许访问本机地址");
+  const addresses = await dns.lookup(parsed.hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => isPrivateNetworkAddress(address))) {
+    throw new Error("不允许访问内网地址");
+  }
+  return parsed;
+}
+
+async function fetchSafeExternalFile(rawUrl, maxRedirects = 3) {
+  let target = await assertSafeExternalUrl(rawUrl);
+  for (let redirect = 0; redirect <= maxRedirects; redirect += 1) {
+    const response = await fetch(target, { redirect: "manual", signal: AbortSignal.timeout(30000) });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location || redirect === maxRedirects) throw new Error("下载重定向次数过多");
+      target = await assertSafeExternalUrl(new URL(location, target).toString());
+      continue;
+    }
+    return response;
+  }
+  throw new Error("下载失败");
+}
+
+app.get("/api/utils/download-proxy", requireAuth, async (req, res) => {
   try {
     const { url, filename } = req.query;
     if (!url) return res.status(400).send("Missing URL");
 
-    // 物理获取外部流
-    const response = await fetch(url);
+    const response = await fetchSafeExternalFile(url);
     if (!response.ok) throw new Error(`Failed to fetch original image: ${response.status}`);
 
-    const buffer = await response.arrayBuffer();
-    const safeFilename = filename || `ai_image_${Date.now()}.jpg`;
+    const maxBytes = 25 * 1024 * 1024;
+    const declaredSize = Number(response.headers.get("content-length") || 0);
+    if (declaredSize > maxBytes) throw new Error("文件超过 25MB 限制");
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of response.body) {
+      total += chunk.length;
+      if (total > maxBytes) throw new Error("文件超过 25MB 限制");
+      chunks.push(chunk);
+    }
+    const buffer = Buffer.concat(chunks);
+    const safeFilename = String(filename || `ai_image_${Date.now()}.jpg`)
+      .replace(/[\r\n"\\/]/g, "_")
+      .slice(0, 180);
 
     res.setHeader("Content-Type", response.headers.get("content-type") || "image/jpeg");
-    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(safeFilename)}"`);
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.send(Buffer.from(buffer));
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(safeFilename)}`);
+    res.send(buffer);
   } catch (error) {
     console.error("[download-proxy] 失败:", error.message);
     res.status(500).send(error.message);
   }
 });
-app.post("/api/ai/product-image-set/generate_OLD_MOCK", requireAuth, async (req, res, next) => {
-  try {
-    const { originalImage, sellingPoints } = req.body;
-    const storeId = req.body?.store_id || req.body?.storeId;
-    // 模拟流式生成结果
-    res.json({ success: true, images: Array(8).fill(originalImage) });
-  } catch (e) { next(e); }
-});
-
 app.patch("/api/products/:offer_id/field", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -2841,19 +2885,6 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
-});
-
-/**
- * v0.3.4 AI 改图 - 输入 image URL, 生成一张优化后的图 (调 image_edit 服务或本地 placeholder)
- */
-app.post("/api/ai/refine-image", requireAuth, async (req, res) => {
-  try {
-    const { image, instruction } = req.body || {};
-    if (!image) return res.status(400).json({ success: false, error: "缺少 image" });
-    // 若接入了外部 AI 服务, 在此调用; 当前 stub: 原图直接返回
-    // TODO: 接入内部 image_edit 生成服务
-    res.json({ success: true, url: image, note: "AI 改图接口就绪 (当前为直通模式, 待接入 image_edit 后台)" });
-  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
 });
 
 /**
@@ -4041,6 +4072,64 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/seller/images/publish-to-ozon", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const offerId = String(req.body?.offer_id || "").trim();
+    const inputImages = Array.isArray(req.body?.images) ? req.body.images : [];
+    if (!storeId || !offerId) return res.status(400).json({ success: false, error: "缺少店铺或商品货号" });
+    if (!inputImages.length || inputImages.length > 15) {
+      return res.status(400).json({ success: false, error: "请选择 1-15 张图片" });
+    }
+
+    const productResult = await db.query(
+      `SELECT offer_id, product_id, image, images
+         FROM app_products
+        WHERE user_id = $1 AND store_id = $2 AND offer_id = $3
+        LIMIT 1`,
+      [userId, storeId, offerId],
+    );
+    const product = productResult.rows[0];
+    if (!product) return res.status(404).json({ success: false, error: "当前店铺未找到该货号，请先同步商品" });
+
+    const publicBaseUrl = getRequestPublicBaseUrl(req);
+    const images = normalizeImportImageList(inputImages.map((value) => {
+      const image = String(value || "").trim();
+      if (/^\/uploads\//i.test(image)) return publicBaseUrl ? `${publicBaseUrl}${image}` : image;
+      return image;
+    })).filter((image) => /^https:\/\//i.test(image));
+    if (!images.length) return res.status(400).json({ success: false, error: "图片必须是可供 Ozon 下载的 HTTPS 地址" });
+
+    let productId = Number(product.product_id || 0);
+    if (!productId) {
+      const info = await callOzonSellerAPI(
+        "/v3/product/info/list",
+        { offer_id: [offerId] },
+        { storeId, userId },
+      );
+      productId = Number((info?.items || [])[0]?.id || 0);
+    }
+    if (!productId) return res.status(409).json({ success: false, error: "Ozon 商品尚未生成 product_id，请稍后同步后重试" });
+
+    const data = await callOzonSellerAPI(
+      "/v1/product/pictures/import",
+      { product_id: productId, images },
+      { storeId, userId },
+    );
+    await db.query(
+      `UPDATE app_products
+          SET product_id = $1, image = $2, images = $3::jsonb, updated_at = now()
+        WHERE user_id = $4 AND store_id = $5 AND offer_id = $6`,
+      [productId, images[0], JSON.stringify(images), userId, storeId, offerId],
+    );
+    res.json({ success: true, product_id: productId, offer_id: offerId, images, count: images.length, data });
+  } catch (error) {
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
 });
 

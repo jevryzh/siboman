@@ -29,5 +29,7 @@ assert(productView.includes("'/api/seller/products/archive'"));
 assert(productView.includes('copyOfferId'));
 assert(productView.includes('exportCsv'));
 assert(productView.includes("'\\ufeff'"), 'CSV export must include a UTF-8 BOM');
+assert(productView.includes("'/api/seller/images/generate'"), 'AI image refinement must use the real generator');
+assert(!server.includes('/api/ai/refine-image'), 'legacy image passthrough stub must be removed');
 
 console.log('Product management structural checks passed.');

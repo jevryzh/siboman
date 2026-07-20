@@ -5,6 +5,7 @@ window.AIImageGeneratorView = {
     const analyzing = Vue.ref(false);
     const generating = Vue.ref(false);
     const uploading = Vue.ref(false);
+    const publishing = Vue.ref(false);
     const resultImages = Vue.ref([]);
     const history = Vue.ref([]);
     const historyStats = Vue.reactive({ total: 0, total_images: 0, total_cost_usd: 0 });
@@ -28,6 +29,7 @@ window.AIImageGeneratorView = {
       aspect_ratio: '1:1',
       custom_prompt: '',
       subject_reference: true,
+      offer_id: '',
     });
 
     const templates = [
@@ -139,6 +141,31 @@ window.AIImageGeneratorView = {
       for (const index of indexes) await downloadImage(resultImages.value[index]?.url, index);
     };
 
+    const publishToOzon = async () => {
+      const indexes = [...selectedResults.value].sort((a, b) => a - b);
+      const images = indexes.map((index) => resultImages.value[index]?.url).filter(Boolean);
+      if (!form.offer_id.trim()) return notify.warning('请填写当前店铺中的商品货号');
+      if (!images.length) return notify.warning('请先选择要推送的图片');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `确定将 ${images.length} 张图片覆盖到货号 ${form.offer_id.trim()} 的 Ozon 图册？`,
+          '推送图片至 Ozon',
+          { confirmButtonText: '确认推送', cancelButtonText: '取消', type: 'warning' },
+        );
+      } catch { return; }
+      publishing.value = true;
+      try {
+        const response = await axios.post('/api/seller/images/publish-to-ozon', {
+          store_id: getStoreId(),
+          offer_id: form.offer_id.trim(),
+          images,
+        }, { timeout: 120000 });
+        notify.success(`已向 Ozon 提交 ${response.data?.count || images.length} 张图片`);
+      } catch (e) {
+        notify.error('推送失败：' + (e.response?.data?.error || e.message));
+      } finally { publishing.value = false; }
+    };
+
     const deleteHistory = async (id) => {
       try {
         await axios.delete(`/api/ai-images/${id}`);
@@ -194,6 +221,7 @@ window.AIImageGeneratorView = {
       form.material_images = [];
       form.title_zh = '';
       form.title_ru = '';
+      form.offer_id = '';
       selectedResults.value = [];
       fetchHistory();
     };
@@ -202,11 +230,11 @@ window.AIImageGeneratorView = {
     Vue.onMounted(fetchHistory);
 
     return {
-      form, analyzing, generating, uploading, resultImages, templates, finalPrompt, estimatedCost,
+      form, analyzing, generating, uploading, publishing, resultImages, templates, finalPrompt, estimatedCost,
       history, historyStats, selectedResults,
       previewVisible, previewUrl, previewIndex,
       handlePaste, removeMaterial, analyzeSellingPoints, generateImages, showPreview, downloadImage,
-      fetchHistory, toggleResult, batchDownload, deleteHistory,
+      fetchHistory, toggleResult, batchDownload, publishToOzon, deleteHistory,
     };
   },
   template: `
@@ -233,6 +261,9 @@ window.AIImageGeneratorView = {
             </div>
           </el-form-item>
           <el-form-item label="中文标题"><el-input v-model="form.title_zh" /></el-form-item>
+          <el-form-item label="Ozon 商品货号">
+            <el-input v-model="form.offer_id" clearable placeholder="推送图片时必填" />
+          </el-form-item>
           <el-form-item label="卖点关键词">
             <el-button type="warning" size="small" :loading="analyzing" @click="analyzeSellingPoints" style="width:100%; margin-bottom:8px">✨ AI 自动分析</el-button>
             <el-input v-model="form.selling_points" type="textarea" :rows="5" />
@@ -275,7 +306,10 @@ window.AIImageGeneratorView = {
         <template #header>
           <div style="display:flex; justify-content:space-between; align-items:center">
             <strong>3. 生成结果</strong>
-            <el-button size="small" :disabled="!selectedResults.length" @click="batchDownload">批量下载 ({{ selectedResults.length }})</el-button>
+            <div style="display:flex; gap:8px">
+              <el-button size="small" :disabled="!selectedResults.length" @click="batchDownload">批量下载 ({{ selectedResults.length }})</el-button>
+              <el-button size="small" type="success" :loading="publishing" :disabled="!selectedResults.length || !form.offer_id.trim()" @click="publishToOzon">推送到 Ozon</el-button>
+            </div>
           </div>
         </template>
         <div v-if="!resultImages.length && !generating"><el-empty /></div>
