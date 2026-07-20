@@ -2734,11 +2734,15 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         const currency = String(pd.currency_code || fd.currency_code || "RUB").toUpperCase();
         const priceNative = Number(pd.price || fd.price || 0);
         const payoutNative = Number(fd.payout || 0);
+        const platformPrice = Number(fd.price || fd.customer_price || 0);
         const qty = Number(pd.quantity || fd.quantity || 1);
         const priceCny = currency === "CNY" ? priceNative
                        : currency === "RUB" ? convertRub(priceNative)
                        : priceNative;
-        const payoutPerItemCny = currency === "CNY" ? payoutNative
+        // 跨境店铺 pd.price 是 CNY，而 financial_data 往往仍是 RUB。
+        // 用同一商品的两套价格推导订单内结算比例，不能把 RUB payout 当 CNY。
+        const settlementRate = currency === "CNY" && platformPrice > 0 ? priceNative / platformPrice : null;
+        const payoutPerItemCny = currency === "CNY" ? (settlementRate ? payoutNative * settlementRate : priceNative)
                                : currency === "RUB" ? convertRub(payoutNative)
                                : payoutNative;
         gmvCny += priceCny * qty;
@@ -2831,7 +2835,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
             const fd = (o.financial_data?.products || []).find(x => String(x.product_id) === String(pd.sku)) || {};
             const currency = String(pd.currency_code || fd.currency_code || "RUB").toUpperCase();
             const payoutNative = Number(fd.payout || 0);
-            weeklyMatchedPayout += (currency === "CNY" ? payoutNative : convertRub(payoutNative)) * qty;
+            const platformPrice = Number(fd.price || fd.customer_price || 0);
+            const settlementPrice = Number(pd.price || 0);
+            const settlementRate = currency === "CNY" && platformPrice > 0 ? settlementPrice / platformPrice : null;
+            weeklyMatchedPayout += (currency === "CNY" ? (settlementRate ? payoutNative * settlementRate : settlementPrice) : convertRub(payoutNative)) * qty;
             matchedCount++;
           } else {
             unmatchedCount++;
@@ -3725,9 +3732,11 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         const customerRub = Number(fd.customer_price || 0);  // 买家实付卢布
         const commissionNative = Number(fd.commission_amount || 0);
         const payoutNative = Number(fd.payout || 0);
+        const platformPrice = Number(fd.price || fd.customer_price || 0);
         const localMeta = imageMap.get(pd.offer_id) || {};
-        const payoutCny = currency === "CNY" ? payoutNative : convertRub(payoutNative);
-        const commissionCny = currency === "CNY" ? commissionNative : convertRub(commissionNative);
+        const settlementRate = currency === "CNY" && platformPrice > 0 ? priceNative / platformPrice : null;
+        const payoutCny = currency === "CNY" ? (settlementRate ? payoutNative * settlementRate : priceNative) : convertRub(payoutNative);
+        const commissionCny = currency === "CNY" ? (settlementRate ? commissionNative * settlementRate : 0) : convertRub(commissionNative);
         const purchasePriceCny = Number(localMeta.purchase_price_cny || 0);
         return {
           offer_id: pd.offer_id,
