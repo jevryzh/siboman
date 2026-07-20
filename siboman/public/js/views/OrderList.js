@@ -26,7 +26,10 @@ window.OrderListView = {
     const shipDialog = Vue.reactive({ visible: false, loading: false, posting_number: '', products: [] });
 
     // 动态取店铺 ID
-    const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
+    const getStoreId = () => {
+      const raw = window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || '');
+      return String(raw || '').split(',').map(value => value.trim()).find(Boolean) || '';
+    };
 
     const notify = {
       success: (m) => (window.ElementPlus?.ElMessage || console).success?.(m),

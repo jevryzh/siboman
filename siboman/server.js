@@ -762,9 +762,20 @@ async function initDatabase() {
         store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
         posting_number TEXT NOT NULL,
         packages JSONB NOT NULL DEFAULT '[]'::jsonb,
+        status TEXT NOT NULL DEFAULT 'processing',
+        error TEXT NOT NULL DEFAULT '',
+        ozon_response JSONB NOT NULL DEFAULT '{}'::jsonb,
+        completed_at TIMESTAMPTZ,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE(store_id, posting_number)
       );
+
+      ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'processing';
+      ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS ozon_response JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+      ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
       CREATE TABLE IF NOT EXISTS app_top_lists (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -3853,6 +3864,7 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
  * v0.3.3 订单发货 - Ozon posting/fbs/ship 单发货 (支持整单发货, 需前端传 packages)
  */
 app.post("/api/seller/orders/ship", requireAuth, async (req, res) => {
+  let claimedEventId = null;
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     const posting_number = String(req.body?.posting_number || "").trim();
@@ -3860,54 +3872,117 @@ app.post("/api/seller/orders/ship", requireAuth, async (req, res) => {
     if (!storeId || !posting_number) return res.status(400).json({ success: false, error: "缺少 store_id / posting_number" });
     if (!Array.isArray(packages) || !packages.length) return res.status(400).json({ success: false, error: "缺少发货包裹信息" });
 
-    const data = await callOzonSellerAPI("/v3/posting/fbs/ship", {
-      posting_number,
-      packages,
-      with: { additional_data: true },
-    }, { storeId, userId: req.user.id });
+    if (!db) return res.status(503).json({ success: false, error: "数据库不可用，无法安全执行发货" });
 
-    let inventoryAdjusted = false;
-    if (db) {
-      const client = await db.connect();
-      try {
-        await client.query('BEGIN');
-        const event = await client.query(
-          `INSERT INTO app_order_ship_events (user_id, store_id, posting_number, packages)
-           VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (store_id, posting_number) DO NOTHING RETURNING id`,
-          [req.user.id, storeId, posting_number, JSON.stringify(packages)],
+    let claim = await db.query(
+      `INSERT INTO app_order_ship_events (user_id, store_id, posting_number, packages, status)
+       VALUES ($1,$2,$3,$4::jsonb,'processing')
+       ON CONFLICT (store_id, posting_number) DO NOTHING
+       RETURNING id, status, packages, ozon_response, completed_at, updated_at`,
+      [req.user.id, storeId, posting_number, JSON.stringify(packages)],
+    );
+    const inserted = claim.rowCount > 0;
+    let ownsClaim = inserted;
+    if (!inserted) {
+      claim = await db.query(
+        `UPDATE app_order_ship_events
+            SET packages=$1::jsonb, status='processing', error='', updated_at=now()
+          WHERE user_id=$2 AND store_id=$3 AND posting_number=$4 AND status='failed'
+          RETURNING id, status, packages, ozon_response, completed_at, updated_at`,
+        [JSON.stringify(packages), req.user.id, storeId, posting_number],
+      );
+      ownsClaim = claim.rowCount > 0;
+      if (!claim.rowCount) {
+        claim = await db.query(
+          `SELECT id, status, packages, ozon_response, completed_at, updated_at
+             FROM app_order_ship_events WHERE user_id=$1 AND store_id=$2 AND posting_number=$3`,
+          [req.user.id, storeId, posting_number],
         );
-        if (event.rowCount) {
-          const shipped = new Map();
-          for (const pack of packages) for (const product of (pack.products || [])) {
-            const sku = String(product.product_id || '');
-            shipped.set(sku, (shipped.get(sku) || 0) + Math.max(0, Number(product.quantity || 0)));
-          }
-          for (const [sku, quantity] of shipped) {
-            const found = await client.query(`SELECT id, stock, stocks_json FROM app_products WHERE store_id=$1 AND (sku::text=$2 OR product_id::text=$2) FOR UPDATE`, [storeId, sku]);
-            for (const product of found.rows) {
-              let remaining = quantity;
-              const stocks = Array.isArray(product.stocks_json) ? product.stocks_json.map(row => ({ ...row })) : [];
-              for (const stock of stocks) {
-                if (remaining <= 0) break;
-                const present = Math.max(0, Number(stock.present || 0));
-                const deducted = Math.min(present, remaining);
-                stock.present = present - deducted;
-                remaining -= deducted;
-              }
-              const total = stocks.length ? stocks.reduce((sum, row) => sum + Math.max(0, Number(row.present || 0)), 0) : Math.max(0, Number(product.stock || 0) - quantity);
-              await client.query(`UPDATE app_products SET stock=$1, stocks_json=$2::jsonb, updated_at=now() WHERE id=$3`, [total, JSON.stringify(stocks), product.id]);
-            }
-          }
-          inventoryAdjusted = true;
-        }
-        await client.query('COMMIT');
-      } catch (error) { await client.query('ROLLBACK'); console.error('[Orders.ship] local inventory adjustment failed:', error.message); }
-      finally { client.release(); }
+      }
+    }
+    const event = claim.rows[0];
+    claimedEventId = event.id;
+    if (event.status === "completed") {
+      return res.status(409).json({ success: false, code: "ORDER_ALREADY_SHIPPED", error: "该订单已提交发货，请刷新订单状态", completed_at: event.completed_at });
+    }
+    if (!ownsClaim && event.status === "processing") {
+      return res.status(409).json({ success: false, code: "ORDER_SHIP_IN_PROGRESS", error: "该订单正在处理，请勿重复提交" });
     }
 
-    res.json({ success: true, data, inventoryAdjusted });
+    let data = event.ozon_response && Object.keys(event.ozon_response).length ? event.ozon_response : null;
+    if (!data) {
+      const latest = await callOzonSellerAPI("/v3/posting/fbs/get", {
+        posting_number,
+        with: { analytics_data: false, financial_data: false },
+      }, { storeId, userId: req.user.id });
+      const currentStatus = String(latest?.result?.status || "").toLowerCase();
+      if (currentStatus === "cancelled") {
+        await db.query(`UPDATE app_order_ship_events SET status='failed', error=$1, updated_at=now() WHERE id=$2`, ["订单已取消", event.id]);
+        return res.status(409).json({ success: false, code: "ORDER_CANCELLED", error: "订单已被取消，已阻止发货" });
+      }
+      if (!["awaiting_packaging", "awaiting_deliver"].includes(currentStatus)) {
+        await db.query(`UPDATE app_order_ship_events SET status='failed', error=$1, updated_at=now() WHERE id=$2`, [`订单当前状态 ${currentStatus || '未知'} 不允许发货`, event.id]);
+        return res.status(409).json({ success: false, code: "ORDER_STATUS_CHANGED", error: `订单状态已变为 ${currentStatus || "未知"}，请刷新后重试` });
+      }
+      data = await callOzonSellerAPI("/v3/posting/fbs/ship", {
+        posting_number,
+        packages,
+        with: { additional_data: true },
+      }, { storeId, userId: req.user.id });
+      await db.query(
+        `UPDATE app_order_ship_events SET status='ozon_succeeded', ozon_response=$1::jsonb, error='', updated_at=now() WHERE id=$2`,
+        [JSON.stringify(data || {}), event.id],
+      );
+    }
+
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      const locked = await client.query(`SELECT status, packages FROM app_order_ship_events WHERE id=$1 FOR UPDATE`, [event.id]);
+      if (locked.rows[0]?.status !== "completed") {
+        const shipped = new Map();
+        for (const pack of (locked.rows[0]?.packages || packages)) for (const product of (pack.products || [])) {
+          const sku = String(product.product_id || "");
+          shipped.set(sku, (shipped.get(sku) || 0) + Math.max(0, Number(product.quantity || 0)));
+        }
+        for (const [sku, quantity] of shipped) {
+          const found = await client.query(
+            `SELECT id, stock, stocks_json FROM app_products
+              WHERE user_id=$1 AND store_id=$2 AND (sku::text=$3 OR product_id::text=$3) FOR UPDATE`,
+            [req.user.id, storeId, sku],
+          );
+          for (const product of found.rows) {
+            let remaining = quantity;
+            const stocks = Array.isArray(product.stocks_json) ? product.stocks_json.map(row => ({ ...row })) : [];
+            for (const stock of stocks) {
+              if (remaining <= 0) break;
+              const present = Math.max(0, Number(stock.present || 0));
+              const deducted = Math.min(present, remaining);
+              stock.present = present - deducted;
+              remaining -= deducted;
+            }
+            const total = stocks.length ? stocks.reduce((sum, row) => sum + Math.max(0, Number(row.present || 0)), 0) : Math.max(0, Number(product.stock || 0) - quantity);
+            await client.query(`UPDATE app_products SET stock=$1, stocks_json=$2::jsonb, updated_at=now() WHERE id=$3 AND user_id=$4`, [total, JSON.stringify(stocks), product.id, req.user.id]);
+          }
+        }
+        await client.query(`UPDATE app_order_ship_events SET status='completed', completed_at=now(), updated_at=now() WHERE id=$1`, [event.id]);
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      console.error("[Orders.ship] local inventory adjustment failed:", error.message);
+      return res.status(500).json({ success: false, code: "LOCAL_RECONCILIATION_REQUIRED", error: "Ozon 已接收发货，但本地库存更新失败；再次提交只会补本地库存，不会重复发货" });
+    } finally { client.release(); }
+
+    res.json({ success: true, data, inventoryAdjusted: true });
   } catch (error) {
     console.error("[Orders.ship]", error.message, error.payload);
+    if (claimedEventId && db) {
+      await db.query(
+        `UPDATE app_order_ship_events SET status=CASE WHEN status='ozon_succeeded' THEN status ELSE 'failed' END, error=$1, updated_at=now() WHERE id=$2`,
+        [String(error.payload?.message || error.message || "发货失败").slice(0, 1000), claimedEventId],
+      ).catch(() => {});
+    }
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
 });
@@ -6237,6 +6312,7 @@ app.post("/api/seller/orders/:postingNumber/note", requireAuth, async (req, res,
 });
 
 app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
@@ -6247,7 +6323,9 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       to: req.body?.to || new Date().toISOString(),
     };
     if (status) filter.status = status;
-    const data = await callOzonSellerAPI("/v3/posting/fbs/list", { filter, limit }, { storeId, userId: req.user.id });
+    const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
+      filter, limit, with: { financial_data: true, analytics_data: true },
+    }, { storeId, userId: req.user.id });
     const postings = data?.result?.postings || [];
 
     // 本地备注补充
@@ -6263,25 +6341,54 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       }
     }
 
-    // 简单 CSV 输出（用 xlsx 太重，导出到 Excel 用户可以直接粘贴）
-    const header = ["货件号", "状态", "创建时间", "配送方式", "仓库", "商品", "SKU", "数量", "总价", "本地备注"];
+    const offerIds = [...new Set(postings.flatMap((posting) => (posting.products || []).map((product) => product.offer_id).filter(Boolean)))];
+    const productMeta = new Map();
+    if (offerIds.length) {
+      const metaRows = await db.query(
+        `SELECT offer_id, purchase_price_cny, source_url_1688 FROM app_products
+          WHERE user_id=$1 AND store_id=$2 AND offer_id=ANY($3::text[])`,
+        [req.user.id, storeId, offerIds],
+      );
+      for (const row of metaRows.rows) productMeta.set(row.offer_id, row);
+    }
+
+    // 订单级履约 CSV，保留 Ozon 原始金额与本地采购信息，便于财务复核。
+    const header = ["货件号", "订单号", "状态", "创建时间", "发货截止", "实际发货时间", "配送方式", "仓库", "买家城市", "收货地址", "商品", "货号", "SKU", "数量", "结算币种", "商品金额", "平台佣金", "平台到手", "采购成本(CNY)", "1688货源", "本地备注"];
     const rows = [header];
     for (const p of postings) {
       const prods = p.products || [];
       const summary = prods.map((x) => x.name).slice(0, 3).join(" / ");
       const skus = prods.map((x) => x.sku || x.offer_id).join(",");
+      const offers = prods.map((x) => x.offer_id).filter(Boolean);
       const qty = prods.reduce((a, x) => a + (x.quantity || 0), 0);
       const dm = p.delivery_method || {};
+      const financialProducts = p.financial_data?.products || [];
+      const nativeAmount = prods.reduce((sum, product) => sum + Number(product.price || 0) * Number(product.quantity || 1), 0);
+      const commission = financialProducts.reduce((sum, product) => sum + Number(product.commission_amount || 0) * Number(product.quantity || 1), 0);
+      const payout = financialProducts.reduce((sum, product) => sum + Number(product.payout || 0) * Number(product.quantity || 1), 0);
+      const purchaseCost = prods.reduce((sum, product) => sum + Number(productMeta.get(product.offer_id)?.purchase_price_cny || 0) * Number(product.quantity || 1), 0);
+      const address = p.customer?.address || p.addressee || p.address || {};
       rows.push([
-        p.posting_number || p.order_number || "",
+        p.posting_number || "",
+        p.order_number || "",
         p.status || "",
         p.in_process_at || p.created_at || "",
+        p.shipment_date || "",
+        p.delivering_date || p.shipped_at || "",
         dm.name || "",
         p.warehouse || dm.warehouse || (dm.warehouse_id ? `#${dm.warehouse_id}` : ""),
+        address.city || p.customer?.address?.city || "",
+        address.address_tail || address.address || address.comment || "",
         summary,
+        offers.join(","),
         skus,
         qty,
-        p.financial_data?.total_price || "",
+        prods[0]?.currency_code || financialProducts[0]?.currency_code || "",
+        nativeAmount,
+        commission,
+        payout,
+        purchaseCost,
+        offers.map((offerId) => productMeta.get(offerId)?.source_url_1688 || "").filter(Boolean).join(" | "),
         notesMap[p.posting_number] || "",
       ]);
     }
