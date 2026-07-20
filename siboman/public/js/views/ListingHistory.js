@@ -20,7 +20,10 @@ window.ListingHistoryView = {
     const retryingId = Vue.ref('');
     const exporting = Vue.ref(false);
     const lastRefreshAt = Vue.ref('');
-    const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
+    const getStoreId = () => {
+      const raw = window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || '');
+      return String(raw || '').split(',').map(value => value.trim()).find(Boolean) || '';
+    };
 
     const filter = Vue.reactive({
       sku: '',
