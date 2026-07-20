@@ -147,6 +147,7 @@ const initApp = () => {
         if (path.includes('ai-generator')) return 'ai-generator';
         if (path.includes('analytics')) return 'analytics';
         if (path.includes('data-screen')) return 'data-screen';
+        if (path.includes('market-discovery')) return 'market-discovery';
         if (path.includes('stores')) return 'stores';
         return 'dashboard';
       });
@@ -197,6 +198,9 @@ const initApp = () => {
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
             </el-menu-item>
+            <el-menu-item index="#/market-discovery" @click="goTo('#/market-discovery')">
+              <el-icon><Histogram /></el-icon><span>市场榜单</span>
+            </el-menu-item>
             <el-menu-item index="#/stores" @click="goTo('#/stores')">
               <el-icon><Setting /></el-icon><span>店铺管理</span>
             </el-menu-item>
@@ -229,6 +233,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'ai-generator'"><ai-image-generator-view /></div>
             <div v-else-if="routeName === 'analytics'"><analytics-center-view /></div>
             <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
+            <div v-else-if="routeName === 'market-discovery'"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
           </el-main>
         </el-container>
@@ -262,6 +267,7 @@ const initApp = () => {
   register('ai-image-generator-view', window.AIImageGeneratorView);
   register('analytics-center-view', window.AnalyticsCenterView);
   register('data-screen-view', window.DataScreenView);
+  register('market-discovery-view', window.MarketDiscoveryView);
   register('store-management-view', window.StoreManagementView);
 
   app.mount('#app');

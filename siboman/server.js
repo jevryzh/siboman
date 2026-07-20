@@ -734,6 +734,49 @@ async function initDatabase() {
         UNIQUE(store_id, posting_number)
       );
 
+      CREATE TABLE IF NOT EXISTS app_top_lists (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        sku TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL DEFAULT '',
+        main_image TEXT NOT NULL DEFAULT '',
+        price_rub NUMERIC(14,2),
+        monthly_sales INTEGER NOT NULL DEFAULT 0,
+        review_count INTEGER NOT NULL DEFAULT 0,
+        seller_count INTEGER,
+        category_id TEXT NOT NULL DEFAULT '',
+        category_name TEXT NOT NULL DEFAULT '',
+        strategy_type TEXT NOT NULL DEFAULT 'hot',
+        ozon_url TEXT NOT NULL DEFAULT '',
+        seller_name TEXT NOT NULL DEFAULT '',
+        origin_country TEXT NOT NULL DEFAULT '',
+        delivery_text TEXT NOT NULL DEFAULT '',
+        is_china_origin BOOLEAN NOT NULL DEFAULT FALSE,
+        china_confidence NUMERIC(5,4) NOT NULL DEFAULT 0,
+        china_evidence TEXT NOT NULL DEFAULT '',
+        source_name TEXT NOT NULL DEFAULT '',
+        source_url TEXT NOT NULL DEFAULT '',
+        source_captured_at TIMESTAMPTZ,
+        source_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS app_china_sellers (
+        seller_name TEXT PRIMARY KEY,
+        identified_method TEXT NOT NULL DEFAULT 'manual',
+        is_confirmed BOOLEAN NOT NULL DEFAULT FALSE,
+        reliability_score NUMERIC(5,4) NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        updated_by UUID REFERENCES app_users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_top_lists_strategy ON app_top_lists(active, strategy_type, monthly_sales DESC);
+      CREATE INDEX IF NOT EXISTS idx_top_lists_category ON app_top_lists(category_id, monthly_sales DESC);
+      CREATE INDEX IF NOT EXISTS idx_top_lists_china ON app_top_lists(is_china_origin, china_confidence DESC, monthly_sales DESC);
+
       CREATE TABLE IF NOT EXISTS app_stock_drafts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -2196,6 +2239,131 @@ app.post("/api/seller/analytics/bestsellers", requireAuth, async (req, res, next
     }, { storeId, userId: req.user.id });
     res.json({ success: true, data });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
+function classifyChinaMarketItem(item = {}) {
+  const country = String(item.origin_country || item.originCountry || '').trim();
+  const delivery = String(item.delivery_text || item.deliveryText || '').trim();
+  const seller = String(item.seller_name || item.sellerName || '').trim();
+  if (/^(CN|CHN|China|中国|Китай)$/i.test(country)) return { isChina: true, confidence: 1, evidence: `原产国:${country}` };
+  if (/\b(China|Китай|КНР|中国)\b/i.test(delivery)) return { isChina: true, confidence: 0.9, evidence: `配送信息:${delivery.slice(0, 160)}` };
+  if (/(Shenzhen|Guangzhou|Yiwu|Dongguan|Hangzhou|Ningbo|Quanzhou|Xiamen|Co\.?\s*,?\s*Ltd|Trading|Technology)/i.test(seller)) {
+    return { isChina: false, confidence: 0.65, evidence: `卖家名称特征:${seller}` };
+  }
+  return { isChina: false, confidence: 0, evidence: '' };
+}
+
+app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const strategy = String(req.query.strategy || 'hot').trim();
+    const category = String(req.query.category || '').trim();
+    const search = String(req.query.search || '').trim();
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const args = [];
+    const where = ['active=TRUE'];
+    if (strategy && strategy !== 'all') { args.push(strategy); where.push(`strategy_type=$${args.length}`); }
+    if (category) { args.push(category); where.push(`(category_id=$${args.length} OR category_name ILIKE '%' || $${args.length} || '%')`); }
+    if (search) { args.push(search); where.push(`(sku ILIKE '%' || $${args.length} || '%' OR title ILIKE '%' || $${args.length} || '%' OR seller_name ILIKE '%' || $${args.length} || '%')`); }
+    const count = await db.query(`SELECT COUNT(*)::int AS total FROM app_top_lists WHERE ${where.join(' AND ')}`, args);
+    const rows = await db.query(
+      `SELECT id, sku, title, main_image, price_rub, monthly_sales, review_count, seller_count,
+              category_id, category_name, strategy_type, ozon_url, seller_name, origin_country,
+              source_name, source_url, source_captured_at, updated_at
+         FROM app_top_lists WHERE ${where.join(' AND ')}
+        ORDER BY monthly_sales DESC, review_count DESC, updated_at DESC
+        LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+      [...args, limit, offset],
+    );
+    const freshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_top_lists WHERE active=TRUE`);
+    res.json({ success: true, items: rows.rows, total: count.rows[0]?.total || 0, freshness: freshness.rows[0] || {}, source_policy: 'independent_verified_import' });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/bestsellers/import", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ success: false, error: '仅管理员可导入公共榜单' });
+    const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 5000) : [];
+    const defaultSource = String(req.body?.source_name || '').trim();
+    const defaultCapturedAt = req.body?.source_captured_at;
+    if (!items.length) return res.status(400).json({ success: false, error: 'items 不能为空' });
+    const imported = [];
+    const errors = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const item = items[index] || {};
+      const sku = String(item.sku || item.product_id || '').trim();
+      const sourceName = String(item.source_name || defaultSource || '').trim();
+      const capturedAt = new Date(item.source_captured_at || defaultCapturedAt || '');
+      if (!sku || !/^\d{6,}$/.test(sku)) { errors.push({ row: index + 1, sku, error: 'SKU 无效' }); continue; }
+      if (!sourceName || Number.isNaN(capturedAt.getTime())) { errors.push({ row: index + 1, sku, error: '缺少有效 source_name/source_captured_at' }); continue; }
+      const classification = classifyChinaMarketItem(item);
+      const strategy = ['hot', 'new', 'potential', 'blue_ocean'].includes(String(item.strategy_type || item.strategy || 'hot')) ? String(item.strategy_type || item.strategy || 'hot') : 'hot';
+      const result = await db.query(
+        `INSERT INTO app_top_lists (sku,title,main_image,price_rub,monthly_sales,review_count,seller_count,category_id,category_name,strategy_type,ozon_url,seller_name,origin_country,delivery_text,is_china_origin,china_confidence,china_evidence,source_name,source_url,source_captured_at,source_payload)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb)
+         ON CONFLICT (sku) DO UPDATE SET title=EXCLUDED.title, main_image=EXCLUDED.main_image, price_rub=EXCLUDED.price_rub,
+           monthly_sales=EXCLUDED.monthly_sales, review_count=EXCLUDED.review_count, seller_count=EXCLUDED.seller_count,
+           category_id=EXCLUDED.category_id, category_name=EXCLUDED.category_name, strategy_type=EXCLUDED.strategy_type,
+           ozon_url=EXCLUDED.ozon_url, seller_name=EXCLUDED.seller_name, origin_country=EXCLUDED.origin_country,
+           delivery_text=EXCLUDED.delivery_text, is_china_origin=EXCLUDED.is_china_origin, china_confidence=EXCLUDED.china_confidence,
+           china_evidence=EXCLUDED.china_evidence, source_name=EXCLUDED.source_name, source_url=EXCLUDED.source_url,
+           source_captured_at=EXCLUDED.source_captured_at, source_payload=EXCLUDED.source_payload, active=TRUE, updated_at=now()
+         RETURNING id, sku`,
+        [sku, String(item.title || item.name || ''), String(item.main_image || item.image || ''), Number(item.price_rub || item.price || 0) || null,
+         Math.max(0, Math.floor(Number(item.monthly_sales || item.sales || 0))), Math.max(0, Math.floor(Number(item.review_count || item.reviews || 0))),
+         Number.isFinite(Number(item.seller_count || item.sellers)) ? Math.max(0, Math.floor(Number(item.seller_count || item.sellers))) : null,
+         String(item.category_id || ''), String(item.category_name || item.category || ''), strategy,
+         String(item.ozon_url || `https://www.ozon.ru/product/${sku}/`), String(item.seller_name || item.seller || ''),
+         String(item.origin_country || ''), String(item.delivery_text || ''), classification.isChina, classification.confidence, classification.evidence,
+         sourceName, String(item.source_url || ''), capturedAt.toISOString(), JSON.stringify(item)],
+      );
+      imported.push(result.rows[0]);
+    }
+    res.status(errors.length && imported.length ? 207 : errors.length ? 400 : 200).json({ success: errors.length === 0, imported: imported.length, failed: errors.length, errors });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/sourcing/china-zone", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const minSales = Math.max(0, Number(req.query.min_sales || 1));
+    const search = String(req.query.search || '').trim();
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const args = [minSales];
+    const where = [`t.active=TRUE`, `t.monthly_sales >= $1`, `(t.is_china_origin=TRUE OR COALESCE(s.is_confirmed,FALSE)=TRUE)`];
+    if (search) { args.push(search); where.push(`(t.sku ILIKE '%'||$${args.length}||'%' OR t.title ILIKE '%'||$${args.length}||'%' OR t.seller_name ILIKE '%'||$${args.length}||'%')`); }
+    const count = await db.query(`SELECT COUNT(*)::int AS total FROM app_top_lists t LEFT JOIN app_china_sellers s ON s.seller_name=t.seller_name WHERE ${where.join(' AND ')}`, args);
+    const rows = await db.query(
+      `SELECT t.id,t.sku,t.title,t.main_image,t.price_rub,t.monthly_sales,t.review_count,t.category_name,t.ozon_url,
+              t.seller_name,t.origin_country,t.china_confidence,t.china_evidence,t.source_name,t.source_captured_at,
+              COALESCE(s.is_confirmed,FALSE) AS seller_confirmed, COALESCE(s.reliability_score,t.china_confidence) AS reliability_score
+         FROM app_top_lists t LEFT JOIN app_china_sellers s ON s.seller_name=t.seller_name
+        WHERE ${where.join(' AND ')} ORDER BY t.monthly_sales DESC,t.review_count DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+      [...args, limit, offset],
+    );
+    res.json({ success: true, items: rows.rows, total: count.rows[0]?.total || 0 });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/china-zone/verify", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ success: false, error: '仅管理员可纠偏中国卖家' });
+    const sellerName = String(req.body?.seller_name || '').trim();
+    if (!sellerName) return res.status(400).json({ success: false, error: 'seller_name 必填' });
+    const confirmed = req.body?.is_confirmed === true;
+    const score = confirmed ? Math.min(1, Math.max(0.8, Number(req.body?.reliability_score || 1))) : 0;
+    const result = await db.query(
+      `INSERT INTO app_china_sellers (seller_name,identified_method,is_confirmed,reliability_score,note,updated_by)
+       VALUES ($1,'manual',$2,$3,$4,$5) ON CONFLICT (seller_name) DO UPDATE SET is_confirmed=EXCLUDED.is_confirmed,
+       reliability_score=EXCLUDED.reliability_score,note=EXCLUDED.note,updated_by=EXCLUDED.updated_by,updated_at=now() RETURNING *`,
+      [sellerName, confirmed, score, String(req.body?.note || '').slice(0, 500), req.user.id],
+    );
+    res.json({ success: true, seller: result.rows[0] });
+  } catch (error) { next(error); }
 });
 
 /**
