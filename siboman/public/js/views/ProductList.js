@@ -74,6 +74,10 @@ window.ProductListView = {
     const editProduct = (row) => {
       drawer.itemId = row.offer_id;
       drawer.form = JSON.parse(JSON.stringify(row));
+      for (const key of ['price', 'old_price', 'min_price', 'purchase_price_cny', 'weight', 'width', 'depth', 'height']) {
+        const value = drawer.form[key];
+        drawer.form[key] = value === null || value === undefined || value === '' ? null : Number(value);
+      }
       if (!Array.isArray(drawer.form.images)) {
         try { drawer.form.images = JSON.parse(drawer.form.images || '[]'); } catch { drawer.form.images = []; }
       }

@@ -36,5 +36,6 @@ assert(server.includes('sync_results: syncResults'), 'product update must report
 assert(server.includes('价格同步失败：'), 'Ozon price errors must not be swallowed');
 assert(productView.includes('source_url_1688'), 'product editor must maintain the procurement URL');
 assert(server.includes('ADD COLUMN IF NOT EXISTS source_url_1688'), 'product schema must store procurement URLs');
+assert(productView.includes("'purchase_price_cny', 'weight'"), 'numeric database values must be normalized for number inputs');
 
 console.log('Product management structural checks passed.');
