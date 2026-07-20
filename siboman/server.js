@@ -684,6 +684,35 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_app_products_store ON app_products(store_id, status);
       CREATE INDEX IF NOT EXISTS idx_app_products_updated ON app_products(updated_at DESC);
 
+      CREATE TABLE IF NOT EXISTS app_exchange_rates (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        base_currency TEXT NOT NULL DEFAULT 'RUB',
+        quote_currency TEXT NOT NULL DEFAULT 'CNY',
+        rate NUMERIC(12,6) NOT NULL,
+        source TEXT NOT NULL DEFAULT 'manual',
+        effective_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_by UUID REFERENCES app_users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_exchange_rates_pair_effective
+        ON app_exchange_rates(base_currency, quote_currency, effective_at DESC);
+
+      CREATE TABLE IF NOT EXISTS app_product_cost_audit (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        product_id UUID REFERENCES app_products(id) ON DELETE SET NULL,
+        offer_id TEXT NOT NULL,
+        field_name TEXT NOT NULL DEFAULT 'purchase_price_cny',
+        old_value NUMERIC(12,2),
+        new_value NUMERIC(12,2),
+        reason TEXT NOT NULL DEFAULT '',
+        changed_by UUID REFERENCES app_users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_product_cost_audit_user_store_created
+        ON app_product_cost_audit(user_id, store_id, created_at DESC);
+
 
     `);
 
@@ -2536,6 +2565,102 @@ app.post("/api/sourcing/china-zone/verify", requireAuth, async (req, res, next) 
   } catch (error) { next(error); }
 });
 
+app.get("/api/finance/settings", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const rateResult = await db.query(
+      `SELECT rate, source, effective_at
+         FROM app_exchange_rates
+        WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
+        ORDER BY effective_at DESC LIMIT 1`,
+    );
+    const latest = rateResult.rows[0] || null;
+    res.json({
+      success: true,
+      exchange_rate: latest ? Number(latest.rate) : RUB_CNY_RATE,
+      exchange_rate_source: latest?.source || "environment",
+      exchange_rate_effective_at: latest?.effective_at || null,
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/finance/exchange-rate", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ success: false, error: "仅管理员可维护汇率" });
+    const rate = Number(req.body?.rate);
+    if (!Number.isFinite(rate) || rate <= 0 || rate > 1) {
+      return res.status(400).json({ success: false, error: "请输入有效的 RUB/CNY 汇率" });
+    }
+    const result = await db.query(
+      `INSERT INTO app_exchange_rates (rate, source, effective_at, created_by)
+       VALUES ($1, 'manual', now(), $2) RETURNING rate, source, effective_at`,
+      [rate, req.user.id],
+    );
+    res.json({ success: true, exchange_rate: Number(result.rows[0].rate), effective_at: result.rows[0].effective_at });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/finance/cost-audit", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query.store_id || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const result = await db.query(
+      `SELECT a.id, a.offer_id, a.old_value, a.new_value, a.reason, a.created_at,
+              COALESCE(u.display_name, u.username, '') AS changed_by_name
+         FROM app_product_cost_audit a
+         LEFT JOIN app_users u ON u.id = a.changed_by
+        WHERE a.user_id = $1 AND a.store_id = $2
+        ORDER BY a.created_at DESC LIMIT 100`,
+      [req.user.id, storeId],
+    );
+    res.json({ success: true, items: result.rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/finance/product-cost", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  const client = await db.connect();
+  try {
+    const storeId = String(req.body?.store_id || "").trim();
+    const offerId = String(req.body?.offer_id || "").trim();
+    const value = Number(req.body?.purchase_price_cny);
+    const reason = String(req.body?.reason || "经营分析补录").trim().slice(0, 300);
+    if (!storeId || !offerId) return res.status(400).json({ success: false, error: "店铺和货号必填" });
+    if (!Number.isFinite(value) || value < 0 || value > 1000000) {
+      return res.status(400).json({ success: false, error: "请输入有效采购成本" });
+    }
+    await client.query("BEGIN");
+    const current = await client.query(
+      `SELECT id, purchase_price_cny FROM app_products
+        WHERE user_id = $1 AND store_id = $2 AND offer_id = $3 FOR UPDATE`,
+      [req.user.id, storeId, offerId],
+    );
+    if (!current.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "商品不存在，请先同步商品列表" });
+    }
+    const oldValue = current.rows[0].purchase_price_cny == null ? null : Number(current.rows[0].purchase_price_cny);
+    await client.query(
+      `UPDATE app_products SET purchase_price_cny = $1, updated_at = now()
+        WHERE id = $2 AND user_id = $3`,
+      [value, current.rows[0].id, req.user.id],
+    );
+    await client.query(
+      `INSERT INTO app_product_cost_audit
+        (user_id, store_id, product_id, offer_id, old_value, new_value, reason, changed_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$1)`,
+      [req.user.id, storeId, current.rows[0].id, offerId, oldValue, value, reason],
+    );
+    await client.query("COMMIT");
+    res.json({ success: true, offer_id: offerId, old_value: oldValue, new_value: value });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(error);
+  } finally { client.release(); }
+});
+
 /**
  * v0.5.0 仪表盘经营统计 - 对标 MyERP
  * 数据源:
@@ -2548,6 +2673,13 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const userId = req.user.id;
+    const rateResult = await db.query(
+      `SELECT rate FROM app_exchange_rates
+        WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
+        ORDER BY effective_at DESC LIMIT 1`,
+    );
+    const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
+    const convertRub = value => Math.round(Number(value || 0) * effectiveRubCnyRate * 100) / 100;
     const range = Math.min(30, Math.max(7, Number(req.query.range) || 7));
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -2604,10 +2736,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         const payoutNative = Number(fd.payout || 0);
         const qty = Number(pd.quantity || fd.quantity || 1);
         const priceCny = currency === "CNY" ? priceNative
-                       : currency === "RUB" ? rubToCny(priceNative)
+                       : currency === "RUB" ? convertRub(priceNative)
                        : priceNative;
         const payoutPerItemCny = currency === "CNY" ? payoutNative
-                               : currency === "RUB" ? rubToCny(payoutNative)
+                               : currency === "RUB" ? convertRub(payoutNative)
                                : payoutNative;
         gmvCny += priceCny * qty;
         payoutCny += payoutPerItemCny * qty;   // payout 是单品到手, 需 ×qty
@@ -2685,6 +2817,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       // 查采购价 → 计算真实利润
       const priceMap = await fetchPurchasePrices(Array.from(weekOfferIds), store.id);
       let weeklyPurchaseCost = 0;
+      let weeklyMatchedPayout = 0;
       let matchedCount = 0;
       let unmatchedCount = 0;
       for (const o of weekOrders) {
@@ -2695,6 +2828,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
           const purchasePrice = priceMap.get(oid);
           if (purchasePrice && purchasePrice > 0) {
             weeklyPurchaseCost += purchasePrice * qty;
+            const fd = (o.financial_data?.products || []).find(x => String(x.product_id) === String(pd.sku)) || {};
+            const currency = String(pd.currency_code || fd.currency_code || "RUB").toUpperCase();
+            const payoutNative = Number(fd.payout || 0);
+            weeklyMatchedPayout += (currency === "CNY" ? payoutNative : convertRub(payoutNative)) * qty;
             matchedCount++;
           } else {
             unmatchedCount++;
@@ -2702,21 +2839,11 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         }
       }
 
-      // 利润 = Payout - 采购成本
-      // 若采购价缺失, 回退: Payout × 0.2
-      // 若 Payout 也为 0 (未结算/取消订单), 回退: GMV × 0.2
-      let weeklyProfit;
-      let profitMethod;
-      if (matchedCount > 0 && weeklyPurchaseCost > 0 && weeklyPayout > 0) {
-        weeklyProfit = weeklyPayout - weeklyPurchaseCost;
-        profitMethod = `payout(¥${weeklyPayout.toFixed(2)}) - purchase(¥${weeklyPurchaseCost.toFixed(2)}) [${matchedCount} matched, ${unmatchedCount} fallback]`;
-      } else if (weeklyPayout > 0) {
-        weeklyProfit = weeklyPayout * 0.2;
-        profitMethod = `payout(¥${weeklyPayout.toFixed(2)}) × 20% fallback (no purchase_price_cny)`;
-      } else {
-        weeklyProfit = weeklyGmv * 0.2;
-        profitMethod = `gmv(¥${weeklyGmv.toFixed(2)}) × 20% fallback (payout=0, no purchase_price_cny)`;
-      }
+      // 只核算采购成本完整的商品，缺失成本的商品不再用固定比例猜测利润。
+      const weeklyProfit = weeklyMatchedPayout - weeklyPurchaseCost;
+      const profitMethod = matchedCount
+        ? `已核算 ${matchedCount} 行：到手 ¥${weeklyMatchedPayout.toFixed(2)} - 采购 ¥${weeklyPurchaseCost.toFixed(2)}；${unmatchedCount} 行待补成本`
+        : `${unmatchedCount} 行待补采购成本，尚无可核算利润`;
 
       const todayReturns = returns.filter(o => {
         const d = new Date(o.in_process_at || o.created_at || 0);
@@ -2807,6 +2934,8 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         weekly_profit: Math.round(weeklyProfit * 100) / 100,
         weekly_orders: weekOrders.length,
         weekly_purchase_cost: Math.round(weeklyPurchaseCost * 100) / 100,
+        profit_complete: unmatchedCount === 0,
+        cost_missing_count: unmatchedCount,
         profit_method: profitMethod,
         stock_warning: parseInt(pr.stock_warning || 0),
         total_products: parseInt(pr.total_products || 0),
@@ -3511,6 +3640,13 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const rateResult = db ? await db.query(
+      `SELECT rate FROM app_exchange_rates
+        WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
+        ORDER BY effective_at DESC LIMIT 1`,
+    ) : { rows: [] };
+    const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
+    const convertRub = value => Math.round(Number(value || 0) * effectiveRubCnyRate * 100) / 100;
 
     const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 50)));
     const offset = Math.max(0, Number(req.body?.offset || 0));
@@ -3581,17 +3717,17 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         const qty = Number(pd.quantity || fd.quantity || 1);
         // 币种感知换算到 CNY, CNY 直读, 严禁 rubToCny
         const priceCny = currency === "CNY" ? priceNative
-                       : currency === "RUB" ? rubToCny(priceNative)
+                       : currency === "RUB" ? convertRub(priceNative)
                        : priceNative;
         const priceRub = currency === "RUB" ? priceNative
-                       : currency === "CNY" ? (priceNative / RUB_CNY_RATE)  // 反算 RUB 供展示参考
+                       : currency === "CNY" ? (priceNative / effectiveRubCnyRate)  // 反算 RUB 供展示参考
                        : 0;
         const customerRub = Number(fd.customer_price || 0);  // 买家实付卢布
         const commissionNative = Number(fd.commission_amount || 0);
         const payoutNative = Number(fd.payout || 0);
         const localMeta = imageMap.get(pd.offer_id) || {};
-        const payoutCny = currency === "CNY" ? payoutNative : rubToCny(payoutNative);
-        const commissionCny = currency === "CNY" ? commissionNative : rubToCny(commissionNative);
+        const payoutCny = currency === "CNY" ? payoutNative : convertRub(payoutNative);
+        const commissionCny = currency === "CNY" ? commissionNative : convertRub(commissionNative);
         const purchasePriceCny = Number(localMeta.purchase_price_cny || 0);
         return {
           offer_id: pd.offer_id,
