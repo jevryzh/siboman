@@ -1,7 +1,9 @@
 // v0.3.5 AI 套图 - 粘贴上传 & 交互优化 & 修复下载
 window.AIImageGeneratorView = {
   setup() {
-    const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
+    const getStoreId = () => String(
+      window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''),
+    ).split(',').map((value) => value.trim()).find(Boolean) || '';
     const analyzing = Vue.ref(false);
     const generating = Vue.ref(false);
     const uploading = Vue.ref(false);
@@ -10,6 +12,7 @@ window.AIImageGeneratorView = {
     const history = Vue.ref([]);
     const historyStats = Vue.reactive({ total: 0, total_images: 0, total_cost_usd: 0 });
     const selectedResults = Vue.ref([]);
+    const currentRecordId = Vue.ref('');
     
     // 预览弹窗状态
     const previewVisible = Vue.ref(false);
@@ -30,6 +33,7 @@ window.AIImageGeneratorView = {
       custom_prompt: '',
       subject_reference: true,
       offer_id: '',
+      publish_mode: 'append',
     });
 
     const templates = [
@@ -113,6 +117,7 @@ window.AIImageGeneratorView = {
         const urls = (r.data?.data?.images || []).filter(Boolean);
         resultImages.value = urls.map(u => ({ url: typeof u === 'string' ? u : u.url, loading: false }));
         selectedResults.value = urls.map((_u, index) => index);
+        currentRecordId.value = r.data?.data?.recordId || '';
         notify.success(`已生成 ${urls.length} 张，预估费用 $${r.data?.usage?.estimatedCostUsd ?? estimatedCost.value}`);
         await fetchHistory();
       } catch (e) {
@@ -148,7 +153,7 @@ window.AIImageGeneratorView = {
       if (!images.length) return notify.warning('请先选择要推送的图片');
       try {
         await window.ElementPlus.ElMessageBox.confirm(
-          `确定将 ${images.length} 张图片覆盖到货号 ${form.offer_id.trim()} 的 Ozon 图册？`,
+          `确定将 ${images.length} 张图片${form.publish_mode === 'replace' ? '替换为' : '追加到'}货号 ${form.offer_id.trim()} 的 Ozon 图册？`,
           '推送图片至 Ozon',
           { confirmButtonText: '确认推送', cancelButtonText: '取消', type: 'warning' },
         );
@@ -159,8 +164,11 @@ window.AIImageGeneratorView = {
           store_id: getStoreId(),
           offer_id: form.offer_id.trim(),
           images,
+          mode: form.publish_mode,
+          record_id: currentRecordId.value,
         }, { timeout: 120000 });
-        notify.success(`已向 Ozon 提交 ${response.data?.count || images.length} 张图片`);
+        notify.success(`已向 Ozon 提交图册，共 ${response.data?.count || images.length} 张`);
+        await fetchHistory();
       } catch (e) {
         notify.error('推送失败：' + (e.response?.data?.error || e.message));
       } finally { publishing.value = false; }
@@ -223,6 +231,7 @@ window.AIImageGeneratorView = {
       form.title_ru = '';
       form.offer_id = '';
       selectedResults.value = [];
+      currentRecordId.value = '';
       fetchHistory();
     };
     window.addEventListener('shop-changed', onShopChanged);
@@ -231,7 +240,7 @@ window.AIImageGeneratorView = {
 
     return {
       form, analyzing, generating, uploading, publishing, resultImages, templates, finalPrompt, estimatedCost,
-      history, historyStats, selectedResults,
+      history, historyStats, selectedResults, currentRecordId,
       previewVisible, previewUrl, previewIndex,
       handlePaste, removeMaterial, analyzeSellingPoints, generateImages, showPreview, downloadImage,
       fetchHistory, toggleResult, batchDownload, publishToOzon, deleteHistory,
@@ -257,6 +266,9 @@ window.AIImageGeneratorView = {
           <el-form-item label="中文标题"><el-input v-model="form.title_zh" /></el-form-item>
           <el-form-item label="Ozon 商品货号">
             <el-input v-model="form.offer_id" clearable placeholder="推送图片时必填" />
+          </el-form-item>
+          <el-form-item label="推送方式">
+            <el-segmented v-model="form.publish_mode" :options="[{label:'追加到原图册',value:'append'},{label:'替换原图册',value:'replace'}]" />
           </el-form-item>
           <el-form-item label="卖点关键词">
             <el-button type="warning" size="small" :loading="analyzing" @click="analyzeSellingPoints" style="width:100%; margin-bottom:8px">✨ AI 自动分析</el-button>
@@ -328,6 +340,7 @@ window.AIImageGeneratorView = {
           </el-table-column>
           <el-table-column label="张数" prop="n" width="65" />
           <el-table-column label="费用" width="90"><template #default="{ row }">USD {{ Number(row.estimated_cost_usd || 0).toFixed(2) }}</template></el-table-column>
+          <el-table-column label="Ozon 推送" width="120"><template #default="{ row }"><el-tag size="small" :type="row.ozon_sync_status ? 'success' : 'info'">{{ row.ozon_sync_status ? ('已推送 ' + (row.offer_id || '')) : '未推送' }}</el-tag></template></el-table-column>
           <el-table-column label="时间" width="155"><template #default="{ row }">{{ String(row.created_at || '').slice(0, 19).replace('T', ' ') }}</template></el-table-column>
           <el-table-column label="操作" width="75"><template #default="{ row }"><el-button link type="danger" @click="deleteHistory(row.id)">删除</el-button></template></el-table-column>
         </el-table>

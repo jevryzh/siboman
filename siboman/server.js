@@ -109,6 +109,7 @@ function formatCny(rub) {
 
 const app = express();
 const jobs = new Map();
+const aiImageActiveByUser = new Map();
 const db = DATABASE_URL ? new Pool({ connectionString: DATABASE_URL }) : null;
 let browserContext = null;
 let browserOpening = null;
@@ -962,6 +963,9 @@ async function initDatabase() {
       ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
       ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(10,4) NOT NULL DEFAULT 0;
       ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS scene_preset TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS offer_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS ozon_sync_status BOOLEAN NOT NULL DEFAULT FALSE;
+      ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS ozon_synced_at TIMESTAMPTZ;
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS raw_payload JSONB;
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS errors_json JSONB;
@@ -4634,6 +4638,12 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res, next) => {
 });
 
 app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
+  const userKey = String(req.user.id);
+  const activeCount = Number(aiImageActiveByUser.get(userKey) || 0);
+  if (activeCount >= 2) {
+    return res.status(429).json({ success: false, error: "同时最多生成 2 个套图任务，请等待当前任务完成" });
+  }
+  aiImageActiveByUser.set(userKey, activeCount + 1);
   try {
     const apiKey = process.env.MINIMAX_API_KEY;
     if (!apiKey) {
@@ -4641,6 +4651,11 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
       return;
     }
     const { prompt, image: refImage, aspectRatio = "3:4", n = 1, model: reqModel, scenePreset = "" } = req.body || {};
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    if (storeId && db) {
+      const store = await db.query("SELECT id FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE", [storeId, req.user.id]);
+      if (!store.rowCount) return res.status(404).json({ success: false, error: "店铺不存在、已停用或无权限" });
+    }
     if (!prompt) {
       res.status(400).json({ success: false, error: "需要 prompt 字段" });
       return;
@@ -4657,10 +4672,15 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
     // MiniMax image-01 i2i: subject_reference 锁定主体
     // type: "character" = 锁定人物 | "object" = 锁定物体/商品
     // 格式: [{ type: "object", image_file: "url_or_base64" }]
-    if (Array.isArray(refImage) && refImage.length && refImage[0]) {
-      body.subject_reference = [{ type: "object", image_file: String(refImage[0]) }];
-    } else if (typeof refImage === "string" && refImage) {
-      body.subject_reference = [{ type: "object", image_file: refImage }];
+    const rawReference = Array.isArray(refImage) ? refImage[0] : refImage;
+    if (rawReference) {
+      const reference = String(rawReference).trim();
+      const publicBaseUrl = getRequestPublicBaseUrl(req);
+      const accessibleReference = /^\/uploads\//i.test(reference) && publicBaseUrl ? `${publicBaseUrl}${reference}` : reference;
+      if (!/^https:\/\//i.test(accessibleReference) && !/^data:image\//i.test(accessibleReference)) {
+        return res.status(400).json({ success: false, error: "参考图必须是公网 HTTPS 图片或 Base64 图片" });
+      }
+      body.subject_reference = [{ type: "object", image_file: accessibleReference }];
     }
     const response = await fetch(`${MINIMAX_BASE_URL}/image_generation`, {
       method: "POST",
@@ -4671,10 +4691,16 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
     let payload = null;
     try { payload = JSON.parse(text); } catch { payload = { raw: text.slice(0, 4000) }; }
     if (!response.ok) {
-      res.status(response.status || 502).json({ success: false, error: `MiniMax 图生 ${response.status}：${text.slice(0, 500)}`, payload });
+      const friendlyError = /illegal|safety|content|sensitive|违规|敏感/i.test(text)
+        ? "生成失败：Prompt 或素材触发内容安全限制，请调整后重试"
+        : `MiniMax 图生 ${response.status}：${text.slice(0, 500)}`;
+      res.status(response.status || 502).json({ success: false, error: friendlyError, payload });
       return;
     }
     const remoteUrls = payload?.data?.image_urls || [];
+    if (!remoteUrls.length) {
+      return res.status(502).json({ success: false, error: "MiniMax 未返回生成图片，请稍后重试", payload });
+    }
     const urls = [];
     const uploadsDir = await ensureUploadsDir();
     for (const remoteUrl of remoteUrls) {
@@ -4687,8 +4713,7 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
         await fs.writeFile(path.join(uploadsDir, filename), Buffer.from(await imageResponse.arrayBuffer()));
         urls.push(`/uploads/${filename}`);
       } catch (error) {
-        console.error(`[ai-image] 永久化失败，保留远端地址: ${error.message}`);
-        urls.push(remoteUrl);
+        throw new Error(`生成图永久保存失败：${error.message}`);
       }
     }
     const estimatedCostUsd = Number((remoteUrls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6));
@@ -4709,11 +4734,11 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) RETURNING id`,
           [
             req.user.id,
-            req.body?.store_id || req.body?.storeId || null,
+            storeId || null,
             body.model,
             body.prompt,
             aspectRatio,
-            requestedN,
+            urls.length,
             Boolean(body.subject_reference),
             JSON.stringify(urls),
             estimatedCostUsd,
@@ -4734,6 +4759,10 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  } finally {
+    const remaining = Number(aiImageActiveByUser.get(userKey) || 1) - 1;
+    if (remaining > 0) aiImageActiveByUser.set(userKey, remaining);
+    else aiImageActiveByUser.delete(userKey);
   }
 });
 
@@ -4743,6 +4772,8 @@ app.post("/api/seller/images/publish-to-ozon", requireAuth, async (req, res) => 
     const userId = req.user.id;
     const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
     const offerId = String(req.body?.offer_id || "").trim();
+    const recordId = String(req.body?.record_id || "").trim();
+    const publishMode = req.body?.mode === "replace" ? "replace" : "append";
     const inputImages = Array.isArray(req.body?.images) ? req.body.images : [];
     if (!storeId || !offerId) return res.status(400).json({ success: false, error: "缺少店铺或商品货号" });
     if (!inputImages.length || inputImages.length > 15) {
@@ -4778,18 +4809,32 @@ app.post("/api/seller/images/publish-to-ozon", requireAuth, async (req, res) => 
     }
     if (!productId) return res.status(409).json({ success: false, error: "Ozon 商品尚未生成 product_id，请稍后同步后重试" });
 
+    const existingImages = normalizeImportImageList([
+      product.image,
+      ...(Array.isArray(product.images) ? product.images : []),
+    ]);
+    const publishImages = publishMode === "replace"
+      ? images
+      : normalizeImportImageList([...existingImages, ...images]).slice(0, 15);
     const data = await callOzonSellerAPI(
       "/v1/product/pictures/import",
-      { product_id: productId, images },
+      { product_id: productId, images: publishImages },
       { storeId, userId },
     );
     await db.query(
       `UPDATE app_products
           SET product_id = $1, image = $2, images = $3::jsonb, updated_at = now()
         WHERE user_id = $4 AND store_id = $5 AND offer_id = $6`,
-      [productId, images[0], JSON.stringify(images), userId, storeId, offerId],
+      [productId, publishImages[0], JSON.stringify(publishImages), userId, storeId, offerId],
     );
-    res.json({ success: true, product_id: productId, offer_id: offerId, images, count: images.length, data });
+    if (recordId) {
+      await db.query(
+        `UPDATE ai_image_records SET offer_id = $1, ozon_sync_status = TRUE, ozon_synced_at = now()
+         WHERE id = $2 AND user_id = $3 AND (store_id IS NULL OR store_id = $4)`,
+        [offerId, recordId, userId, storeId],
+      );
+    }
+    res.json({ success: true, product_id: productId, offer_id: offerId, images: publishImages, added_count: images.length, count: publishImages.length, mode: publishMode, data });
   } catch (error) {
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
@@ -6656,7 +6701,7 @@ app.get("/api/ai-images/history", requireAuth, async (req, res, next) => {
     if (storeId) { args.push(storeId); storeWhere = ` AND store_id = $${args.length}`; }
     const r = await db.query(
       `SELECT id, model, prompt, aspect_ratio, n, has_ref_image, image_urls,
-              estimated_cost_usd, scene_preset, created_at
+              estimated_cost_usd, scene_preset, offer_id, ozon_sync_status, ozon_synced_at, created_at
          FROM ai_image_records WHERE user_id = $1${storeWhere}
          ORDER BY created_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
       [...args, limit, offset],

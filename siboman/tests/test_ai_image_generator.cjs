@@ -25,5 +25,10 @@ assert(server.includes('app.delete("/api/ai-images/:id", requireAuth'));
 assert(server.includes('await ensureUploadsDir()'));
 assert(server.includes('`/uploads/${filename}`'));
 assert(server.includes('INSERT INTO ai_image_records (user_id, store_id'));
+assert(server.includes('const aiImageActiveByUser = new Map()'));
+assert(server.includes('生成图永久保存失败'));
+assert(server.includes('ozon_sync_status = TRUE'));
+assert(view.includes("publish_mode: 'append'"));
+assert(view.includes('追加到原图册'));
 
 console.log('AI image generator structural checks passed.');
