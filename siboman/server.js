@@ -2107,6 +2107,24 @@ app.get("/api/seller/stocks/drafts", requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.get("/api/seller/stocks/change-logs", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query.store_id || "").trim();
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 100)));
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const result = await db.query(
+      `SELECT id, offer_id, warehouse_id, previous_stock, target_stock, status, error, created_at
+       FROM app_stock_change_logs
+       WHERE user_id = $1 AND store_id = $2
+       ORDER BY created_at DESC
+       LIMIT $3`,
+      [req.user.id, storeId, limit],
+    );
+    res.json({ success: true, items: result.rows, total: result.rowCount });
+  } catch (error) { next(error); }
+});
+
 app.post("/api/seller/stocks/save-draft", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -2155,6 +2173,14 @@ app.post("/api/seller/stocks/import", requireAuth, async (req, res, next) => {
       [req.user.id, storeId, offerIds],
     );
     const productMap = new Map(products.rows.map(row => [row.offer_id, row]));
+    let activeWarehouses = [];
+    try {
+      const warehouseData = await callOzonSellerAPI("/v2/warehouse/list", {}, { storeId, userId: req.user.id });
+      activeWarehouses = (warehouseData?.warehouses || warehouseData?.result || [])
+        .filter((warehouse) => !warehouse.status || String(warehouse.status).toLowerCase() === "active");
+    } catch (error) {
+      console.warn("[stocks/import] 获取仓库列表失败，继续使用商品已有仓库:", error.message);
+    }
     const imported = [];
     const errors = [];
     for (let index = 0; index < rows.length; index += 1) {
@@ -2164,9 +2190,21 @@ app.post("/api/seller/stocks/import", requireAuth, async (req, res, next) => {
       if (!offerId || !product) { errors.push({ row: index + 2, offer_id: offerId, error: '未找到当前店铺商品' }); continue; }
       const stocks = Array.isArray(product.stocks_json) ? product.stocks_json : [];
       const requestedWarehouse = Number(source.warehouse_id || source['Warehouse ID'] || source['仓库ID']);
-      const warehouse = stocks.find(item => Number(item.warehouse_id) === requestedWarehouse) || stocks[0];
-      const warehouseId = Number(requestedWarehouse || warehouse?.warehouse_id);
-      if (!Number.isFinite(warehouseId) || warehouseId <= 0) { errors.push({ row: index + 2, offer_id: offerId, error: '商品没有可用仓库，请先同步库存' }); continue; }
+      const knownWarehouseIds = [...new Set([
+        ...stocks.map((item) => Number(item.warehouse_id)),
+        ...activeWarehouses.map((item) => Number(item.warehouse_id)),
+      ].filter((id) => Number.isFinite(id) && id > 0))];
+      if (requestedWarehouse && !knownWarehouseIds.includes(requestedWarehouse)) {
+        errors.push({ row: index + 2, offer_id: offerId, error: `仓库 ${requestedWarehouse} 不属于当前店铺` });
+        continue;
+      }
+      if (!requestedWarehouse && knownWarehouseIds.length > 1) {
+        errors.push({ row: index + 2, offer_id: offerId, error: '当前店铺有多个仓库，请在文件中填写 warehouse_id' });
+        continue;
+      }
+      const warehouseId = Number(requestedWarehouse || knownWarehouseIds[0]);
+      const warehouse = stocks.find(item => Number(item.warehouse_id) === warehouseId);
+      if (!Number.isFinite(warehouseId) || warehouseId <= 0) { errors.push({ row: index + 2, offer_id: offerId, error: '当前店铺没有可用仓库' }); continue; }
       const currentStock = Number(warehouse?.present ?? product.stock ?? 0);
       const quantityRaw = source.stock ?? source.quantity ?? source.Quantity ?? source['目标库存'];
       const diffRaw = source.diff ?? source.Diff ?? source['变更量'];

@@ -13,6 +13,7 @@ for (const route of [
   '/api/seller/stocks/drafts',
   '/api/seller/stocks/save-draft',
   '/api/seller/stocks/import',
+  '/api/seller/stocks/change-logs',
   '/api/seller/products/stocks/bulk',
 ]) assert(server.includes(route), `missing route ${route}`);
 assert(server.includes('drafts.slice(index, index + 100)'));
@@ -27,6 +28,8 @@ assert(inventory.includes('window.XLSX'));
 assert(inventory.includes('exportReplenishment'));
 assert(inventory.includes('submitWithConflictCheck'));
 assert(inventory.includes('发现 Ozon 实时库存冲突'));
+assert(inventory.includes('库存变更记录'));
+assert(server.includes('当前店铺有多个仓库，请在文件中填写 warehouse_id'));
 assert(server.includes('app.post("/api/seller/stocks/import", requireAuth'));
 assert(server.includes('app.patch("/api/products/:offer_id/field", requireAuth'));
 

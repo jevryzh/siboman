@@ -8,6 +8,7 @@ window.InventoryManagementView = {
     const draftLoading = Vue.ref(false);
     const importInput = Vue.ref(null);
     const importLoading = Vue.ref(false);
+    const logDialog = Vue.reactive({ visible: false, loading: false, items: [] });
     const threshold = Vue.ref(Math.max(1, Number(localStorage.getItem('inventoryLowStockThreshold') || 5)));
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 50, total: 0 });
 
@@ -22,7 +23,9 @@ window.InventoryManagementView = {
     });
 
     // v0.3.2: 动态读取当前店铺 ID
-    const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
+    const getStoreId = () => String(
+      window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''),
+    ).split(',').map((value) => value.trim()).find(Boolean) || '';
 
     const notify = {
       success: (msg) => (window.ElementPlus?.ElMessage || console).success?.(msg),
@@ -285,6 +288,17 @@ window.InventoryManagementView = {
       window.XLSX.writeFile(book, '库存导入模板.xlsx');
     };
 
+    const openChangeLogs = async () => {
+      logDialog.visible = true;
+      logDialog.loading = true;
+      try {
+        const res = await axios.get('/api/seller/stocks/change-logs', { params: { store_id: getStoreId(), limit: 100 } });
+        logDialog.items = res.data.items || [];
+      } catch (e) {
+        notify.error('变更记录加载失败: ' + (e.response?.data?.error || e.message));
+      } finally { logDialog.loading = false; }
+    };
+
     const exportReplenishment = () => {
       const rows = inventory.value.filter(row => totalStock(row) < threshold.value).map(row => ({
         'Offer ID': row.offer_id, '商品名称': row.name, '当前库存': totalStock(row), '建议补货': Math.max(0, threshold.value * 2 - totalStock(row)), '1688链接': row.source_url_1688 || '', '近7天销量': row.sales_7d || '',
@@ -296,6 +310,11 @@ window.InventoryManagementView = {
     const onPageChange = () => fetchInventory();
     const onSizeChange = () => { pagination.currentPage = 1; fetchInventory(); };
     const onSearch = () => { pagination.currentPage = 1; fetchInventory(); };
+    let searchTimer = null;
+    const onSearchInput = () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(onSearch, 400);
+    };
 
     // v0.3.3 分仓工具
     const parseStocks = (row) => {
@@ -320,14 +339,17 @@ window.InventoryManagementView = {
     Vue.onMounted(refreshAll);
     const onShopChanged = () => { pagination.currentPage = 1; inventory.value = []; drafts.value = []; pagination.total = 0; refreshAll(); };
     window.addEventListener('shop-changed', onShopChanged);
-    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
+    Vue.onBeforeUnmount(() => {
+      clearTimeout(searchTimer);
+      window.removeEventListener('shop-changed', onShopChanged);
+    });
 
     return {
       inventory, loading, syncLoading, search, pagination, stockDialog,
-      drafts, draftLoading, importInput, importLoading, threshold, inventoryStats,
+      drafts, draftLoading, importInput, importLoading, logDialog, threshold, inventoryStats,
       fetchInventory, handleSyncAll, openStockEditor, submitStockChanges,
-      fetchDrafts, refreshAll, onThresholdChange, saveStockDrafts, submitAllDrafts, clearDrafts, importStocks, downloadTemplate, exportReplenishment,
-      onPageChange, onSizeChange, onSearch,
+      fetchDrafts, refreshAll, onThresholdChange, saveStockDrafts, submitAllDrafts, clearDrafts, importStocks, downloadTemplate, exportReplenishment, openChangeLogs,
+      onPageChange, onSizeChange, onSearch, onSearchInput,
       parseStocks, totalStock, totalReserved, warehouseCount, warehouseLabel, warehouseTagType,
     };
   },
@@ -345,12 +367,13 @@ window.InventoryManagementView = {
               <el-button size="small" :loading="importLoading" @click="importInput?.click()">导入库存</el-button>
               <el-button size="small" @click="downloadTemplate">下载模板</el-button>
               <el-button size="small" @click="exportReplenishment">导出预补货单</el-button>
+              <el-button size="small" @click="openChangeLogs">变更记录</el-button>
               <input ref="importInput" type="file" accept=".csv,.xlsx,.xls" style="display:none" @change="importStocks" />
             </div>
             <div style="display:flex; gap:8px">
               <span style="font-size:12px; color:#606266; align-self:center">低库存阈值</span>
               <el-input-number :model-value="threshold" :min="1" :max="9999" size="small" style="width:100px" @change="onThresholdChange" />
-              <el-input v-model="search" placeholder="货号 / 商品名" size="small" style="width:240px" @keyup.enter="onSearch" clearable />
+              <el-input v-model="search" placeholder="货号 / 商品名" size="small" style="width:240px" @input="onSearchInput" @keyup.enter="onSearch" clearable />
               <el-button type="primary" size="small" @click="onSearch">查询</el-button>
             </div>
           </div>
@@ -469,6 +492,26 @@ window.InventoryManagementView = {
           />
         </div>
       </el-card>
+
+      <el-dialog v-model="logDialog.visible" title="库存变更记录" width="900px" destroy-on-close>
+        <el-table :data="logDialog.items" v-loading="logDialog.loading" border stripe size="small" max-height="560">
+          <el-table-column prop="created_at" label="时间" width="170">
+            <template #default="{ row }">{{ (row.created_at || '').slice(0,19).replace('T',' ') }}</template>
+          </el-table-column>
+          <el-table-column prop="offer_id" label="货号" min-width="150" />
+          <el-table-column prop="warehouse_id" label="仓库 ID" width="130" />
+          <el-table-column prop="previous_stock" label="原库存" width="90" align="right" />
+          <el-table-column prop="target_stock" label="目标库存" width="90" align="right" />
+          <el-table-column label="结果" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.status === 'success' ? 'success' : (row.status === 'conflict' ? 'warning' : 'danger')">
+                {{ row.status === 'success' ? '成功' : (row.status === 'conflict' ? '冲突' : '失败') }}
+              </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="error" label="说明" min-width="220" show-overflow-tooltip />
+        </el-table>
+      </el-dialog>
 
       <!-- v0.3.4 分仓库存修改对话框 -->
       <el-dialog v-model="stockDialog.visible" width="720px" :title="'分仓库存调整 · ' + (stockDialog.row?.offer_id || '')" destroy-on-close>
