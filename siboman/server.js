@@ -1195,13 +1195,28 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
     const userId = req.user.id;
     if (!store_id) return res.status(400).json({ success: false, error: "未指定店铺" });
 
+    const existingResult = await db.query(
+      `SELECT product_id, image, images, price, old_price, min_price, currency_code FROM app_products
+        WHERE user_id = $1 AND store_id = $2 AND offer_id = $3 LIMIT 1`,
+      [userId, store_id, offer_id],
+    );
+    const existing = existingResult.rows[0];
+    if (!existing) return res.status(404).json({ success: false, error: "当前店铺未找到该商品" });
+
     const price = Number(b.price || 0);
-    const stock = Number(b.stock || 0);
     const oldPrice = b.old_price != null ? Number(b.old_price) : null;
     const minPrice = b.min_price != null ? Number(b.min_price) : null;
+    const syncResults = { price: "skipped", pictures: "skipped", local: "pending" };
+    const syncErrors = [];
 
     // 1) 更新价格 (v1/product/import-prices)
-    if (price > 0) {
+    const priceChanged = price > 0 && (
+      Number(existing.price || 0) !== price
+      || Number(existing.old_price || 0) !== Number(oldPrice || 0)
+      || Number(existing.min_price || 0) !== Number(minPrice || 0)
+      || String(existing.currency_code || "RUB") !== String(b.currency_code || "RUB")
+    );
+    if (priceChanged) {
       try {
         await callOzonSellerAPI("/v1/product/import-prices", {
           prices: [{
@@ -1212,19 +1227,44 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
             currency_code: String(b.currency_code || "RUB"),
           }],
         }, { storeId: store_id, userId });
+        syncResults.price = "submitted";
       } catch (e) {
-        console.warn(`[full-update] price sync warn: ${e.message}`);
+        syncResults.price = "failed";
+        syncErrors.push(`价格同步失败：${e.message}`);
       }
     }
 
-    // 2) 更新库存 (v2/products/stocks)
-    if (Number.isFinite(stock)) {
+    // 2) 图片使用专用 Pictures API；库存只允许从库存管理按仓库提交。
+    const rawPictures = [
+      b.image,
+      ...(Array.isArray(b.images) ? b.images : []),
+    ].filter(Boolean);
+    const existingPictures = normalizeImportImageList([
+      existing.image,
+      ...(Array.isArray(existing.images) ? existing.images : []),
+    ].filter(Boolean));
+    const requestedPictures = normalizeImportImageList(rawPictures);
+    const picturesChanged = requestedPictures.length > 0
+      && JSON.stringify(requestedPictures) !== JSON.stringify(existingPictures);
+    if (picturesChanged) {
       try {
-        await callOzonSellerAPI("/v2/products/stocks", {
-          stocks: [{ offer_id, stock, warehouse_id: b.warehouse_id || undefined }].filter(x => x.warehouse_id || true),
-        }, { storeId: store_id, userId });
+        let productId = Number(existing.product_id || 0);
+        if (!productId) {
+          const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: [offer_id] }, { storeId: store_id, userId });
+          productId = Number((info?.items || [])[0]?.id || 0);
+        }
+        if (!productId) throw new Error("Ozon 尚未返回 product_id");
+        const baseUrl = getRequestPublicBaseUrl(req);
+        const pictures = normalizeImportImageList(rawPictures.map((value) => {
+          const image = String(value || "").trim();
+          return /^\/uploads\//i.test(image) && baseUrl ? `${baseUrl}${image}` : image;
+        })).filter((image) => /^https:\/\//i.test(image));
+        if (!pictures.length) throw new Error("没有可供 Ozon 下载的 HTTPS 图片");
+        await callOzonSellerAPI("/v1/product/pictures/import", { product_id: productId, images: pictures }, { storeId: store_id, userId });
+        syncResults.pictures = "submitted";
       } catch (e) {
-        console.warn(`[full-update] stock sync warn: ${e.message}`);
+        syncResults.pictures = "failed";
+        syncErrors.push(`图片同步失败：${e.message}`);
       }
     }
 
@@ -1247,11 +1287,13 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
          vat = COALESCE($14, vat),
          category_name = COALESCE($15, category_name),
          barcode = COALESCE($16, barcode),
+         image = COALESCE($17, image),
+         images = COALESCE($18::jsonb, images),
          updated_at = now()
-       WHERE offer_id = $17 AND store_id = $18 AND user_id = $19`,
+       WHERE offer_id = $19 AND store_id = $20 AND user_id = $21`,
       [
         b.name ?? null, b.brand ?? null, b.description ?? null, b.country_of_origin ?? null,
-        price || null, Number.isFinite(stock) ? stock : null,
+        price || null, null,
         b.weight != null ? Number(b.weight) : null,
         b.depth != null ? Number(b.depth) : null,
         b.width != null ? Number(b.width) : null,
@@ -1259,11 +1301,18 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
         oldPrice, minPrice,
         b.currency_code ?? null, b.vat ?? null,
         b.category_name ?? null, b.barcode ?? null,
+        b.image ?? null, Array.isArray(b.images) ? JSON.stringify(b.images) : null,
         offer_id, store_id, userId,
       ]
     );
+    syncResults.local = "saved";
 
-    res.json({ success: true });
+    res.status(syncErrors.length ? 207 : 200).json({
+      success: syncErrors.length === 0,
+      sync_results: syncResults,
+      errors: syncErrors,
+      message: syncErrors.length ? "本地资料已保存，部分 Ozon 同步失败" : "本地资料已保存，价格和图片已提交 Ozon",
+    });
   } catch (error) {
     console.error("[full-update] err:", error);
     res.status(error.statusCode || 500).json({ success: false, error: error.message, payload: error.payload || null });

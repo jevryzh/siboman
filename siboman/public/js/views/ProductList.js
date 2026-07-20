@@ -227,11 +227,12 @@ window.ProductListView = {
     const saveProduct = async () => {
       saveLoading.value = true;
       try {
-        await axios.patch(`/api/seller/products/${encodeURIComponent(drawer.itemId)}/full-update`, {
+        const response = await axios.patch(`/api/seller/products/${encodeURIComponent(drawer.itemId)}/full-update`, {
           ...drawer.form,
           store_id: getStoreId(),
         });
-        notify.success('Ozon 同步成功，本地库已刷新');
+        if (response.data?.success) notify.success('商品资料已保存，价格和图片已提交 Ozon');
+        else notify.warning((response.data?.errors || []).join('；') || '本地资料已保存，部分 Ozon 同步失败');
         drawer.visible = false;
         await fetchProducts();
       } catch (e) {
@@ -642,7 +643,7 @@ window.ProductListView = {
           <el-button v-else type="success" plain @click="() => { unarchiveProduct(drawer.form); drawer.visible = false; }">
             重新上架
           </el-button>
-          <el-button type="primary" :loading="saveLoading" @click="saveProduct">立即同步至 Ozon</el-button>
+          <el-button type="primary" :loading="saveLoading" @click="saveProduct">保存并同步价格/图片</el-button>
         </template>
       </el-drawer>
     </div>

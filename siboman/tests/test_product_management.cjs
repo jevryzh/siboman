@@ -31,5 +31,8 @@ assert(productView.includes('exportCsv'));
 assert(productView.includes("'\\ufeff'"), 'CSV export must include a UTF-8 BOM');
 assert(productView.includes("'/api/seller/images/generate'"), 'AI image refinement must use the real generator');
 assert(!server.includes('/api/ai/refine-image'), 'legacy image passthrough stub must be removed');
+assert(productView.includes('保存并同步价格/图片'), 'product editor must describe its real sync scope');
+assert(server.includes('sync_results: syncResults'), 'product update must report each downstream sync result');
+assert(server.includes('价格同步失败：'), 'Ozon price errors must not be swallowed');
 
 console.log('Product management structural checks passed.');
