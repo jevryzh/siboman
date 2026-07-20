@@ -49,6 +49,9 @@ assert(orders.includes('saveNote'));
 assert(orders.includes("row.status !== 'cancelled'"));
 assert(orders.includes('source_url_1688'), 'orders must expose the product procurement link');
 assert(orders.includes("split(',')"), 'orders must normalize duplicated store ids');
+assert(orders.includes("{ label: '争议中', value: 'arbitration' }"));
+assert(orders.includes("if (!['awaiting_packaging', 'awaiting_deliver'].includes(row.status))"));
+assert(orders.includes('statusText(row.status)'));
 
 assert(listing.includes("params.set('store_id', getStoreId())"));
 assert(listing.includes('syncTask'));

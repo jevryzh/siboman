@@ -44,6 +44,7 @@ window.OrderListView = {
       { label: '已发货', value: 'delivering' },
       { label: '已送达', value: 'delivered' },
       { label: '已取消', value: 'cancelled' },
+      { label: '争议中', value: 'arbitration' },
     ];
 
     const statusTagType = (s) => ({
@@ -52,7 +53,14 @@ window.OrderListView = {
       delivering: 'success',
       delivered: 'success',
       cancelled: 'danger',
+      arbitration: 'danger',
+      dispute: 'danger',
     }[s] || 'info');
+    const statusText = (s) => ({
+      awaiting_packaging: '待备货', awaiting_deliver: '备货中', delivering: '运输中',
+      driver_pickup: '配送员取件', delivered: '已送达', cancelled: '已取消',
+      arbitration: '争议中', dispute: '争议中',
+    }[s] || s || '-');
 
     const fetchOrders = async () => {
       const sid = getStoreId();
@@ -224,6 +232,7 @@ window.OrderListView = {
     };
 
     const deadlineInfo = (row) => {
+      if (!['awaiting_packaging', 'awaiting_deliver'].includes(row.status)) return { text: '-', urgent: false };
       const raw = row.shipment_date || row.delivering_date || '';
       if (!raw) return { text: '-', urgent: false };
       const ms = new Date(raw).getTime() - Date.now();
@@ -250,7 +259,7 @@ window.OrderListView = {
       orders, loading, activeTab, statusTabs, pagination,
       selectedOrders, notes, batchLoading, noteDialog,
       detailDrawer, shipDialog,
-      fetchOrders, openDetail, openShipDialog, confirmShip, statusTagType,
+      fetchOrders, openDetail, openShipDialog, confirmShip, statusTagType, statusText,
       onSelectionChange, openNoteDialog, saveNote, exportOrders, printLabels, batchShip, deadlineInfo,
       // v0.3.5 时窗
       dateRange, rangeShortcuts,
@@ -348,7 +357,7 @@ window.OrderListView = {
 
           <el-table-column label="状态" width="110">
             <template #default="{ row }">
-              <el-tag size="small" :type="statusTagType(row.status)">{{ row.status }}</el-tag>
+              <el-tag size="small" :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
             </template>
           </el-table-column>
 
@@ -397,7 +406,7 @@ window.OrderListView = {
             <el-descriptions :column="2" border size="small">
               <el-descriptions-item label="货件单号">{{ detailDrawer.order.posting_number }}</el-descriptions-item>
               <el-descriptions-item label="状态">
-                <el-tag size="small" :type="statusTagType(detailDrawer.order.status)">{{ detailDrawer.order.status }}</el-tag>
+                <el-tag size="small" :type="statusTagType(detailDrawer.order.status)">{{ statusText(detailDrawer.order.status) }}</el-tag>
               </el-descriptions-item>
               <el-descriptions-item label="下单时间">{{ (detailDrawer.order.in_process_at || '').replace('T',' ').slice(0,19) }}</el-descriptions-item>
               <el-descriptions-item label="发货截止">{{ (detailDrawer.order.shipment_date || '').replace('T',' ').slice(0,19) }}</el-descriptions-item>
