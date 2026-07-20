@@ -239,12 +239,6 @@ window.AIImageGeneratorView = {
   },
   template: `
     <div class="ai-image-gen-v035" style="display:flex; gap:16px; min-height:calc(100vh - 130px)">
-      <style>
-        .paste-upload-area { border: 1px dashed #dcdfe6; border-radius: 6px; padding: 20px; text-align: center; background: #fafafa; cursor: pointer; }
-        .image-card-wrapper { position: relative; overflow: hidden; border-radius: 8px; border: 1px solid #ebeef5; cursor: pointer; transition: transform 0.2s; }
-        .image-card-wrapper:hover { transform: scale(1.02); }
-      </style>
-
       <el-card style="width:360px; flex-shrink:0">
         <template #header><strong>1. 输入商品信息</strong></template>
         <el-form :model="form" label-position="top" size="small">
