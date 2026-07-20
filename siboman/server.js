@@ -232,6 +232,13 @@ app.get("/api/extension/seller-credentials", requireAuth, async (req, res, next)
 app.post("/api/collect-items", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
+    const requestedStoreId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    let storeId = null;
+    if (requestedStoreId) {
+      const ownedStore = await db.query(`SELECT id FROM app_stores WHERE id=$1 AND user_id=$2 AND active=TRUE`, [requestedStoreId, req.user.id]);
+      if (!ownedStore.rowCount) return res.status(404).json({ success: false, error: "店铺不存在、已停用或无权限" });
+      storeId = ownedStore.rows[0].id;
+    }
     const extensionItems = Array.isArray(req.body?.items) ? req.body.items : [];
     if (extensionItems.length) {
       const inserted = [];
@@ -240,14 +247,27 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
         const ozonSku = String(item.sku || item.product_id || item.offer_id || "").trim();
         const ozonUrl = String(item.ozon_url || item.source_url || (ozonSku ? `https://www.ozon.ru/product/${ozonSku}/` : ""));
         const exists = await db.query(
-          `SELECT id FROM collect_items
-           WHERE user_id = $1 AND status IN ('pending','scraped')
+          `SELECT id, status FROM collect_items
+           WHERE user_id = $1
              AND (($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3))
            LIMIT 1`,
           [req.user.id, ozonSku, ozonUrl],
         );
         if (exists.rowCount) {
-          skipped.push({ source: ozonSku || ozonUrl, reason: "已存在" });
+          if (exists.rows[0].status !== "uploaded") {
+            await db.query(
+              `UPDATE collect_items SET
+                 store_id=COALESCE($1,store_id), title=COALESCE(NULLIF($2,''),title),
+                 main_image=COALESCE(NULLIF($3,''),main_image), images=CASE WHEN jsonb_array_length($4::jsonb)>0 THEN $4::jsonb ELSE images END,
+                 price_rub=COALESCE($5,price_rub), brand=COALESCE(NULLIF($6,''),brand),
+                 attributes=CASE WHEN $7::jsonb <> '{}'::jsonb THEN $7::jsonb ELSE attributes END,
+                 status='scraped', note='',
+                 status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to','scraped','reason','插件数据合并','at',now())),
+                 updated_at=now() WHERE id=$8 AND user_id=$9`,
+              [storeId, String(item.name || item.title || ""), String(item.image || item.main_image || ""), JSON.stringify(item.images || []), Number(item.price || item.price_rub || 0) || null, String(item.brand || ""), JSON.stringify(item.attributes || {}), exists.rows[0].id, req.user.id],
+            );
+          }
+          skipped.push({ source: ozonSku || ozonUrl, reason: exists.rows[0].status === "uploaded" ? "已上架" : "已合并更新" });
           continue;
         }
         const result = await db.query(
@@ -258,7 +278,7 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
            RETURNING id, ozon_url, ozon_sku, status, created_at`,
           [
             req.user.id,
-            req.body?.store_id || req.body?.storeId || null,
+            storeId,
             ozonSku || ozonUrl,
             ozonUrl,
             ozonSku,
@@ -282,7 +302,6 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
     }
 
     const inputsText = String(req.body?.inputs || req.body?.text || "").trim();
-    const storeId = req.body?.store_id || req.body?.storeId || null;
     const parsed = parseCollectInputs(inputsText);
     if (!parsed.length) {
       return res.status(400).json({ success: false, error: "未识别到有效的 Ozon 链接或 SKU。" });
@@ -292,14 +311,25 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
     const skipped = [];
     for (const row of parsed) {
       const exists = await db.query(
-        `SELECT id FROM collect_items
-         WHERE user_id = $1 AND status IN ('pending','scraped')
+        `SELECT id, status, ozon_url FROM collect_items
+         WHERE user_id = $1
            AND (($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3))
          LIMIT 1`,
         [req.user.id, row.ozonSku || "", row.ozonUrl || ""],
       );
       if (exists.rowCount) {
-        skipped.push({ source: row.sourceValue, reason: "已存在" });
+        const existing = exists.rows[0];
+        if (["failed", "ignored"].includes(existing.status)) {
+          const restored = await db.query(
+            `UPDATE collect_items SET store_id=COALESCE($1,store_id), status='pending', note='',
+               status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to','pending','reason','重新采集','at',now())),
+               updated_at=now() WHERE id=$2 AND user_id=$3 RETURNING id, ozon_url`,
+            [storeId, existing.id, req.user.id],
+          );
+          inserted.push(restored.rows[0]);
+        } else {
+          skipped.push({ source: row.sourceValue, reason: existing.status === "uploaded" ? "已上架" : "已存在" });
+        }
         continue;
       }
       const r = await db.query(
@@ -313,14 +343,20 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
 
     // 采集箱只采 Ozon 信息；不启用 1688 搜图，避免进入已冻结的单品找货链路。
     if (inserted.length) {
-      await db.query(
+      const jobResult = await db.query(
         `INSERT INTO app_jobs (id, user_id, store_id, kind, status, phase, total, processed, payload)
-         VALUES (gen_random_uuid(), $1, $2, 'run', 'queued', '等待采集端领取', $3, 0, $4)`,
+         VALUES (gen_random_uuid(), $1, $2, 'run', 'queued', '等待采集端领取', $3, 0, $4) RETURNING id`,
         [req.user.id, storeId, inserted.length, JSON.stringify({
           urls: inserted.map((item) => item.ozon_url),
           urlRows: inserted.map((item, index) => ({ url: item.ozon_url, sourceRow: index + 1, collectId: item.id })),
           options: { enable1688: false, enableAI: false, collectionOnly: true }
         })]
+      );
+      await db.query(
+        `UPDATE collect_items SET linked_job_id=$1,
+           status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to',status,'reason','创建采集任务','job_id',$1,'at',now())),
+           updated_at=now() WHERE user_id=$2 AND id=ANY($3::uuid[])`,
+        [jobResult.rows[0].id, req.user.id, inserted.map((item) => item.id)],
       );
     }
 
@@ -728,6 +764,8 @@ async function initDatabase() {
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS height INTEGER;
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS status_log JSONB DEFAULT '[]'::jsonb;
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS source_url_1688 TEXT NOT NULL DEFAULT '';
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
 
       ALTER TABLE app_jobs ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
     `);
@@ -3212,26 +3250,33 @@ app.get("/api/collect-items", requireAuth, async (req, res) => {
     const userId = req.user.id;
     const status = String(req.query?.status || "all").trim();
     const search = String(req.query?.search || "").trim();
-    const storeId = String(req.query?.store_id || "").trim();
+    const storeId = String(req.query?.store_id || "").split(",")[0].trim();
+    const allowedStatuses = new Set(["all", "pending", "scraped", "uploaded", "failed", "ignored"]);
+    if (!allowedStatuses.has(status)) return res.status(400).json({ success: false, error: "无效采集状态" });
+    if (storeId && !/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(storeId)) return res.status(400).json({ success: false, error: "无效店铺 ID" });
     const limit = Math.min(200, Math.max(1, Number(req.query?.limit || 50)));
     const offset = Math.max(0, Number(req.query?.offset || 0));
     const args = [userId];
     const where = ["user_id = $1"];
     if (status && status !== "all") { args.push(status); where.push(`status = $${args.length}`); }
+    else where.push(`status <> 'ignored'`);
     if (storeId) { args.push(storeId); where.push(`store_id = $${args.length}`); }
     if (search) {
       args.push(`%${search}%`);
       where.push(`(ozon_url ILIKE $${args.length} OR ozon_sku ILIKE $${args.length} OR title ILIKE $${args.length})`);
     }
     const countResult = await db.query(`SELECT count(*)::int AS count FROM collect_items WHERE ${where.join(" AND ")}`, args);
+    const statusCountArgs = [userId];
+    let statusCountWhere = "user_id = $1";
+    if (storeId) { statusCountArgs.push(storeId); statusCountWhere += " AND store_id = $2"; }
     const statusResult = await db.query(
-      `SELECT status, count(*)::int AS count FROM collect_items WHERE user_id = $1 GROUP BY status`,
-      [userId],
+      `SELECT status, count(*)::int AS count FROM collect_items WHERE ${statusCountWhere} GROUP BY status`,
+      statusCountArgs,
     );
     const statusCounts = { all: 0 };
     for (const row of statusResult.rows) {
       statusCounts[row.status] = Number(row.count || 0);
-      statusCounts.all += Number(row.count || 0);
+      if (row.status !== "ignored") statusCounts.all += Number(row.count || 0);
     }
     const result = await db.query(
       `SELECT * FROM collect_items WHERE ${where.join(" AND ")}
@@ -6229,18 +6274,25 @@ app.post("/api/collect-items/:id", requireAuth, async (req, res, next) => {
   try {
     const allowed = [
       "status", "note", "title", "main_image", "images", "price_cny", "price_rub",
-      "seller", "brand", "linked_offer_id", "weight", "depth", "width", "height", "attributes"
+      "seller", "brand", "linked_offer_id", "source_url_1688", "description",
+      "weight", "depth", "width", "height", "attributes"
     ];
     const sets = [];
     const args = [];
     for (const key of allowed) {
       if (req.body?.[key] !== undefined) {
         let val = req.body[key];
+        if (key === "status" && !["pending", "scraped", "uploaded", "failed", "ignored"].includes(String(val))) {
+          return res.status(400).json({ success: false, error: "无效采集状态" });
+        }
         if (["images", "attributes"].includes(key) && typeof val === "object") {
           val = JSON.stringify(val);
         }
         args.push(val);
         sets.push(`${key} = $${args.length}`);
+        if (key === "status") {
+          sets.push(`status_log = COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to',$${args.length}::text,'reason','人工更新','at',now()))`);
+        }
       }
     }
     if (!sets.length) { res.status(400).json({ success: false, error: "没有可更新字段" }); return; }
@@ -6259,6 +6311,42 @@ app.put("/api/collect-items/:id", requireAuth, async (req, res, next) => {
   // Express 只按 method 匹配路由；显式切换为 POST 后复用同一更新处理器。
   req.method = "POST";
   return app._router.handle(req, res, next);
+});
+
+app.post("/api/collect-items/:id/retry", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  const client = await db.connect();
+  try {
+    await client.query("BEGIN");
+    const itemResult = await client.query(
+      `SELECT id, store_id, ozon_url, status FROM collect_items WHERE id=$1 AND user_id=$2 FOR UPDATE`,
+      [req.params.id, req.user.id],
+    );
+    if (!itemResult.rowCount) { await client.query("ROLLBACK"); return res.status(404).json({ success: false, error: "找不到该采集项" }); }
+    const item = itemResult.rows[0];
+    if (item.status === "uploaded") { await client.query("ROLLBACK"); return res.status(409).json({ success: false, error: "已上架记录不能重新采集" }); }
+    if (!item.ozon_url) { await client.query("ROLLBACK"); return res.status(400).json({ success: false, error: "该记录没有有效 Ozon 链接" }); }
+    const jobResult = await client.query(
+      `INSERT INTO app_jobs (id, user_id, store_id, kind, status, phase, total, processed, payload)
+       VALUES (gen_random_uuid(),$1,$2,'run','queued','等待采集端领取',1,0,$3::jsonb) RETURNING id`,
+      [req.user.id, item.store_id, JSON.stringify({
+        urls: [item.ozon_url],
+        urlRows: [{ url: item.ozon_url, sourceRow: 1, collectId: item.id }],
+        options: { enable1688: false, enableAI: false, collectionOnly: true },
+      })],
+    );
+    await client.query(
+      `UPDATE collect_items SET status='pending', note='', linked_job_id=$1,
+         status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to','pending','reason','人工重试','job_id',$1,'at',now())),
+         updated_at=now() WHERE id=$2 AND user_id=$3`,
+      [jobResult.rows[0].id, item.id, req.user.id],
+    );
+    await client.query("COMMIT");
+    res.json({ success: true, job_id: jobResult.rows[0].id });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(error);
+  } finally { client.release(); }
 });
 
 app.post("/api/collect-items/bulk-delete", requireAuth, async (req, res, next) => {
@@ -7063,9 +7151,11 @@ async function finalizeWorkerRunJob(existing, job) {
     const collectId = String(source?.collectId || "").trim();
     if (collectionOnly && collectId && result.error && db) {
       await db.query(
-        `UPDATE collect_items SET status = 'failed', note = $1, updated_at = now()
+        `UPDATE collect_items SET status = 'failed', note = $1,
+           status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to','failed','reason',$1::text,'job_id',$4::text,'at',now())),
+           updated_at = now()
          WHERE id = $2 AND user_id = $3`,
-        [String(result.error).slice(0, 1000), collectId, existing.owner?.id],
+        [String(result.error).slice(0, 1000), collectId, existing.owner?.id, jobId],
       );
     }
     if (result.error) continue;
@@ -7078,7 +7168,9 @@ async function finalizeWorkerRunJob(existing, job) {
         await db.query(
           `UPDATE collect_items
            SET title = $1, main_image = $2, images = $3::jsonb, price_rub = $4,
-               brand = $5, attributes = $6::jsonb, status = 'scraped', note = '', updated_at = now()
+               brand = $5, attributes = $6::jsonb, status = 'scraped', note = '',
+               status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to','scraped','reason','采集完成','job_id',$9::text,'at',now())),
+               updated_at = now()
            WHERE id = $7 AND user_id = $8`,
           [
             String(ozon.title || ""),
@@ -7089,6 +7181,7 @@ async function finalizeWorkerRunJob(existing, job) {
             JSON.stringify(ozon.attributes || []),
             collectId,
             existing.owner?.id,
+            jobId,
           ],
         );
       }

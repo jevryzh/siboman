@@ -25,7 +25,8 @@ window.CollectionBoxView = {
       { label: '已忽略', value: 'ignored' },
     ];
 
-    const currentStoreId = Vue.computed(() => localStorage.getItem('currentStoreId') || '');
+    const currentStoreId = Vue.computed(() => String(window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '').split(',')[0].trim());
+    let searchTimer = null;
 
     const fetchItems = async () => {
       loading.value = true;
@@ -96,6 +97,10 @@ window.CollectionBoxView = {
 
     const onTabChange = () => { pagination.currentPage = 1; fetchItems(); };
     const onSearch = () => { pagination.currentPage = 1; fetchItems(); };
+    const onSearchInput = () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(onSearch, 350);
+    };
     const onSelectionChange = (rows) => { selectedRows.value = rows || []; };
 
     const updateStatus = async (row, status) => {
@@ -127,6 +132,21 @@ window.CollectionBoxView = {
       }
     };
 
+    const retryItem = async (row) => {
+      try {
+        const res = await axios.post(`/api/collect-items/${row.id}/retry`);
+        ElementPlus.ElMessage.success(`已重新创建采集任务 ${res.data.job_id || ''}`);
+        fetchItems();
+      } catch (e) { ElementPlus.ElMessage.error('重试失败：' + (e.response?.data?.error || e.message)); }
+    };
+
+    const exportCsv = () => {
+      const rows = [['Ozon SKU','标题','Ozon链接','主图','全部图片','售价(RUB)','1688链接','1688成本(CNY)','状态','失败原因'], ...items.value.map(row => [row.ozon_sku,row.title,row.ozon_url,row.main_image,(row.images || []).join(' | '),row.price_rub,row.source_url_1688,row.price_cny,statusLabel(row.status),row.note])];
+      const csv = rows.map(row => row.map(value => `"${String(value ?? '').replaceAll('"','""')}"`).join(',')).join('\n');
+      const url = URL.createObjectURL(new Blob([`\ufeff${csv}`], { type: 'text/csv;charset=utf-8' }));
+      const anchor = document.createElement('a'); anchor.href = url; anchor.download = `采集箱-${new Date().toISOString().slice(0,10)}.csv`; anchor.click(); URL.revokeObjectURL(url);
+    };
+
     const statusLabel = (status) => ({
       pending: '待采集', scraped: '已采集', uploaded: '已上架', failed: '失败', ignored: '已忽略',
     }[status] || status || '未知');
@@ -145,13 +165,13 @@ window.CollectionBoxView = {
     Vue.onMounted(fetchItems);
     const onShopChanged = () => { pagination.currentPage = 1; selectedRows.value = []; fetchItems(); };
     window.addEventListener('shop-changed', onShopChanged);
-    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
+    Vue.onBeforeUnmount(() => { clearTimeout(searchTimer); window.removeEventListener('shop-changed', onShopChanged); });
 
     return { 
       items, loading, importText, handleImport, editItem, drawer,
       activeTab, search, selectedRows, statusCounts, statusTabs,
       pagination, fetchItems, getProfitStyle, suggestedPrice, applySuggestedPrice, saveDraft,
-      onTabChange, onSearch, onSelectionChange, updateStatus, bulkDelete, statusLabel, statusType,
+      onTabChange, onSearch, onSearchInput, onSelectionChange, updateStatus, bulkDelete, retryItem, exportCsv, statusLabel, statusType,
     };
   },
   template: `
@@ -168,8 +188,9 @@ window.CollectionBoxView = {
           <div style="display:flex; justify-content:space-between; gap:12px; align-items:center">
             <strong>采集箱</strong>
             <div style="display:flex; gap:8px">
-              <el-input v-model="search" clearable placeholder="搜索标题 / SKU / 链接" style="width:260px" @keyup.enter="onSearch" />
+              <el-input v-model="search" clearable placeholder="搜索标题 / SKU / 链接" style="width:260px" @input="onSearchInput" @keyup.enter="onSearch" />
               <el-button @click="onSearch">搜索</el-button>
+              <el-button @click="exportCsv">导出 CSV</el-button>
               <el-button type="danger" plain :disabled="!selectedRows.length" @click="bulkDelete">批量删除</el-button>
             </div>
           </div>
@@ -197,8 +218,9 @@ window.CollectionBoxView = {
           </el-table-column>
           <el-table-column label="1688 货源" width="120">
              <template #default="{ row }">
+                <a v-if="row.source_url_1688" :href="row.source_url_1688" target="_blank" rel="noopener noreferrer">查看货源</a>
                 <div v-if="row.price_cny">¥ {{ row.price_cny }}</div>
-                <div v-else style="color:#ccc">未匹配</div>
+                <div v-else-if="!row.source_url_1688" style="color:#ccc">未匹配</div>
              </template>
           </el-table-column>
           <el-table-column label="状态" width="100">
@@ -207,6 +229,7 @@ window.CollectionBoxView = {
           <el-table-column label="操作" width="190" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" @click="editItem(row)">编辑</el-button>
+              <el-button v-if="row.status === 'failed'" link type="danger" @click="retryItem(row)">重新采集</el-button>
               <el-button v-if="row.status !== 'ignored'" link type="warning" @click="updateStatus(row, 'ignored')">忽略</el-button>
               <el-button v-else link type="success" @click="updateStatus(row, 'pending')">恢复</el-button>
             </template>
@@ -254,10 +277,13 @@ window.CollectionBoxView = {
           <el-form-item label="详细描述 (Description)">
              <el-input v-model="drawer.form.description" type="textarea" :rows="8" />
           </el-form-item>
+          <el-form-item label="1688 货源链接">
+             <el-input v-model="drawer.form.source_url_1688" placeholder="https://detail.1688.com/offer/..." />
+          </el-form-item>
         </el-form>
         
         <template #footer>
-          <el-button type="primary" @click="saveDraft">物理保存并同步</el-button>
+          <el-button type="primary" @click="saveDraft">保存采集资料</el-button>
         </template>
       </el-drawer>
 
