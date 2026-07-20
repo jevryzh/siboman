@@ -1400,6 +1400,41 @@ app.get("/api/seller/warehouses", requireAuth, async (req, res) => {
   }
 });
 
+async function fetchLiveStocksByOffer(storeId, userId, offerIds) {
+  const ids = [...new Set((offerIds || []).map((value) => String(value || "").trim()).filter(Boolean))];
+  const result = new Map();
+  for (let index = 0; index < ids.length; index += 100) {
+    const chunk = ids.slice(index, index + 100);
+    const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: chunk }, { storeId, userId });
+    for (const item of (info?.items || info?.result?.items || [])) {
+      result.set(`${item.offer_id}|*`, true);
+      const stocks = Array.isArray(item?.stocks?.stocks) ? item.stocks.stocks : (Array.isArray(item?.stocks) ? item.stocks : []);
+      for (const stock of stocks) {
+        const warehouseId = Number(stock.warehouse_id || 0);
+        if (warehouseId > 0) result.set(`${item.offer_id}|${warehouseId}`, Number(stock.present || 0));
+      }
+    }
+  }
+  return result;
+}
+
+function findStockConflicts(rows, liveStocks) {
+  return rows.flatMap((row) => {
+    const key = `${row.offer_id}|${Number(row.warehouse_id)}`;
+    if (!liveStocks.has(key) && !liveStocks.has(`${row.offer_id}|*`)) return [];
+    const liveStock = liveStocks.has(key) ? Number(liveStocks.get(key)) : 0;
+    const expectedStock = Number(row.expected_stock ?? row.current_ozon_stock ?? 0);
+    return liveStock === expectedStock ? [] : [{
+      id: row.id || null,
+      offer_id: row.offer_id,
+      warehouse_id: Number(row.warehouse_id),
+      expected_stock: expectedStock,
+      live_stock: liveStock,
+      target_stock: Number(row.target_stock ?? row.stock),
+    }];
+  });
+}
+
 /**
  * v0.3.5 分仓库存明细 - 查询指定 offer_id 在所有已知仓库的库存分布
  * 数据源优先级 (三级 fallback):
@@ -1418,8 +1453,8 @@ app.get("/api/seller/products/stocks/detail", requireAuth, async (req, res) => {
 
     // 1) 本地商品行 (stocks_json + product_id)
     const localR = await db.query(
-      `SELECT product_id, stock, stocks_json FROM app_products WHERE store_id=$1 AND offer_id=$2`,
-      [storeId, offer_id],
+      `SELECT product_id, stock, stocks_json FROM app_products WHERE user_id=$1 AND store_id=$2 AND offer_id=$3`,
+      [userId, storeId, offer_id],
     );
     if (!localR.rows.length) return res.status(404).json({ success: false, error: "本地未找到商品, 请先同步" });
     const prod = localR.rows[0];
@@ -1525,6 +1560,7 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     const userId = req.user.id;
     const raw = Array.isArray(req.body?.stocks) ? req.body.stocks : [];
+    const force = req.body?.force === true;
     if (!raw.length) return res.status(400).json({ success: false, error: "stocks 为空" });
 
     // 补齐 product_id (从本地库查)
@@ -1532,8 +1568,8 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
     let offerToPid = new Map();
     if (offersNeedResolve.length) {
       const r = await db.query(
-        `SELECT offer_id, product_id FROM app_products WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
-        [storeId, offersNeedResolve],
+        `SELECT offer_id, product_id FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+        [userId, storeId, offersNeedResolve],
       );
       offerToPid = new Map(r.rows.map(x => [x.offer_id, x.product_id]));
     }
@@ -1553,6 +1589,20 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
 
     if (!payload.length) return res.status(400).json({ success: false, error: "无有效 payload (缺 product_id 或 warehouse_id)" });
 
+    const liveStocks = await fetchLiveStocksByOffer(storeId, userId, payload.map((row) => row.offer_id));
+    const conflicts = findStockConflicts(raw, liveStocks);
+    if (conflicts.length && !force) {
+      for (const conflict of conflicts) {
+        await db.query(
+          `INSERT INTO app_stock_change_logs (
+             user_id, store_id, offer_id, warehouse_id, previous_stock, target_stock, status, error
+           ) VALUES ($1,$2,$3,$4,$5,$6,'conflict',$7)`,
+          [userId, storeId, conflict.offer_id, conflict.warehouse_id, conflict.live_stock, conflict.target_stock, `页面基线 ${conflict.expected_stock}，Ozon 实时 ${conflict.live_stock}`],
+        );
+      }
+      return res.status(409).json({ success: false, code: "STOCK_CONFLICT", error: "Ozon 实时库存已发生变化", conflicts });
+    }
+
     const data = await callOzonSellerAPI("/v2/products/stocks", { stocks: payload }, { storeId, userId });
 
     // v0.3.5 物理修复: 精确按 offer_id 汇总 payload 内所有仓库新库存写回本地
@@ -1566,8 +1616,8 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
     for (const [offer_id, arr] of byOffer) {
       // 读现有 stocks_json, 合并 warehouse_id 维度覆盖新库存
       const cur = await db.query(
-        `SELECT stocks_json FROM app_products WHERE store_id = $1 AND offer_id = $2`,
-        [storeId, offer_id],
+        `SELECT stocks_json FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = $3`,
+        [userId, storeId, offer_id],
       );
       let stocksJson = [];
       try {
@@ -1580,7 +1630,8 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
       for (const s of arr) {
         const wid = Number(s.warehouse_id);
         const existing = whMap.get(wid) || { warehouse_id: wid, source: "fbs", reserved: 0 };
-        const previousStock = Number(existing.present || 0);
+        const liveKey = `${offer_id}|${wid}`;
+        const previousStock = liveStocks.has(liveKey) ? Number(liveStocks.get(liveKey)) : Number(existing.present || 0);
         whMap.set(wid, { ...existing, warehouse_id: wid, present: Number(s.stock) });
         await db.query(
           `INSERT INTO app_stock_change_logs (
@@ -1595,8 +1646,8 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
       await db.query(
         `UPDATE app_products
          SET stock = $3, stocks_json = $4::jsonb, updated_at = now()
-         WHERE store_id = $1 AND offer_id = $2`,
-        [storeId, offer_id, totalStock, JSON.stringify(merged)],
+         WHERE user_id = $1 AND store_id = $2 AND offer_id = $5`,
+        [userId, storeId, totalStock, JSON.stringify(merged), offer_id],
       );
     }
     res.json({ success: true, data, submitted: payload });
@@ -2034,6 +2085,7 @@ app.post("/api/seller/products/stocks/bulk", requireAuth, async (req, res, next)
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+    const force = req.body?.force === true;
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     const params = [req.user.id, storeId];
     let idWhere = "";
@@ -2045,6 +2097,26 @@ app.post("/api/seller/products/stocks/bulk", requireAuth, async (req, res, next)
     if (!draftResult.rowCount) return res.status(400).json({ success: false, error: "没有待提交库存草稿" });
 
     const drafts = draftResult.rows;
+    const liveStocks = await fetchLiveStocksByOffer(storeId, req.user.id, drafts.map((row) => row.offer_id));
+    const conflicts = findStockConflicts(drafts, liveStocks);
+    if (conflicts.length && !force) {
+      for (const conflict of conflicts) {
+        await db.query(
+          `INSERT INTO app_stock_change_logs (
+             user_id, store_id, offer_id, warehouse_id, previous_stock, target_stock, status, error
+           ) VALUES ($1,$2,$3,$4,$5,$6,'conflict',$7)`,
+          [req.user.id, storeId, conflict.offer_id, conflict.warehouse_id, conflict.live_stock, conflict.target_stock, `草稿基线 ${conflict.expected_stock}，Ozon 实时 ${conflict.live_stock}`],
+        );
+      }
+      return res.status(409).json({ success: false, code: "STOCK_CONFLICT", error: "Ozon 实时库存已发生变化", conflicts });
+    }
+    if (conflicts.length) {
+      const currentByKey = new Map(conflicts.map((row) => [`${row.offer_id}|${row.warehouse_id}`, row.live_stock]));
+      for (const draft of drafts) {
+        const actual = currentByKey.get(`${draft.offer_id}|${Number(draft.warehouse_id)}`);
+        if (actual !== undefined) draft.current_ozon_stock = actual;
+      }
+    }
     const successes = [];
     const failures = [];
     for (let index = 0; index < drafts.length; index += 100) {

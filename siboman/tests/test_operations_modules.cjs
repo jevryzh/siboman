@@ -16,12 +16,17 @@ for (const route of [
   '/api/seller/products/stocks/bulk',
 ]) assert(server.includes(route), `missing route ${route}`);
 assert(server.includes('drafts.slice(index, index + 100)'));
+assert(server.includes('fetchLiveStocksByOffer'));
+assert(server.includes('code: "STOCK_CONFLICT"'));
+assert(server.includes("'conflict'"));
 assert(inventory.includes('submitAllDrafts'));
 assert(inventory.includes('saveStockDrafts'));
 assert(inventory.includes('inventoryLowStockThreshold'));
 assert(inventory.includes('inventoryStats'));
 assert(inventory.includes('window.XLSX'));
 assert(inventory.includes('exportReplenishment'));
+assert(inventory.includes('submitWithConflictCheck'));
+assert(inventory.includes('发现 Ozon 实时库存冲突'));
 assert(server.includes('app.post("/api/seller/stocks/import", requireAuth'));
 assert(server.includes('app.patch("/api/products/:offer_id/field", requireAuth'));
 

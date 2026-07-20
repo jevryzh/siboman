@@ -30,6 +30,31 @@ window.InventoryManagementView = {
       error: (msg) => (window.ElementPlus?.ElMessage || console).error?.(msg),
     };
 
+    const submitWithConflictCheck = async (url, payload, config = {}) => {
+      try {
+        return await axios.post(url, payload, config);
+      } catch (error) {
+        const data = error.response?.data || {};
+        if (error.response?.status !== 409 || data.code !== 'STOCK_CONFLICT') throw error;
+        const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+        const details = conflicts.slice(0, 8).map((item) =>
+          `${item.offer_id} / 仓${item.warehouse_id}: 原 ${item.expected_stock}，现 ${item.live_stock}，目标 ${item.target_stock}`
+        ).join('\n');
+        try {
+          await window.ElementPlus.ElMessageBox.confirm(
+            `${conflicts.length} 条库存已被其他操作修改：\n${details}${conflicts.length > 8 ? '\n…' : ''}\n\n是否以当前草稿目标库存覆盖？`,
+            '发现 Ozon 实时库存冲突',
+            { type: 'warning', confirmButtonText: '确认覆盖', cancelButtonText: '取消', dangerouslyUseHTMLString: false },
+          );
+        } catch {
+          const cancelled = new Error('已取消覆盖实时库存');
+          cancelled.code = 'STOCK_CONFLICT_CANCELLED';
+          throw cancelled;
+        }
+        return axios.post(url, { ...payload, force: true }, config);
+      }
+    };
+
     const fetchInventory = async () => {
       const sid = getStoreId();
       if (!sid) return;
@@ -158,8 +183,9 @@ window.InventoryManagementView = {
           product_id: stockDialog.row.product_id,
           warehouse_id: Number(s.warehouse_id),
           stock: Number(s.new_stock),
+          expected_stock: Number(s.present),
         }));
-        const res = await axios.post('/api/seller/products/stocks', { store_id: getStoreId(), stocks });
+        const res = await submitWithConflictCheck('/api/seller/products/stocks', { store_id: getStoreId(), stocks });
         const draftIds = changed.map((stock) => stock.draft_id).filter(Boolean);
         if (draftIds.length) {
           await axios.delete('/api/seller/stocks/drafts', { data: { store_id: getStoreId(), ids: draftIds } });
@@ -168,6 +194,7 @@ window.InventoryManagementView = {
         stockDialog.visible = false;
         setTimeout(refreshAll, 800);
       } catch (e) {
+        if (e.code === 'STOCK_CONFLICT_CANCELLED') return;
         notify.error('提交失败: ' + (e.response?.data?.payload?.message || e.response?.data?.error || e.message));
       } finally {
         stockDialog.submitting = false;
@@ -208,11 +235,13 @@ window.InventoryManagementView = {
       } catch { return; }
       draftLoading.value = true;
       try {
-        const res = await axios.post('/api/seller/products/stocks/bulk', { store_id: getStoreId() }, { validateStatus: (status) => status === 200 || status === 207 });
+        const res = await submitWithConflictCheck('/api/seller/products/stocks/bulk', { store_id: getStoreId() }, { validateStatus: (status) => status === 200 || status === 207 });
         const message = `提交 ${res.data.submitted || 0} 条：成功 ${res.data.succeeded || 0}，失败 ${res.data.failed || 0}`;
         if (res.data.failed) notify.warning(message); else notify.success(message);
         await refreshAll();
-      } catch (e) { notify.error('批量提交失败: ' + (e.response?.data?.error || e.message)); }
+      } catch (e) {
+        if (e.code !== 'STOCK_CONFLICT_CANCELLED') notify.error('批量提交失败: ' + (e.response?.data?.error || e.message));
+      }
       finally { draftLoading.value = false; }
     };
 
