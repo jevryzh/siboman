@@ -2447,10 +2447,10 @@ app.get("/api/seller/products/category-examples", requireAuth, async (req, res, 
     const r = await db.query(
       `SELECT sku, offer_id, name, images
          FROM app_products
-        WHERE store_id = $1 AND description_category_id = $2 AND name != ''
+        WHERE user_id = $1 AND store_id = $2 AND description_category_id = $3 AND name != ''
         ORDER BY updated_at DESC NULLS LAST
-        LIMIT $3`,
-      [storeId, catId, limit],
+        LIMIT $4`,
+      [req.user.id, storeId, catId, limit],
     );
     res.json({
       success: true,
@@ -3326,8 +3326,8 @@ app.post("/api/ai/pricing", requireAuth, async (req, res) => {
     // 简易策略: 同店铺同类目均价 + 重量系数 (业务可迭代)
     const r = await db.query(
       `SELECT AVG(price) as avg_price, MIN(price) as min_price, COUNT(*) as n
-       FROM app_products WHERE store_id = $1 AND price > 0`,
-      [storeId],
+       FROM app_products WHERE user_id = $1 AND store_id = $2 AND price > 0`,
+      [req.user.id, storeId],
     );
     const avg = Number(r.rows?.[0]?.avg_price || 0);
     const min = Number(r.rows?.[0]?.min_price || 0);

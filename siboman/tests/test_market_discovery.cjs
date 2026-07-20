@@ -6,6 +6,8 @@ const main = fs.readFileSync('public/js/main.js', 'utf8');
 
 for (const table of ['app_top_lists', 'app_china_sellers']) assert(server.includes(`CREATE TABLE IF NOT EXISTS ${table}`));
 for (const route of ['/api/sourcing/bestsellers', '/api/sourcing/bestsellers/import', '/api/sourcing/china-zone', '/api/sourcing/china-zone/verify']) assert(server.includes(route));
+assert(view.includes("split(',').map(value => value.trim()).find(Boolean)"));
+assert(server.includes('WHERE user_id = $1 AND store_id = $2 AND description_category_id = $3'));
 assert.match(server, /source_name\/source_captured_at/);
 assert.match(server, /req\.user\.role !== 'admin'/);
 assert.match(server, /confidence: 0\.65/);

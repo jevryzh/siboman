@@ -12,7 +12,9 @@ window.MarketDiscoveryView = {
     const isAdmin = Vue.ref(false);
     const importInput = Vue.ref(null);
     const importDialog = Vue.reactive({ visible: false, loading: false, items: [], source_name: '', source_captured_at: new Date().toISOString().slice(0, 16) });
-    const storeId = () => window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '';
+    const storeId = () => String(
+      window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '',
+    ).split(',').map(value => value.trim()).find(Boolean) || '';
     const errorText = error => error?.response?.data?.error || error?.message || '请求失败';
     const formatTime = value => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '-';
     const isStale = Vue.computed(() => !freshness.value.latest || Date.now() - new Date(freshness.value.latest).getTime() > 86400e3);
@@ -35,6 +37,7 @@ window.MarketDiscoveryView = {
     function onSelect(items) { selected.value = items || []; }
     async function addToCollection(items = selected.value) {
       if (!items.length) return ElementPlus.ElMessage.warning('请先选择商品');
+      if (!storeId()) return ElementPlus.ElMessage.warning('请先选择店铺');
       try {
         const response = await axios.post('/api/collect-items', {
           store_id: storeId(),
