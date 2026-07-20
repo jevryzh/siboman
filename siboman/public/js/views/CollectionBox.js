@@ -11,7 +11,19 @@ window.CollectionBoxView = {
     });
     const importText = Vue.ref('');
     const activeTab = Vue.ref('all');
+    const search = Vue.ref('');
+    const selectedRows = Vue.ref([]);
+    const statusCounts = Vue.reactive({ all: 0 });
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 20, total: 0 });
+
+    const statusTabs = [
+      { label: '全部', value: 'all' },
+      { label: '待采集', value: 'pending' },
+      { label: '已采集', value: 'scraped' },
+      { label: '已上架', value: 'uploaded' },
+      { label: '失败', value: 'failed' },
+      { label: '已忽略', value: 'ignored' },
+    ];
 
     const currentStoreId = Vue.computed(() => localStorage.getItem('currentStoreId') || '');
 
@@ -22,12 +34,16 @@ window.CollectionBoxView = {
           params: { 
             status: activeTab.value, 
             store_id: currentStoreId.value,
+            search: search.value,
             limit: pagination.pageSize,
             offset: (pagination.currentPage - 1) * pagination.pageSize
           }
         });
         items.value = res.data.items || [];
         pagination.total = res.data.total || 0;
+        Object.assign(statusCounts, { all: 0 }, res.data.status_counts || {});
+      } catch (e) {
+        ElementPlus.ElMessage.error('获取采集箱失败：' + (e.response?.data?.error || e.message));
       } finally {
         loading.value = false;
       }
@@ -36,12 +52,12 @@ window.CollectionBoxView = {
     const handleImport = async () => {
       if (!importText.value.trim()) return;
       try {
-        await axios.post('/api/collect-items', { inputs: importText.value, storeId: currentStoreId.value });
-        ElementPlus.ElMessage.success('已提交采集');
+        const res = await axios.post('/api/collect-items', { inputs: importText.value, storeId: currentStoreId.value });
+        ElementPlus.ElMessage.success(`已加入 ${res.data.insertedCount || 0} 条，跳过 ${res.data.skippedCount || 0} 条重复数据`);
         importText.value = '';
         fetchItems();
       } catch (e) {
-        ElementPlus.ElMessage.error('采集失败');
+        ElementPlus.ElMessage.error('采集失败：' + (e.response?.data?.error || e.message));
       }
     };
 
@@ -78,6 +94,46 @@ window.CollectionBoxView = {
       }
     };
 
+    const onTabChange = () => { pagination.currentPage = 1; fetchItems(); };
+    const onSearch = () => { pagination.currentPage = 1; fetchItems(); };
+    const onSelectionChange = (rows) => { selectedRows.value = rows || []; };
+
+    const updateStatus = async (row, status) => {
+      try {
+        await axios.post(`/api/collect-items/${row.id}`, { status });
+        ElementPlus.ElMessage.success(status === 'ignored' ? '已忽略' : '已恢复');
+        fetchItems();
+      } catch (e) {
+        ElementPlus.ElMessage.error('更新失败：' + (e.response?.data?.error || e.message));
+      }
+    };
+
+    const bulkDelete = async () => {
+      if (!selectedRows.value.length) return ElementPlus.ElMessage.warning('请先选择采集项');
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          `确定删除选中的 ${selectedRows.value.length} 条记录？`,
+          '批量删除',
+          { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      try {
+        const res = await axios.post('/api/collect-items/bulk-delete', { ids: selectedRows.value.map((row) => row.id) });
+        ElementPlus.ElMessage.success(`已删除 ${res.data.deleted || 0} 条`);
+        selectedRows.value = [];
+        fetchItems();
+      } catch (e) {
+        ElementPlus.ElMessage.error('删除失败：' + (e.response?.data?.error || e.message));
+      }
+    };
+
+    const statusLabel = (status) => ({
+      pending: '待采集', scraped: '已采集', uploaded: '已上架', failed: '失败', ignored: '已忽略',
+    }[status] || status || '未知');
+    const statusType = (status) => ({
+      pending: 'warning', scraped: 'success', uploaded: 'success', failed: 'danger', ignored: 'info',
+    }[status] || 'info');
+
     const getProfitStyle = (row) => {
       if (!row.price_rub || !row.price_cny) return {};
       const margin = (row.price_rub * 0.0862 - row.price_cny) / (row.price_rub * 0.0862);
@@ -87,31 +143,54 @@ window.CollectionBoxView = {
     };
 
     Vue.onMounted(fetchItems);
-    window.addEventListener('shop-changed', () => { pagination.currentPage = 1; fetchItems(); });
+    const onShopChanged = () => { pagination.currentPage = 1; selectedRows.value = []; fetchItems(); };
+    window.addEventListener('shop-changed', onShopChanged);
+    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return { 
-      items, loading, importText, handleImport, editItem, drawer, 
-      pagination, fetchItems, getProfitStyle, suggestedPrice, applySuggestedPrice, saveDraft 
+      items, loading, importText, handleImport, editItem, drawer,
+      activeTab, search, selectedRows, statusCounts, statusTabs,
+      pagination, fetchItems, getProfitStyle, suggestedPrice, applySuggestedPrice, saveDraft,
+      onTabChange, onSearch, onSelectionChange, updateStatus, bulkDelete, statusLabel, statusType,
     };
   },
   template: `
     <div class="collection-box-v3">
-      <el-card style="margin-bottom: 20px">
-        <div style="display: flex; gap: 10px">
-          <el-input v-model="importText" placeholder="粘贴单条或多条 Ozon 链接/SKU..." @keyup.enter="handleImport" />
-          <el-button type="primary" @click="handleImport">立即采集</el-button>
+      <el-card style="margin-bottom:16px">
+        <div style="display:flex; gap:10px; align-items:flex-start">
+          <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon 链接或 SKU，每行一条" />
+          <el-button type="primary" @click="handleImport" style="height:32px">加入采集箱</el-button>
         </div>
       </el-card>
 
       <el-card>
-        <el-table :data="items" v-loading="loading" stripe border>
+        <template #header>
+          <div style="display:flex; justify-content:space-between; gap:12px; align-items:center">
+            <strong>采集箱</strong>
+            <div style="display:flex; gap:8px">
+              <el-input v-model="search" clearable placeholder="搜索标题 / SKU / 链接" style="width:260px" @keyup.enter="onSearch" />
+              <el-button @click="onSearch">搜索</el-button>
+              <el-button type="danger" plain :disabled="!selectedRows.length" @click="bulkDelete">批量删除</el-button>
+            </div>
+          </div>
+        </template>
+
+        <el-tabs v-model="activeTab" @tab-change="onTabChange">
+          <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :name="tab.value">
+            <template #label>{{ tab.label }} <span style="color:#909399">({{ statusCounts[tab.value] || 0 }})</span></template>
+          </el-tab-pane>
+        </el-tabs>
+
+        <el-table :data="items" v-loading="loading" stripe border @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="44" />
           <el-table-column label="商品信息" min-width="250">
             <template #default="{ row }">
               <div style="display: flex; gap: 10px; align-items: center">
-                <el-image :src="row.main_image" style="width: 45px; height: 45px" fit="cover" />
+                <el-image :src="row.main_image" style="width:45px; height:45px" fit="cover" preview-teleported :preview-src-list="row.images?.length ? row.images : [row.main_image]" />
                 <div style="flex: 1; min-width: 0">
                   <div class="text-ellipsis" style="font-size: 13px">{{ row.title || '正在采集...' }}</div>
-                  <div style="font-size: 11px; color: #999">货号: {{ row.linked_offer_id || '-' }}</div>
+                  <div style="font-size:11px; color:#999">SKU: {{ row.ozon_sku || '-' }}</div>
+                  <div v-if="row.note" style="font-size:11px; color:#f56c6c; margin-top:3px">{{ row.note }}</div>
                 </div>
               </div>
             </template>
@@ -122,10 +201,14 @@ window.CollectionBoxView = {
                 <div v-else style="color:#ccc">未匹配</div>
              </template>
           </el-table-column>
-          <el-table-column label="状态" width="100" prop="status" />
-          <el-table-column label="操作" width="100" fixed="right">
+          <el-table-column label="状态" width="100">
+            <template #default="{ row }"><el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template>
+          </el-table-column>
+          <el-table-column label="操作" width="190" fixed="right">
             <template #default="{ row }">
-              <el-button link type="primary" @click="editItem(row)">编辑/上架</el-button>
+              <el-button link type="primary" @click="editItem(row)">编辑</el-button>
+              <el-button v-if="row.status !== 'ignored'" link type="warning" @click="updateStatus(row, 'ignored')">忽略</el-button>
+              <el-button v-else link type="success" @click="updateStatus(row, 'pending')">恢复</el-button>
             </template>
           </el-table-column>
         </el-table>

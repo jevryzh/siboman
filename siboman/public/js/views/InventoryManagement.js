@@ -4,6 +4,11 @@ window.InventoryManagementView = {
     const loading = Vue.ref(false);
     const syncLoading = Vue.ref(false);
     const search = Vue.ref('');
+    const drafts = Vue.ref([]);
+    const draftLoading = Vue.ref(false);
+    const importInput = Vue.ref(null);
+    const importLoading = Vue.ref(false);
+    const threshold = Vue.ref(Math.max(1, Number(localStorage.getItem('inventoryLowStockThreshold') || 5)));
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 50, total: 0 });
 
     // v0.3.4 分仓修改弹窗
@@ -40,6 +45,27 @@ window.InventoryManagementView = {
       } finally {
         loading.value = false;
       }
+    };
+
+    const fetchDrafts = async () => {
+      const sid = getStoreId();
+      if (!sid) return;
+      try {
+        const res = await axios.get('/api/seller/stocks/drafts', { params: { store_id: sid } });
+        drafts.value = res.data.items || [];
+      } catch (e) { notify.error('库存草稿加载失败: ' + (e.response?.data?.error || e.message)); }
+    };
+
+    const refreshAll = async () => Promise.all([fetchInventory(), fetchDrafts()]);
+    const inventoryStats = Vue.computed(() => ({
+      total: pagination.total,
+      outOfStock: inventory.value.filter((row) => totalStock(row) === 0).length,
+      lowStock: inventory.value.filter((row) => totalStock(row) > 0 && totalStock(row) < threshold.value).length,
+      drafts: drafts.value.length,
+    }));
+    const onThresholdChange = (value) => {
+      threshold.value = Math.max(1, Number(value || 5));
+      localStorage.setItem('inventoryLowStockThreshold', String(threshold.value));
     };
 
     const handleSyncAll = async () => {
@@ -83,6 +109,15 @@ window.InventoryManagementView = {
           selected: false,
           has_stock: w.has_stock,
         }));
+        for (const stock of stockDialog.stocks) {
+          const draft = drafts.value.find((item) => item.offer_id === row.offer_id && Number(item.warehouse_id) === Number(stock.warehouse_id));
+          if (draft) {
+            stock.new_stock = Number(draft.target_stock);
+            stock.selected = true;
+            stock.draft_id = draft.id;
+            stock.last_error = draft.last_error || '';
+          }
+        }
       } catch (e) {
         // Fallback: detail 失败时走旧的 warehouses + parseStocks 组合
         console.warn('[stock-editor] detail 接口失败, 回退旧逻辑:', e.message);
@@ -125,14 +160,108 @@ window.InventoryManagementView = {
           stock: Number(s.new_stock),
         }));
         const res = await axios.post('/api/seller/products/stocks', { store_id: getStoreId(), stocks });
+        const draftIds = changed.map((stock) => stock.draft_id).filter(Boolean);
+        if (draftIds.length) {
+          await axios.delete('/api/seller/stocks/drafts', { data: { store_id: getStoreId(), ids: draftIds } });
+        }
         notify.success(`已提交 ${stocks.length} 个仓库的库存变更至 Ozon`);
         stockDialog.visible = false;
-        setTimeout(fetchInventory, 800);
+        setTimeout(refreshAll, 800);
       } catch (e) {
         notify.error('提交失败: ' + (e.response?.data?.payload?.message || e.response?.data?.error || e.message));
       } finally {
         stockDialog.submitting = false;
       }
+    };
+
+    const saveStockDrafts = async () => {
+      const selected = stockDialog.stocks.filter((stock) => stock.selected);
+      if (!selected.length) return notify.warning('请勾选要保存的仓库');
+      if (selected.some((stock) => Number(stock.new_stock) < 0)) return notify.warning('库存不能小于 0');
+      stockDialog.submitting = true;
+      try {
+        const res = await axios.post('/api/seller/stocks/save-draft', {
+          store_id: getStoreId(),
+          stocks: selected.map((stock) => ({
+            offer_id: stockDialog.row.offer_id,
+            product_id: stockDialog.row.product_id,
+            warehouse_id: stock.warehouse_id,
+            current_stock: stock.present,
+            target_stock: stock.new_stock,
+          })),
+        });
+        notify.success(`已保存 ${res.data.saved || 0} 条库存草稿`);
+        stockDialog.visible = false;
+        await fetchDrafts();
+      } catch (e) { notify.error('保存草稿失败: ' + (e.response?.data?.error || e.message)); }
+      finally { stockDialog.submitting = false; }
+    };
+
+    const submitAllDrafts = async () => {
+      if (!drafts.value.length) return notify.warning('没有待提交的库存草稿');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `确定将 ${drafts.value.length} 条库存草稿提交到 Ozon？`,
+          '批量提交库存',
+          { type: 'warning', confirmButtonText: '确认提交', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      draftLoading.value = true;
+      try {
+        const res = await axios.post('/api/seller/products/stocks/bulk', { store_id: getStoreId() }, { validateStatus: (status) => status === 200 || status === 207 });
+        const message = `提交 ${res.data.submitted || 0} 条：成功 ${res.data.succeeded || 0}，失败 ${res.data.failed || 0}`;
+        if (res.data.failed) notify.warning(message); else notify.success(message);
+        await refreshAll();
+      } catch (e) { notify.error('批量提交失败: ' + (e.response?.data?.error || e.message)); }
+      finally { draftLoading.value = false; }
+    };
+
+    const clearDrafts = async () => {
+      if (!drafts.value.length) return;
+      try {
+        await window.ElementPlus.ElMessageBox.confirm('确定清空当前店铺全部库存草稿？', '清空草稿', { type: 'warning' });
+      } catch { return; }
+      try {
+        await axios.delete('/api/seller/stocks/drafts', { data: { store_id: getStoreId() } });
+        drafts.value = [];
+        notify.success('库存草稿已清空');
+      } catch (e) { notify.error('清空失败: ' + (e.response?.data?.error || e.message)); }
+    };
+
+    const importStocks = async (event) => {
+      const file = event.target.files?.[0];
+      event.target.value = '';
+      if (!file) return;
+      if (!window.XLSX) return notify.error('Excel 解析组件加载失败，请刷新页面后重试');
+      importLoading.value = true;
+      try {
+        const workbook = window.XLSX.read(await file.arrayBuffer(), { type: 'array' });
+        const sheet = workbook.Sheets[workbook.SheetNames[0]];
+        const rows = window.XLSX.utils.sheet_to_json(sheet, { defval: '' });
+        if (!rows.length) return notify.warning('文件中没有数据');
+        const res = await axios.post('/api/seller/stocks/import', { store_id: getStoreId(), rows });
+        const message = `导入完成：成功 ${res.data.imported || 0}，失败 ${res.data.failed || 0}`;
+        if (res.data.failed) {
+          const sample = (res.data.errors || []).slice(0, 3).map(item => `第${item.row}行 ${item.offer_id || ''}: ${item.error}`).join('；');
+          notify.warning(`${message}。${sample}`);
+        } else notify.success(message);
+        await fetchDrafts();
+      } catch (e) { notify.error('导入失败: ' + (e.response?.data?.error || e.message)); }
+      finally { importLoading.value = false; }
+    };
+
+    const downloadTemplate = () => {
+      const sheet = window.XLSX.utils.json_to_sheet([{ offer_id: '示例货号', stock: 10, warehouse_id: '' }]);
+      const book = window.XLSX.utils.book_new(); window.XLSX.utils.book_append_sheet(book, sheet, '库存导入');
+      window.XLSX.writeFile(book, '库存导入模板.xlsx');
+    };
+
+    const exportReplenishment = () => {
+      const rows = inventory.value.filter(row => totalStock(row) < threshold.value).map(row => ({
+        'Offer ID': row.offer_id, '商品名称': row.name, '当前库存': totalStock(row), '建议补货': Math.max(0, threshold.value * 2 - totalStock(row)), '1688链接': row.source_url_1688 || '', '近7天销量': row.sales_7d || '',
+      }));
+      if (!rows.length) return notify.warning('当前页没有需要补货的商品');
+      const sheet = window.XLSX.utils.json_to_sheet(rows); const book = window.XLSX.utils.book_new(); window.XLSX.utils.book_append_sheet(book, sheet, '预补货单'); window.XLSX.writeFile(book, `预补货单-${new Date().toISOString().slice(0, 10)}.xlsx`);
     };
 
     const onPageChange = () => fetchInventory();
@@ -159,14 +288,16 @@ window.InventoryManagementView = {
     };
     const warehouseTagType = (source) => ({ fbs: 'primary', fbo: 'success', crossborder: 'warning', rfbs: 'info' }[String(source || '').toLowerCase()] || 'info');
 
-    Vue.onMounted(fetchInventory);
-    const onShopChanged = () => { pagination.currentPage = 1; inventory.value = []; pagination.total = 0; fetchInventory(); };
+    Vue.onMounted(refreshAll);
+    const onShopChanged = () => { pagination.currentPage = 1; inventory.value = []; drafts.value = []; pagination.total = 0; refreshAll(); };
     window.addEventListener('shop-changed', onShopChanged);
     Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return {
       inventory, loading, syncLoading, search, pagination, stockDialog,
+      drafts, draftLoading, importInput, importLoading, threshold, inventoryStats,
       fetchInventory, handleSyncAll, openStockEditor, submitStockChanges,
+      fetchDrafts, refreshAll, onThresholdChange, saveStockDrafts, submitAllDrafts, clearDrafts, importStocks, downloadTemplate, exportReplenishment,
       onPageChange, onSizeChange, onSearch,
       parseStocks, totalStock, totalReserved, warehouseCount, warehouseLabel, warehouseTagType,
     };
@@ -179,14 +310,29 @@ window.InventoryManagementView = {
             <div style="display:flex; align-items:center; gap:12px">
               <span style="font-weight:bold">库存管理 (v0.3.4)</span>
               <el-tag size="small" type="info">共 {{ pagination.total }} 个 SKU</el-tag>
-              <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">🔄 同步 Ozon 全量</el-button>
+              <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">同步 Ozon 全量</el-button>
+              <el-button type="primary" size="small" :disabled="!drafts.length" :loading="draftLoading" @click="submitAllDrafts">提交草稿 ({{ drafts.length }})</el-button>
+              <el-button size="small" :disabled="!drafts.length" @click="clearDrafts">清空草稿</el-button>
+              <el-button size="small" :loading="importLoading" @click="importInput?.click()">导入库存</el-button>
+              <el-button size="small" @click="downloadTemplate">下载模板</el-button>
+              <el-button size="small" @click="exportReplenishment">导出预补货单</el-button>
+              <input ref="importInput" type="file" accept=".csv,.xlsx,.xls" style="display:none" @change="importStocks" />
             </div>
             <div style="display:flex; gap:8px">
+              <span style="font-size:12px; color:#606266; align-self:center">低库存阈值</span>
+              <el-input-number :model-value="threshold" :min="1" :max="9999" size="small" style="width:100px" @change="onThresholdChange" />
               <el-input v-model="search" placeholder="货号 / 商品名" size="small" style="width:240px" @keyup.enter="onSearch" clearable />
               <el-button type="primary" size="small" @click="onSearch">查询</el-button>
             </div>
           </div>
         </template>
+
+        <div style="display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); border:1px solid #ebeef5; margin-bottom:16px">
+          <div style="padding:14px 18px; border-right:1px solid #ebeef5"><div style="font-size:12px;color:#909399">商品总数</div><strong style="font-size:24px">{{ inventoryStats.total }}</strong></div>
+          <div style="padding:14px 18px; border-right:1px solid #ebeef5"><div style="font-size:12px;color:#909399">当前页缺货</div><strong style="font-size:24px;color:#f56c6c">{{ inventoryStats.outOfStock }}</strong></div>
+          <div style="padding:14px 18px; border-right:1px solid #ebeef5"><div style="font-size:12px;color:#909399">当前页低库存</div><strong style="font-size:24px;color:#e6a23c">{{ inventoryStats.lowStock }}</strong></div>
+          <div style="padding:14px 18px"><div style="font-size:12px;color:#909399">暂存待提交</div><strong style="font-size:24px;color:#409eff">{{ inventoryStats.drafts }}</strong></div>
+        </div>
 
         <el-table :data="inventory" v-loading="loading" stripe border size="small">
           <!-- v0.3.4: 图片放大 60x60 + 点击预览大图 -->
@@ -226,7 +372,7 @@ window.InventoryManagementView = {
               <el-popover placement="top" :width="320" trigger="hover">
                 <template #reference>
                   <div style="display:flex; align-items:center; gap:8px; cursor:pointer">
-                    <el-tag size="small" :type="totalStock(row) < 10 ? 'danger' : 'success'" style="font-weight:bold; font-size:13px">
+                    <el-tag size="small" :type="totalStock(row) < threshold ? 'danger' : 'success'" style="font-weight:bold; font-size:13px">
                       {{ totalStock(row) }}
                     </el-tag>
                     <span style="font-size:11px; color:#999">{{ warehouseCount(row) }} 仓</span>
@@ -263,7 +409,8 @@ window.InventoryManagementView = {
 
           <el-table-column label="预警" width="90">
             <template #default="{ row }">
-              <el-tag size="small" v-if="totalStock(row) < 10" type="danger">低库存</el-tag>
+              <el-tag size="small" v-if="totalStock(row) === 0" type="danger">缺货</el-tag>
+              <el-tag size="small" v-else-if="totalStock(row) < threshold" type="warning">低库存</el-tag>
               <el-tag size="small" v-else type="success">充足</el-tag>
             </template>
           </el-table-column>
@@ -340,7 +487,8 @@ window.InventoryManagementView = {
             </el-table-column>
             <el-table-column label="新库存" width="140">
               <template #default="{ row }">
-                <el-input-number v-model="row.new_stock" :min="0" size="small" :disabled="!row.selected" style="width:120px" />
+                <div><el-input-number v-model="row.new_stock" :min="0" size="small" :disabled="!row.selected" style="width:120px" /></div>
+                <div v-if="row.last_error" style="font-size:10px; color:#f56c6c; margin-top:3px" :title="row.last_error">上次提交失败</div>
               </template>
             </el-table-column>
           </el-table>
@@ -350,8 +498,9 @@ window.InventoryManagementView = {
         </div>
         <template #footer>
           <el-button @click="stockDialog.visible = false">取消</el-button>
+          <el-button type="success" plain :loading="stockDialog.submitting" @click="saveStockDrafts">保存草稿</el-button>
           <el-button type="primary" :loading="stockDialog.submitting" @click="submitStockChanges">
-            提交至 Ozon (/v2/products/stocks)
+            立即提交至 Ozon
           </el-button>
         </template>
       </el-dialog>

@@ -5,6 +5,10 @@ window.OrderListView = {
     // Ozon v3/posting/fbs/list 严格要求小写 status alias
     const activeTab = Vue.ref('awaiting_packaging');
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 20, total: 0 });
+    const selectedOrders = Vue.ref([]);
+    const notes = Vue.reactive({});
+    const batchLoading = Vue.ref(false);
+    const noteDialog = Vue.reactive({ visible: false, posting_number: '', note: '', saving: false });
 
     // v0.3.5: 时窗筛选 (Ozon 限制窗口 ≤ 1 年)
     const now = new Date();
@@ -64,6 +68,12 @@ window.OrderListView = {
         });
         orders.value = res.data.orders || [];
         pagination.total = res.data.total || orders.value.length;
+        const numbers = orders.value.map((row) => row.posting_number).filter(Boolean);
+        if (numbers.length) {
+          const noteRes = await axios.get('/api/seller/orders/notes', { params: { store_id: sid, numbers: numbers.join(',') } });
+          for (const key of Object.keys(notes)) delete notes[key];
+          Object.assign(notes, noteRes.data.notes || {});
+        }
       } catch (e) {
         const msg = e.response?.data?.payload?.message || e.response?.data?.error || e.message;
         notify.error('获取订单失败: ' + msg);
@@ -127,9 +137,104 @@ window.OrderListView = {
       }
     };
 
+    const onSelectionChange = (rows) => { selectedOrders.value = rows || []; };
+    const openNoteDialog = (row) => {
+      noteDialog.posting_number = row.posting_number;
+      noteDialog.note = notes[row.posting_number]?.note || '';
+      noteDialog.visible = true;
+    };
+    const saveNote = async () => {
+      noteDialog.saving = true;
+      try {
+        const res = await axios.post(`/api/seller/orders/${encodeURIComponent(noteDialog.posting_number)}/note`, {
+          store_id: getStoreId(), note: noteDialog.note,
+        });
+        notes[noteDialog.posting_number] = res.data.note;
+        noteDialog.visible = false;
+        notify.success('订单备注已保存');
+      } catch (e) { notify.error('备注保存失败: ' + (e.response?.data?.error || e.message)); }
+      finally { noteDialog.saving = false; }
+    };
+
+    const exportOrders = async () => {
+      const [sinceD, toD] = dateRange.value || [];
+      try {
+        const res = await axios.post('/api/seller/orders/export', {
+          store_id: getStoreId(),
+          status: activeTab.value === 'all' ? '' : activeTab.value,
+          since: sinceD ? new Date(sinceD).toISOString() : undefined,
+          to: toD ? new Date(toD + 'T23:59:59').toISOString() : undefined,
+          limit: 1000,
+        }, { responseType: 'blob' });
+        const url = URL.createObjectURL(res.data);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `ozon-orders-${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) { notify.error('导出失败: ' + (e.response?.data?.error || e.message)); }
+    };
+
+    const printLabels = async (rows = selectedOrders.value) => {
+      const numbers = (rows || []).map(row => row.posting_number).filter(Boolean).slice(0, 50);
+      if (!numbers.length) return notify.warning('请先选择订单');
+      batchLoading.value = true;
+      try {
+        const response = await axios.post('/api/seller/orders/labels', { store_id: getStoreId(), posting_numbers: numbers }, { responseType: 'blob' });
+        const url = URL.createObjectURL(new Blob([response.data], { type: response.headers['content-type'] || 'application/pdf' }));
+        const anchor = document.createElement('a'); anchor.href = url; anchor.download = `ozon-labels-${new Date().toISOString().slice(0, 10)}.pdf`; anchor.click();
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        notify.success(`已生成 ${numbers.length} 个订单的面单`);
+      } catch (e) {
+        let message = e.message;
+        if (e.response?.data instanceof Blob) { try { message = JSON.parse(await e.response.data.text()).error || message; } catch {} }
+        notify.error('面单生成失败: ' + message);
+      } finally { batchLoading.value = false; }
+    };
+
+    const batchShip = async () => {
+      const eligible = selectedOrders.value.filter((row) => ['awaiting_packaging', 'awaiting_deliver'].includes(row.status));
+      if (!eligible.length) return notify.warning('所选订单中没有可发货订单');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `将对 ${eligible.length} 个订单执行不可逆的发货操作，请确认商品已经完成备货。`,
+          '批量发货确认',
+          { type: 'warning', confirmButtonText: '确认发货', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      batchLoading.value = true;
+      let succeeded = 0;
+      const errors = [];
+      for (const row of eligible) {
+        try {
+          await axios.post('/api/seller/orders/ship', {
+            store_id: getStoreId(), posting_number: row.posting_number,
+            packages: [{ products: (row.products || []).map((product) => ({ product_id: Number(product.sku), quantity: Number(product.quantity || 1) })) }],
+          });
+          succeeded++;
+        } catch (e) { errors.push(`${row.posting_number}: ${e.response?.data?.error || e.message}`); }
+      }
+      batchLoading.value = false;
+      if (errors.length) notify.warning(`成功 ${succeeded} 单，失败 ${errors.length} 单`); else notify.success(`已提交 ${succeeded} 个订单`);
+      selectedOrders.value = [];
+      fetchOrders();
+    };
+
+    const deadlineInfo = (row) => {
+      const raw = row.shipment_date || row.delivering_date || '';
+      if (!raw) return { text: '-', urgent: false };
+      const ms = new Date(raw).getTime() - Date.now();
+      if (!Number.isFinite(ms)) return { text: '-', urgent: false };
+      if (ms <= 0) return { text: '已超时', urgent: true };
+      const hours = Math.floor(ms / 3600000);
+      const minutes = Math.floor((ms % 3600000) / 60000);
+      return { text: `${hours}小时${minutes}分`, urgent: ms <= 2 * 3600000 };
+    };
+
     const onShopChanged = () => {
       pagination.currentPage = 1;
       orders.value = [];
+      selectedOrders.value = [];
       pagination.total = 0;
       fetchOrders();
     };
@@ -140,8 +245,10 @@ window.OrderListView = {
 
     return {
       orders, loading, activeTab, statusTabs, pagination,
+      selectedOrders, notes, batchLoading, noteDialog,
       detailDrawer, shipDialog,
       fetchOrders, openDetail, openShipDialog, confirmShip, statusTagType,
+      onSelectionChange, openNoteDialog, saveNote, exportOrders, printLabels, batchShip, deadlineInfo,
       // v0.3.5 时窗
       dateRange, rangeShortcuts,
     };
@@ -165,7 +272,8 @@ window.OrderListView = {
                 :shortcuts="rangeShortcuts"
                 size="small"
                 @change="() => { pagination.currentPage=1; fetchOrders(); }" />
-              <el-button type="primary" size="small" @click="fetchOrders">🔄 刷新</el-button>
+              <el-button size="small" @click="exportOrders">导出订单</el-button>
+              <el-button type="primary" size="small" @click="fetchOrders">刷新</el-button>
             </div>
           </div>
         </template>
@@ -174,7 +282,13 @@ window.OrderListView = {
           <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :label="tab.label" :name="tab.value" />
         </el-tabs>
 
-        <el-table :data="orders" v-loading="loading" stripe border size="small">
+        <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; margin-bottom:10px; background:#ecf5ff; border:1px solid #b3d8ff">
+          <span style="font-size:13px">已选择 {{ selectedOrders.length }} 个订单</span>
+          <div><el-button type="primary" size="small" :loading="batchLoading" @click="printLabels()">批量面单</el-button><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
+        </div>
+
+        <el-table :data="orders" v-loading="loading" stripe border size="small" @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="44" :selectable="(row) => row.status !== 'cancelled'" />
           <el-table-column label="货件单号" prop="posting_number" width="180" fixed="left" />
           <el-table-column label="下单时间" width="160">
             <template #default="{ row }">
@@ -234,9 +348,19 @@ window.OrderListView = {
             </template>
           </el-table-column>
 
-          <el-table-column label="操作" width="150" fixed="right">
+          <el-table-column label="发货剩余" width="110">
+            <template #default="{ row }"><span :style="{ color: deadlineInfo(row).urgent ? '#f56c6c' : '#606266', fontWeight: deadlineInfo(row).urgent ? 'bold' : 'normal' }">{{ deadlineInfo(row).text }}</span></template>
+          </el-table-column>
+
+          <el-table-column label="备注" min-width="150">
+            <template #default="{ row }"><span v-if="notes[row.posting_number]?.note" style="font-size:12px">{{ notes[row.posting_number].note }}</span><span v-else style="color:#c0c4cc">-</span></template>
+          </el-table-column>
+
+          <el-table-column label="操作" width="190" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" size="small" @click="openDetail(row)">详情</el-button>
+              <el-button link size="small" @click="openNoteDialog(row)">备注</el-button>
+              <el-button v-if="row.status !== 'cancelled'" link type="primary" size="small" @click="printLabels([row])">面单</el-button>
               <el-button v-if="row.status === 'awaiting_packaging' || row.status === 'awaiting_deliver'"
                          link type="warning" size="small" @click="openShipDialog(row)">发货</el-button>
             </template>
@@ -256,6 +380,11 @@ window.OrderListView = {
           />
         </div>
       </el-card>
+
+      <el-dialog v-model="noteDialog.visible" title="订单备注" width="480px">
+        <el-input v-model="noteDialog.note" type="textarea" :rows="5" maxlength="2000" show-word-limit placeholder="例如：加固包装、赠送贴纸、采购注意事项" />
+        <template #footer><el-button @click="noteDialog.visible=false">取消</el-button><el-button type="primary" :loading="noteDialog.saving" @click="saveNote">保存备注</el-button></template>
+      </el-dialog>
 
       <!-- v0.3.3 订单详情抽屉 -->
       <el-drawer v-model="detailDrawer.visible" title="订单详情" size="720px" destroy-on-close>

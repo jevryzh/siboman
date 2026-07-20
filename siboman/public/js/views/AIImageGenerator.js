@@ -6,6 +6,9 @@ window.AIImageGeneratorView = {
     const generating = Vue.ref(false);
     const uploading = Vue.ref(false);
     const resultImages = Vue.ref([]);
+    const history = Vue.ref([]);
+    const historyStats = Vue.reactive({ total: 0, total_images: 0, total_cost_usd: 0 });
+    const selectedResults = Vue.ref([]);
     
     // 预览弹窗状态
     const previewVisible = Vue.ref(false);
@@ -21,6 +24,25 @@ window.AIImageGeneratorView = {
       target_market: 'ozon',
       model: 'wanxiang-2.7',
       count: 3,
+      template_id: 'white-clean',
+      aspect_ratio: '1:1',
+      custom_prompt: '',
+      subject_reference: true,
+    });
+
+    const templates = [
+      { id: 'white-clean', name: '专业白底', prompt: 'Clean white background, soft studio lighting, accurate product colors, commercial ecommerce photography' },
+      { id: 'moscow-street', name: '莫斯科街景', prompt: 'Premium product photography on a Moscow street, natural winter light, realistic commercial style' },
+      { id: 'modern-home', name: '现代家居', prompt: 'Product placed in a bright modern home, natural daylight, realistic lifestyle ecommerce photography' },
+      { id: 'detail-closeup', name: '细节特写', prompt: 'Macro close-up product photography, emphasize material, texture and craftsmanship, sharp focus' },
+    ];
+
+    const estimatedCost = Vue.computed(() => (Number(form.count || 0) * 0.03).toFixed(2));
+    const finalPrompt = Vue.computed(() => {
+      const preset = templates.find((item) => item.id === form.template_id)?.prompt || '';
+      const subject = form.title_ru || form.title_zh || 'the reference product';
+      const points = String(form.selling_points || '').split('\n').filter(Boolean).join(', ');
+      return `${preset}. Subject: ${subject}. ${points ? `Selling points: ${points}.` : ''} ${form.custom_prompt || ''} Keep the product shape, color, material and logo consistent with the reference image. No watermark, no distorted text.`.trim();
     });
 
     const notify = {
@@ -78,17 +100,51 @@ window.AIImageGeneratorView = {
       generating.value = true;
       resultImages.value = Array(form.count).fill({ loading: true });
       try {
-        const r = await axios.post('/api/ai/product-image-set/generate', {
-          ...form,
-          store_id: getStoreId()
-        });
-        const urls = (r.data?.images || []).filter(Boolean);
+        const r = await axios.post('/api/seller/images/generate', {
+          store_id: getStoreId(),
+          prompt: finalPrompt.value,
+          image: form.subject_reference ? form.material_images : [],
+          aspectRatio: form.aspect_ratio,
+          n: form.count,
+          scenePreset: form.template_id,
+        }, { timeout: 120000 });
+        const urls = (r.data?.data?.images || []).filter(Boolean);
         resultImages.value = urls.map(u => ({ url: typeof u === 'string' ? u : u.url, loading: false }));
-        notify.success(`生成完成`);
+        selectedResults.value = urls.map((_u, index) => index);
+        notify.success(`已生成 ${urls.length} 张，预估费用 $${r.data?.usage?.estimatedCostUsd ?? estimatedCost.value}`);
+        await fetchHistory();
       } catch (e) {
         resultImages.value = [];
-        notify.error('生成失败');
+        notify.error('生成失败：' + (e.response?.data?.error || e.message));
       } finally { generating.value = false; }
+    };
+
+    const fetchHistory = async () => {
+      try {
+        const r = await axios.get('/api/ai-images/history', { params: { store_id: getStoreId(), limit: 20 } });
+        history.value = r.data.items || [];
+        Object.assign(historyStats, r.data.stats || {});
+      } catch (e) { notify.error('历史记录加载失败：' + (e.response?.data?.error || e.message)); }
+    };
+
+    const toggleResult = (index) => {
+      const next = new Set(selectedResults.value);
+      if (next.has(index)) next.delete(index); else next.add(index);
+      selectedResults.value = [...next];
+    };
+
+    const batchDownload = async () => {
+      const indexes = [...selectedResults.value].sort((a, b) => a - b);
+      if (!indexes.length) return notify.warning('请先选择图片');
+      for (const index of indexes) await downloadImage(resultImages.value[index]?.url, index);
+    };
+
+    const deleteHistory = async (id) => {
+      try {
+        await axios.delete(`/api/ai-images/${id}`);
+        notify.success('历史记录已删除');
+        fetchHistory();
+      } catch (e) { notify.error('删除失败：' + (e.response?.data?.error || e.message)); }
     };
 
     const showPreview = (url, i) => {
@@ -138,14 +194,19 @@ window.AIImageGeneratorView = {
       form.material_images = [];
       form.title_zh = '';
       form.title_ru = '';
+      selectedResults.value = [];
+      fetchHistory();
     };
     window.addEventListener('shop-changed', onShopChanged);
     Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
+    Vue.onMounted(fetchHistory);
 
     return {
-      form, analyzing, generating, uploading, resultImages,
+      form, analyzing, generating, uploading, resultImages, templates, finalPrompt, estimatedCost,
+      history, historyStats, selectedResults,
       previewVisible, previewUrl, previewIndex,
       handlePaste, removeMaterial, analyzeSellingPoints, generateImages, showPreview, downloadImage,
+      fetchHistory, toggleResult, batchDownload, deleteHistory,
     };
   },
   template: `
@@ -188,28 +249,60 @@ window.AIImageGeneratorView = {
               <el-radio-button value="etsy">Etsy</el-radio-button>
             </el-radio-group>
           </el-form-item>
-          <el-form-item label="类型">
-            <el-radio-group v-model="form.image_type">
-              <el-radio-button value="main">主图</el-radio-button>
-              <el-radio-button value="detail">详情图</el-radio-button>
-            </el-radio-group>
+          <el-form-item label="场景模板">
+            <el-select v-model="form.template_id" style="width:100%">
+              <el-option v-for="item in templates" :key="item.id" :label="item.name" :value="item.id" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="图片比例">
+            <el-segmented v-model="form.aspect_ratio" :options="['1:1', '3:4', '9:16']" />
+          </el-form-item>
+          <el-form-item label="自定义要求">
+            <el-input v-model="form.custom_prompt" type="textarea" :rows="3" placeholder="可补充背景、光线、构图要求" />
+          </el-form-item>
+          <el-form-item>
+            <el-checkbox v-model="form.subject_reference">保持商品主体一致</el-checkbox>
           </el-form-item>
           <el-form-item label="生成张数">
-            <el-input-number v-model="form.count" :min="1" :max="form.image_type === 'main' ? 3 : 6" />
+            <el-input-number v-model="form.count" :min="1" :max="8" />
           </el-form-item>
-          <el-button type="danger" style="width:100%; height:50px" :loading="generating" @click="generateImages">🚀 一键生成套图</el-button>
+          <div style="font-size:12px; color:#909399; margin-bottom:10px">预估费用 USD {{ estimatedCost }}</div>
+          <el-button type="primary" style="width:100%; height:44px" :loading="generating" @click="generateImages">生成套图</el-button>
         </el-form>
       </el-card>
 
       <el-card style="flex:1">
-        <template #header><strong>3. 生成结果</strong></template>
+        <template #header>
+          <div style="display:flex; justify-content:space-between; align-items:center">
+            <strong>3. 生成结果</strong>
+            <el-button size="small" :disabled="!selectedResults.length" @click="batchDownload">批量下载 ({{ selectedResults.length }})</el-button>
+          </div>
+        </template>
         <div v-if="!resultImages.length && !generating"><el-empty /></div>
         <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:12px">
-          <div v-for="(img, i) in resultImages" :key="i" class="image-card-wrapper" @click="showPreview(img.url, i)">
+          <div v-for="(img, i) in resultImages" :key="i" class="image-card-wrapper">
             <div v-if="img.loading" style="height:240px; display:flex; align-items:center; justify-content:center; background:#f5f7fa"><el-icon class="is-loading" size="30"><Loading /></el-icon></div>
-            <el-image v-else :src="img.url" style="width:100%; height:240px" fit="cover" />
+            <el-image v-else :src="img.url" style="width:100%; height:240px" fit="cover" @click="showPreview(img.url, i)" />
+            <el-checkbox :model-value="selectedResults.includes(i)" @change="toggleResult(i)" style="position:absolute; top:8px; left:8px; background:#fff; padding:2px 6px; border-radius:4px" />
           </div>
         </div>
+
+        <el-divider>生成历史</el-divider>
+        <div style="display:flex; gap:16px; color:#606266; font-size:12px; margin-bottom:10px">
+          <span>{{ historyStats.total || 0 }} 次任务</span><span>{{ historyStats.total_images || 0 }} 张图片</span><span>累计 USD {{ Number(historyStats.total_cost_usd || 0).toFixed(2) }}</span>
+        </div>
+        <el-table :data="history" size="small" max-height="280">
+          <el-table-column label="图片" width="120">
+            <template #default="{ row }"><el-image :src="row.image_urls?.[0]" style="width:52px; height:52px" fit="cover" preview-teleported :preview-src-list="row.image_urls || []" /></template>
+          </el-table-column>
+          <el-table-column label="模板 / Prompt" min-width="220" show-overflow-tooltip>
+            <template #default="{ row }"><div>{{ row.scene_preset || '-' }}</div><small style="color:#909399">{{ row.prompt }}</small></template>
+          </el-table-column>
+          <el-table-column label="张数" prop="n" width="65" />
+          <el-table-column label="费用" width="90"><template #default="{ row }">USD {{ Number(row.estimated_cost_usd || 0).toFixed(2) }}</template></el-table-column>
+          <el-table-column label="时间" width="155"><template #default="{ row }">{{ String(row.created_at || '').slice(0, 19).replace('T', ' ') }}</template></el-table-column>
+          <el-table-column label="操作" width="75"><template #default="{ row }"><el-button link type="danger" @click="deleteHistory(row.id)">删除</el-button></template></el-table-column>
+        </el-table>
       </el-card>
 
       <el-dialog v-model="previewVisible" title="查看生成结果" width="500px">

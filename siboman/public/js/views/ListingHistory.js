@@ -14,6 +14,10 @@ window.ListingHistoryView = {
     const total = Vue.ref(0);
     const stats = Vue.ref({ total: 0, imported: 0, failed: 0, processing: 0, today: 0, success_rate: 0 });
     const selectedIds = Vue.ref([]);
+    const pagination = Vue.reactive({ currentPage: 1, pageSize: 50 });
+    const detailDialog = Vue.reactive({ visible: false, row: null });
+    const syncingTaskId = Vue.ref('');
+    const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
 
     const filter = Vue.reactive({
       sku: '',
@@ -32,7 +36,9 @@ window.ListingHistoryView = {
         if (filter.status && filter.status !== 'all') params.set('status', filter.status);
         if (filter.start_date) params.set('start_date', filter.start_date);
         if (filter.end_date) params.set('end_date', filter.end_date);
-        params.set('limit', '100');
+        if (getStoreId()) params.set('store_id', getStoreId());
+        params.set('limit', String(pagination.pageSize));
+        params.set('offset', String((pagination.currentPage - 1) * pagination.pageSize));
         const r = await axios.get(`/api/seller/listing-history?${params}`);
         if (r.data.success) {
           items.value = r.data.items;
@@ -46,12 +52,13 @@ window.ListingHistoryView = {
       }
     };
 
-    const onQuery = () => fetchList();
+    const onQuery = () => { pagination.currentPage = 1; fetchList(); };
     const onReset = () => {
       filter.sku = '';
       filter.status = 'all';
       filter.start_date = '';
       filter.end_date = '';
+      pagination.currentPage = 1;
       fetchList();
     };
 
@@ -97,6 +104,24 @@ window.ListingHistoryView = {
       return map[s] || { label: s, bg: '#f4f4f5', color: '#909399' };
     };
 
+    const displayStatus = (row) => row.partial_success
+      ? { label: '部分成功', bg: '#fdf6ec', color: '#e6a23c' }
+      : statusBadge(row.status);
+
+    const syncTask = async (row) => {
+      if (String(row.task_id || '').startsWith('portal-')) return window.ElementPlus.ElMessage.warning('该记录由门户上架，后台会自动按货号同步');
+      syncingTaskId.value = row.task_id;
+      try {
+        const res = await axios.post('/api/seller/import/sync-task', { task_id: row.task_id, store_id: row.store_id || getStoreId() });
+        window.ElementPlus.ElMessage.success(`状态已同步：${res.data.localStatus || res.data.ozonStatus || '完成'}`);
+        await fetchList();
+      } catch (e) { window.ElementPlus.ElMessage.error('同步失败：' + (e.response?.data?.error || e.message)); }
+      finally { syncingTaskId.value = ''; }
+    };
+    const showDetail = (row) => { detailDialog.row = row; detailDialog.visible = true; };
+    const onPageChange = () => fetchList();
+    const onSizeChange = () => { pagination.currentPage = 1; fetchList(); };
+
     const fmtMoney = (v) => v ? '¥' + Number(v).toFixed(2) : '-';
     const fmtDate = (s) => {
       if (!s) return '-';
@@ -117,11 +142,15 @@ window.ListingHistoryView = {
     Vue.onUnmounted(() => {
       if (refreshTimer) clearInterval(refreshTimer);
     });
+    const onShopChanged = () => { pagination.currentPage = 1; selectedIds.value = []; fetchList(); };
+    window.addEventListener('shop-changed', onShopChanged);
+    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return {
-      loading, items, total, stats, filter, selectedIds,
+      loading, items, total, stats, filter, selectedIds, pagination, detailDialog, syncingTaskId,
       fetchList, onQuery, onReset, deleteOne, batchDelete,
-      statusBadge, fmtMoney, fmtDate, onSelectionChange,
+      statusBadge, displayStatus, fmtMoney, fmtDate, onSelectionChange,
+      syncTask, showDetail, onPageChange, onSizeChange,
     };
   },
   template: `
@@ -213,8 +242,8 @@ window.ListingHistoryView = {
           </el-table-column>
           <el-table-column label="状态" width="100">
             <template #default="{ row }">
-              <span :style="{ background: statusBadge(row.status).bg, color: statusBadge(row.status).color, padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600 }">
-                {{ statusBadge(row.status).label }}
+              <span :style="{ background: displayStatus(row).bg, color: displayStatus(row).color, padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600 }">
+                {{ displayStatus(row).label }}
               </span>
             </template>
           </el-table-column>
@@ -247,12 +276,18 @@ window.ListingHistoryView = {
               <span v-else style="color:#c0c4cc; font-size:12px">-</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="80" fixed="right">
+          <el-table-column label="操作" width="180" fixed="right">
             <template #default="{ row }">
+              <el-button type="primary" link size="small" @click="showDetail(row)">详情</el-button>
+              <el-button v-if="row.status === 'processing' || row.status === 'pending'" type="warning" link size="small" :loading="syncingTaskId === row.task_id" @click="syncTask(row)">同步</el-button>
               <el-button type="danger" link size="small" @click="deleteOne(row)" icon="Delete">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
+
+        <div style="display:flex; justify-content:flex-end; padding:14px 16px 4px">
+          <el-pagination v-model:current-page="pagination.currentPage" v-model:page-size="pagination.pageSize" :total="total" :page-sizes="[20,50,100,200]" layout="total, sizes, prev, pager, next, jumper" @current-change="onPageChange" @size-change="onSizeChange" />
+        </div>
 
         <!-- 提示 -->
         <div style="padding:12px 16px; font-size:11px; color:#909399; display:flex; align-items:center; gap:8px">
@@ -260,6 +295,22 @@ window.ListingHistoryView = {
           每 30s 自动刷新 + 后台每 60s 调 Ozon 同步真实状态 · task_id 在 "最后轮询" 列反映 polling 活性
         </div>
       </div>
+
+      <el-dialog v-model="detailDialog.visible" title="上架任务详情" width="760px">
+        <template v-if="detailDialog.row">
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item label="任务 ID" :span="2">{{ detailDialog.row.task_id }}</el-descriptions-item>
+            <el-descriptions-item label="店铺">{{ detailDialog.row.store_name || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="货号">{{ detailDialog.row.offer_id || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="状态">{{ displayStatus(detailDialog.row).label }}</el-descriptions-item>
+            <el-descriptions-item label="变体">{{ detailDialog.row.variants_count || 0 }} 个，失败 {{ detailDialog.row.failed_variants_count || 0 }} 个</el-descriptions-item>
+          </el-descriptions>
+          <el-divider>Ozon 返回错误</el-divider>
+          <el-empty v-if="!detailDialog.row.errors_json?.length" description="没有错误" :image-size="60" />
+          <el-alert v-for="(error, index) in (detailDialog.row.errors_json || [])" :key="index" type="error" :closable="false" style="margin-bottom:8px" :title="error.message || error.description || error.code || '未知错误'" :description="error.code ? '错误代码：' + error.code : ''" />
+        </template>
+        <template #footer><el-button @click="detailDialog.visible=false">关闭</el-button></template>
+      </el-dialog>
     </div>
   `,
 };

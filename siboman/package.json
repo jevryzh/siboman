@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "collector": "node collector.js"
+    "collector": "node collector.js",
+    "test:erp": "node --check server.js && node --check public/js/views/ProductList.js && node --check public/js/views/CollectionBox.js && node --check public/js/views/AIImageGenerator.js && node --check public/js/views/InventoryManagement.js && node --check public/js/views/OrderList.js && node --check public/js/views/ListingHistory.js && node --check public/js/views/AnalyticsCenter.js && node --check public/js/views/DataScreen.js && node tests/test_product_management.cjs && node tests/test_collection_box.cjs && node tests/test_ai_image_generator.cjs && node tests/test_operations_modules.cjs && node tests/test_analytics_center.cjs && node tests/test_data_screen.cjs"
   },
   "dependencies": {
     "express": "^4.19.2",
     "fflate": "^0.8.2",
+    "multer": "^2.2.0",
     "pdf-lib": "^1.17.1",
     "pg": "^8.22.0",
     "playwright": "^1.45.3"

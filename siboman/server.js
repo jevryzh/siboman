@@ -74,6 +74,7 @@ const DETAIL_DELAY_MAX_MS = Number(process.env.DETAIL_DELAY_MAX_MS || 6500);
 const DETAIL_BROWSE_MODE = process.env.DETAIL_BROWSE_MODE || "balanced";
 const DEFAULT_MAX_CONSECUTIVE_FAILURES = Number(process.env.DEFAULT_MAX_CONSECUTIVE_FAILURES || 3);
 const DISABLE_SERVER_SCRAPER = /^(1|true|yes)$/i.test(process.env.DISABLE_SERVER_SCRAPER || "");
+const SERVER_SINGLE_SOURCING = /^(1|true|yes)$/i.test(process.env.SERVER_SINGLE_SOURCING || "");
 const WORKER_ONLINE_WINDOW_MS = Number(process.env.WORKER_ONLINE_WINDOW_MS || 45000);
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const INITIAL_USERS = process.env.INITIAL_USERS || "";
@@ -229,15 +230,76 @@ app.get("/api/extension/seller-credentials", requireAuth, async (req, res, next)
 app.post("/api/collect-items", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
+    const extensionItems = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (extensionItems.length) {
+      const inserted = [];
+      const skipped = [];
+      for (const item of extensionItems) {
+        const ozonSku = String(item.sku || item.product_id || item.offer_id || "").trim();
+        const ozonUrl = String(item.ozon_url || item.source_url || (ozonSku ? `https://www.ozon.ru/product/${ozonSku}/` : ""));
+        const exists = await db.query(
+          `SELECT id FROM collect_items
+           WHERE user_id = $1 AND status IN ('pending','scraped')
+             AND (($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3))
+           LIMIT 1`,
+          [req.user.id, ozonSku, ozonUrl],
+        );
+        if (exists.rowCount) {
+          skipped.push({ source: ozonSku || ozonUrl, reason: "已存在" });
+          continue;
+        }
+        const result = await db.query(
+          `INSERT INTO collect_items (
+             user_id, store_id, source_type, source_value, ozon_url, ozon_sku,
+             title, main_image, images, price_rub, brand, attributes, status
+           ) VALUES ($1,$2,'extension',$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11::jsonb,'scraped')
+           RETURNING id, ozon_url, ozon_sku, status, created_at`,
+          [
+            req.user.id,
+            req.body?.store_id || req.body?.storeId || null,
+            ozonSku || ozonUrl,
+            ozonUrl,
+            ozonSku,
+            String(item.name || item.title || ""),
+            String(item.image || item.main_image || ""),
+            JSON.stringify(item.images || []),
+            Number(item.price || item.price_rub || 0) || null,
+            String(item.brand || ""),
+            JSON.stringify(item.attributes || {}),
+          ],
+        );
+        inserted.push(result.rows[0]);
+      }
+      return res.json({
+        success: true,
+        inserted,
+        skipped,
+        insertedCount: inserted.length,
+        skippedCount: skipped.length,
+      });
+    }
+
     const inputsText = String(req.body?.inputs || req.body?.text || "").trim();
-    const storeId = req.body?.storeId || null;
+    const storeId = req.body?.store_id || req.body?.storeId || null;
     const parsed = parseCollectInputs(inputsText);
     if (!parsed.length) {
       return res.status(400).json({ success: false, error: "未识别到有效的 Ozon 链接或 SKU。" });
     }
 
     const inserted = [];
+    const skipped = [];
     for (const row of parsed) {
+      const exists = await db.query(
+        `SELECT id FROM collect_items
+         WHERE user_id = $1 AND status IN ('pending','scraped')
+           AND (($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3))
+         LIMIT 1`,
+        [req.user.id, row.ozonSku || "", row.ozonUrl || ""],
+      );
+      if (exists.rowCount) {
+        skipped.push({ source: row.sourceValue, reason: "已存在" });
+        continue;
+      }
       const r = await db.query(
         `INSERT INTO collect_items (user_id, store_id, source_type, source_value, ozon_url, ozon_sku, status)
          VALUES ($1, $2, $3, $4, $5, $6, 'pending') 
@@ -247,20 +309,20 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
       if (r.rows[0]) inserted.push(r.rows[0]);
     }
 
-    // 生产对齐：如果是单条 URL，立即触发采集任务并自动搜图
-    if (inserted.length === 1) {
-      const item = inserted[0];
+    // 采集箱只采 Ozon 信息；不启用 1688 搜图，避免进入已冻结的单品找货链路。
+    if (inserted.length) {
       await db.query(
         `INSERT INTO app_jobs (id, user_id, store_id, kind, status, phase, total, processed, payload)
-         VALUES (gen_random_uuid(), $1, $2, 'run', 'pending', '采集并找货中...', 1, 0, $3)`,
-        [req.user.id, storeId, JSON.stringify({ 
-          urls: [item.ozon_url],
-          options: { enable1688: true, collectId: item.id }
+         VALUES (gen_random_uuid(), $1, $2, 'run', 'queued', '等待采集端领取', $3, 0, $4)`,
+        [req.user.id, storeId, inserted.length, JSON.stringify({
+          urls: inserted.map((item) => item.ozon_url),
+          urlRows: inserted.map((item, index) => ({ url: item.ozon_url, sourceRow: index + 1, collectId: item.id })),
+          options: { enable1688: false, enableAI: false, collectionOnly: true }
         })]
       );
     }
 
-    res.json({ success: true, count: inserted.length });
+    res.json({ success: true, inserted, skipped, insertedCount: inserted.length, skippedCount: skipped.length });
   } catch (error) { next(error); }
 });
 
@@ -662,6 +724,44 @@ async function initDatabase() {
         UNIQUE(store_id, posting_number, sku)
       );
 
+      CREATE TABLE IF NOT EXISTS app_order_ship_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        posting_number TEXT NOT NULL,
+        packages JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(store_id, posting_number)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_stock_drafts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        offer_id TEXT NOT NULL,
+        product_id BIGINT,
+        warehouse_id BIGINT NOT NULL,
+        current_ozon_stock INTEGER NOT NULL DEFAULT 0,
+        target_stock INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(user_id, store_id, offer_id, warehouse_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_stock_change_logs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        offer_id TEXT NOT NULL,
+        warehouse_id BIGINT NOT NULL,
+        previous_stock INTEGER NOT NULL,
+        target_stock INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'success',
+        error TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
       CREATE TABLE IF NOT EXISTS ai_image_records (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -697,6 +797,8 @@ async function initDatabase() {
     await db.query(`
       ALTER TABLE order_notes ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
+      ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(10,4) NOT NULL DEFAULT 0;
+      ALTER TABLE ai_image_records ADD COLUMN IF NOT EXISTS scene_preset TEXT NOT NULL DEFAULT '';
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS raw_payload JSONB;
       ALTER TABLE app_listing_history ADD COLUMN IF NOT EXISTS errors_json JSONB;
@@ -712,6 +814,8 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_collect_items_user_status ON collect_items(user_id, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collect_items_store_offer ON collect_items(store_id, linked_offer_id);
       CREATE INDEX IF NOT EXISTS idx_order_notes_store ON order_notes(store_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_stock_drafts_store ON app_stock_drafts(user_id, store_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_stock_change_logs_store ON app_stock_change_logs(user_id, store_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_ai_image_records_store ON ai_image_records(store_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_listing_history_store_offer ON app_listing_history(store_id, offer_id);
 
@@ -1136,7 +1240,8 @@ function pickAttrValue(attributes, attrId) {
 
 /**
  * 把 Ozon 商品 statuses + visibility_details 映射为前端 Tab 认可的业务状态。
- * 前端 Tab 枚举: ALL / VISIBLE / READY_TO_SUPPLY / NEED_ATTENTION / IN_ACTIVE
+ * 前端 Tab 枚举: ALL / VISIBLE / READY_TO_SUPPLY / NEED_ATTENTION /
+ * NOT_MODERATED / FAILED_MODERATION / IN_ACTIVE
  * 依据 (真实抓包证据, 见诊断报告):
  *   - is_created=false        -> 草稿, 归 READY_TO_SUPPLY
  *   - is_failed=true 或
@@ -1160,9 +1265,9 @@ function mapOzonStatus(info) {
 
   if (!isCreated) return "READY_TO_SUPPLY";
   if (archived || !activeProduct) return "IN_ACTIVE";
-  if (isFailed || moderate === "rejected" || moderate === "moderating" || validation === "failed") {
-    return "NEED_ATTENTION";
-  }
+  if (moderate === "rejected") return "FAILED_MODERATION";
+  if (moderate === "moderating" || moderate === "pending") return "NOT_MODERATED";
+  if (isFailed || validation === "failed") return "NEED_ATTENTION";
   const hasPrice = v.has_price === true;
   const hasStock = v.has_stock === true;
   if (hasPrice && hasStock && (moderate === "approved" || moderate === "")) {
@@ -1376,7 +1481,14 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res) => {
       for (const s of arr) {
         const wid = Number(s.warehouse_id);
         const existing = whMap.get(wid) || { warehouse_id: wid, source: "fbs", reserved: 0 };
+        const previousStock = Number(existing.present || 0);
         whMap.set(wid, { ...existing, warehouse_id: wid, present: Number(s.stock) });
+        await db.query(
+          `INSERT INTO app_stock_change_logs (
+             user_id, store_id, offer_id, warehouse_id, previous_stock, target_stock, status
+           ) VALUES ($1,$2,$3,$4,$5,$6,'success')`,
+          [userId, storeId, offer_id, wid, previousStock, Number(s.stock)],
+        );
       }
       const merged = Array.from(whMap.values());
       const totalStock = merged.reduce((sum, x) => sum + (Number(x.present) || 0), 0);
@@ -1704,16 +1816,188 @@ app.get("/api/inventory", requireAuth, async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-app.post("/api/seller/orders/tracking", requireAuth, async (req, res, next) => {
+app.get("/api/seller/stocks/drafts", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
   try {
-    const { posting_number } = req.body;
+    const storeId = String(req.query.store_id || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const result = await db.query(
+      `SELECT id, offer_id, product_id, warehouse_id, current_ozon_stock, target_stock,
+              last_error, created_at, updated_at
+       FROM app_stock_drafts
+       WHERE user_id = $1 AND store_id = $2
+       ORDER BY updated_at DESC`,
+      [req.user.id, storeId],
+    );
+    res.json({ success: true, items: result.rows, total: result.rowCount });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/stocks/save-draft", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
     const storeId = req.body?.store_id || req.body?.storeId;
-    // 模拟 Ozon 物流追踪 API
-    res.json({ success: true, tracking: [
-      { time: new Date().toISOString(), text: "货件已揽收" },
-      { time: new Date(Date.now() - 86400000).toISOString(), text: "等待备货中" }
-    ] });
-  } catch (e) { next(e); }
+    const stocks = Array.isArray(req.body?.stocks) ? req.body.stocks.slice(0, 500) : [];
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    if (!stocks.length) return res.status(400).json({ success: false, error: "stocks 不能为空" });
+    const saved = [];
+    for (const stock of stocks) {
+      const offerId = String(stock.offer_id || "").trim();
+      const warehouseId = Number(stock.warehouse_id);
+      const currentStock = Math.max(0, Math.floor(Number(stock.current_stock ?? stock.current_ozon_stock ?? 0)));
+      const targetStock = Math.floor(Number(stock.target_stock ?? stock.new_stock));
+      if (!offerId || !Number.isFinite(warehouseId) || warehouseId <= 0 || !Number.isFinite(targetStock) || targetStock < 0) {
+        return res.status(400).json({ success: false, error: `库存草稿参数无效：${offerId || "未知货号"}` });
+      }
+      const result = await db.query(
+        `INSERT INTO app_stock_drafts (
+           user_id, store_id, offer_id, product_id, warehouse_id, current_ozon_stock, target_stock, last_error
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'')
+         ON CONFLICT (user_id, store_id, offer_id, warehouse_id)
+         DO UPDATE SET product_id = EXCLUDED.product_id,
+                       current_ozon_stock = EXCLUDED.current_ozon_stock,
+                       target_stock = EXCLUDED.target_stock,
+                       last_error = '', updated_at = now()
+         RETURNING id, offer_id, warehouse_id, current_ozon_stock, target_stock, updated_at`,
+        [req.user.id, storeId, offerId, stock.product_id || null, warehouseId, currentStock, targetStock],
+      );
+      saved.push(result.rows[0]);
+    }
+    res.json({ success: true, items: saved, saved: saved.length });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/stocks/import", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 2000) : [];
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    if (!rows.length) return res.status(400).json({ success: false, error: "导入文件没有有效数据" });
+    const offerIds = [...new Set(rows.map(row => String(row.offer_id || row['Offer ID'] || row['货号'] || '').trim()).filter(Boolean))];
+    const products = await db.query(
+      `SELECT offer_id, product_id, stock, stocks_json FROM app_products
+        WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+      [req.user.id, storeId, offerIds],
+    );
+    const productMap = new Map(products.rows.map(row => [row.offer_id, row]));
+    const imported = [];
+    const errors = [];
+    for (let index = 0; index < rows.length; index += 1) {
+      const source = rows[index] || {};
+      const offerId = String(source.offer_id || source['Offer ID'] || source['货号'] || '').trim();
+      const product = productMap.get(offerId);
+      if (!offerId || !product) { errors.push({ row: index + 2, offer_id: offerId, error: '未找到当前店铺商品' }); continue; }
+      const stocks = Array.isArray(product.stocks_json) ? product.stocks_json : [];
+      const requestedWarehouse = Number(source.warehouse_id || source['Warehouse ID'] || source['仓库ID']);
+      const warehouse = stocks.find(item => Number(item.warehouse_id) === requestedWarehouse) || stocks[0];
+      const warehouseId = Number(requestedWarehouse || warehouse?.warehouse_id);
+      if (!Number.isFinite(warehouseId) || warehouseId <= 0) { errors.push({ row: index + 2, offer_id: offerId, error: '商品没有可用仓库，请先同步库存' }); continue; }
+      const currentStock = Number(warehouse?.present ?? product.stock ?? 0);
+      const quantityRaw = source.stock ?? source.quantity ?? source.Quantity ?? source['目标库存'];
+      const diffRaw = source.diff ?? source.Diff ?? source['变更量'];
+      const targetStock = quantityRaw !== undefined && quantityRaw !== '' ? Number(quantityRaw) : currentStock + Number(diffRaw);
+      if (!Number.isFinite(targetStock) || targetStock < 0 || !Number.isInteger(targetStock)) { errors.push({ row: index + 2, offer_id: offerId, error: '目标库存必须是非负整数' }); continue; }
+      const saved = await db.query(
+        `INSERT INTO app_stock_drafts (user_id, store_id, offer_id, product_id, warehouse_id, current_ozon_stock, target_stock, last_error)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'')
+         ON CONFLICT (user_id, store_id, offer_id, warehouse_id)
+         DO UPDATE SET product_id=EXCLUDED.product_id, current_ozon_stock=EXCLUDED.current_ozon_stock,
+                       target_stock=EXCLUDED.target_stock, last_error='', updated_at=now()
+         RETURNING id, offer_id, warehouse_id, current_ozon_stock, target_stock`,
+        [req.user.id, storeId, offerId, product.product_id || null, warehouseId, Math.max(0, Math.floor(currentStock)), targetStock],
+      );
+      imported.push(saved.rows[0]);
+    }
+    res.json({ success: true, imported: imported.length, failed: errors.length, items: imported, errors });
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/seller/stocks/drafts", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const params = [req.user.id, storeId];
+    let idWhere = "";
+    if (ids.length) { params.push(ids); idWhere = ` AND id = ANY($3::uuid[])`; }
+    const result = await db.query(
+      `DELETE FROM app_stock_drafts WHERE user_id = $1 AND store_id = $2${idWhere} RETURNING id`,
+      params,
+    );
+    res.json({ success: true, deleted: result.rowCount });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/products/stocks/bulk", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const params = [req.user.id, storeId];
+    let idWhere = "";
+    if (ids.length) { params.push(ids); idWhere = ` AND id = ANY($3::uuid[])`; }
+    const draftResult = await db.query(
+      `SELECT * FROM app_stock_drafts WHERE user_id = $1 AND store_id = $2${idWhere} ORDER BY created_at`,
+      params,
+    );
+    if (!draftResult.rowCount) return res.status(400).json({ success: false, error: "没有待提交库存草稿" });
+
+    const drafts = draftResult.rows;
+    const successes = [];
+    const failures = [];
+    for (let index = 0; index < drafts.length; index += 100) {
+      const batch = drafts.slice(index, index + 100);
+      const payload = batch.map((row) => ({
+        offer_id: row.offer_id,
+        ...(row.product_id ? { product_id: Number(row.product_id) } : {}),
+        warehouse_id: Number(row.warehouse_id),
+        stock: Number(row.target_stock),
+      }));
+      try {
+        await callOzonSellerAPI("/v2/products/stocks", { stocks: payload }, { storeId, userId: req.user.id });
+        successes.push(...batch);
+      } catch (error) {
+        const message = String(error.payload?.message || error.message || "库存同步失败").slice(0, 1000);
+        failures.push(...batch.map((row) => ({ ...row, error: message })));
+      }
+    }
+
+    for (const row of successes) {
+      await db.query(
+        `INSERT INTO app_stock_change_logs (
+           user_id, store_id, offer_id, warehouse_id, previous_stock, target_stock, status
+         ) VALUES ($1,$2,$3,$4,$5,$6,'success')`,
+        [req.user.id, storeId, row.offer_id, row.warehouse_id, row.current_ozon_stock, row.target_stock],
+      );
+      await db.query(`DELETE FROM app_stock_drafts WHERE id = $1 AND user_id = $2`, [row.id, req.user.id]);
+    }
+    for (const row of failures) {
+      await db.query(
+        `UPDATE app_stock_drafts SET last_error = $1, updated_at = now() WHERE id = $2 AND user_id = $3`,
+        [row.error, row.id, req.user.id],
+      );
+      await db.query(
+        `INSERT INTO app_stock_change_logs (
+           user_id, store_id, offer_id, warehouse_id, previous_stock, target_stock, status, error
+         ) VALUES ($1,$2,$3,$4,$5,$6,'failed',$7)`,
+        [req.user.id, storeId, row.offer_id, row.warehouse_id, row.current_ozon_stock, row.target_stock, row.error],
+      );
+    }
+    res.status(failures.length ? 207 : 200).json({
+      success: failures.length === 0,
+      submitted: drafts.length,
+      succeeded: successes.length,
+      failed: failures.length,
+      errors: failures.map((row) => ({ id: row.id, offer_id: row.offer_id, warehouse_id: row.warehouse_id, error: row.error })),
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/orders/tracking", requireAuth, async (req, res, next) => {
+  res.status(501).json({ success: false, error: "当前 Ozon Seller API 未提供可靠的逐节点物流轨迹，已移除模拟数据" });
 });
 
 /**
@@ -1729,30 +2013,10 @@ app.post("/api/seller/orders/tracking", requireAuth, async (req, res, next) => {
  * 输出: { success: true, images: [url,url,...] } - 严禁 null
  */
 app.post("/api/ai/product-image-set/generate", requireAuth, async (req, res) => {
-  try {
-    if (!DASHSCOPE_API_KEY) {
-      return res.status(503).json({ success: false, error: "未配置 DASHSCOPE_API_KEY" });
-    }
-    const body = req.body || {};
-    const materialImages = Array.isArray(body.material_images) ? body.material_images.filter(Boolean) : [];
-    const sellingPoints = String(body.selling_points || "").trim();
-    const titleZh = String(body.title_zh || "").trim();
-    const titleRu = String(body.title_ru || body.title_en || "").trim();
-    const imageType = String(body.image_type || "main").toLowerCase();
-    const targetMarket = String(body.target_market || "ozon").toLowerCase();
-    const count = Math.min(6, Math.max(1, Number(body.count || 3)));
-
-    if (!materialImages.length) {
-      return res.status(400).json({ success: false, error: "请至少上传一张素材图" });
-    }
-
-    const errors = [];
-    const results = [];
-    
-    // 调用万相 2.1 / 2.7 的逻辑保持不变...
-    // 这里补全通用下载代理接口
-    // ... (保持原有生成逻辑)
-  } catch (error) { next(error); }
+  res.status(410).json({
+    success: false,
+    error: "旧套图接口已停用，请使用 /api/seller/images/generate",
+  });
 });
 
 /* ============================================================
@@ -1788,7 +2052,7 @@ app.post("/api/ai/product-image-set/generate_OLD_MOCK", requireAuth, async (req,
   } catch (e) { next(e); }
 });
 
-app.patch("/api/products/:offer_id/field", async (req, res, next) => {
+app.patch("/api/products/:offer_id/field", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const { offer_id } = req.params;
@@ -1863,21 +2127,63 @@ app.get("/api/seller/products/category-examples", requireAuth, async (req, res, 
 });
 
 
+const categoryAnalyticsCache = new Map();
 app.post("/api/seller/analytics/categories", requireAuth, async (req, res, next) => {
   try {
-    const { range = "28", dimension = "category1" } = req.body;
+    const { range = "28", dimension = "category1", filter_type: filterType = "all" } = req.body;
     const storeId = req.body?.store_id || req.body?.storeId;
-    const data = await callOzonSellerAPI("/v1/analytics/data", {
-      date_from: new Date(Date.now() - parseInt(range) * 24 * 3600 * 1000).toISOString().split('T')[0],
-      date_to: new Date().toISOString().split('T')[0],
+    const days = Math.min(90, Math.max(7, Number.parseInt(range, 10) || 28));
+    const cacheKey = `${req.user.id}:${storeId}:${days}:${dimension}`;
+    let cached = categoryAnalyticsCache.get(cacheKey);
+    if (!cached || Date.now() - cached.createdAt > 10 * 60 * 1000) {
+      const end = new Date();
+      const start = new Date(end.getTime() - days * 86400e3);
+      const previousStart = new Date(start.getTime() - days * 86400e3);
+      const request = (dateFrom, dateTo) => callOzonSellerAPI("/v1/analytics/data", {
+      date_from: dateFrom.toISOString().split('T')[0],
+      date_to: dateTo.toISOString().split('T')[0],
       metrics: ["ordered_units", "revenue", "returns_units"],
       dimension: [dimension],
       filters: [],
       sort: [{ key: "revenue", order: "DESC" }],
       limit: 100,
       offset: 0
-    }, { storeId, userId: req.user.id });
-    res.json({ success: true, data });
+      }, { storeId, userId: req.user.id });
+      const [data, previous] = await Promise.all([request(start, end), request(previousStart, start)]);
+      const previousRows = previous?.result?.data || [];
+      const previousMap = new Map(previousRows.map(row => [String(row.dimensions?.[0]?.id || row.dimensions?.[0]?.name || ''), Number(row.metrics?.[1] || 0)]));
+      const items = (data?.result?.data || []).map(row => {
+        const dimensionRow = row.dimensions?.[0] || {};
+        const categoryId = String(dimensionRow.id || dimensionRow.name || '');
+        const orderedUnits = Number(row.metrics?.[0] || 0);
+        const revenue = Number(row.metrics?.[1] || 0);
+        const returns = Number(row.metrics?.[2] || 0);
+        const previousRevenue = previousMap.get(categoryId) || 0;
+        return {
+          category_id: categoryId,
+          category_path: dimensionRow.name || '未分类',
+          ordered_units: orderedUnits,
+          revenue,
+          previous_revenue: previousRevenue,
+          gmv_growth: previousRevenue > 0 ? (revenue - previousRevenue) / previousRevenue : (revenue > 0 ? 1 : 0),
+          avg_price: orderedUnits > 0 ? revenue / orderedUnits : 0,
+          returns_units: returns,
+          return_rate: orderedUnits > 0 ? returns / orderedUnits : 0,
+          seller_count: null,
+          cr5: null,
+          fbs_ratio: null,
+        };
+      });
+      cached = { createdAt: Date.now(), data, items };
+      categoryAnalyticsCache.set(cacheKey, cached);
+      if (categoryAnalyticsCache.size > 200) categoryAnalyticsCache.delete(categoryAnalyticsCache.keys().next().value);
+    }
+    let items = cached.items;
+    if (filterType === 'growth') items = items.filter(item => item.gmv_growth >= 0.3);
+    else if (filterType === 'high_return') items = items.filter(item => item.return_rate >= 0.15);
+    else if (filterType === 'brand_concentrated') items = [];
+    else if (filterType === 'fbs_opportunity') items = [];
+    res.json({ success: true, data: cached.data, items, cached_at: new Date(cached.createdAt).toISOString(), unavailable_metrics: ['seller_count', 'cr5', 'fbs_ratio'] });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -1907,7 +2213,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const range = Math.min(30, Math.max(7, Number(req.query.range) || 7));
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const weekAgo = new Date(now.getTime() - 7 * 86400e3);
+    const weekAgo = new Date(now.getTime() - range * 86400e3);
     const yesterdayStart = new Date(todayStart.getTime() - 86400e3);
     const todayStartISO = todayStart.toISOString();
     const weekAgoISO = weekAgo.toISOString();
@@ -1916,7 +2222,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
 
     // 1. 查所有 active 店铺
     const storesRes = await db.query(
-      `SELECT id, name, client_id, api_key FROM app_stores WHERE active = TRUE`
+      `SELECT id, name, client_id, api_key
+         FROM app_stores
+        WHERE active = TRUE AND user_id = $1`,
+      [userId],
     );
     const stores = storesRes.rows;
     if (!stores.length) {
@@ -2087,6 +2396,28 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         [store.id]
       );
       const pr = prodRes.rows[0] || {};
+      const warningRes = await db.query(
+        `SELECT offer_id, name, image, stock
+           FROM app_products
+          WHERE store_id = $1 AND stock < 10 AND status != 'IN_ACTIVE'
+          ORDER BY stock ASC, updated_at DESC
+          LIMIT 20`,
+        [store.id],
+      );
+
+      const recentOrders = weekOrders.slice(0, 15).map(order => {
+        const metrics = calcOrderMetrics(order);
+        const product = order.products?.[0] || {};
+        return {
+          store_name: store.name,
+          posting_number: order.posting_number || '',
+          status: order.status || '',
+          amount_cny: metrics.gmv,
+          product_name: product.name || product.offer_id || '',
+          image: product.image || product.primary_image || '',
+          created_at: order.in_process_at || order.created_at || null,
+        };
+      });
 
       // v0.5.2 同步判定: last_sync > 24h 前 → "需同步", 否则 "已同步"
       const lastSync = pr.last_sync ? new Date(pr.last_sync) : null;
@@ -2143,6 +2474,8 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         total_products: parseInt(pr.total_products || 0),
         last_sync: pr.last_sync || null,
         _dailyBuckets: dailyBuckets,
+        _recentOrders: recentOrders,
+        _stockWarnings: warningRes.rows,
       };
     }));
 
@@ -2211,7 +2544,14 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     console.log(`[dashboard] summary: orders=${summary.today_orders} gmv=¥${summary.today_gmv} profit=¥${summary.weekly_profit} warn=${summary.stock_warning}`);
 
     // 清理内部字段 (_dailyBuckets 不返回给前端)
-    const cleanStoreComparison = storeData.map(({ _dailyBuckets, ...rest }) => rest);
+    const recentOrders = storeData.flatMap(item => item._recentOrders || [])
+      .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
+      .slice(0, 15);
+    const stockWarnings = storeData.flatMap(item => (item._stockWarnings || []).map(row => ({
+      ...row,
+      store_name: item.store_name,
+    }))).slice(0, 20);
+    const cleanStoreComparison = storeData.map(({ _dailyBuckets, _recentOrders, _stockWarnings, ...rest }) => rest);
 
     res.json({
       success: true,
@@ -2219,6 +2559,8 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       store_comparison: cleanStoreComparison,
       trends,
       recentJobs: jobsRes.rows,
+      recent_orders: recentOrders,
+      stock_warnings: stockWarnings,
       generated_at: nowISO,
     });
   } catch (error) {
@@ -2290,13 +2632,40 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
       params
     );
 
+    const statusCountRes = await db.query(
+      `SELECT status, count(*)::int AS count
+       FROM app_products
+       WHERE user_id = $1 AND store_id = $2
+       GROUP BY status`,
+      [userId, storeId]
+    );
+    const status_counts = { ALL: 0 };
+    for (const row of statusCountRes.rows) {
+      status_counts[row.status || "UNKNOWN"] = Number(row.count || 0);
+      status_counts.ALL += Number(row.count || 0);
+    }
+
+    const items = rows.rows.map((row) => {
+      const issues = [];
+      if (!(Number(row.weight) > 0)) issues.push("缺少重量");
+      if (!(Number(row.width) > 0 && Number(row.depth) > 0 && Number(row.height) > 0)) issues.push("缺少尺寸");
+      if ((Number(row.width) + Number(row.depth) + Number(row.height)) >= 2000) issues.push("尺寸三边和超过 2000mm");
+      const titleLength = String(row.name || "").trim().length;
+      if (titleLength < 20 || titleLength > 500) issues.push("标题长度应为 20-500 字符");
+      if (!row.image) issues.push("缺少主图");
+      if (!row.brand) issues.push("缺少品牌");
+      if (!row.description) issues.push("缺少描述");
+      return { ...row, compliance_issues: issues, compliance_ok: issues.length === 0 };
+    });
+
     res.json({
       success: true,
       total: parseInt(countRes.rows[0].count),
-      items: rows.rows,
+      items,
+      status_counts,
       data: {
         result: {
-          items: rows.rows,
+          items,
           total: parseInt(countRes.rows[0].count)
         }
       }
@@ -2363,68 +2732,48 @@ app.post("/api/ai/pricing", requireAuth, async (req, res) => {
  * 严禁: 任何 Mock 数据兜底
  */
 /**
- * v0.6.2 浏览器插件推送采集数据 → 批量跟卖
- * 输入: { items: [{offer_id, name, image, images, price, ...}] }
- * 存入 collect_items 表, 前端 BatchUpload 可消费
- */
-app.post("/api/collect-items", requireAuth, async (req, res) => {
-  if (!requireDb(res)) return;
-  try {
-    const userId = req.user.id;
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    if (!items.length) return res.status(400).json({ success: false, error: "items 为空" });
-
-    let inserted = 0;
-    for (const item of items) {
-      try {
-        await db.query(
-          `INSERT INTO collect_items (user_id, offer_id, name, image, images, price, currency_code, brand, weight, depth, width, height, category_name, description, status, source, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'pending', $15, now())
-           ON CONFLICT DO NOTHING`,
-          [
-            userId,
-            String(item.offer_id || ""),
-            String(item.name || ""),
-            String(item.image || ""),
-            JSON.stringify(item.images || []),
-            Number(item.price || 0),
-            String(item.currency_code || "CNY"),
-            String(item.brand || ""),
-            Number(item.weight || 0),
-            Number(item.depth || 0),
-            Number(item.width || 0),
-            Number(item.height || 0),
-            String(item.category_name || ""),
-            String(item.description || ""),
-            String(item.source || "extension"),
-          ],
-        );
-        inserted++;
-      } catch (e) { /* skip duplicate */ }
-    }
-
-    console.log(`[collect-items] 插入 ${inserted}/${items.length} 条 (from extension)`);
-    res.json({ success: true, inserted, total: items.length });
-  } catch (e) {
-    console.error("[collect-items]", e.message);
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
-/**
  * v0.6.2 获取 collect_items 列表 (供 BatchUpload 消费)
  */
 app.get("/api/collect-items", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
     const userId = req.user.id;
-    const status = req.query?.status || "pending";
-    const limit = Math.min(200, Number(req.query?.limit || 100));
-    const r = await db.query(
-      `SELECT * FROM collect_items WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3`,
-      [userId, status, limit],
+    const status = String(req.query?.status || "all").trim();
+    const search = String(req.query?.search || "").trim();
+    const storeId = String(req.query?.store_id || "").trim();
+    const limit = Math.min(200, Math.max(1, Number(req.query?.limit || 50)));
+    const offset = Math.max(0, Number(req.query?.offset || 0));
+    const args = [userId];
+    const where = ["user_id = $1"];
+    if (status && status !== "all") { args.push(status); where.push(`status = $${args.length}`); }
+    if (storeId) { args.push(storeId); where.push(`store_id = $${args.length}`); }
+    if (search) {
+      args.push(`%${search}%`);
+      where.push(`(ozon_url ILIKE $${args.length} OR ozon_sku ILIKE $${args.length} OR title ILIKE $${args.length})`);
+    }
+    const countResult = await db.query(`SELECT count(*)::int AS count FROM collect_items WHERE ${where.join(" AND ")}`, args);
+    const statusResult = await db.query(
+      `SELECT status, count(*)::int AS count FROM collect_items WHERE user_id = $1 GROUP BY status`,
+      [userId],
     );
-    res.json({ success: true, items: r.rows });
+    const statusCounts = { all: 0 };
+    for (const row of statusResult.rows) {
+      statusCounts[row.status] = Number(row.count || 0);
+      statusCounts.all += Number(row.count || 0);
+    }
+    const result = await db.query(
+      `SELECT * FROM collect_items WHERE ${where.join(" AND ")}
+       ORDER BY created_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+      [...args, limit, offset],
+    );
+    res.json({
+      success: true,
+      items: result.rows,
+      total: Number(countResult.rows[0]?.count || 0),
+      status_counts: statusCounts,
+      limit,
+      offset,
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -2872,11 +3221,11 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     const imageMap = new Map();
     if (allOfferIds.size && db) {
       const joinRows = await db.query(
-        `SELECT offer_id, image, name FROM app_products
+        `SELECT offer_id, image, name, purchase_price_cny FROM app_products
          WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
         [storeId, Array.from(allOfferIds)],
       );
-      for (const r of joinRows.rows) imageMap.set(r.offer_id, { image: r.image, name: r.name });
+      for (const r of joinRows.rows) imageMap.set(r.offer_id, { image: r.image, name: r.name, purchase_price_cny: Number(r.purchase_price_cny || 0) });
     }
 
     // ---- 金额平铺 (v0.3.4 修正: 币种感知, 不再暴力 rubToCny) ----
@@ -2911,6 +3260,9 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         const commissionNative = Number(fd.commission_amount || 0);
         const payoutNative = Number(fd.payout || 0);
         const localMeta = imageMap.get(pd.offer_id) || {};
+        const payoutCny = currency === "CNY" ? payoutNative : rubToCny(payoutNative);
+        const commissionCny = currency === "CNY" ? commissionNative : rubToCny(commissionNative);
+        const purchasePriceCny = Number(localMeta.purchase_price_cny || 0);
         return {
           offer_id: pd.offer_id,
           sku: pd.sku,
@@ -2925,8 +3277,12 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
           subtotal_cny: Math.round(priceCny * qty * 100) / 100,
           subtotal_rub: Math.round(priceRub * qty * 100) / 100,
           commission_amount: commissionNative,
-          commission_cny: currency === "CNY" ? commissionNative : rubToCny(commissionNative),
-          payout_cny: currency === "CNY" ? payoutNative : rubToCny(payoutNative),
+          commission_cny: Math.round(commissionCny * qty * 100) / 100,
+          payout_cny: Math.round(payoutCny * qty * 100) / 100,
+          purchase_price_cny: purchasePriceCny,
+          purchase_cost_cny: Math.round(purchasePriceCny * qty * 100) / 100,
+          profit_cny: purchasePriceCny > 0 ? Math.round((payoutCny * qty - purchasePriceCny * qty) * 100) / 100 : null,
+          profit_is_estimated: purchasePriceCny <= 0,
         };
       });
       const totalCny = products.reduce((s, x) => s + (x.subtotal_cny || 0), 0);
@@ -3031,11 +3387,72 @@ app.post("/api/seller/orders/ship", requireAuth, async (req, res) => {
       with: { additional_data: true },
     }, { storeId, userId: req.user.id });
 
-    res.json({ success: true, data });
+    let inventoryAdjusted = false;
+    if (db) {
+      const client = await db.connect();
+      try {
+        await client.query('BEGIN');
+        const event = await client.query(
+          `INSERT INTO app_order_ship_events (user_id, store_id, posting_number, packages)
+           VALUES ($1,$2,$3,$4::jsonb) ON CONFLICT (store_id, posting_number) DO NOTHING RETURNING id`,
+          [req.user.id, storeId, posting_number, JSON.stringify(packages)],
+        );
+        if (event.rowCount) {
+          const shipped = new Map();
+          for (const pack of packages) for (const product of (pack.products || [])) {
+            const sku = String(product.product_id || '');
+            shipped.set(sku, (shipped.get(sku) || 0) + Math.max(0, Number(product.quantity || 0)));
+          }
+          for (const [sku, quantity] of shipped) {
+            const found = await client.query(`SELECT id, stock, stocks_json FROM app_products WHERE store_id=$1 AND (sku::text=$2 OR product_id::text=$2) FOR UPDATE`, [storeId, sku]);
+            for (const product of found.rows) {
+              let remaining = quantity;
+              const stocks = Array.isArray(product.stocks_json) ? product.stocks_json.map(row => ({ ...row })) : [];
+              for (const stock of stocks) {
+                if (remaining <= 0) break;
+                const present = Math.max(0, Number(stock.present || 0));
+                const deducted = Math.min(present, remaining);
+                stock.present = present - deducted;
+                remaining -= deducted;
+              }
+              const total = stocks.length ? stocks.reduce((sum, row) => sum + Math.max(0, Number(row.present || 0)), 0) : Math.max(0, Number(product.stock || 0) - quantity);
+              await client.query(`UPDATE app_products SET stock=$1, stocks_json=$2::jsonb, updated_at=now() WHERE id=$3`, [total, JSON.stringify(stocks), product.id]);
+            }
+          }
+          inventoryAdjusted = true;
+        }
+        await client.query('COMMIT');
+      } catch (error) { await client.query('ROLLBACK'); console.error('[Orders.ship] local inventory adjustment failed:', error.message); }
+      finally { client.release(); }
+    }
+
+    res.json({ success: true, data, inventoryAdjusted });
   } catch (error) {
     console.error("[Orders.ship]", error.message, error.payload);
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
+});
+
+app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    const postingNumbers = Array.isArray(req.body?.posting_numbers) ? req.body.posting_numbers.map(String).filter(Boolean).slice(0, 50) : [];
+    if (!storeId || !postingNumbers.length) return res.status(400).json({ success: false, error: '请选择需要打印面单的订单' });
+    const credentials = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2 AND active=TRUE`, [storeId, req.user.id]);
+    if (!credentials.rowCount) return res.status(404).json({ success: false, error: '未找到店铺或无权限' });
+    const response = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
+      method: 'POST',
+      headers: { 'Client-Id': credentials.rows[0].client_id, 'Api-Key': credentials.rows[0].api_key, 'Content-Type': 'application/json', Accept: 'application/pdf, application/json' },
+      body: JSON.stringify({ posting_number: postingNumbers }),
+    });
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (!response.ok) return res.status(response.status).json({ success: false, error: `Ozon 面单生成失败：${bytes.toString('utf8').slice(0, 1000)}` });
+    const contentType = response.headers.get('content-type') || 'application/pdf';
+    if (contentType.includes('json')) return res.status(502).json({ success: false, error: `Ozon 未返回 PDF：${bytes.toString('utf8').slice(0, 1000)}` });
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `inline; filename="ozon-labels-${Date.now()}.pdf"`);
+    res.send(bytes);
+  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
 // ---------- 上架记录 ----------
@@ -3185,9 +3602,9 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
       }
     }
     if (storeId) { params.push(storeId); conds.push(`lh.store_id = $${params.length}`); }
-    if (sku) { params.push(`%${sku}%`); conds.push(`(lh.offer_id ILIKE $${params.length} OR lh.product_name ILIKE $${params.length} OR lh.task_id = $${params.length - 0})`); }
+    if (sku) { params.push(`%${sku}%`); conds.push(`(lh.offer_id ILIKE $${params.length} OR lh.product_name ILIKE $${params.length} OR lh.task_id ILIKE $${params.length})`); }
     if (startDate) { params.push(startDate); conds.push(`lh.created_at >= $${params.length}`); }
-    if (endDate) { params.push(endDate); conds.push(`lh.created_at < $${params.length}`); }
+    if (endDate) { params.push(endDate); conds.push(`lh.created_at < ($${params.length}::date + interval '1 day')`); }
 
     const where = conds.join(" AND ");
 
@@ -3396,8 +3813,24 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
       res.status(response.status || 502).json({ success: false, error: `MiniMax 图生 ${response.status}：${text.slice(0, 500)}`, payload });
       return;
     }
-    const urls = payload?.data?.image_urls || [];
-    const estimatedCostUsd = Number((urls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6));
+    const remoteUrls = payload?.data?.image_urls || [];
+    const urls = [];
+    const uploadsDir = await ensureUploadsDir();
+    for (const remoteUrl of remoteUrls) {
+      try {
+        const imageResponse = await fetch(remoteUrl);
+        if (!imageResponse.ok) throw new Error(`HTTP ${imageResponse.status}`);
+        const contentType = String(imageResponse.headers.get("content-type") || "image/jpeg");
+        const extension = contentType.includes("png") ? "png" : contentType.includes("webp") ? "webp" : "jpg";
+        const filename = `ai-${crypto.randomUUID()}.${extension}`;
+        await fs.writeFile(path.join(uploadsDir, filename), Buffer.from(await imageResponse.arrayBuffer()));
+        urls.push(`/uploads/${filename}`);
+      } catch (error) {
+        console.error(`[ai-image] 永久化失败，保留远端地址: ${error.message}`);
+        urls.push(remoteUrl);
+      }
+    }
+    const estimatedCostUsd = Number((remoteUrls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6));
     const usage = {
       model: payload?.model || body.model,
       promptTokens: (payload?.usage?.prompt_tokens || 0),
@@ -3411,10 +3844,11 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
     if (db && req.user?.id) {
       try {
         const r = await db.query(
-          `INSERT INTO ai_image_records (user_id, model, prompt, aspect_ratio, n, has_ref_image, image_urls, estimated_cost_usd, scene_preset)
-           VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9) RETURNING id`,
+          `INSERT INTO ai_image_records (user_id, store_id, model, prompt, aspect_ratio, n, has_ref_image, image_urls, estimated_cost_usd, scene_preset)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10) RETURNING id`,
           [
             req.user.id,
+            req.body?.store_id || req.body?.storeId || null,
             body.model,
             body.prompt,
             aspectRatio,
@@ -5056,104 +5490,7 @@ function parseCollectInputs(text) {
   return out;
 }
 
-app.post("/api/collect-items", requireAuth, async (req, res, next) => {
-  if (!requireDb(res)) return;
-  try {
-    const inputsText = String(req.body?.inputs || req.body?.text || "").trim();
-    const storeId = req.body?.storeId || null;
-    const parsed = parseCollectInputs(inputsText);
-    if (!parsed.length) {
-      res.status(400).json({ success: false, error: "没有识别到 Ozon 链接或 SKU。请粘贴 https://www.ozon.ru/... 或纯数字 SKU（一行一条）。" });
-      return;
-    }
-    const inserted = [];
-    const skipped = [];
-    for (const row of parsed) {
-      // 去重：同一用户 + 同 SKU 或同 URL 已存在 pending/scraped 就跳过
-      const exists = await db.query(
-        `SELECT id FROM collect_items WHERE user_id = $1 AND status IN ('pending','scraped') AND (
-            ($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3)
-         ) LIMIT 1`,
-        [req.user.id, row.ozonSku || "", row.ozonUrl || ""],
-      );
-      if (exists.rowCount) {
-        skipped.push({ source: row.sourceValue, reason: "已存在（pending/scraped）" });
-        continue;
-      }
-      const r = await db.query(
-        `INSERT INTO collect_items (user_id, store_id, source_type, source_value, ozon_url, ozon_sku, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id, ozon_url, ozon_sku, status, created_at`,
-        [req.user.id, storeId, row.sourceType, row.sourceValue, row.ozonUrl, row.ozonSku],
-      );
-      inserted.push(r.rows[0]);
-    }
-
-    // 如果只有一条，且是 URL，则立即创建一个抓取任务
-    if (inserted.length === 1 && parsed[0].sourceType === 'ozon_url') {
-      const item = inserted[0];
-      await db.query(
-        `INSERT INTO app_jobs (id, user_id, store_id, kind, status, phase, total, processed, payload)
-         VALUES (gen_random_uuid(), $1, $2, 'run', 'pending', '等待采集端领取', 1, 0, $3)`,
-        [req.user.id, storeId, JSON.stringify({ 
-          urls: [item.ozon_url],
-          options: {
-            enable1688: true,
-            headless: true,
-            collectId: item.id
-          }
-        })]
-      );
-    }
-
-    res.json({ success: true, inserted, skipped, insertedCount: inserted.length, skippedCount: skipped.length });
-  } catch (error) { next(error); }
-});
-
-app.get("/api/collect-items", requireAuth, async (req, res, next) => {
-  if (!requireDb(res)) return;
-  try {
-    const status = String(req.query.status || "").trim();
-    const limit = Math.min(500, Math.max(1, Number(req.query.limit || 50)));
-    const offset = Math.max(0, Number(req.query.offset || 0));
-    const search = String(req.query.search || "").trim();
-    const storeId = req.query.store_id || null;
-
-    const args = [req.user.id];
-    const where = ["user_id = $1"];
-    if (status && status !== "all") { args.push(status); where.push(`status = $${args.length}`); }
-    if (storeId) { args.push(storeId); where.push(`store_id = $${args.length}`); }
-    if (search) {
-      args.push(`%${search}%`);
-      where.push(`(ozon_url ILIKE $${args.length} OR ozon_sku ILIKE $${args.length} OR title ILIKE $${args.length})`);
-    }
-
-    // 1. 查询总数
-    const countRes = await db.query(
-      `SELECT count(*) FROM collect_items WHERE ${where.join(" AND ")}`,
-      args
-    );
-
-    // 2. 分页查询
-    const rows = await db.query(
-      `SELECT id, source_type, source_value, ozon_url, ozon_sku, title, main_image, price_cny, price_rub,
-               seller, brand, status, note, linked_job_id, linked_offer_id, attributes, created_at, updated_at
-          FROM collect_items WHERE ${where.join(" AND ")}
-          ORDER BY created_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
-      [...args, limit, offset]
-    );
-
-    res.json({ 
-      success: true, 
-      items: rows.rows, 
-      total: parseInt(countRes.rows[0].count),
-      limit, 
-      offset 
-    });
-  } catch (error) { next(error); }
-});
-
-
-app.delete("/api/collect-items/:id", async (req, res, next) => {
+app.delete("/api/collect-items/:id", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const r = await db.query("DELETE FROM collect_items WHERE id = $1 AND user_id = $2 RETURNING id", [req.params.id, req.user.id]);
@@ -5162,7 +5499,8 @@ app.delete("/api/collect-items/:id", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.post("/api/collect-items/:id", async (req, res, next) => {
+app.post("/api/collect-items/:id", requireAuth, async (req, res, next) => {
+  if (req.params.id === "bulk-delete") return next();
   if (!requireDb(res)) return;
   try {
     const allowed = [
@@ -5193,13 +5531,13 @@ app.post("/api/collect-items/:id", async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-app.put("/api/collect-items/:id", async (req, res, next) => {
-  // 复用 POST 逻辑
-  req.url = req.url.replace(/^\/api\/collect-items\//, "/api/collect-items/");
+app.put("/api/collect-items/:id", requireAuth, async (req, res, next) => {
+  // Express 只按 method 匹配路由；显式切换为 POST 后复用同一更新处理器。
+  req.method = "POST";
   return app._router.handle(req, res, next);
 });
 
-app.post("/api/collect-items/bulk-delete", async (req, res, next) => {
+app.post("/api/collect-items/bulk-delete", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
@@ -5217,10 +5555,13 @@ app.get("/api/seller/orders/notes", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const numbers = String(req.query.numbers || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const storeId = String(req.query.store_id || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     if (!numbers.length) { res.json({ success: true, notes: {} }); return; }
     const r = await db.query(
-      `SELECT posting_number, note, updated_at FROM order_notes WHERE user_id = $1 AND posting_number = ANY($2::text[])`,
-      [req.user.id, numbers],
+      `SELECT posting_number, note, updated_at FROM order_notes
+       WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
+      [req.user.id, storeId, numbers],
     );
     const notes = {};
     for (const row of r.rows) notes[row.posting_number] = { note: row.note, updated_at: row.updated_at };
@@ -5232,13 +5573,15 @@ app.post("/api/seller/orders/:postingNumber/note", requireAuth, async (req, res,
   if (!requireDb(res)) return;
   try {
     const pn = String(req.params.postingNumber || "").trim();
+    const storeId = req.body?.store_id || req.body?.storeId;
     if (!pn) { res.status(400).json({ success: false, error: "缺少 posting_number" }); return; }
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     const note = String(req.body?.note || "").slice(0, 2000);
     const r = await db.query(
-      `INSERT INTO order_notes (user_id, posting_number, note) VALUES ($1, $2, $3)
-       ON CONFLICT (user_id, posting_number) DO UPDATE SET note = EXCLUDED.note, updated_at = now()
+      `INSERT INTO order_notes (user_id, store_id, posting_number, note) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (store_id, posting_number) DO UPDATE SET note = EXCLUDED.note, user_id = EXCLUDED.user_id, updated_at = now()
        RETURNING posting_number, note, updated_at`,
-      [req.user.id, pn, note],
+      [req.user.id, storeId, pn, note],
     );
     res.json({ success: true, note: r.rows[0] });
   } catch (error) { next(error); }
@@ -5246,6 +5589,8 @@ app.post("/api/seller/orders/:postingNumber/note", requireAuth, async (req, res,
 
 app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
   try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     const status = String(req.body?.status || "").trim();
     const limit = Math.min(1000, Math.max(1, Number(req.body?.limit || 200)));
     const filter = {
@@ -5253,7 +5598,7 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       to: req.body?.to || new Date().toISOString(),
     };
     if (status) filter.status = status;
-    const data = await callOzonSellerAPI("/v3/posting/fbs/list", { filter, limit });
+    const data = await callOzonSellerAPI("/v3/posting/fbs/list", { filter, limit }, { storeId, userId: req.user.id });
     const postings = data?.result?.postings || [];
 
     // 本地备注补充
@@ -5262,8 +5607,8 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       const nums = postings.map((p) => p.posting_number).filter(Boolean);
       if (nums.length) {
         const nr = await db.query(
-          `SELECT posting_number, note FROM order_notes WHERE user_id = $1 AND posting_number = ANY($2::text[])`,
-          [req.user.id, nums],
+          `SELECT posting_number, note FROM order_notes WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
+          [req.user.id, storeId, nums],
         );
         for (const r of nr.rows) notesMap[r.posting_number] = r.note;
       }
@@ -5306,30 +5651,34 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
    AI 商品套图历史（10-ai-product-images.md 基础版）
    ============================================================ */
 
-app.get("/api/ai-images/history", async (req, res, next) => {
+app.get("/api/ai-images/history", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const limit = Math.min(200, Math.max(1, Number(req.query.limit || 30)));
     const offset = Math.max(0, Number(req.query.offset || 0));
+    const storeId = String(req.query.store_id || "").trim();
+    const args = [req.user.id];
+    let storeWhere = "";
+    if (storeId) { args.push(storeId); storeWhere = ` AND store_id = $${args.length}`; }
     const r = await db.query(
       `SELECT id, model, prompt, aspect_ratio, n, has_ref_image, image_urls,
               estimated_cost_usd, scene_preset, created_at
-         FROM ai_image_records WHERE user_id = $1
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-      [req.user.id, limit, offset],
+         FROM ai_image_records WHERE user_id = $1${storeWhere}
+         ORDER BY created_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+      [...args, limit, offset],
     );
     const stat = await db.query(
       `SELECT count(*)::int AS total,
               COALESCE(SUM(n),0)::int AS total_images,
               COALESCE(SUM(estimated_cost_usd),0)::numeric AS total_cost_usd
-         FROM ai_image_records WHERE user_id = $1`,
-      [req.user.id],
+         FROM ai_image_records WHERE user_id = $1${storeWhere}`,
+      args,
     );
     res.json({ success: true, items: r.rows, stats: stat.rows[0] });
   } catch (error) { next(error); }
 });
 
-app.delete("/api/ai-images/:id", async (req, res, next) => {
+app.delete("/api/ai-images/:id", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const r = await db.query("DELETE FROM ai_image_records WHERE id = $1 AND user_id = $2 RETURNING id", [req.params.id, req.user.id]);
@@ -5339,7 +5688,8 @@ app.delete("/api/ai-images/:id", async (req, res, next) => {
 });
 
 app.post("/api/jobs", async (req, res, next) => {
-  if (DISABLE_SERVER_SCRAPER && !db) {
+  const queueSingleSourcing = DISABLE_SERVER_SCRAPER && db && !SERVER_SINGLE_SOURCING;
+  if (DISABLE_SERVER_SCRAPER && !db && !SERVER_SINGLE_SOURCING) {
     res.status(409).json({ success: false, error: "服务器端已禁用直接采集。后续会通过你电脑上的本机采集端执行任务。" });
     return;
   }
@@ -5363,7 +5713,7 @@ app.post("/api/jobs", async (req, res, next) => {
       status: "queued",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      phase: DISABLE_SERVER_SCRAPER ? "等待本机采集端领取" : "等待开始",
+      phase: queueSingleSourcing ? "等待本机采集端领取" : "等待开始",
       kind: "run",
       total: urls.length,
       sourceTotal: allUrlRows.length,
@@ -5402,7 +5752,7 @@ app.post("/api/jobs", async (req, res, next) => {
       headless: req.body.headless === true,
     };
 
-    if (DISABLE_SERVER_SCRAPER && db) {
+    if (queueSingleSourcing) {
       const queued = await createQueuedDbJob(req.user, job, {
         urls,
         urlRows,
@@ -5512,6 +5862,11 @@ app.post("/api/batch-ozon/jobs", async (req, res, next) => {
 
 app.get("/api/jobs/:id", async (req, res, next) => {
   try {
+    const runtimeJob = jobs.get(req.params.id);
+    if (runtimeJob) {
+      res.json({ success: true, job: serializeJob(runtimeJob) });
+      return;
+    }
     if (db) {
       const job = await getDbJobForUser(req.params.id, req.user);
       if (!job) {
@@ -5539,6 +5894,13 @@ app.get("/api/jobs/:id", async (req, res, next) => {
 
 app.post("/api/jobs/:id/cancel", async (req, res, next) => {
   try {
+    const runtimeJob = jobs.get(req.params.id);
+    if (runtimeJob) {
+      runtimeJob.cancelRequested = true;
+      log(runtimeJob, "已请求停止，当前商品处理完后会停下。", "warn");
+      res.json({ success: true });
+      return;
+    }
     if (db) {
       const job = await getDbJobForUser(req.params.id, req.user);
       if (!job) {
@@ -5572,7 +5934,9 @@ app.post("/api/jobs/:id/cancel", async (req, res, next) => {
 
 app.get("/api/jobs/:id/download", async (req, res, next) => {
   try {
-    if (db && !(await getDbJobForUser(req.params.id, req.user))) {
+    const runtimeJob = jobs.get(req.params.id);
+    const storedJob = runtimeJob ? null : await loadStoredJob(req.params.id);
+    if (db && !runtimeJob && !storedJob && !(await getDbJobForUser(req.params.id, req.user))) {
       res.status(404).send("文件不存在");
       return;
     }
@@ -5584,7 +5948,9 @@ app.get("/api/jobs/:id/download", async (req, res, next) => {
 
 app.get("/api/history/:id/download", async (req, res, next) => {
   try {
-    if (db && !(await getDbJobForUser(req.params.id, req.user))) {
+    const runtimeJob = jobs.get(req.params.id);
+    const storedJob = runtimeJob ? null : await loadStoredJob(req.params.id);
+    if (db && !runtimeJob && !storedJob && !(await getDbJobForUser(req.params.id, req.user))) {
       res.status(404).send("文件不存在");
       return;
     }
@@ -5844,7 +6210,7 @@ async function runJob(job, options) {
           log(job, "正在用 Ozon 主图搜索 1688 候选货源，并补采起批量、价格、运费、尺寸、重量。");
           const searchResult = await search1688ByImage(context, result.ozon.mainImage, options.maxCandidates, job.id, sourceRow);
           if (searchResult.success) {
-            result.candidates = searchResult.candidates.map((candidate) => annotateCandidateQuantity(candidate, result.ozon));
+            result.candidates = searchResult.candidates.map((candidate) => normalizeSourcingCandidateForReview(candidate, result.ozon));
             log(job, `找到 ${result.candidates.length} 个 1688 候选，详情字段已尽量补全。`);
             if (options.enableAI && result.candidates.length) {
               job.phase = `AI 审核 ${progressLabel}`;
@@ -5930,14 +6296,50 @@ async function finalizeWorkerRunJob(existing, job) {
   const payload = existing?.payload && typeof existing.payload === "object" ? existing.payload : {};
   const options = payload.options && typeof payload.options === "object" ? payload.options : payload;
   const enableAI = options.enableAI !== false;
+  const collectionOnly = options.collectionOnly === true;
+  const urlRows = Array.isArray(payload.urlRows) ? payload.urlRows : [];
   const jobId = existing?.id || job.id || "";
   job.logs = Array.isArray(job.logs) ? job.logs : [];
   for (const result of job.results) {
-    if (!result || result.error) continue;
+    if (!result) continue;
+    const sourceRow = Number(result.sourceRow || 0);
+    const source = urlRows.find((row) => Number(row?.sourceRow || 0) === sourceRow);
+    const collectId = String(source?.collectId || "").trim();
+    if (collectionOnly && collectId && result.error && db) {
+      await db.query(
+        `UPDATE collect_items SET status = 'failed', note = $1, updated_at = now()
+         WHERE id = $2 AND user_id = $3`,
+        [String(result.error).slice(0, 1000), collectId, existing.owner?.id],
+      );
+    }
+    if (result.error) continue;
     result.ozon = normalizePluginOzonResult(result.ozon || {});
+    if (collectionOnly && db) {
+      if (collectId) {
+        const ozon = result.ozon || {};
+        const imageUrls = Array.isArray(ozon.images) ? ozon.images.filter(Boolean) : [];
+        const mainImage = ozon.mainImageUrl || ozon.mainImage?.url || imageUrls[0] || "";
+        await db.query(
+          `UPDATE collect_items
+           SET title = $1, main_image = $2, images = $3::jsonb, price_rub = $4,
+               brand = $5, attributes = $6::jsonb, status = 'scraped', note = '', updated_at = now()
+           WHERE id = $7 AND user_id = $8`,
+          [
+            String(ozon.title || ""),
+            String(mainImage),
+            JSON.stringify(imageUrls),
+            Number(ozon.currentBlackPriceCnyValue || ozon.raw?.price || 0) || null,
+            String(ozon.brand || ""),
+            JSON.stringify(ozon.attributes || []),
+            collectId,
+            existing.owner?.id,
+          ],
+        );
+      }
+    }
     await hydrateWorkerRunResultImages(jobId, result);
     if (Array.isArray(result.candidates) && result.candidates.length) {
-      result.candidates = result.candidates.map((candidate) => annotateCandidateQuantity(candidate, result.ozon));
+      result.candidates = result.candidates.map((candidate) => normalizeSourcingCandidateForReview(candidate, result.ozon));
       if (enableAI && shouldReviewWorkerResultWithAi(result)) {
         job.logs.push(makeLogEntry(`服务器 AI 审核第 ${result.sourceRow || ""} 行候选。`));
         result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
@@ -6538,6 +6940,7 @@ async function scrapeOzonProduct(context, url, jobId, index) {
     ].join(" "));
     const ozonWeight = inferOzonWeight({ ...extracted, networkWeightCandidates });
 
+    const moqText = moqItem?.text || data.minOrderQuantity || data.moq || "";
     return {
       ...extracted,
       sourceUrl: url,
@@ -7188,6 +7591,34 @@ async function searchOffersByImageId(imageId, cookieState) {
     const moqItem = Array.isArray(data.afterPriceList)
       ? data.afterPriceList.find((entry) => entry.matKey === "quantity_begin")
       : null;
+    const priceRangeMoq = Array.isArray(data.priceInfo?.priceRange)
+      ? data.priceInfo.priceRange[0]?.beginAmount
+      : "";
+    const priceRangeMoqAlt = Array.isArray(data.priceRange)
+      ? data.priceRange[0]?.beginAmount
+      : "";
+    const priceRangesMoq = Array.isArray(data.priceRanges)
+      ? data.priceRanges[0]?.beginAmount
+      : "";
+    const moqRaw = pickFirstText(
+      moqItem?.text,
+      moqItem?.value,
+      moqItem?.name,
+      data.minOrderQuantity,
+      data.minimumOrderQuantity,
+      data.minOrder,
+      data.beginAmount,
+      data.startAmount,
+      data.batchNumber,
+      data.moq,
+      data.priceInfo?.beginAmount,
+      priceRangeMoq,
+      priceRangeMoqAlt,
+      priceRangesMoq,
+    );
+    const moqText = moqRaw && /^\d+(?:\.\d+)?$/.test(String(moqRaw).trim())
+      ? `${String(moqRaw).trim()}件起批`
+      : moqRaw;
     const title = data.title || data.subject || "";
     const promotionText = collectPromotionTextFromValue(data);
     const packQuantity = inferPackQuantityFromText([title, promotionText].join(" "));
@@ -7198,8 +7629,8 @@ async function searchOffersByImageId(imageId, cookieState) {
       image: normalizeUrl(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || ""),
       link: normalizeUrl(data.linkUrl || data.sameDesignUrl || (offerId ? `https://detail.1688.com/offer/${offerId}.html` : "")),
       shopName: data.shop?.text || data.shopAddition?.text || data.loginId || data.sellerName || "",
-      moq: moqItem?.text || "1件起批",
-      minOrderQuantity: moqItem?.text || "1件起批",
+      moq: moqText,
+      minOrderQuantity: moqText,
       promotionText,
       packQuantity: packQuantity.quantity,
       packQuantityEvidence: packQuantity.evidence,
@@ -7256,6 +7687,213 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
           return Math.round(number);
         }
         return null;
+      };
+      const weightKeyPattern = /(?:weight|unitweight|skuweight|grossweight|netweight|packageweight|pieceweight|重量|克重|毛重|净重|包装重|发货重|商品重|计费重)/i;
+      const shippingKeyPattern = /(?:shippingfee|shipping|shiptemplate|postage|postfee|postfeevalue|freight|freightfee|freightprice|freighttemplate|freightmodule|logisticsfee|logisticsinfo|deliveryfee|deliverytemplate|expressfee|templatefee|carriage|totalcost|logistics|delivery|express|运费|物流费|物流|快递费|快递|配送费|配送|发货费|邮费|邮资|运费模板|物流模板)/i;
+      const moqKeyPattern = /(?:minorder|minorderquantity|minimumorder|beginamount|startamount|batchnumber|moq|起批|起订|起购|起拍|最小起订|最少起批)/i;
+      const primitiveWeightValue = (value) => {
+        if (typeof value === "string" || typeof value === "number") return value;
+        if (!value || typeof value !== "object") return "";
+        return pick(value.value, value.text, value.name, value.title, value.displayValue, value.displayName, value.content);
+      };
+      const primitiveShippingValue = (value) => {
+        if (typeof value === "string" || typeof value === "number") return value;
+        if (!value || typeof value !== "object") return "";
+        return pick(value.value, value.text, value.name, value.title, value.displayValue, value.displayName, value.content, value.amount, value.price, value.fee, value.cost);
+      };
+      const findWeightInRaw = (root) => {
+        const seen = new Set();
+        const stack = [{ key: "", value: root, depth: 0 }];
+        const candidates = [];
+        let visited = 0;
+        while (stack.length && candidates.length < 24 && visited < 2500) {
+          const item = stack.pop();
+          visited += 1;
+          const key = clean(item.key);
+          const value = item.value;
+          if (value == null || item.depth > 7) continue;
+          const candidate = primitiveWeightValue(value);
+          if (candidate && weightKeyPattern.test(key) && normalizeWeightGramsInPage(candidate)) candidates.push(candidate);
+          if (typeof value !== "object") continue;
+          if (seen.has(value)) continue;
+          seen.add(value);
+          const entries = Array.isArray(value) ? value.map((child, index) => [String(index), child]) : Object.entries(value);
+          for (const [childKey, childValue] of entries.slice(0, 160)) {
+            stack.push({ key: key ? `${key}.${childKey}` : childKey, value: childValue, depth: item.depth + 1 });
+          }
+        }
+        return candidates.find((value) => normalizeWeightGramsInPage(value)) || "";
+      };
+      const normalizeShippingFeeInPage = (value, depth = 0) => {
+        if (value == null || depth > 4) return "";
+        if (typeof value === "object") {
+          const candidates = [
+            value.totalCost,
+            value.postFeeValue,
+            value.shippingFee,
+            value.freightFee,
+            value.freightPrice,
+            value.logisticsFee,
+            value.deliveryFee,
+            value.deliveryTemplate,
+            value.expressFee,
+            value.templateFee,
+            value.price,
+            value.fee,
+            value.amount,
+            value.cost,
+            value.freight,
+            value.freightTemplate,
+            value.freightModule,
+            value.logisticsInfo,
+            value.postage,
+            value.carriage,
+            value.shipTemplate,
+            value.value,
+            value.text,
+            value.title,
+            value.name,
+            value.displayText,
+            value.displayValue,
+            value.content,
+          ];
+          for (const item of candidates) {
+            const normalized = normalizeShippingFeeInPage(item, depth + 1);
+            if (normalized) return normalized;
+          }
+          if (!Array.isArray(value)) {
+            for (const [key, child] of Object.entries(value).slice(0, 80)) {
+              if (!shippingKeyPattern.test(key)) continue;
+              const normalized = normalizeShippingFeeInPage(child, depth + 1);
+              if (normalized) return normalized;
+            }
+          }
+          return "";
+        }
+        const text = clean(value);
+        if (!text) return "";
+        if (/包邮|免运费|免费配送|卖家承担|free\s*shipping|运费\s*0|物流费\s*0/i.test(text)) return "0";
+        const match = text.match(/(?:¥|￥|RMB|CNY)?\s*(\d+(?:[.,]\d+)?)(?:\s*(?:元|块|rmb|cny))?/i);
+        if (!match) return "";
+        const number = Number(match[1].replace(",", "."));
+        if (!Number.isFinite(number) || number < 0 || number > 9999) return "";
+        return String(number);
+      };
+      const pickShippingFee = (...values) => {
+        for (const value of values) {
+          const normalized = normalizeShippingFeeInPage(value);
+          if (normalized !== "") return normalized;
+        }
+        return "";
+      };
+      const pickSourcedWeight = (items) => {
+        for (const item of items) {
+          const value = clean(item?.value);
+          if (value && normalizeWeightGramsInPage(value)) return { value, source: item.source };
+        }
+        return { value: "", source: "" };
+      };
+      const pickSourcedShippingFee = (items) => {
+        for (const item of items) {
+          const normalized = normalizeShippingFeeInPage(item?.value);
+          if (normalized !== "") return { value: normalized, source: item.source };
+        }
+        return { value: "", source: "" };
+      };
+      const findShippingInRaw = (root) => {
+        const seen = new Set();
+        const stack = [{ key: "", value: root, depth: 0 }];
+        const candidates = [];
+        let visited = 0;
+        while (stack.length && candidates.length < 24 && visited < 3500) {
+          const item = stack.pop();
+          visited += 1;
+          const key = clean(item.key);
+          const value = item.value;
+          if (value == null || item.depth > 8) continue;
+          const candidate = primitiveShippingValue(value);
+          if (candidate && shippingKeyPattern.test(key)) {
+            const normalized = normalizeShippingFeeInPage(candidate);
+            if (normalized) candidates.push(normalized);
+          }
+          if (typeof value !== "object") continue;
+          if (seen.has(value)) continue;
+          seen.add(value);
+          const entries = Array.isArray(value) ? value.map((child, index) => [String(index), child]) : Object.entries(value);
+          for (const [childKey, childValue] of entries.slice(0, 180)) {
+            stack.push({ key: key ? `${key}.${childKey}` : childKey, value: childValue, depth: item.depth + 1 });
+          }
+        }
+        return candidates.find(Boolean) || "";
+      };
+      const normalizeMoqInPage = (value, depth = 0) => {
+        if (value == null || depth > 3) return "";
+        if (typeof value === "object") {
+          const candidates = [
+            value.minOrderQuantity,
+            value.minimumOrderQuantity,
+            value.minOrder,
+            value.minimumOrder,
+            value.beginAmount,
+            value.startAmount,
+            value.batchNumber,
+            value.moq,
+            value.value,
+            value.text,
+            value.title,
+            value.name,
+            value.displayValue,
+            value.content,
+          ];
+          for (const item of candidates) {
+            const normalized = normalizeMoqInPage(item, depth + 1);
+            if (normalized) return normalized;
+          }
+          if (!Array.isArray(value)) {
+            for (const [key, child] of Object.entries(value).slice(0, 80)) {
+              if (!moqKeyPattern.test(key)) continue;
+              const normalized = normalizeMoqInPage(child, depth + 1);
+              if (normalized) return normalized;
+            }
+          }
+          return "";
+        }
+        const text = clean(value);
+        if (!text) return "";
+        if (/一\s*(?:件|个|只|套|箱|包)?\s*(?:起批|起订|起购|可批|拿样|代发)|1\s*(?:件|个|只|套|箱|包)?\s*(?:起批|起订|起购|可批|拿样|代发)|(?:起批|起订|起购|起订量|起购量|最少起批|min(?:imum)?\s*order(?:\s*qty|\s*quantity)?|minimum\s*purchase|moq)\s*[:：]?\s*1(?:\D|$)/i.test(text)) return "1件起批";
+        const direct = text.match(/^(\d+(?:\.\d+)?)$/);
+        const match = text.match(/(?:^|[^\d])(\d+(?:\.\d+)?)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发|min(?:imum)?\s*order(?:\s*qty|\s*quantity)?|minimum\s*purchase|moq)/i)
+          || text.match(/(?:起批|起订|起购|起拍|起订量|起购量|最少起批|min(?:imum)?\s*order(?:\s*qty|\s*quantity)?|minimum\s*purchase|moq)\s*[:：]?\s*(\d+(?:\.\d+)?)/i)
+          || direct;
+        if (!match) return "";
+        const number = Number(match[1]);
+        if (!Number.isFinite(number) || number <= 0 || number > 100000) return "";
+        return `${Math.ceil(number)}件起批`;
+      };
+      const findMoqInRaw = (root) => {
+        const seen = new Set();
+        const stack = [{ key: "", value: root, depth: 0 }];
+        const candidates = [];
+        let visited = 0;
+        while (stack.length && candidates.length < 24 && visited < 3000) {
+          const item = stack.pop();
+          visited += 1;
+          const key = clean(item.key);
+          const value = item.value;
+          if (value == null || item.depth > 7) continue;
+          if (moqKeyPattern.test(key)) {
+            const normalized = normalizeMoqInPage(value);
+            if (normalized) candidates.push(normalized);
+          }
+          if (typeof value !== "object") continue;
+          if (seen.has(value)) continue;
+          seen.add(value);
+          const entries = Array.isArray(value) ? value.map((child, index) => [String(index), child]) : Object.entries(value);
+          for (const [childKey, childValue] of entries.slice(0, 160)) {
+            stack.push({ key: key ? `${key}.${childKey}` : childKey, value: childValue, depth: item.depth + 1 });
+          }
+        }
+        return candidates.find(Boolean) || "";
       };
       const promotionPattern = /首单|首件|首购|新人|新客|新用户|新人价|新客价|首单价|首单减|首购价|立减|满减|优惠|优惠券|券后|领券|补贴|到手价|特价|限时|促销|专享|折扣|discount|coupon|new\s*user|first\s*order/i;
       const raw =
@@ -7358,6 +7996,15 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
 
       const rawBodyText = document.body.innerText || "";
       const bodyText = clean(rawBodyText);
+      const findWeightInBody = () => {
+        const match = bodyText.match(/(?:包装重量|发货重量|商品重量|产品重量|计费重量|毛重|净重|克重|重量)\s*[:：]?\s*(\d+(?:[.,]\d+)?\s*(?:kg|公斤|千克|g|克|mg|毫克))/i);
+        return match ? match[1] : "";
+      };
+      const findShippingInBody = () => {
+        if (/包邮|免运费|免费配送|卖家承担运费/i.test(bodyText)) return "0";
+        const match = bodyText.match(/(?:运费|物流费用|物流费|快递费|配送费|发货费用|邮费)\s*[:：]?\s*(?:¥|￥|RMB|CNY)?\s*(\d+(?:[.,]\d+)?)(?:\s*(?:元|块|rmb|cny))?/i);
+        return match ? normalizeShippingFeeInPage(match[1]) : "";
+      };
       const promotionLines = rawBodyText.split(/\n+/)
         .map(clean)
         .filter((line) => promotionPattern.test(line) && line.length <= 220)
@@ -7374,6 +8021,8 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
       const minOrderQuantity = pick(
         moqFromPriceRange ? `${moqFromPriceRange}件起批` : "",
         moqFromDom ? `${moqFromDom[1]}件起批` : "",
+        normalizeMoqInPage(fallback.moq),
+        findMoqInRaw(raw),
         fallback.moq,
       );
 
@@ -7413,24 +8062,57 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
       const skuWeight = freightInfo.skuWeight && typeof freightInfo.skuWeight === "object"
         ? Object.values(freightInfo.skuWeight).find(Boolean)
         : "";
-      const weightRaw = pick(
-        firstScale[colMap.weight],
-        firstScale.weight,
-        packInfo.unitWeight,
-        shipping.unitWeight,
-        skuWeight,
-        getAttr("重量", "克重", "毛重", "净重", "weight"),
-      );
+      const attrWeight = getAttr("包装重量", "发货重量", "商品重量", "产品重量", "计费重量", "重量", "克重", "毛重", "净重", "weight");
+      const rawWeight = findWeightInRaw(raw);
+      const bodyWeight = findWeightInBody();
+      const pickedWeight = pickSourcedWeight([
+        { value: firstScale[colMap.weight], source: "1688规格表字段" },
+        { value: firstScale.weight, source: "1688规格表weight" },
+        { value: firstScale.unitWeight, source: "1688规格表unitWeight" },
+        { value: firstScale.grossWeight, source: "1688规格表grossWeight" },
+        { value: firstScale.netWeight, source: "1688规格表netWeight" },
+        { value: packInfo.unitWeight, source: "1688包装信息unitWeight" },
+        { value: packInfo.grossWeight, source: "1688包装信息grossWeight" },
+        { value: packInfo.netWeight, source: "1688包装信息netWeight" },
+        { value: packInfo.packageWeight, source: "1688包装信息packageWeight" },
+        { value: shipping.unitWeight, source: "1688物流信息unitWeight" },
+        { value: shipping.grossWeight, source: "1688物流信息grossWeight" },
+        { value: shipping.netWeight, source: "1688物流信息netWeight" },
+        { value: shipping.packageWeight, source: "1688物流信息packageWeight" },
+        { value: skuWeight, source: "1688运费skuWeight" },
+        { value: attrWeight, source: "1688属性表" },
+        { value: rawWeight, source: "1688页面原始数据" },
+        { value: bodyWeight, source: "1688页面文本" },
+      ]);
+      const weightRaw = pickedWeight.value;
       const weightGrams = normalizeWeightGramsInPage(weightRaw);
       const weightText = weightGrams ? `${weightGrams} g` : "";
 
-      const shippingFee = pick(
-        freightInfo.totalCost,
-        freightInfo.postFeeValue,
-        shipping.totalCost,
-        shipping.postFeeValue,
-        getAttr("运费", "物流费用", "快递费"),
-      );
+      const attrShipping = getAttr("运费", "物流费用", "物流费", "快递费", "配送费", "发货费用", "邮费");
+      const rawShipping = findShippingInRaw(raw);
+      const bodyShipping = findShippingInBody();
+      const pickedShipping = pickSourcedShippingFee([
+        { value: freightInfo.totalCost, source: "1688运费freightInfo.totalCost" },
+        { value: freightInfo.postFeeValue, source: "1688运费freightInfo.postFeeValue" },
+        { value: freightInfo.shippingFee, source: "1688运费freightInfo.shippingFee" },
+        { value: freightInfo.freightFee, source: "1688运费freightInfo.freightFee" },
+        { value: freightInfo.freightPrice, source: "1688运费freightInfo.freightPrice" },
+        { value: freightInfo.logisticsFee, source: "1688运费freightInfo.logisticsFee" },
+        { value: freightInfo.deliveryFee, source: "1688运费freightInfo.deliveryFee" },
+        { value: freightInfo.expressFee, source: "1688运费freightInfo.expressFee" },
+        { value: shipping.totalCost, source: "1688物流shipping.totalCost" },
+        { value: shipping.postFeeValue, source: "1688物流shipping.postFeeValue" },
+        { value: shipping.shippingFee, source: "1688物流shipping.shippingFee" },
+        { value: shipping.freightFee, source: "1688物流shipping.freightFee" },
+        { value: shipping.freightPrice, source: "1688物流shipping.freightPrice" },
+        { value: shipping.logisticsFee, source: "1688物流shipping.logisticsFee" },
+        { value: shipping.deliveryFee, source: "1688物流shipping.deliveryFee" },
+        { value: shipping.expressFee, source: "1688物流shipping.expressFee" },
+        { value: attrShipping, source: "1688属性表" },
+        { value: rawShipping, source: "1688页面原始数据" },
+        { value: bodyShipping, source: "1688页面文本" },
+      ]);
+      const shippingFee = pickedShipping.value || (/运费|物流|快递|配送/.test(bodyText) ? "未公开/需选择地区" : "");
 
       const title = pick(
         raw.productTitle?.fields?.title,
@@ -7446,9 +8128,11 @@ async function scrape1688CandidateDetails(context, candidate, jobId, productInde
         minOrderQuantity,
         moq: minOrderQuantity,
         shippingFee,
+        shippingFeeSource: pickedShipping.source || (shippingFee ? "页面提示存在运费但金额未公开" : ""),
         dimensionsText,
         weightText,
         weightGrams,
+        weightSource: pickedWeight.source,
         promotionText,
         detailAttributes: attrs,
       };
@@ -7476,9 +8160,11 @@ function merge1688CandidateDetails(candidate, details) {
     minOrderQuantity: details.minOrderQuantity || candidate.minOrderQuantity || candidate.moq,
     moq: details.moq || details.minOrderQuantity || candidate.moq,
     shippingFee: details.shippingFee || candidate.shippingFee || "",
+    shippingFeeSource: details.shippingFeeSource || candidate.shippingFeeSource || "",
     dimensionsText: details.dimensionsText || candidate.dimensionsText || "",
     weightText: details.weightText || candidate.weightText || "",
     weightGrams: details.weightGrams || candidate.weightGrams || normalizeWeightGrams(details.weightText || candidate.weightText),
+    weightSource: details.weightSource || candidate.weightSource || "",
     priceDetails: details.priceDetails || candidate.priceDetails || "",
     promotionText: [candidate.promotionText, details.promotionText].filter(Boolean).join("；"),
     packQuantity,
@@ -7488,30 +8174,37 @@ function merge1688CandidateDetails(candidate, details) {
 }
 
 function addTrafficBaitAssessment(candidate) {
-  const unitPriceRmb = extract1688MinimumTierUnitPrice(candidate.priceDetails || candidate.price);
-  const values = extractRmbValues([
-    candidate.price,
-    candidate.priceDetails,
-    candidate.minOrderQuantity,
-    candidate.moq,
-  ].join(" "));
-  const positiveValues = values.filter((value) => value > 0).sort((a, b) => a - b);
+  const tierPrices = extract1688TierPrices(candidate.priceDetails);
+  const fallbackPrice = Number(normalize1688PriceOnly(candidate.price));
+  const unitPriceRmb = tierPrices.length
+    ? tierPrices[0]
+    : Number.isFinite(fallbackPrice) && fallbackPrice > 0
+      ? fallbackPrice
+      : null;
+  const explicitZeroPrice = /[¥￥]\s*0(?:\.0+)?(?:\D|$)|(?:^|[^\d])0(?:\.0+)?\s*(?:元|RMB|CNY)/i.test(String(candidate.priceDetails || candidate.price || ""));
+  const positiveValues = (tierPrices.length ? tierPrices : (unitPriceRmb ? [unitPriceRmb] : []))
+    .filter((value) => value > 0)
+    .sort((a, b) => a - b);
   const minPriceRmb = positiveValues[0] ?? null;
   const maxPriceRmb = positiveValues[positiveValues.length - 1] ?? null;
   const hasVeryLowPrice = minPriceRmb !== null && minPriceRmb < LOW_PRICE_THRESHOLD_RMB;
   const hasLargeSpread = minPriceRmb !== null && maxPriceRmb !== null && maxPriceRmb >= 10 && maxPriceRmb / Math.max(minPriceRmb, 0.01) >= 10;
-  const trafficBaitRisk = hasVeryLowPrice || hasLargeSpread;
+  const invalidPriceRisk = explicitZeroPrice || unitPriceRmb === null;
+  const trafficBaitRisk = invalidPriceRisk || hasVeryLowPrice || hasLargeSpread;
   const promotionRisk = hasPromotionRisk(candidate);
   const reasons = [];
+  if (explicitZeroPrice) reasons.push("价格为 ¥0，无法作为真实采购价");
+  if (unitPriceRmb === null && !explicitZeroPrice) reasons.push("未解析到有效采购价");
   if (hasVeryLowPrice) reasons.push(`出现低于 ¥${LOW_PRICE_THRESHOLD_RMB} 的价格`);
   if (hasLargeSpread) reasons.push("价格区间跨度异常大，可能是引流 SKU");
   const promotionReason = promotionRisk ? summarizePromotionReason(candidate.promotionText || candidate.price || candidate.priceDetails || candidate.title) : "";
   return {
     ...candidate,
-    price: unitPriceRmb !== null ? formatPriceNumber(unitPriceRmb) : normalize1688PriceOnly(candidate.price || candidate.priceDetails),
+    price: unitPriceRmb !== null ? formatPriceNumber(unitPriceRmb) : normalize1688PriceOnly(candidate.priceDetails || candidate.price),
     unitPriceRmb,
     minPriceRmb,
     maxPriceRmb,
+    invalidPriceRisk,
     trafficBaitRisk,
     trafficBaitReason: trafficBaitRisk ? reasons.join("；") : "",
     promotionRisk,
@@ -7544,6 +8237,42 @@ function annotateCandidateQuantity(candidate, ozon) {
     estimatedPurchasePriceRmb,
     quantityAssessment,
   };
+}
+
+function normalizeSourcingCandidateForReview(candidate, ozon) {
+  return {
+    ...addTrafficBaitAssessment(annotateCandidateQuantity(candidate, ozon)),
+    modelMatchScore: getModelMatchScore(ozon, candidate),
+  };
+}
+
+function getModelMatchScore(ozon = {}, candidate = {}) {
+  const ozonText = [ozon.title, ozon.description].filter(Boolean).join(" ").toUpperCase();
+  const candidateText = [candidate.title, candidate.detailAttributes && JSON.stringify(candidate.detailAttributes)].filter(Boolean).join(" ").toUpperCase();
+  if (!ozonText || !candidateText) return 0;
+  const normalize = (value) => String(value || "").replace(/\s+/g, "").toUpperCase();
+  const ozonNorm = normalize(ozonText);
+  const candidateNorm = normalize(candidateText);
+  const patterns = [
+    /\b(?:GT|X|K|Q|CF|Z|Y|A|FD|YS|LK)\s*[- ]?\s*\d{1,4}\s*(?:PRO|MAX|PLUS|ULTRA)?\b/gi,
+    /\b[A-Z]{1,4}\s*[- ]?\s*\d{1,4}\s*(?:PRO|MAX|PLUS|ULTRA)?\b/gi,
+  ];
+  const tokens = new Set();
+  for (const pattern of patterns) {
+    for (const match of ozonText.matchAll(pattern)) {
+      const token = normalize(match[0]);
+      if (token.length >= 2 && token.length <= 16) tokens.add(token);
+    }
+  }
+  let score = 0;
+  for (const token of tokens) {
+    if (candidateNorm.includes(token)) score += 180;
+    else if (/PRO|MAX|PLUS|ULTRA$/.test(token)) {
+      const base = token.replace(/(?:PRO|MAX|PLUS|ULTRA)+$/, "");
+      if (base.length >= 2 && candidateNorm.includes(base)) score += 120;
+    }
+  }
+  return Math.min(score, 260);
 }
 
 function buildQuantityAssessment(ozonQuantity, candidateQuantity, purchaseMultiplier) {
@@ -7878,21 +8607,40 @@ function normalize1688PriceOnly(value) {
   return formatPriceNumber(values[0]);
 }
 
-function extract1688MinimumTierUnitPrice(value) {
+function extract1688TierPrices(value) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
-  if (!text) return null;
+  if (!text) return [];
+  const tierPattern = /(\d+)\s*(?:件|个|只|套|箱|包)?\s*起\s*[¥￥]\s*(\d+(?:\.\d+)?)/g;
   const tiers = [];
-  const pattern = /(\d+)\s*(?:件|个|只|套|箱|包)?\s*起\s*[¥￥]?\s*(\d+(?:\.\d+)?)/g;
-  for (const match of text.matchAll(pattern)) {
+  for (const match of text.matchAll(tierPattern)) {
     const quantity = Number(match[1]);
     const price = Number(match[2]);
     if (Number.isFinite(quantity) && quantity > 0 && Number.isFinite(price) && price > 0) {
       tiers.push({ quantity, price });
     }
   }
-  if (!tiers.length) return null;
-  tiers.sort((a, b) => a.quantity - b.quantity);
-  return tiers[0].price;
+  if (tiers.length) {
+    tiers.sort((a, b) => a.quantity - b.quantity);
+    return Array.from(new Set(tiers.map((tier) => tier.price)));
+  }
+  const prices = [];
+  const patterns = [
+    /(?:^|[;；,，\s])(?:[¥￥]\s*)?(\d+(?:\.\d+)?)\s*(?:元|RMB|CNY)(?=$|[;；,，\s])/gi,
+    /[¥￥]\s*(\d+(?:\.\d+)?)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of text.matchAll(pattern)) {
+      const price = Number(match[1]);
+      if (Number.isFinite(price) && price > 0) prices.push(price);
+    }
+    if (prices.length) return Array.from(new Set(prices));
+  }
+  return [];
+}
+
+function extract1688MinimumTierUnitPrice(value) {
+  const prices = extract1688TierPrices(value);
+  return prices.length ? prices[0] : null;
 }
 
 function formatPriceNumber(value) {
@@ -7993,12 +8741,197 @@ function getRealPromotionSnippets(text) {
     .filter((item) => REAL_PROMOTION_PATTERN.test(item) && !PROMOTION_BOILERPLATE_PATTERN.test(item) && !PROMOTION_FIELD_ONLY_PATTERN.test(item));
 }
 
+function parseMoqQuantity(value) {
+  const text = String(value ?? "").replace(/,/g, "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  if (/^\d+(?:\.\d+)?$/.test(text)) {
+    const number = Number(text);
+    return Number.isFinite(number) && number > 0 ? Math.ceil(number) : null;
+  }
+  const onePiecePattern = /(?:一|1)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发)|(?:起批|起订|起购|起拍|起订量|起购量|最少起批|最小起订|可批|拿样|代发)\s*[:：]?\s*(?:一|1)(?:\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces))?|(?:min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)\s*[:：]?\s*1(?:\s*(?:pcs?|piece|pieces))?/i;
+  if (onePiecePattern.test(text)) return 1;
+  const match = text.match(/(?:^|[^\d])(\d+(?:\.\d+)?)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发|min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)/i)
+    || text.match(/(?:起批|起订|起购|起拍|起订量|起购量|最少起批|最小起订|可批|拿样|代发|min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)\s*[:：]?\s*(\d+(?:\.\d+)?)/i);
+  if (!match) return null;
+  const number = Number(match[1]);
+  if (!Number.isFinite(number) || number <= 0) return null;
+  return Math.ceil(number);
+}
+
+function isMoqEligible(candidate) {
+  const quantity = parseMoqQuantity(candidate?.minOrderQuantity || candidate?.moq);
+  return quantity === 1;
+}
+
+function getMoqRuleStatus(candidate) {
+  const quantity = parseMoqQuantity(candidate?.minOrderQuantity || candidate?.moq);
+  if (quantity === 1) return "通过：一件起购";
+  if (quantity == null) return "未通过：起批量未确认";
+  return `未通过：起批量 ${quantity}`;
+}
+
+function getMoqAvoidReason(candidate) {
+  const quantity = parseMoqQuantity(candidate?.minOrderQuantity || candidate?.moq);
+  if (quantity == null) return "1688 起批量未确认，不满足一件代采自动选品规则。";
+  return quantity > 1 ? `1688 起批量为 ${quantity}，不满足一件代采规则。` : "";
+}
+
+function getCandidateAvoidReason(candidate) {
+  const moqReason = getMoqAvoidReason(candidate);
+  if (moqReason) return moqReason;
+  if (candidate?.trafficBaitRisk) return candidate.trafficBaitReason || "1688 候选疑似引流款，不作为最终货源。";
+  return "";
+}
+
 function isAvoidedCandidate(candidate) {
-  return Boolean(candidate?.trafficBaitRisk);
+  return Boolean(getCandidateAvoidReason(candidate));
+}
+
+function scoreSourcingCandidate(candidate = {}) {
+  if (!candidate || isAvoidedCandidate(candidate)) return -100000;
+  let score = 0;
+  const rank = Number(candidate.rank);
+  const aiConfidence = Number(candidate.aiConfidence);
+  const unitPrice = Number(normalize1688PriceOnly(candidate.priceDetails || candidate.price));
+  const shippingFee = parseRmbNumber(candidate.shippingFee);
+  const weightGrams = Number(candidate.weightGrams || normalizeWeightGrams(candidate.weightText));
+  const dimensionsText = String(candidate.dimensionsText || "").trim();
+  const detailAttrCount = candidate.detailAttributes && typeof candidate.detailAttributes === "object"
+    ? Object.keys(candidate.detailAttributes).length
+    : 0;
+
+  score += 1000;
+  if (candidate.aiVerdict === "exact" || candidate.finalMatchType === "exact") score += 600;
+  if (candidate.aiVerdict === "approximate" || candidate.finalMatchType === "approximate") score += 220;
+  if (candidate.aiVerdict === "not_match") score -= 500;
+  if (candidate.aiSelected) score += 120;
+  if (Number.isFinite(aiConfidence)) score += Math.round(aiConfidence * 120);
+  if (candidate.localImage?.filePath || candidate.image) score += 70;
+  if (candidate.title) score += 40;
+  if (Number.isFinite(unitPrice) && unitPrice > 0) score += 70;
+  if (Number.isFinite(shippingFee) && shippingFee >= 0) score += 80;
+  if (Number.isFinite(weightGrams) && weightGrams > 0) score += 70;
+  if (dimensionsText) score += 45;
+  if (candidate.priceDetails) score += 35;
+  if (candidate.shopName) score += 20;
+  if (detailAttrCount) score += Math.min(90, detailAttrCount * 6);
+  if (Number.isFinite(Number(candidate.modelMatchScore))) score += Number(candidate.modelMatchScore);
+  if (candidate.promotionRisk) score -= 25;
+  if (Number.isFinite(rank)) score -= Math.min(80, rank * 4);
+  return score;
+}
+
+function compareSourcingCandidates(a, b) {
+  const scoreDiff = scoreSourcingCandidate(b) - scoreSourcingCandidate(a);
+  if (scoreDiff) return scoreDiff;
+  return (Number(a?.rank) || 9999) - (Number(b?.rank) || 9999);
+}
+
+function getCandidateLandedCost(candidate = {}) {
+  const unitPrice = Number(normalize1688PriceOnly(candidate.priceDetails || candidate.price));
+  const shippingFee = parseRmbNumber(candidate.shippingFee);
+  if (!Number.isFinite(unitPrice) || unitPrice <= 0) return null;
+  return unitPrice + (shippingFee !== null ? shippingFee : 0);
+}
+
+function compareExactSourcingCandidates(a, b) {
+  const aPromotion = Boolean(a?.promotionRisk);
+  const bPromotion = Boolean(b?.promotionRisk);
+  if (aPromotion !== bPromotion) return aPromotion ? 1 : -1;
+  const aCost = getCandidateLandedCost(a);
+  const bCost = getCandidateLandedCost(b);
+  if (aCost !== null && bCost !== null && Math.abs(aCost - bCost) > 0.01) return aCost - bCost;
+  if (aCost !== null && bCost === null) return -1;
+  if (aCost === null && bCost !== null) return 1;
+  return compareSourcingCandidates(a, b);
 }
 
 function findBestFallbackCandidate(candidates = []) {
-  return candidates.find((candidate) => !isAvoidedCandidate(candidate)) || null;
+  return candidates
+    .filter((candidate) => !isAvoidedCandidate(candidate) && candidate?.aiVerdict !== "not_match")
+    .sort(compareSourcingCandidates)[0] || null;
+}
+
+function scoreDiagnosticCandidate(candidate = {}) {
+  if (!candidate) return -100000;
+  let score = 0;
+  const rank = Number(candidate.rank);
+  const aiConfidence = Number(candidate.aiConfidence);
+  const verdict = candidate.aiVerdict || candidate.finalMatchType || "";
+  const unitPrice = Number(normalize1688PriceOnly(candidate.priceDetails || candidate.price));
+  if (candidate.aiSelected) score += 500;
+  if (verdict === "exact") score += 420;
+  if (verdict === "approximate") score += 260;
+  if (verdict === "not_match") score -= 420;
+  if (Number.isFinite(aiConfidence)) {
+    score += verdict === "not_match" ? -Math.round(aiConfidence * 180) : Math.round(aiConfidence * 90);
+  }
+  if (candidate.title) score += 40;
+  if (candidate.localImage?.filePath || candidate.image) score += 60;
+  if (candidate.priceDetails || candidate.price) score += 35;
+  if (candidate.link) score += 25;
+  if (candidate.shippingFee) score += 20;
+  if (candidate.weightGrams || candidate.weightText) score += 20;
+  if (parseMoqQuantity(candidate.minOrderQuantity || candidate.moq) === 1) score += 120;
+  if (Number.isFinite(unitPrice) && unitPrice > 0 && unitPrice < 5) score -= 140;
+  if (candidate.invalidPriceRisk) score -= 160;
+  if (candidate.trafficBaitRisk) score -= 90;
+  if (Number.isFinite(rank)) score -= Math.min(60, rank * 3);
+  return score;
+}
+
+function findBestDiagnosticCandidate(candidates = [], selectedRank = null) {
+  if (!Array.isArray(candidates) || !candidates.length) return null;
+  const selected = candidates.find((candidate) => Number(candidate.rank) === Number(selectedRank));
+  if (selected && !isAvoidedCandidate(selected)) return selected;
+  const pool = candidates.filter((candidate) => !isAvoidedCandidate(candidate));
+  const diagnosticPool = pool.length ? pool : candidates;
+  return [...diagnosticPool].sort((a, b) => {
+    const diff = scoreDiagnosticCandidate(b) - scoreDiagnosticCandidate(a);
+    if (diff) return diff;
+    return (Number(a?.rank) || 9999) - (Number(b?.rank) || 9999);
+  })[0] || null;
+}
+
+function pickReviewedCandidate(reviewedCandidates, verdicts) {
+  const verdictSet = new Set(verdicts);
+  const exactOnly = verdictSet.size === 1 && verdictSet.has("exact");
+  return reviewedCandidates
+    .filter(({ candidate, review }) => !isAvoidedCandidate(candidate) && candidate?.aiVerdict !== "not_match" && verdictSet.has(review?.verdict))
+    .sort((a, b) => exactOnly
+      ? compareExactSourcingCandidates(a.candidate, b.candidate)
+      : compareSourcingCandidates(a.candidate, b.candidate))[0] || null;
+}
+
+function getFunctionalMismatchReason(ozon = {}, candidate = {}) {
+  const ozonText = [
+    ozon.title,
+    ozon.description,
+    ozon.attributes && JSON.stringify(ozon.attributes),
+  ].filter(Boolean).join(" ").toLowerCase();
+  const candidateText = [
+    candidate.title,
+    candidate.detailAttributes && JSON.stringify(candidate.detailAttributes),
+  ].filter(Boolean).join(" ").toLowerCase();
+  const ozonChildPhoneWatch = /детск|реб[её]н|child|kids|儿童|小孩|学生/.test(ozonText)
+    && /(?:4g|gps|sim|сим|телефон|phone|видеосвяз|video\s*call|定位|电话|视频|插卡|通话)/i.test(ozonText);
+  if (ozonChildPhoneWatch) {
+    const candidateHasChildPhoneSignals = /(?:4g|gps|sim|儿童|小孩|学生|老人|定位|电话|视频|插卡|通话|全网通|微聊|拍照|phone|kids|child)/i.test(candidateText);
+    const candidateLooksGenericBand = /(?:手环|运动手表|运动监测|计步|心率|闹钟|普通|bracelet|fitness)/i.test(candidateText);
+    if (!candidateHasChildPhoneSignals && candidateLooksGenericBand) {
+      return "Ozon 是儿童 4G/GPS 电话手表，候选标题/属性更像普通运动手环，缺少电话、定位、SIM 或视频通话等核心功能。";
+    }
+  }
+  const ozonWatchBundle = /(?:набор|комплект|ремешк|strap|band|表带|套装|礼盒)/i.test(ozonText)
+    && /(?:\b[3-9]\b|\b1[0-9]\b|нескольк|много|多条|十条|10\s*(?:条|шт|pcs|ремешк|strap|band)|3\s*(?:条|шт|pcs|ремешк|strap|band))/i.test(ozonText)
+    && /(?:watch|smart\s*watch|смарт|часы|手表)/i.test(ozonText);
+  if (ozonWatchBundle) {
+    const candidateHasBundle = /(?:набор|комплект|ремешк|strap|band|表带|套装|礼盒|多条|十条|10\s*(?:条|шт|pcs|ремешк|strap|band)|3\s*(?:条|шт|pcs|ремешк|strap|band))/i.test(candidateText);
+    if (!candidateHasBundle) {
+      return "Ozon 是多表带/礼盒套装，候选更像单只手表，缺少套装表带或礼盒配置。";
+    }
+  }
+  return "";
 }
 
 function extractRmbValues(text) {
@@ -8066,7 +8999,7 @@ async function reviewCandidatesWithMiniMax(ozon, candidates) {
           {
             role: "system",
             content:
-              "你是跨境电商货源匹配审核员。你的任务是在候选里给出一个最优货源：优先选择与 Ozon 商品同款、同功能、同外观、同关键规格的 exact；如果没有 exact，但有外观/功能/用途高度相近且可供人工复核的候选，选择 approximate；如果候选明显不相关或都是引流款，返回 none。同时根据商品标题、属性、尺寸、图片和候选信息估算单个 Ozon 销售单位的包装后重量（克）。首单减、新人价、券后价等只属于价格风险备注，不影响产品是否一致。只输出 JSON，不要输出 Markdown。",
+              "你是跨境电商货源匹配审核员。你的任务是在候选里给出一个最优货源：优先选择与 Ozon 商品同款、同功能、同外观、同关键规格的 exact；如果没有 exact，但有外观/功能/用途高度相近且可供人工复核的候选，选择 approximate；如果候选明显不相关、都是引流款或没有满足一件起购的候选，返回 none。1688 候选的 MOQ/起批量大于 1 是硬性淘汰条件，不能选为 exact 或 approximate。同时根据商品标题、属性、尺寸、图片和候选信息估算单个 Ozon 销售单位的包装后重量（克）。首单减、新人价、券后价等只属于价格风险备注，不影响产品是否一致；图片水印、平台贴纸、标题噪音也不能把真实同款降级为近似。只输出 JSON，不要输出 Markdown。",
           },
           { role: "user", content },
         ],
@@ -8123,12 +9056,15 @@ async function reviewCandidatesWithMiniMax(ozon, candidates) {
 }
 
 function buildAiFailureCandidateReviews(candidates, reason) {
-  return candidates.map((candidate) => ({
-    rank: candidate.rank,
-    verdict: "approximate",
-    confidence: 0,
-    reason,
-  }));
+  return candidates.map((candidate) => {
+    const avoidReason = getCandidateAvoidReason(candidate);
+    return {
+      rank: candidate.rank,
+      verdict: avoidReason ? "not_match" : "approximate",
+      confidence: 0,
+      reason: avoidReason || reason,
+    };
+  });
 }
 
 function buildMiniMaxThinkingOptions(type) {
@@ -8149,9 +9085,15 @@ function buildAiReviewPrompt(ozon, candidates) {
     price: candidate.price,
     priceDetails: candidate.priceDetails,
     minOrderQuantity: candidate.minOrderQuantity || candidate.moq,
+    parsedMoqQuantity: parseMoqQuantity(candidate.minOrderQuantity || candidate.moq),
+    moqEligible: isMoqEligible(candidate),
+    moqAvoidReason: getMoqAvoidReason(candidate),
     shippingFee: candidate.shippingFee,
     dimensionsText: candidate.dimensionsText,
     weightText: candidate.weightText,
+    shippingFeeSource: candidate.shippingFeeSource,
+    weightSource: candidate.weightSource,
+    invalidPriceRisk: candidate.invalidPriceRisk,
     trafficBaitRisk: candidate.trafficBaitRisk,
     trafficBaitReason: candidate.trafficBaitReason,
     promotionRisk: candidate.promotionRisk,
@@ -8186,15 +9128,17 @@ ${JSON.stringify({
 ${JSON.stringify(compactCandidates, null, 2)}
 
 审核规则：
-1. 优先找 exact：同款、同功能、同外观、同关键规格。
-2. 如果没有 exact，可以选 approximate：图片/标题/用途高度相近，但存在颜色、套装、细节、规格、品牌不明等风险，需要人工复核。
-3. 重量和尺寸只作为参考信息，不作为硬性一致条件；Ozon 和 1688 都可能乱标重量或尺寸。
-4. Ozon 图片角落里的商家水印、平台贴纸、后期叠字（例如右下角 MAOLA 这类标记）不要当成品牌或产品本体；只有印在实物/包装上的标识才算产品特征。
-5. 如果候选存在 trafficBaitRisk，通常视为 1688 引流款，不要选中；除非其他候选更差且它仍是最接近项，则只能作为 approximate，并明确写出引流风险。
-6. promotionRisk 只代表价格可能依赖首单减、新人价、新客价、券后价、补贴、限时优惠等，属于采购价风险备注；它不能作为判断产品是否一致的依据，也不能因为 promotionRisk 把 exact 降级成 approximate 或 none。
-7. 必须核对 Ozon 标题、属性和图片中是否写了多件/套装/pack/pcs/шт 等数量。若 Ozon 是多件一起卖，而 1688 候选是单件或较少件数，不能把单件价当成 Ozon 一套的采购价；需要按 purchaseMultiplier 或你从图片识别到的数量倍数计算，并在 reason 里说明数量风险。
-8. 只返回一个 selected_rank。若所有候选都明显不相关、数量无法合理对应或都是引流款，decision 返回 "none"，selected_rank 返回 null。
-9. 需要估算 Ozon 当前销售单位的包装后重量，单位为克。优先参考明确尺寸、材质、件数、同类商品常见重量和图片体积感；Ozon/1688 抓到的重量只作为参考，发现明显异常时不要盲信。估算不确定时仍给出合理区间里的中位估计，并降低 estimated_weight_confidence。
+1. 1688 候选必须明确满足一件起购：只有 minOrderQuantity/MOQ/起批量能解析为 1 的候选才可选中。起批量大于 1 或起批量未取到的候选都必须判为 not_match，不能作为 selected_rank，也不能作为 approximate 兜底，这是硬规则。
+2. 优先找 exact：同款、同功能、同外观、同关键规格。若实物、款式、功能和关键规格一致，不要因为 Ozon 水印、商家贴纸、标题翻译、品牌缺失、拍摄角度、光线、背景或店铺图差异把它降级成 approximate。
+3. approximate 只能用于产品可替代但不是严格同款的情况。尺寸、颜色、型号、材质、版本、接口、适用对象、套装数量、容量、功率、功能、细节造型存在差异时，必须保持 approximate 或 not_match，不能为了看起来像而强行 exact。
+4. 重量和尺寸只作为参考信息，不作为硬性一致条件；Ozon 和 1688 都可能乱标重量或尺寸。候选都相近时，优先选择 shippingFee、weightText、dimensionsText、priceDetails、detailAttributes 更完整的候选，但不能突破 MOQ=1 规则。
+5. Ozon 图片角落里的商家水印、平台贴纸、后期叠字（例如右下角 MAOLA 这类标记）不要当成品牌或产品本体；只有印在实物/包装上的标识才算产品特征。
+6. 如果候选存在 trafficBaitRisk，通常视为 1688 引流款，不要选中；除非其他候选更差且它仍是最接近项，则只能作为 approximate，并明确写出引流风险。
+7. promotionRisk 只代表价格可能依赖首单减、新人价、新客价、券后价、补贴、限时优惠等，属于采购价风险备注；它不能作为判断产品是否一致的依据，也不能因为 promotionRisk 把 exact 降级成 approximate 或 none。
+8. 必须核对 Ozon 标题、属性和图片中是否写了多件/套装/pack/pcs/шт 等数量。若 Ozon 是多件一起卖，而 1688 候选是单件或较少件数，不能把单件价当成 Ozon 一套的采购价；需要按 purchaseMultiplier 或你从图片识别到的数量倍数计算，并在 reason 里说明数量风险。若 Ozon 明确是多表带/礼盒套装（例如 3 条、10 条表带），1688 候选只是单只手表且没有对应表带套装，不要作为 selected_rank，只能判 not_match。
+9. 智能手表、儿童电话手表、扫地机器人、净水器、电器等功能型商品，核心功能/适用对象/型号系列优先于外观相似。儿童 4G 电话手表不能优先选择普通运动手环；手表本体不能选择表带、保护壳、充电器等配件；净水器不能选择花洒、充电线、车充等相邻图片误召回。
+10. 只返回一个 selected_rank。若所有候选都明显不相关、数量无法合理对应、都是引流款或都不满足一件起购，decision 返回 "none"，selected_rank 返回 null。
+11. 需要估算 Ozon 当前销售单位的包装后重量，单位为克。优先参考明确尺寸、材质、件数、同类商品常见重量和图片体积感；Ozon/1688 抓到的重量只作为参考，发现明显异常时不要盲信。估算不确定时仍给出合理区间里的中位估计，并降低 estimated_weight_confidence。
 
 只返回 JSON，格式如下：
 {
@@ -8480,6 +9424,21 @@ function normalizeAiEstimatedWeightGrams(value) {
   return Math.min(300000, Math.max(1, Math.round(number)));
 }
 
+function shouldPromoteApproximateAiReview(review, selected, selectedConfidence) {
+  if (review.decision !== "approximate" || selected?.verdict !== "approximate") return false;
+  if (selectedConfidence < AI_CONFIDENCE_THRESHOLD) return false;
+  const text = [review.reason, selected.reason, review.quantity_reason]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  if (!text) return false;
+  const displayNoisePattern = /水印|贴纸|角落|后期|叠字|商家标记|平台标记|背景|拍摄|角度|图片差异|标题|翻译|品牌缺失|品牌未体现|logo|watermark|sticker|background|angle|photo|translation/i;
+  const displayNoiseOnlyPattern = /(?:仅|只是|只有|主要是|差异为|区别为|不同点为|不一致的是).{0,24}(?:水印|贴纸|角落|后期|叠字|商家标记|平台标记|背景|拍摄|角度|图片|标题|翻译|品牌|logo|watermark|sticker|background|angle|photo|translation)/i;
+  const exactIdentityPattern = /同款|同一商品|同一个商品|本体一致|实物一致|主体一致|外观一致|功能一致|same\s+item|same\s+product|identical\s+item|same\s+model|only\s+packaging|仅包装|仅赠品|仅促销|仅店铺图/i;
+  const realRiskPattern = /规格|尺寸|尺码|大小|颜色|色号|型号|款式|造型|形状|套装|数量|件数|容量|毫升|升|材质|材料|功能不同|功能差异|功能缺失|功能不一致|功能少|功能多|接口|版本|适配|兼容|多出|少了|缺少|可能不是|pack\s*(?:count|size)|pcs\s*(?:count|diff|different)|piece\s*(?:count|diff|different)|size|color|model|material|version|mismatch|different\s+function|function\s+mismatch|missing\s+function/i;
+  return (displayNoiseOnlyPattern.test(text) || exactIdentityPattern.test(text) || displayNoisePattern.test(text)) && !realRiskPattern.test(text);
+}
+
 function enforceStrictAiReview(review) {
   if (review.decision === "none" || !review.selected_rank) {
     return { ...review, decision: "none", selected_rank: null };
@@ -8509,6 +9468,17 @@ function enforceStrictAiReview(review) {
       decision: "approximate",
       confidence: selectedConfidence,
       reason: review.reason || "AI 返回了最接近候选，但判断为不完全匹配，需要人工确认。",
+    };
+  }
+  if (shouldPromoteApproximateAiReview(review, selected, selectedConfidence)) {
+    return {
+      ...review,
+      decision: "exact",
+      confidence: selectedConfidence,
+      reason: [review.reason || selected.reason || "差异仅为展示噪音。", "系统校正：水印、贴纸、标题翻译、拍摄角度或背景差异不降级为近似匹配。"].filter(Boolean).join(" "),
+      candidate_reviews: review.candidate_reviews.map((item) => Number(item.rank) === Number(selected.rank)
+        ? { ...item, verdict: "exact", confidence: Math.max(Number(item.confidence) || 0, selectedConfidence), reason: item.reason || review.reason || "差异仅为展示噪音。" }
+        : item),
     };
   }
   return { ...review, confidence: selectedConfidence };
@@ -8561,12 +9531,16 @@ function applyAiReview(result) {
   const reviews = new Map((result.aiReview.candidate_reviews || []).map((item) => [Number(item.rank), item]));
   result.candidates = result.candidates.map((candidate) => {
     const review = reviews.get(Number(candidate.rank));
+    const avoidReason = getCandidateAvoidReason(candidate);
+    const functionalMismatchReason = getFunctionalMismatchReason(result.ozon || {}, candidate);
+    const rejectReason = avoidReason || functionalMismatchReason;
+    const selectedByAi = result.aiReview.decision !== "none" && Number(result.aiReview.selected_rank) === Number(candidate.rank);
     return {
       ...candidate,
-      aiVerdict: review?.verdict || "approximate",
-      aiConfidence: review?.confidence ?? 0,
-      aiReason: review?.reason || "",
-      aiSelected: result.aiReview.decision !== "none" && Number(result.aiReview.selected_rank) === Number(candidate.rank),
+      aiVerdict: rejectReason ? "not_match" : (review?.verdict || "approximate"),
+      aiConfidence: rejectReason ? 0 : (review?.confidence ?? 0),
+      aiReason: rejectReason || review?.reason || "",
+      aiSelected: selectedByAi && !rejectReason,
     };
   });
   result.selectedCandidate = chooseFinalCandidate(result);
@@ -8578,30 +9552,43 @@ function applyAiReview(result) {
 
 function chooseFinalCandidate(result) {
   if (result.aiReview?.decision === "none") return null;
-  const selected = result.candidates.find((candidate) => candidate.aiSelected);
-  if (selected) return markFinalCandidate(selected, result.aiReview.decision, result.aiReview.reason);
+  const skippedSelected = result.candidates.find((candidate) => Number(candidate.rank) === Number(result.aiReview?.selected_rank));
+  const skippedSelectedReason = skippedSelected ? getCandidateAvoidReason(skippedSelected) : "";
 
   const reviews = new Map((result.aiReview?.candidate_reviews || []).map((item) => [Number(item.rank), item]));
   const reviewedCandidates = result.candidates
-    .map((candidate) => ({ candidate, review: reviews.get(Number(candidate.rank)) }))
-    .sort((a, b) => (Number(b.review?.confidence) || 0) - (Number(a.review?.confidence) || 0));
-  const exact = reviewedCandidates.find(({ candidate, review }) => !isAvoidedCandidate(candidate) && review?.verdict === "exact");
+    .map((candidate) => ({ candidate, review: reviews.get(Number(candidate.rank)) }));
+  const exact = pickReviewedCandidate(reviewedCandidates, ["exact"]);
   if (exact) {
-    return markFinalCandidate(exact.candidate, "exact", exact.review?.reason || "AI 选中的候选存在促销/引流风险，改选非促销的完全一致候选。");
+    const selectedWasChanged = Number(exact.candidate.rank) !== Number(result.aiReview?.selected_rank);
+    const reasonPrefix = skippedSelectedReason
+      ? `AI 选中的候选已跳过：${skippedSelectedReason}`
+      : selectedWasChanged
+        ? "已按 MOQ=1、运费/重量/属性完整度从完全一致候选中择优。"
+        : "";
+    return markFinalCandidate(exact.candidate, "exact", [reasonPrefix, exact.review?.reason || exact.candidate.aiReason || "选择符合一件起购规则的完全一致候选。"].filter(Boolean).join(" "));
   }
-  const approximate = reviewedCandidates.find(({ candidate, review }) => !isAvoidedCandidate(candidate) && review?.verdict === "approximate") ||
-    reviewedCandidates.find(({ candidate, review }) => !isAvoidedCandidate(candidate) && review?.verdict !== "not_match");
+  const approximate = pickReviewedCandidate(reviewedCandidates, ["approximate"]) ||
+    pickReviewedCandidate(reviewedCandidates, ["exact", "approximate", "uncertain", ""]);
   if (approximate) {
-    return markFinalCandidate(approximate.candidate, "approximate", result.aiReview?.reason || approximate.review?.reason || "没有完全一致候选，返回最接近项。");
+    const selectedWasChanged = Number(approximate.candidate.rank) !== Number(result.aiReview?.selected_rank);
+    const reasonPrefix = skippedSelectedReason
+      ? `AI 选中的候选已跳过：${skippedSelectedReason}`
+      : selectedWasChanged
+        ? "已按 MOQ=1、运费/重量/属性完整度从近似候选中择优。"
+        : "";
+    return markFinalCandidate(approximate.candidate, "approximate", [reasonPrefix, approximate.review?.reason || result.aiReview?.reason || "没有完全一致候选，返回最接近且符合一件起购规则的候选。"].filter(Boolean).join(" "));
   }
   const fallback = findBestFallbackCandidate(result.candidates);
   if (fallback) {
-    return markFinalCandidate(fallback, "approximate", "没有完全一致候选，返回最靠前的非引流/非促销候选供人工确认。");
+    const reasonPrefix = skippedSelectedReason ? `AI 选中的候选已跳过：${skippedSelectedReason}` : "";
+    return markFinalCandidate(fallback, "approximate", [reasonPrefix, "没有完全一致候选，返回信息更完整且符合一件起购规则的非引流候选供人工确认。"].filter(Boolean).join(" "));
   }
   return null;
 }
 
 function markFinalCandidate(candidate, matchType, reason) {
+  if (!candidate || isAvoidedCandidate(candidate)) return null;
   return {
     ...candidate,
     finalMatchType: matchType === "exact" ? "exact" : "approximate",
@@ -8974,6 +9961,34 @@ function extractOzonProductId(value) {
   return groups.length ? groups[groups.length - 1] : "";
 }
 
+function formatAttributeValueForSheet(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => formatAttributeValueForSheet(item))
+      .filter(Boolean)
+      .join(", ");
+  }
+  if (typeof value === "object") {
+    const direct = value.value ?? value.text ?? value.name ?? value.title ?? value.displayValue ?? value.displayName;
+    if (direct != null && direct !== value) return formatAttributeValueForSheet(direct);
+    try {
+      return JSON.stringify(value, null, 0);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function formatAttributesForSheet(attributes, limit = 20) {
+  return Object.entries(attributes || {})
+    .slice(0, limit)
+    .map(([key, value]) => `${key}: ${formatAttributeValueForSheet(value)}`)
+    .join("\n");
+}
+
 async function writeJobArtifacts(job) {
   if (job.kind === "batch-ozon") {
     await writeBatchOzonArtifacts(job);
@@ -8995,8 +10010,17 @@ async function writeJobArtifacts(job) {
     const ozon = result.ozon || {};
     const fallbackCandidate = findBestFallbackCandidate(result.candidates || []);
     const aiSaysNoCandidate = result.aiReview?.decision === "none" && !result.aiReview?.selected_rank;
-    const finalCandidate = result.selectedCandidate ||
-      (!aiSaysNoCandidate && fallbackCandidate ? markFinalCandidate(fallbackCandidate, "approximate", "未进行 AI 最终选择，返回候选中最靠前的非引流/非促销结果供人工确认。") : null);
+    const selectedCandidate = result.selectedCandidate && !isAvoidedCandidate(result.selectedCandidate)
+      ? markFinalCandidate(
+        result.selectedCandidate,
+        result.selectedCandidate.finalMatchType || result.aiReview?.decision,
+        result.selectedCandidate.finalReason || result.selectedCandidate.aiReason || result.aiReview?.reason,
+      )
+      : null;
+    const fallbackFinalCandidate = !aiSaysNoCandidate && fallbackCandidate
+      ? markFinalCandidate(fallbackCandidate, "approximate", "未进行 AI 最终选择，返回候选中最靠前且明确一件起购的非引流/非促销结果供人工确认。")
+      : null;
+    const finalCandidate = selectedCandidate || fallbackFinalCandidate;
     const ozonDisplayPrice = getOzonDisplayPriceText(ozon);
     const ozonBlackPrice = getOzonBestBlackPriceText(ozon);
     const ozonWeightGrams = formatNumberForSheet(ozon.weightGrams || normalizeWeightGrams(ozon.weightText));
@@ -9041,10 +10065,7 @@ async function writeJobArtifacts(job) {
       _templateBlackPrice: parseRmbNumber(ozonBlackPrice) ?? "",
       _templateAlibabaCost: "",
     };
-    const attrs = Object.entries(ozon.attributes || {})
-      .slice(0, 20)
-      .map(([key, value]) => `${key}: ${value}`)
-      .join("\n");
+    const attrs = formatAttributesForSheet(ozon.attributes);
     if (attrs) base["Ozon属性"] = attrs;
 
     if (finalCandidate) {
@@ -9052,6 +10073,8 @@ async function writeJobArtifacts(job) {
       const unitPriceForExport = Number(normalize1688PriceOnly(candidate.priceDetails || candidate.price));
       const shippingFeeForExport = parseRmbNumber(candidate.shippingFee);
       const candidateWeightGrams = formatNumberForSheet(candidate.weightGrams || normalizeWeightGrams(candidate.weightText));
+      const moqQuantityForExport = parseMoqQuantity(candidate.minOrderQuantity || candidate.moq);
+      const candidateAvoidReason = getCandidateAvoidReason(candidate);
       const estimatedPurchasePriceForExport = Number.isFinite(unitPriceForExport) && unitPriceForExport > 0 && candidate.purchaseMultiplier
         ? Number((unitPriceForExport * Number(candidate.purchaseMultiplier)).toFixed(2))
         : candidate.estimatedPurchasePriceRmb;
@@ -9068,9 +10091,15 @@ async function writeJobArtifacts(job) {
         "1688销售件数": candidate.candidatePackQuantity || candidate.packQuantity || "",
         "1688件数依据": candidate.packQuantityEvidence || "",
         "最少起批": candidate.minOrderQuantity || candidate.moq,
-        "1688运费": candidate.shippingFee,
+        "MOQ解析值": moqQuantityForExport ?? "",
+        "MOQ规则状态": getMoqRuleStatus(candidate),
+        "候选跳过原因": candidateAvoidReason,
+        "候选质量分": scoreSourcingCandidate(candidate),
+        "1688运费": candidate.shippingFee || (candidate.detailError ? "" : "未公开/需选择地区"),
+        "1688运费来源": candidate.shippingFeeSource || "",
         "1688尺寸": candidate.dimensionsText,
         "1688重量（克）": candidateWeightGrams,
+        "1688重量来源": candidate.weightSource || "",
         "1688图片": "",
         "1688链接": candidate.link,
         "1688图片链接": candidate.image,
@@ -9083,8 +10112,8 @@ async function writeJobArtifacts(job) {
         "_templateWeightGrams": ozonWeightGrams || candidateWeightGrams,
         "_templateAiEstimatedWeightGrams": aiEstimatedWeightGrams,
         "_templateBlackPrice": parseRmbNumber(ozonBlackPrice) ?? "",
-        "_templateAlibabaCost": Number.isFinite(unitPriceForExport) && unitPriceForExport > 0
-          ? Number((unitPriceForExport + (shippingFeeForExport ?? 0)).toFixed(2))
+        "_templateAlibabaCost": Number.isFinite(unitPriceForExport) && unitPriceForExport > 0 && shippingFeeForExport !== null
+          ? Number((unitPriceForExport + shippingFeeForExport).toFixed(2))
           : "",
         "AI是否选中": candidate.aiSelected ? "是" : "",
         "AI候选判断": aiVerdictText(candidate.aiVerdict),
@@ -9096,6 +10125,47 @@ async function writeJobArtifacts(job) {
         _highlight: candidate.finalMatchType === "exact" ? "" : "yellow",
       });
     } else {
+      const diagnosticCandidate = findBestDiagnosticCandidate(result.candidates || [], result.aiReview?.selected_rank);
+      if (diagnosticCandidate) {
+        const moqQuantityForExport = parseMoqQuantity(diagnosticCandidate.minOrderQuantity || diagnosticCandidate.moq);
+        const candidateWeightGrams = formatNumberForSheet(diagnosticCandidate.weightGrams || normalizeWeightGrams(diagnosticCandidate.weightText));
+        const candidateAvoidReason = getCandidateAvoidReason(diagnosticCandidate);
+        rows.push({
+          ...base,
+          "匹配类型": "无候选",
+          "候选序号": diagnosticCandidate.rank,
+          "1688标题": diagnosticCandidate.title,
+          "1688价格": normalize1688PriceOnly(diagnosticCandidate.priceDetails || diagnosticCandidate.price),
+          "1688价格明细": diagnosticCandidate.priceDetails,
+          "最少起批": diagnosticCandidate.minOrderQuantity || diagnosticCandidate.moq,
+          "MOQ解析值": moqQuantityForExport ?? "",
+          "MOQ规则状态": getMoqRuleStatus(diagnosticCandidate),
+          "候选跳过原因": candidateAvoidReason || "AI 判定无可自动采用候选，仅导出该候选供人工复核。",
+          "候选质量分": scoreDiagnosticCandidate(diagnosticCandidate),
+          "1688运费": diagnosticCandidate.shippingFee || (diagnosticCandidate.detailError ? "" : "未公开/需选择地区"),
+          "1688运费来源": diagnosticCandidate.shippingFeeSource || "",
+          "1688尺寸": diagnosticCandidate.dimensionsText,
+          "1688重量（克）": candidateWeightGrams,
+          "1688重量来源": diagnosticCandidate.weightSource || "",
+          "1688图片": "",
+          "1688链接": diagnosticCandidate.link,
+          "1688图片链接": diagnosticCandidate.image,
+          "疑似引流款": diagnosticCandidate.trafficBaitRisk ? "是" : "",
+          "引流款原因": diagnosticCandidate.trafficBaitReason || "",
+          "疑似优惠价": diagnosticCandidate.promotionRisk ? "是" : "",
+          "优惠价原因": diagnosticCandidate.promotionReason || "",
+          "优惠信息": diagnosticCandidate.promotionText || "",
+          "AI是否选中": diagnosticCandidate.aiSelected || Number(diagnosticCandidate.rank) === Number(result.aiReview?.selected_rank) ? "是" : "",
+          "AI候选判断": aiVerdictText(diagnosticCandidate.aiVerdict),
+          "AI候选置信度": diagnosticCandidate.aiConfidence ?? "",
+          "AI候选原因": diagnosticCandidate.aiReason || result.aiReview?.reason || "",
+          "1688详情采集状态": diagnosticCandidate.detailError ? `采集失败：${diagnosticCandidate.detailError}` : "已采集",
+          "1688图片下载状态": diagnosticCandidate.imageDownloadError ? `下载失败：${diagnosticCandidate.imageDownloadError}` : diagnosticCandidate.localImage?.filePath ? "已嵌入" : "",
+          _1688ImagePath: diagnosticCandidate.localImage?.filePath || "",
+          _highlight: "yellow",
+        });
+        continue;
+      }
       rows.push({
         ...base,
         "匹配类型": "无候选",
@@ -9117,10 +10187,7 @@ async function writeBatchOzonArtifacts(job) {
 
   const rows = (job.results || []).map((result) => {
     const ozon = result.ozon || {};
-    const attrs = Object.entries(ozon.attributes || {})
-      .slice(0, 20)
-      .map(([key, value]) => `${key}: ${value}`)
-      .join("\n");
+    const attrs = formatAttributesForSheet(ozon.attributes);
     return {
       "序号": result.sourceRow || "",
       "筛选结果": result.error ? "采集失败" : result.passedFilters ? "通过" : "未通过",
@@ -9362,10 +10429,44 @@ async function getBrowserContext({ headless = false } = {}) {
 function serializeJob(job) {
   return {
     ...job,
-    logs: job.logs.slice(-300),
-    results: job.results.map(stripBuffers),
+    logs: (Array.isArray(job.logs) ? job.logs : []).slice(-300).map((entry) => {
+      if (typeof entry === "string") return entry.slice(0, 2000);
+      return {
+        ...entry,
+        message: String(entry?.message || "").slice(0, 2000),
+      };
+    }),
+    results: (Array.isArray(job.results) ? job.results : []).map((result) => compactJobJsonValue(stripBuffers(result), "result")),
     cancelRequested: undefined,
   };
+}
+
+function compactJobJsonValue(value, key = "", depth = 0) {
+  if (value == null) return value;
+  if (typeof value === "string") {
+    if (/^data:image\/|base64,/i.test(value)) return `[省略 base64 ${value.length} 字符]`;
+    return value.length > 4000 ? `${value.slice(0, 4000)}... [已截断 ${value.length} 字符]` : value;
+  }
+  if (typeof value !== "object") return value;
+  if (depth > 8) return "[已省略深层对象]";
+  if (Array.isArray(value)) {
+    const limit = key === "results" ? 2000
+      : key === "logs" ? 300
+        : /candidates|candidate_reviews/i.test(key) ? 20
+          : 80;
+    return value.slice(0, limit).map((item) => compactJobJsonValue(item, key, depth + 1));
+  }
+  const heavyKeyPattern = /(?:^|_)(raw|html|script|snapshot|payload|base64|dataurl|bodytext|textcontent|webpack|apollo|redux)(?:$|_)/i;
+  const out = {};
+  for (const [childKey, childValue] of Object.entries(value)) {
+    if (childKey === "buffer" || heavyKeyPattern.test(childKey)) {
+      const size = typeof childValue === "string" ? childValue.length : Array.isArray(childValue) ? childValue.length : "";
+      out[childKey] = size ? `[已省略大字段 ${size}]` : "[已省略大字段]";
+      continue;
+    }
+    out[childKey] = compactJobJsonValue(childValue, childKey, depth + 1);
+  }
+  return out;
 }
 
 function makeLogEntry(message, level = "info") {
@@ -9541,7 +10642,7 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
     downloadUrl,
     updatedAt: new Date().toISOString(),
   };
-  await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
+  await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(serializeJob(jobJson), null, 2), "utf8");
   if (shouldUseWorkerExcel) {
     const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
     await fs.writeFile(path.join(dir, excelName), Buffer.from(String(excelBase64), "base64"));
@@ -9561,7 +10662,7 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
     await writeJobArtifacts(artifactJob);
     downloadUrl = artifactJob.downloadUrl || `/api/history/${id}/download`;
     jobJson.downloadUrl = downloadUrl;
-    await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(jobJson, null, 2), "utf8");
+    await fs.writeFile(path.join(dir, "results.json"), JSON.stringify(serializeJob(jobJson), null, 2), "utf8");
   }
   return downloadUrl;
 }
@@ -10412,7 +11513,8 @@ function logisticsFormula(column, rowNumber) {
 function calculateAlibabaCost(row) {
   const price = parseRmbNumber(row["1688价格"]);
   if (price === null) return "";
-  const shipping = parseRmbNumber(row["1688运费"]) ?? 0;
+  const shipping = parseRmbNumber(row["1688运费"]);
+  if (shipping === null) return "";
   return Number((price + shipping).toFixed(2));
 }
 

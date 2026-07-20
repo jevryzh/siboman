@@ -94,7 +94,7 @@ window.DashboardView = {
     const goToCollection = () => { window.location.hash = '#/collection'; };
     const goToOrders = () => { window.location.hash = '#/orders'; };
     const goToProducts = () => { window.location.hash = '#/products'; };
-    const goToAIImage = () => { window.location.hash = '#/ai-image'; };
+    const goToAIImage = () => { window.location.hash = '#/ai-generator'; };
     const goToInventory = () => { window.location.hash = '#/inventory'; };
 
     // v0.5.6 全部同步
@@ -146,6 +146,7 @@ window.DashboardView = {
     return {
       summary, storeComparison, trends, recentJobs, loading,
       syncLoading, syncingStore, trendRange, setTrendRange,
+      fetchDashboard,
       fmtMoney, fmtPct, fmtRate, fmtNum0, fmtMoney0, fmtPct0,
       goToStores, goToCollection, goToOrders, goToProducts, goToAIImage, goToInventory,
       syncAllStores, syncOneStore,

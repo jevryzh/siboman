@@ -12,6 +12,25 @@
       .el-aside { background: #001529; color: #fff; }
       .logo { height: 60px; line-height: 60px; text-align: center; font-size: 18px; font-weight: bold; background: #002140; color: #409eff; }
       .text-ellipsis { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .data-screen { min-height:calc(100vh - 120px); background:#10151d; color:#f5f7fa; padding:22px; box-sizing:border-box; display:flex; flex-direction:column; gap:16px; }
+      .data-screen:fullscreen { min-height:100vh; padding:28px; }
+      .screen-head { display:flex; align-items:center; justify-content:space-between; }
+      .screen-title { font-size:22px; font-weight:700; }
+      .screen-muted { color:#9da9b8; font-size:13px; }
+      .screen-grid { display:grid; grid-template-columns:minmax(220px,300px) minmax(420px,1fr) minmax(300px,380px); gap:14px; flex:1; }
+      .screen-panel { background:#19212c; border:1px solid #2b3746; border-radius:6px; padding:16px; min-width:0; }
+      .screen-kpi { padding:18px 0; border-bottom:1px solid #2b3746; }
+      .screen-kpi:last-child { border:0; }
+      .screen-kpi strong { display:block; font:700 34px ui-monospace,monospace; margin-top:7px; }
+      .screen-trend { height:240px; display:flex; align-items:flex-end; gap:10px; padding-top:20px; }
+      .screen-bar { flex:1; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; height:100%; gap:6px; }
+      .screen-bar i { display:block; width:min(42px,75%); background:#2f9bff; border-radius:3px 3px 0 0; min-height:3px; }
+      .screen-list { display:flex; flex-direction:column; }
+      .screen-order { display:grid; grid-template-columns:1fr auto; gap:4px; padding:11px 0; border-bottom:1px solid #2b3746; }
+      .screen-marquee { overflow:hidden; white-space:nowrap; color:#ff8a80; }
+      .screen-marquee span { display:inline-block; padding-left:100%; animation:screen-scroll 22s linear infinite; }
+      @keyframes screen-scroll { to { transform:translateX(-100%); } }
+      @media(max-width:1100px) { .screen-grid { grid-template-columns:240px 1fr; } .screen-feed { grid-column:1/-1; } .data-screen { min-height:auto; } }
     </style>
   </head>
   <body>
@@ -25,6 +44,7 @@
     <script src="https://unpkg.com/@element-plus/icons-vue"></script>
     <script src="https://unpkg.com/axios/dist/axios.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/echarts/dist/echarts.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
     
     <!-- 基座组件 -->
     <script src="/js/components/InlineEditCell.js?v=22915"></script>
@@ -32,18 +52,20 @@
     <script src="/js/components/CollectionEditDrawer.js?v=22915"></script>
 
     <!-- 业务视图 -->
-    <script src="/js/views/Dashboard.js?v=22915"></script>
-    <script src="/js/views/SourcingModule.js?v=22915"></script>
-    <script src="/js/views/CollectionBox.js?v=22915"></script>
-    <script src="/js/views/ProductList.js?v=22915"></script>
-    <script src="/js/views/InventoryManagement.js?v=22915"></script>
-    <script src="/js/views/OrderList.js?v=22915"></script>
+    <script src="/js/views/Dashboard.js?v=22961"></script>
+    <script src="/js/views/SourcingModule.js?v=22922"></script>
+    <script src="/js/views/CollectionBox.js?v=22960"></script>
+    <script src="/js/views/ProductList.js?v=22960"></script>
+    <script src="/js/views/InventoryManagement.js?v=22960"></script>
+    <script src="/js/views/OrderList.js?v=22960"></script>
     <script src="/js/views/BatchUpload.js?v=22915"></script>
-    <script src="/js/views/AIImageGenerator.js?v=22915"></script>
-    <script src="/js/views/StoreManagement.js?v=22915"></script>
-    <script src="/js/views/ListingHistory.js?v=22915"></script>
+    <script src="/js/views/AIImageGenerator.js?v=22960"></script>
+    <script src="/js/views/StoreManagement.js?v=22923"></script>
+    <script src="/js/views/ListingHistory.js?v=22960"></script>
+    <script src="/js/views/AnalyticsCenter.js?v=22961"></script>
+    <script src="/js/views/DataScreen.js?v=22961"></script>
 
     <!-- 主逻辑 -->
-    <script src="/js/main.js?v=22915" type="module"></script>
+    <script src="/js/main.js?v=22960" type="module"></script>
   </body>
 </html>

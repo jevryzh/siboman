@@ -136,6 +136,7 @@ const initApp = () => {
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
         if (path.includes('dashboard')) return 'dashboard';
+        if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
         if (path.includes('product')) return 'products';
@@ -144,6 +145,8 @@ const initApp = () => {
         if (path.includes('upload')) return 'upload';
         if (path.includes('listing-history')) return 'listing-history';
         if (path.includes('ai-generator')) return 'ai-generator';
+        if (path.includes('analytics')) return 'analytics';
+        if (path.includes('data-screen')) return 'data-screen';
         if (path.includes('stores')) return 'stores';
         return 'dashboard';
       });
@@ -167,6 +170,9 @@ const initApp = () => {
             <el-menu-item index="#/collection" @click="goTo('#/collection')">
               <el-icon><Box /></el-icon><span>采集箱</span>
             </el-menu-item>
+            <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')">
+              <el-icon><Search /></el-icon><span>单品找货</span>
+            </el-menu-item>
             <el-menu-item index="#/products" @click="goTo('#/products')">
               <el-icon><Goods /></el-icon><span>商品管理</span>
             </el-menu-item>
@@ -184,6 +190,12 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/ai-generator" @click="goTo('#/ai-generator')">
               <el-icon><MagicStick /></el-icon><span>AI 套图</span>
+            </el-menu-item>
+            <el-menu-item index="#/analytics" @click="goTo('#/analytics')">
+              <el-icon><DataAnalysis /></el-icon><span>经营分析</span>
+            </el-menu-item>
+            <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
+              <el-icon><Monitor /></el-icon><span>数据大屏</span>
             </el-menu-item>
             <el-menu-item index="#/stores" @click="goTo('#/stores')">
               <el-icon><Setting /></el-icon><span>店铺管理</span>
@@ -207,6 +219,7 @@ const initApp = () => {
           <el-main>
             <div v-if="routeName === 'dashboard'"><dashboard-view /></div>
             <div v-else-if="routeName === 'sourcing'"><sourcing-module-view /></div>
+            <div v-else-if="routeName === 'single-sourcing'"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
@@ -214,6 +227,8 @@ const initApp = () => {
             <div v-else-if="routeName === 'upload'"><batch-upload-view /></div>
             <div v-else-if="routeName === 'listing-history'"><listing-history-view /></div>
             <div v-else-if="routeName === 'ai-generator'"><ai-image-generator-view /></div>
+            <div v-else-if="routeName === 'analytics'"><analytics-center-view /></div>
+            <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
           </el-main>
         </el-container>
@@ -245,6 +260,8 @@ const initApp = () => {
   register('batch-upload-view', window.BatchUploadView);
   register('listing-history-view', window.ListingHistoryView);
   register('ai-image-generator-view', window.AIImageGeneratorView);
+  register('analytics-center-view', window.AnalyticsCenterView);
+  register('data-screen-view', window.DataScreenView);
   register('store-management-view', window.StoreManagementView);
 
   app.mount('#app');

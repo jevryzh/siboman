@@ -8,6 +8,9 @@ window.ProductListView = {
     const search = Vue.ref('');
     const drawer = Vue.reactive({ visible: false, itemId: '', form: {}, categoryPath: [] });
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 50, total: 0 });
+    const statusCounts = Vue.reactive({ ALL: 0 });
+    const selectedRows = Vue.ref([]);
+    const bulkLoading = Vue.ref(false);
 
     // v0.3.2: 不用 Vue.computed 缓存 localStorage (localStorage 非响应式).
     // 动态读取; 请求拦截器会自动往请求里注入 store_id.
@@ -24,6 +27,8 @@ window.ProductListView = {
       { label: '销售中', value: 'VISIBLE' },
       { label: '待销售', value: 'READY_TO_SUPPLY' },
       { label: '需修改', value: 'NEED_ATTENTION' },
+      { label: '待审核', value: 'NOT_MODERATED' },
+      { label: '审核失败', value: 'FAILED_MODERATION' },
       { label: '已下架', value: 'IN_ACTIVE' },
     ];
 
@@ -42,6 +47,7 @@ window.ProductListView = {
         });
         products.value = res.data.items || [];
         pagination.total = Number(res.data.total || 0);
+        Object.assign(statusCounts, { ALL: 0 }, res.data.status_counts || {});
       } catch (e) {
         notify.error('获取列表失败: ' + (e.response?.data?.error || e.message));
       } finally {
@@ -234,6 +240,59 @@ window.ProductListView = {
     const onTabChange = () => { pagination.currentPage = 1; fetchProducts(); };
     const onSearch = () => { pagination.currentPage = 1; fetchProducts(); };
 
+    const copyOfferId = async (offerId) => {
+      try {
+        await navigator.clipboard.writeText(String(offerId || ''));
+        notify.success('货号已复制');
+      } catch {
+        notify.warning('复制失败，请手动复制');
+      }
+    };
+
+    const onSelectionChange = (rows) => { selectedRows.value = rows || []; };
+    const bulkArchive = async () => {
+      if (!selectedRows.value.length) return notify.warning('请先选择商品');
+      if (selectedRows.value.length > 100) return notify.warning('单次最多处理 100 个商品');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `确定归档选中的 ${selectedRows.value.length} 个商品？`,
+          '批量归档确认',
+          { confirmButtonText: '确定归档', cancelButtonText: '取消', type: 'warning' },
+        );
+      } catch { return; }
+      bulkLoading.value = true;
+      try {
+        await axios.post('/api/seller/products/archive', {
+          store_id: getStoreId(),
+          offer_id: selectedRows.value.map((row) => row.offer_id),
+        });
+        notify.success(`已归档 ${selectedRows.value.length} 个商品`);
+        selectedRows.value = [];
+        await fetchProducts();
+      } catch (e) {
+        notify.error('批量归档失败: ' + (e.response?.data?.error || e.message));
+      } finally { bulkLoading.value = false; }
+    };
+
+    const csvCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
+    const exportCsv = () => {
+      if (!products.value.length) return notify.warning('当前没有可导出的商品');
+      const headers = ['货号', 'Ozon SKU', '标题', '状态', '价格', '币种', '库存', '品牌', '重量(g)', '尺寸(mm)', '合规问题'];
+      const rows = products.value.map((row) => [
+        row.offer_id, row.sku, row.name, row.status_name || row.status,
+        row.price, row.currency_code || 'RUB', row.stock, row.brand, row.weight,
+        `${row.width || 0}x${row.depth || 0}x${row.height || 0}`,
+        (row.compliance_issues || []).join('；'),
+      ]);
+      const content = '\ufeff' + [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\n');
+      const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ozon-products-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+
     // 店铺切换: 重置分页 + 清空数据 + 拉新店铺
     const onShopChanged = () => {
       pagination.currentPage = 1;
@@ -248,10 +307,12 @@ window.ProductListView = {
 
     return {
       products, loading, syncLoading, saveLoading,
-      activeTab, statusTabs, search, drawer, pagination,
+      activeTab, statusTabs, statusCounts, search, drawer, pagination,
+      selectedRows, bulkLoading,
       fetchProducts, handleSyncAll, editProduct, saveProduct,
       archiveProduct, unarchiveProduct,
       onPageChange, onSizeChange, onTabChange, onSearch,
+      copyOfferId, onSelectionChange, bulkArchive, exportCsv,
       // v0.3.5
       categoryTree, ensureCategoryTree, onCategoryChange,
       allPreviewList, uploadImage, removeGalleryImage,
@@ -270,7 +331,9 @@ window.ProductListView = {
               <el-button type="success" size="small" @click="() => (window.location.hash = '#/collection')">
                 ➕ 新增商品 (采集箱)
               </el-button>
-              <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">🔄 同步 Ozon 商品</el-button>
+              <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">同步 Ozon 商品</el-button>
+              <el-button size="small" :disabled="!selectedRows.length" :loading="bulkLoading" @click="bulkArchive">批量归档</el-button>
+              <el-button size="small" @click="exportCsv">导出当前页</el-button>
             </div>
             <div style="display:flex; gap:8px">
               <el-input v-model="search" placeholder="搜 SKU / 货号 / 标题" size="small" style="width:240px" @keyup.enter="onSearch" clearable />
@@ -281,10 +344,13 @@ window.ProductListView = {
         </template>
 
         <el-tabs v-model="activeTab" @tab-change="onTabChange">
-          <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :label="tab.label" :name="tab.value" />
+          <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :name="tab.value">
+            <template #label>{{ tab.label }} <span style="color:#909399">({{ statusCounts[tab.value] || 0 }})</span></template>
+          </el-tab-pane>
         </el-tabs>
 
-        <el-table :data="products" v-loading="loading" stripe border size="small">
+        <el-table :data="products" v-loading="loading" stripe border size="small" @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="44" />
           <el-table-column label="预览" width="70">
             <template #default="{ row }">
               <el-image :src="row.image" style="width:44px; height:44px; border-radius:4px" fit="cover" preview-teleported />
@@ -295,6 +361,7 @@ window.ProductListView = {
               <div style="font-size:13px; font-weight:500; line-height:1.4">{{ row.name || '(无标题)' }}</div>
               <div style="font-size:11px; color:#999; margin-top:4px">
                 货号 <code>{{ row.offer_id }}</code>
+                <el-button link size="small" title="复制货号" @click.stop="copyOfferId(row.offer_id)"><el-icon><CopyDocument /></el-icon></el-button>
                 <span v-if="row.sku"> · SKU <code>{{ row.sku }}</code></span>
               </div>
             </template>
@@ -304,6 +371,14 @@ window.ProductListView = {
               <el-tag size="small" :type="row.status === 'price_sent' ? 'success' : 'info'">
                 {{ row.status_name || row.status || '未知' }}
               </el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="体检" width="110">
+            <template #default="{ row }">
+              <el-tag v-if="row.compliance_ok" size="small" type="success">通过</el-tag>
+              <el-tooltip v-else :content="(row.compliance_issues || []).join('；')" placement="top">
+                <el-tag size="small" type="danger">{{ row.compliance_issues.length }} 项问题</el-tag>
+              </el-tooltip>
             </template>
           </el-table-column>
           <el-table-column label="价格" width="130" sortable prop="price">
