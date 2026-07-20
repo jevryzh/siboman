@@ -1107,32 +1107,63 @@ app.get("/api/version", (_req, res) => {
 /* ============================================================
    商品管理增强 - 行内编辑 API (修正版)
    ============================================================ */
-app.patch("/api/seller/products/:offer_id/field", requireAuth, async (req, res, next) => {
+async function updateProductField(req, res, next) {
   if (!requireDb(res)) return;
   try {
-    const { offer_id } = req.params;
+    const offerId = String(req.params.offer_id || "").trim();
     const { key, value } = req.body;
-    const storeId = req.body?.store_id || req.body?.storeId;
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
     const userId = req.user.id;
+    if (!offerId || !storeId) return res.status(400).json({ success: false, error: "缺少货号或店铺" });
+    if (!["price", "stock", "purchase_price_cny"].includes(key)) {
+      return res.status(400).json({ success: false, error: "不支持修改该字段" });
+    }
+
+    const product = await db.query(
+      "SELECT offer_id FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = $3",
+      [userId, storeId, offerId],
+    );
+    if (!product.rowCount) return res.status(404).json({ success: false, error: "商品不存在或不属于当前店铺" });
 
     if (key === 'purchase_price_cny') {
+      const numericValue = Number(value);
+      if (!Number.isFinite(numericValue) || numericValue < 0) {
+        return res.status(400).json({ success: false, error: "采购价必须是大于等于 0 的数字" });
+      }
+      await db.query(
+        "UPDATE app_products SET purchase_price_cny = $1, updated_at = now() WHERE user_id = $2 AND store_id = $3 AND offer_id = $4",
+        [numericValue, userId, storeId, offerId],
+      );
       await db.query(
         "UPDATE collect_items SET price_cny = $1, updated_at = now() WHERE linked_offer_id = $2 AND user_id = $3",
-        [value, offer_id, userId]
+        [numericValue, offerId, userId],
       );
     } else if (key === 'price') {
+      const numericValue = Number(value);
+      if (!Number.isFinite(numericValue) || numericValue <= 0) {
+        return res.status(400).json({ success: false, error: "售价必须是大于 0 的数字" });
+      }
       await callOzonSellerAPI("/v1/product/import-prices", {
-        prices: [{ offer_id, price: String(value) }]
+        prices: [{ offer_id: offerId, price: String(numericValue) }]
       }, { storeId, userId });
     } else if (key === 'stock') {
+      const numericValue = Number(value);
+      if (!Number.isInteger(numericValue) || numericValue < 0) {
+        return res.status(400).json({ success: false, error: "库存必须是大于等于 0 的整数" });
+      }
       await callOzonSellerAPI("/v1/product/import-stocks", {
-        stocks: [{ offer_id, stocks: parseInt(value) }]
+        stocks: [{ offer_id: offerId, stocks: numericValue }]
       }, { storeId, userId });
     }
 
     res.json({ success: true });
-  } catch (error) { next(error); }
-});
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ success: false, error: error.message });
+    next(error);
+  }
+}
+
+app.patch("/api/seller/products/:offer_id/field", requireAuth, updateProductField);
 
 app.use(requireAuth);
 // index.html 永不缓存 + 拦截 / 和 /index.html 请求做占位符替换（注入 BUILD_VERSION）
@@ -1764,8 +1795,8 @@ app.post("/api/seller/products/archive", requireAuth, async (req, res) => {
     // 若前端只传 offer_id, 从本地库解析 product_id
     if ((!productIds.length) && offerIds.length) {
       const r = await db.query(
-        `SELECT product_id, offer_id FROM app_products WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
-        [storeId, offerIds],
+        `SELECT product_id, offer_id FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+        [userId, storeId, offerIds],
       );
       productIds = r.rows.map(x => x.product_id).filter(Boolean);
     }
@@ -1777,8 +1808,8 @@ app.post("/api/seller/products/archive", requireAuth, async (req, res) => {
     // 本地库同步状态
     await db.query(
       `UPDATE app_products SET status = 'IN_ACTIVE', updated_at = now()
-       WHERE store_id = $1 AND product_id = ANY($2::bigint[])`,
-      [storeId, productIds],
+       WHERE user_id = $1 AND store_id = $2 AND product_id = ANY($3::bigint[])`,
+      [userId, storeId, productIds],
     );
     res.json({ success: true, data, archived: productIds });
   } catch (error) {
@@ -1802,8 +1833,8 @@ app.post("/api/seller/products/unarchive", requireAuth, async (req, res) => {
     if (typeof offerIds === "string") offerIds = [offerIds];
     if ((!productIds.length) && offerIds.length) {
       const r = await db.query(
-        `SELECT product_id FROM app_products WHERE store_id = $1 AND offer_id = ANY($2::text[])`,
-        [storeId, offerIds],
+        `SELECT product_id FROM app_products WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+        [userId, storeId, offerIds],
       );
       productIds = r.rows.map(x => x.product_id).filter(Boolean);
     }
@@ -1813,8 +1844,8 @@ app.post("/api/seller/products/unarchive", requireAuth, async (req, res) => {
     const data = await callOzonSellerAPI("/v1/product/unarchive", { product_id: productIds }, { storeId, userId });
     await db.query(
       `UPDATE app_products SET status = 'READY_TO_SUPPLY', updated_at = now()
-       WHERE store_id = $1 AND product_id = ANY($2::bigint[])`,
-      [storeId, productIds],
+       WHERE user_id = $1 AND store_id = $2 AND product_id = ANY($3::bigint[])`,
+      [userId, storeId, productIds],
     );
     res.json({ success: true, data, unarchived: productIds });
   } catch (error) {
@@ -1832,7 +1863,10 @@ app.post("/api/seller/products/sync-global", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
     const userId = req.user.id;
-    const storesRes = await db.query("SELECT id, name FROM app_stores WHERE active = TRUE");
+    const storesRes = await db.query(
+      "SELECT id, name FROM app_stores WHERE user_id = $1 AND active = TRUE ORDER BY updated_at DESC",
+      [userId],
+    );
     const stores = storesRes.rows;
     if (!stores.length) {
       return res.json({ success: true, results: [], total_count: 0, message: "无 active 店铺" });
@@ -2355,41 +2389,7 @@ app.get("/api/utils/download-proxy", requireAuth, async (req, res) => {
     res.status(500).send(error.message);
   }
 });
-app.patch("/api/products/:offer_id/field", requireAuth, async (req, res, next) => {
-  if (!requireDb(res)) return;
-  try {
-    const { offer_id } = req.params;
-    const { key, value } = req.body;
-    const storeId = req.body?.store_id || req.body?.storeId;
-    const userId = req.user.id;
-
-    if (!['price', 'stock', 'purchase_price_cny'].includes(key)) {
-      return res.status(400).json({ success: false, error: "不支持修改该字段" });
-    }
-
-    if (key === 'purchase_price_cny') {
-      // 本地数据库更新
-      await db.query(
-        "UPDATE app_products SET purchase_price_cny = $1, updated_at = now() WHERE offer_id = $2 AND store_id = $3",
-        [value, offer_id, storeId]
-      );
-    } else if (key === 'price') {
-      // 同步 Ozon 价格
-      await callOzonSellerAPI("/v1/product/import-prices", {
-        prices: [{ offer_id, price: String(value) }]
-      }, { storeId, userId });
-    } else if (key === 'stock') {
-      // 同步 Ozon 库存
-      await callOzonSellerAPI("/v1/product/import-stocks", {
-        stocks: [{ offer_id, stocks: parseInt(value) }]
-      }, { storeId, userId });
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    res.status(error.statusCode || 502).json({ success: false, error: error.message });
-  }
-});
+app.patch("/api/products/:offer_id/field", requireAuth, updateProductField);
 
 /**
  * v2.2.9: 类目示例商品 — 给 picker 候选显示 5 个真实商品名 (俄文), 让用户
@@ -3142,7 +3142,7 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
 
     if (search) {
       params.push(`%${search}%`);
-      where.push(`(name ILIKE $${params.length} OR offer_id ILIKE $${params.length})`);
+      where.push(`(name ILIKE $${params.length} OR offer_id ILIKE $${params.length} OR sku::text ILIKE $${params.length})`);
     }
 
     // 2. 分页查询记录 (全字段回传给前端抽屉编辑) - v0.3.3 加 stocks_json 分仓原始数据
@@ -3205,6 +3205,71 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
         }
       }
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/seller/products/export", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const visibility = String(req.body?.visibility || "ALL").toUpperCase();
+    const search = String(req.body?.search || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    if (!OZON_VISIBILITY_ENUM.has(visibility)) {
+      return res.status(400).json({ success: false, error: "不支持的商品状态" });
+    }
+
+    const where = ["user_id = $1", "store_id = $2"];
+    const params = [userId, storeId];
+    if (visibility !== "ALL") {
+      params.push(visibility);
+      where.push(`status = $${params.length}`);
+    }
+    if (search) {
+      params.push(`%${search}%`);
+      where.push(`(name ILIKE $${params.length} OR offer_id ILIKE $${params.length} OR sku::text ILIKE $${params.length})`);
+    }
+
+    const result = await db.query(
+      `SELECT offer_id, sku, name, status, status_name, price, currency_code, stock,
+              brand, country_of_origin, weight, width, depth, height,
+              purchase_price_cny, source_url_1688, description, image, updated_at
+       FROM app_products
+       WHERE ${where.join(" AND ")}
+       ORDER BY updated_at DESC
+       LIMIT 10000`,
+      params,
+    );
+    const csvCell = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+    const headers = [
+      "货号", "Ozon SKU", "标题", "业务状态", "Ozon 状态", "售价", "币种", "库存",
+      "品牌", "原产国", "重量(g)", "宽度(mm)", "深度(mm)", "高度(mm)",
+      "采购价(CNY)", "1688采购链接", "主图", "合规问题", "最后同步",
+    ];
+    const rows = result.rows.map((row) => {
+      const issues = [];
+      if (!(Number(row.weight) > 0)) issues.push("缺少重量");
+      if (!(Number(row.width) > 0 && Number(row.depth) > 0 && Number(row.height) > 0)) issues.push("缺少尺寸");
+      if ((Number(row.width) + Number(row.depth) + Number(row.height)) >= 2000) issues.push("尺寸三边和超过 2000mm");
+      const titleLength = String(row.name || "").trim().length;
+      if (titleLength < 20 || titleLength > 500) issues.push("标题长度应为 20-500 字符");
+      if (!row.image) issues.push("缺少主图");
+      if (!row.brand) issues.push("缺少品牌");
+      if (!row.description) issues.push("缺少描述");
+      return [
+        row.offer_id, row.sku, row.name, row.status, row.status_name, row.price,
+        row.currency_code || "RUB", row.stock, row.brand, row.country_of_origin,
+        row.weight, row.width, row.depth, row.height, row.purchase_price_cny,
+        row.source_url_1688, row.image, issues.join("；"), row.updated_at?.toISOString?.() || row.updated_at,
+      ];
+    });
+    const content = `\ufeff${[headers, ...rows].map((row) => row.map(csvCell).join(",")).join("\n")}`;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="ozon-products-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.send(content);
   } catch (error) {
     next(error);
   }

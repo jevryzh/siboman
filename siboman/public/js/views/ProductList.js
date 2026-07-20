@@ -14,7 +14,9 @@ window.ProductListView = {
 
     // v0.3.2: 不用 Vue.computed 缓存 localStorage (localStorage 非响应式).
     // 动态读取; 请求拦截器会自动往请求里注入 store_id.
-    const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
+    const getStoreId = () => String(
+      window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''),
+    ).split(',').map((value) => value.trim()).find(Boolean) || '';
 
     const notify = {
       success: (msg) => (window.ElementPlus?.ElMessage || console).success?.(msg),
@@ -250,6 +252,11 @@ window.ProductListView = {
     const onSizeChange = () => { pagination.currentPage = 1; fetchProducts(); };
     const onTabChange = () => { pagination.currentPage = 1; fetchProducts(); };
     const onSearch = () => { pagination.currentPage = 1; fetchProducts(); };
+    let searchTimer = null;
+    const onSearchInput = () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(onSearch, 400);
+    };
 
     const copyOfferId = async (offerId) => {
       try {
@@ -285,23 +292,21 @@ window.ProductListView = {
       } finally { bulkLoading.value = false; }
     };
 
-    const csvCell = (value) => `"${String(value ?? '').replace(/"/g, '""')}"`;
-    const exportCsv = () => {
-      if (!products.value.length) return notify.warning('当前没有可导出的商品');
-      const headers = ['货号', 'Ozon SKU', '标题', '状态', '价格', '币种', '库存', '品牌', '重量(g)', '尺寸(mm)', '合规问题'];
-      const rows = products.value.map((row) => [
-        row.offer_id, row.sku, row.name, row.status_name || row.status,
-        row.price, row.currency_code || 'RUB', row.stock, row.brand, row.weight,
-        `${row.width || 0}x${row.depth || 0}x${row.height || 0}`,
-        (row.compliance_issues || []).join('；'),
-      ]);
-      const content = '\ufeff' + [headers, ...rows].map((row) => row.map(csvCell).join(',')).join('\n');
-      const url = URL.createObjectURL(new Blob([content], { type: 'text/csv;charset=utf-8' }));
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `ozon-products-${new Date().toISOString().slice(0, 10)}.csv`;
-      a.click();
-      URL.revokeObjectURL(url);
+    const exportCsv = async () => {
+      if (!pagination.total) return notify.warning('当前筛选条件没有可导出的商品');
+      try {
+        const response = await axios.post('/api/seller/products/export', {
+          store_id: getStoreId(), visibility: activeTab.value, search: search.value,
+        }, { responseType: 'blob', timeout: 120000 });
+        const url = URL.createObjectURL(response.data);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `ozon-products-${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (e) {
+        notify.error('导出失败: ' + (e.response?.data?.error || e.message));
+      }
     };
 
     // 店铺切换: 重置分页 + 清空数据 + 拉新店铺
@@ -312,7 +317,10 @@ window.ProductListView = {
       fetchProducts();
     };
     window.addEventListener('shop-changed', onShopChanged);
-    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
+    Vue.onBeforeUnmount(() => {
+      clearTimeout(searchTimer);
+      window.removeEventListener('shop-changed', onShopChanged);
+    });
 
     Vue.onMounted(fetchProducts);
 
@@ -322,7 +330,7 @@ window.ProductListView = {
       selectedRows, bulkLoading,
       fetchProducts, handleSyncAll, editProduct, saveProduct,
       archiveProduct, unarchiveProduct,
-      onPageChange, onSizeChange, onTabChange, onSearch,
+      onPageChange, onSizeChange, onTabChange, onSearch, onSearchInput,
       copyOfferId, onSelectionChange, bulkArchive, exportCsv,
       // v0.3.5
       categoryTree, ensureCategoryTree, onCategoryChange,
@@ -344,10 +352,10 @@ window.ProductListView = {
               </el-button>
               <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">同步 Ozon 商品</el-button>
               <el-button size="small" :disabled="!selectedRows.length" :loading="bulkLoading" @click="bulkArchive">批量归档</el-button>
-              <el-button size="small" @click="exportCsv">导出当前页</el-button>
+              <el-button size="small" @click="exportCsv">导出筛选结果</el-button>
             </div>
             <div style="display:flex; gap:8px">
-              <el-input v-model="search" placeholder="搜 SKU / 货号 / 标题" size="small" style="width:240px" @keyup.enter="onSearch" clearable />
+              <el-input v-model="search" placeholder="搜 SKU / 货号 / 标题" size="small" style="width:240px" @input="onSearchInput" @keyup.enter="onSearch" clearable />
               <el-button type="primary" size="small" @click="onSearch">查询</el-button>
               <el-button size="small" @click="fetchProducts">刷新</el-button>
             </div>
@@ -379,7 +387,7 @@ window.ProductListView = {
           </el-table-column>
           <el-table-column label="状态" width="120">
             <template #default="{ row }">
-              <el-tag size="small" :type="row.status === 'price_sent' ? 'success' : 'info'">
+              <el-tag size="small" :type="row.status === 'VISIBLE' ? 'success' : (['NEED_ATTENTION', 'FAILED_MODERATION'].includes(row.status) ? 'danger' : 'info')">
                 {{ row.status_name || row.status || '未知' }}
               </el-tag>
             </template>
