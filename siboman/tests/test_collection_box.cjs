@@ -19,6 +19,8 @@ assert(server.includes('source_url_1688 TEXT NOT NULL'));
 assert(server.includes("status <> 'ignored'"));
 assert(server.includes("reason','采集完成'"));
 assert(server.includes('linked_job_id=$1'));
+assert(server.includes("reason','启动时发现孤立任务'"));
+assert(server.includes('/\\/product\\/(\\d+)'));
 
 for (const status of ['all', 'pending', 'scraped', 'uploaded', 'failed', 'ignored']) {
   assert(view.includes(`value: '${status}'`), `missing collection status ${status}`);
@@ -32,5 +34,6 @@ assert(view.includes('导出 CSV'));
 assert(view.includes('source_url_1688'));
 assert(view.includes('@input="onSearchInput"'));
 assert(view.includes('保存采集资料'));
+assert(view.includes('v-if="row.main_image"'));
 
 console.log('Collection box structural checks passed.');

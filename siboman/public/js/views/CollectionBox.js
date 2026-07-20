@@ -207,7 +207,8 @@ window.CollectionBoxView = {
           <el-table-column label="商品信息" min-width="250">
             <template #default="{ row }">
               <div style="display: flex; gap: 10px; align-items: center">
-                <el-image :src="row.main_image" style="width:45px; height:45px" fit="cover" preview-teleported :preview-src-list="row.images?.length ? row.images : [row.main_image]" />
+                <el-image v-if="row.main_image" :src="row.main_image" style="width:45px; height:45px" fit="cover" preview-teleported :preview-src-list="row.images?.length ? row.images : [row.main_image]" />
+                <div v-else style="width:45px;height:45px;background:#f5f7fa;color:#909399;display:flex;align-items:center;justify-content:center;font-size:11px">无图</div>
                 <div style="flex: 1; min-width: 0">
                   <div class="text-ellipsis" style="font-size: 13px">{{ row.title || '正在采集...' }}</div>
                   <div style="font-size:11px; color:#999">SKU: {{ row.ozon_sku || '-' }}</div>

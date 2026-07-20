@@ -767,6 +767,18 @@ async function initDatabase() {
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS source_url_1688 TEXT NOT NULL DEFAULT '';
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
 
+      UPDATE collect_items SET status='failed', note='未关联采集任务，请点击重新采集',
+        status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from','pending','to','failed','reason','启动时发现孤立任务','at',now())),
+        updated_at=now()
+      WHERE status='pending' AND linked_job_id IS NULL AND created_at < now() - interval '5 minutes';
+
+      UPDATE collect_items c SET status='failed',
+        note=COALESCE(NULLIF(j.error,''), NULLIF(j.phase,''), '采集任务未完成'),
+        status_log=COALESCE(c.status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from','pending','to','failed','reason','关联任务已结束','job_id',j.id,'at',now())),
+        updated_at=now()
+      FROM app_jobs j
+      WHERE c.linked_job_id=j.id AND c.status='pending' AND j.status IN ('error','canceled','done');
+
       ALTER TABLE app_jobs ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
     `);
 
@@ -6245,7 +6257,7 @@ function parseCollectInputs(text) {
     if (/^https?:\/\/.*ozon\./i.test(raw)) {
       sourceType = "ozon_url";
       ozonUrl = raw;
-      const skuMatch = raw.match(/\/product\/[^/]*-(\d+)(?:\/|\?|$)/) || raw.match(/[?&]sku=(\d+)/) || raw.match(/-(\d{6,})(?:\/|\?|$)/);
+      const skuMatch = raw.match(/\/product\/(\d+)(?:\/|\?|$)/) || raw.match(/\/product\/[^/]*-(\d+)(?:\/|\?|$)/) || raw.match(/[?&]sku=(\d+)/) || raw.match(/-(\d{6,})(?:\/|\?|$)/);
       if (skuMatch) ozonSku = skuMatch[1];
     } else if (/^\d{6,}$/.test(raw)) {
       sourceType = "ozon_sku";
