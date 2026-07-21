@@ -1,0 +1,476 @@
+{
+  "schemaVersion": 1,
+  "taskId": "P1-3",
+  "title": "ERP P1 read-only acceptance matrix and local smoke guard",
+  "riskLevels": {
+    "read_only": "Only reads local fixture/code or authorized ERP data. No external mutation.",
+    "requires_authorization": "Requires an authenticated ERP session and store-scoped permission before meaningful acceptance.",
+    "external_write_impact": "Can mutate Ozon Seller, AI provider billing/jobs, plugin release flow, inventory, orders, or durable ERP business data."
+  },
+  "globalGuards": [
+    "Every module must validate a business workflow beyond route/page registration.",
+    "Every store-scoped request must carry a current store id or prove server-side user/store ownership filtering.",
+    "External write impact modules require an explicit operator confirmation, visible error result, and no real execution in local smoke.",
+    "Unavailable analytics, ranking, AI, Ozon Seller, or plugin data sources must degrade visibly instead of blanking the page.",
+    "Single sourcing remains frozen and must not reappear as a normal sidebar entry."
+  ],
+  "modules": [
+    {
+      "id": "store-management",
+      "menuLabel": "店铺管理",
+      "route": "#/stores",
+      "viewFile": "public/js/views/StoreManagement.js",
+      "riskLevel": "requires_authorization",
+      "readonlyAcceptance": [
+        "List shops from the authenticated user's store scope.",
+        "Mask Client ID in the table and never render API keys.",
+        "Display manifest, zip, and installed plugin versions with a refresh action."
+      ],
+      "authorizationAcceptance": [
+        "Adding, removing, or editing store settings requires an authenticated session.",
+        "Watermark and plugin settings refresh visible store state after save."
+      ],
+      "externalWriteAcceptance": [],
+      "localSmoke": {
+        "viewContains": [
+          "axios.get('/api/seller/shops')",
+          "maskClientId",
+          "PLUGIN_MANIFEST_VERSION",
+          "PLUGIN_ZIP_VERSION",
+          "refreshPluginStatus",
+          "需要刷新插件"
+        ],
+        "serverContains": [
+          "app.get(\"/api/seller/shops\"",
+          "app.post(\"/api/seller/shops\"",
+          "app.delete(\"/api/seller/shops/:id\""
+        ]
+      },
+      "bugsOrGaps": [
+        {
+          "severity": "P1",
+          "owner": "backend-engineer",
+          "summary": "v1 store routes from the team contract are not the primary UI path yet; keep compatibility plan tracked before external test acceptance."
+        }
+      ]
+    },
+    {
+      "id": "product-management",
+      "menuLabel": "商品管理",
+      "route": "#/products",
+      "viewFile": "public/js/views/ProductList.js",
+      "riskLevel": "requires_authorization",
+      "readonlyAcceptance": [
+        "Tabs cover visible, ready, attention, moderation, inactive, and all statuses.",
+        "Search, pagination, CSV export, procurement URL, image preview, and compliance issues are visible.",
+        "Filtered export must use the same store/search/status scope as the table."
+      ],
+      "authorizationAcceptance": [
+        "Field edits verify user_id, store_id, and offer_id ownership server-side.",
+        "Bulk archive is capped at 100 selected items and reports downstream sync results."
+      ],
+      "externalWriteAcceptance": [
+        "Price/image sync to Ozon is not part of local smoke and must be accepted only in an authorized test store."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "value: 'VISIBLE'",
+          "value: 'READY_TO_SUPPLY'",
+          "value: 'FAILED_MODERATION'",
+          "selectedRows.value.length > 100",
+          "'/api/seller/products/export'",
+          "source_url_1688",
+          "保存并同步价格/图片"
+        ],
+        "serverContains": [
+          "status_counts",
+          "compliance_issues",
+          "app.post(\"/api/seller/products/export\"",
+          "WHERE user_id = $1 AND store_id = $2 AND offer_id = $3",
+          "sync_results: syncResults"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "collection-box",
+      "menuLabel": "采集箱",
+      "route": "#/collection",
+      "viewFile": "public/js/views/CollectionBox.js",
+      "riskLevel": "requires_authorization",
+      "readonlyAcceptance": [
+        "List collection items by status, current store, search term, and pagination.",
+        "Show failed reasons, ignored state, source URL, all images, cost, suggested price, and profit risk color.",
+        "CSV export includes SKU, source URL, images, status, and failure note."
+      ],
+      "authorizationAcceptance": [
+        "Import, edit, retry, ignore, restore, and bulk delete mutate only the authorized user's store data.",
+        "Repeated links/SKUs are skipped or merged instead of duplicating work."
+      ],
+      "externalWriteAcceptance": [
+        "Collector execution is not part of local smoke; live collector/Ozon page scraping needs explicit operator authorization."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "axios.get('/api/collect-items'",
+          "store_id: currentStoreId.value",
+          "statusCounts",
+          "bulkDelete",
+          "retryItem",
+          "exportCsv",
+          "getProfitStyle",
+          "saveDraft"
+        ],
+        "serverContains": [
+          "app.get(\"/api/collect-items\"",
+          "app.post(\"/api/collect-items\"",
+          "app.post(\"/api/collect-items/bulk-delete\"",
+          "app.post(\"/api/collect-items/:id/retry\""
+        ]
+      },
+      "bugsOrGaps": [
+        {
+          "severity": "P1",
+          "owner": "backend-engineer",
+          "summary": "Local fixture and structure guard now cover duplicate URL/SKU parse, merge, and skip behavior; authorized collector-chain testing is still required."
+        }
+      ]
+    },
+    {
+      "id": "batch-upload",
+      "menuLabel": "批量上架",
+      "route": "#/upload",
+      "viewFile": "public/js/views/BatchUpload.js",
+      "riskLevel": "external_write_impact",
+      "readonlyAcceptance": [
+        "Paste parsing shows item validity, category resolution confidence, multi-image payload, rich content, stock, warehouse, and per-store readiness before publish.",
+        "Plugin freshness is checked before collection; publish prefers official import-by-sku and keeps Seller Portal as a disabled fallback.",
+        "Completion copy distinguishes Ozon task submitted/processing from final success."
+      ],
+      "authorizationAcceptance": [
+        "Publishing requires an authenticated ERP page and current store selection.",
+        "Multi-store publish isolates warehouse ids and ignores stale warehouse config that does not belong to the target store."
+      ],
+      "externalWriteAcceptance": [
+        "Real publish calls Ozon Seller import-by-sku or V3 import, is not part of local smoke, and must only run in an authorized test store.",
+        "Acceptance must preserve multi-image gallery, title, category/type_id, attributes, rich content JSON, stock, warehouse, and price.",
+        "Slow Ozon task creation is tracked as processing and never prematurely failed."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "ensureFreshPlugin",
+          "const canUsePortal = false",
+          "复制源卡片",
+          "importMode === 'sku'",
+          "collectViaExtension",
+          "portalImportViaExtension",
+          "buildV3Item",
+          "richContent: d.richContent ||",
+          "descriptionCategoryId: d.description_category_id",
+          "typeId: d.type_id",
+          "itemForStore._warehouse_id = whId",
+          "这不是创建完成"
+        ],
+        "serverContains": [
+          "sourceVariantAttributesToImportAttrs",
+          "injectRichContentAttribute(item, sourceVariant)",
+          "normalizeImportImageList(item.images)",
+          "description_category_id=${categoryId} 是 5位公开 URL cat",
+          "ozonPayload.stocks = ozonStocks",
+          "status = $1, errors_json = $2::jsonb",
+          "translateOzonListingError"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "listing-history",
+      "menuLabel": "上架记录",
+      "route": "#/listing-history",
+      "viewFile": "public/js/views/ListingHistory.js",
+      "riskLevel": "requires_authorization",
+      "readonlyAcceptance": [
+        "List history by store, SKU/task id, status, date, and pagination.",
+        "Expose canonical status, Ozon task_id, raw errors, translated messages, item detail, and refresh time.",
+        "CSV export includes original Ozon error text."
+      ],
+      "authorizationAcceptance": [
+        "Retry, sync, delete, and export are authenticated and store-scoped.",
+        "Partial success explains what requires operator action before retry."
+      ],
+      "externalWriteAcceptance": [
+        "Manual sync reads Ozon task state; retry must not silently republish without returning to the guarded upload flow."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "axios.get('/api/seller/listing-history', { params })",
+          "syncTask",
+          "retryTask",
+          "exportHistory",
+          "row.task_id",
+          "errors_json",
+          "message_zh",
+          "每 30s 自动刷新",
+          "部分商品需处理后重试"
+        ],
+        "serverContains": [
+          "/api/seller/listing-history/:id/retry",
+          "/api/seller/listing-history/export",
+          "lh.task_id ILIKE",
+          "translateOzonListingError",
+          "req.body?.taskId || req.body?.task_id",
+          "LISTING_STATUS_CONTRACT"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "inventory-management",
+      "menuLabel": "库存管理",
+      "route": "#/inventory",
+      "viewFile": "public/js/views/InventoryManagement.js",
+      "riskLevel": "external_write_impact",
+      "readonlyAcceptance": [
+        "List inventory by current store, search, pagination, warehouse, and low-stock threshold.",
+        "Show total, out-of-stock, low-stock, and pending draft counts.",
+        "Show stock change logs and precise SKU/warehouse errors."
+      ],
+      "authorizationAcceptance": [
+        "Draft save, draft clear, Excel import, and bulk submit are authenticated and current-store scoped.",
+        "Negative target stock is blocked before submission."
+      ],
+      "externalWriteAcceptance": [
+        "Submitting stock calls Ozon stock APIs, is not part of local smoke, and requires explicit confirmation for bulk drafts.",
+        "Conflicts against live Ozon stock show operator confirmation before force overwrite.",
+        "Warehouse ids must be isolated by store."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "inventoryLowStockThreshold",
+          "inventoryStats",
+          "submitWithConflictCheck",
+          "发现 Ozon 实时库存冲突",
+          "saveStockDrafts",
+          "submitAllDrafts",
+          "exportReplenishment",
+          "库存变更记录"
+        ],
+        "serverContains": [
+          "CREATE TABLE IF NOT EXISTS app_stock_drafts",
+          "CREATE TABLE IF NOT EXISTS app_stock_change_logs",
+          "/api/seller/stocks/drafts",
+          "/api/seller/stocks/import",
+          "/api/seller/products/stocks/bulk",
+          "code: \"STOCK_CONFLICT\"",
+          "当前店铺有多个仓库，请在文件中填写 warehouse_id"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "order-management",
+      "menuLabel": "订单管理",
+      "route": "#/orders",
+      "viewFile": "public/js/views/OrderList.js",
+      "riskLevel": "external_write_impact",
+      "readonlyAcceptance": [
+        "List orders by current store, status tab, date range, and pagination.",
+        "Show order details, procurement links, local notes, labels, deadlines, shipping status, cost fields, and export.",
+        "Cancelled or dispute orders must visibly block dangerous actions."
+      ],
+      "authorizationAcceptance": [
+        "Notes, label generation, order export, and shipping actions are authenticated and store-scoped.",
+        "Batch labels and batch ship cap selected rows and report partial failures."
+      ],
+      "externalWriteAcceptance": [
+        "Ship/package calls are irreversible Ozon operations, are not part of local smoke, and require confirmation.",
+        "Successful shipment attempts must audit status and local inventory adjustment result.",
+        "Local inventory failure after Ozon success must remain visible."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "batchShip",
+          "printLabels",
+          "exportOrders",
+          "saveNote",
+          "source_url_1688",
+          "row.status !== 'cancelled'",
+          "if (!['awaiting_packaging', 'awaiting_deliver'].includes(row.status))",
+          "statusText(row.status)"
+        ],
+        "serverContains": [
+          "CREATE TABLE IF NOT EXISTS app_order_ship_events",
+          "app.post(\"/api/seller/orders/labels\", requireAuth",
+          "app.post(\"/api/seller/orders/ship\", requireAuth",
+          "inventoryAdjusted",
+          "ORDER_SHIP_IN_PROGRESS",
+          "ORDER_ALREADY_SHIPPED",
+          "Ozon 已接收发货，但本地库存更新失败",
+          "实际发货时间"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "ai-product-images",
+      "menuLabel": "AI 套图",
+      "route": "#/ai-generator",
+      "viewFile": "public/js/views/AIImageGenerator.js",
+      "riskLevel": "external_write_impact",
+      "readonlyAcceptance": [
+        "Provider status, prompts, source image, generated assets, history, and visible failure reasons are reviewable without triggering generation.",
+        "Default provider order is Agnes, TokenDun, Wanxiang, MiniMax.",
+        "Failed provider handoff is visible and does not block the page."
+      ],
+      "authorizationAcceptance": [
+        "Generation endpoints require an authenticated ERP session and ai:generate equivalent permission.",
+        "Generated image history remains scoped to user and store."
+      ],
+      "externalWriteAcceptance": [
+        "AI generation can create billable provider jobs and must not run in local smoke.",
+        "Ozon image push, if enabled, requires an authorized test store and per-SKU confirmation."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "/api/seller/images/generate",
+          "generationProvider",
+          "generationAttempts",
+          "回退",
+          "history",
+          "失败"
+        ],
+        "serverContains": [
+          "const AI_IMAGE_PROVIDER = String(process.env.AI_IMAGE_PROVIDER || \"agnes\")",
+          "const AI_IMAGE_PROVIDER_ORDER = [\"agnes\", \"tokendun\", \"wanxiang\", \"minimax\"]",
+          "Agnes 失败，切换 TokenDun",
+          "TokenDun 失败，切换备用供应商",
+          "万相失败，切换 MiniMax",
+          "app.get(\"/api/v1/ai/images/providers\", requireAuth",
+          "app.post(\"/api/v1/ai/images/generate\", requireAuth, handleAiImageGenerate)"
+        ]
+      },
+      "bugsOrGaps": [
+        {
+          "severity": "P1",
+          "owner": "backend-engineer",
+          "summary": "Local fixture and structure guard now cover malformed AI JSON cleanup; authorized AI provider testing is still required."
+        }
+      ]
+    },
+    {
+      "id": "analytics-center",
+      "menuLabel": "经营分析",
+      "route": "#/analytics",
+      "viewFile": "public/js/views/AnalyticsCenter.js",
+      "riskLevel": "read_only",
+      "readonlyAcceptance": [
+        "Dashboard, category analytics, bestsellers, product cost, exchange rate, profit rows, and audit history load under current store scope.",
+        "Missing cost or finance source degrades with an explicit message instead of guessed profit.",
+        "Ozon analytics failures return cached or empty states without blocking core operations."
+      ],
+      "authorizationAcceptance": [
+        "Cost and exchange-rate edits require authorization and audit history."
+      ],
+      "externalWriteAcceptance": [
+        "Cost or exchange-rate edits alter profit calculations and require separate authorized acceptance; local smoke is read-only."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "/api/seller/dashboard",
+          "/api/seller/analytics/categories",
+          "/api/seller/analytics/bestsellers",
+          "profitRows",
+          "purchase_cost_cny",
+          "不再显示猜测利润",
+          "/api/finance/product-cost",
+          "/api/finance/exchange-rate",
+          "成本变更记录"
+        ],
+        "serverContains": [
+          "WHERE active = TRUE AND user_id = $1",
+          "profit_complete: storeData.every",
+          "profit_is_estimated",
+          "CREATE TABLE IF NOT EXISTS app_product_cost_audit",
+          "CREATE TABLE IF NOT EXISTS app_exchange_rates",
+          "尚无可核算利润"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "data-screen",
+      "menuLabel": "数据大屏",
+      "route": "#/data-screen",
+      "viewFile": "public/js/views/DataScreen.js",
+      "riskLevel": "read_only",
+      "readonlyAcceptance": [
+        "Realtime metrics, order stream, status distribution, inventory alerts, and zero-data states render from local authorized data.",
+        "Fullscreen controls and refresh loop do not mutate orders, inventory, or products.",
+        "Network failure shows a visible disconnected/degraded state."
+      ],
+      "authorizationAcceptance": [
+        "Metrics remain scoped to the selected store."
+      ],
+      "externalWriteAcceptance": [],
+      "localSmoke": {
+        "viewContains": [
+          "/api/seller/dashboard",
+          "realtime: true",
+          "fullscreen",
+          "stock_warnings",
+          "recent_orders",
+          "连接已中断",
+          "setInterval"
+        ],
+        "serverContains": [
+          "app.get(\"/api/seller/dashboard\"",
+          "recent_orders",
+          "stock_warnings",
+          "store_comparison"
+        ]
+      },
+      "bugsOrGaps": []
+    },
+    {
+      "id": "market-discovery",
+      "menuLabel": "市场榜单",
+      "route": "#/market-discovery",
+      "viewFile": "public/js/views/MarketDiscovery.js",
+      "riskLevel": "requires_authorization",
+      "readonlyAcceptance": [
+        "Bestseller and China-zone lists show source name, capture time, category, confidence, and unavailable-source fallback.",
+        "Ranking data source is independent from frozen single-sourcing.",
+        "Add-to-collection is explicit and does not silently start a listing publish."
+      ],
+      "authorizationAcceptance": [
+        "Import or add-to-collection is authenticated and current-store scoped.",
+        "Admin-only imports are blocked for non-admin users."
+      ],
+      "externalWriteAcceptance": [
+        "Any future live crawler or paid ranking import requires separate authorization; local smoke only checks structure."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "独立公共数据源",
+          "addToCollection",
+          "split(',').map(value => value.trim()).find(Boolean)"
+        ],
+        "viewMustNotContain": [
+          "single-sourcing",
+          "1688",
+          "找货"
+        ],
+        "serverContains": [
+          "CREATE TABLE IF NOT EXISTS app_top_lists",
+          "CREATE TABLE IF NOT EXISTS app_china_sellers",
+          "/api/sourcing/bestsellers",
+          "/api/sourcing/bestsellers/import",
+          "/api/sourcing/china-zone",
+          "req.user.role !== 'admin'",
+          "confidence: 0.65"
+        ]
+      },
+      "bugsOrGaps": []
+    }
+  ]
+}

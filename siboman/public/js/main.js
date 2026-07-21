@@ -89,9 +89,23 @@ const initApp = () => {
       const isReady = Vue.ref(false);
       const shops = Vue.ref([]);
       const currentStoreId = Vue.ref(localStorage.getItem('currentStoreId') || '');
+      const buildInfo = Vue.ref({ version: '', buildTime: '' });
+
+      const envLabel = Vue.computed(() => {
+        const host = window.location.hostname || '';
+        if (host.includes('test.renwz.cn')) return '测试环境';
+        if (host.includes('xm.renwz.cn')) return '生产环境';
+        return '本地环境';
+      });
 
       const fetchInitData = async () => {
         try {
+          axios.get('/api/version').then((res) => {
+            buildInfo.value = {
+              version: res.data?.version || '',
+              buildTime: res.data?.buildTime || '',
+            };
+          }).catch(() => {});
           const authRes = await axios.get('/api/auth/status');
           // 只有明确 authenticated=false 才跳登录; 网络错误 / 5xx 不跳
           if (authRes?.data?.authenticated === false) {
@@ -136,7 +150,7 @@ const initApp = () => {
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
         if (path.includes('dashboard')) return 'dashboard';
-        if (path.includes('single-sourcing')) return 'single-sourcing';
+        if (path.includes('single-sourcing')) return 'single-sourcing-frozen';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
         if (path.includes('product')) return 'products';
@@ -152,7 +166,7 @@ const initApp = () => {
         return 'dashboard';
       });
 
-      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange };
+      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange, buildInfo, envLabel };
     },
     template: `
       <el-container class="layout-container" v-loading="!isReady">
@@ -170,9 +184,6 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/collection" @click="goTo('#/collection')">
               <el-icon><Box /></el-icon><span>采集箱</span>
-            </el-menu-item>
-            <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')">
-              <el-icon><Search /></el-icon><span>单品找货</span>
             </el-menu-item>
             <el-menu-item index="#/products" @click="goTo('#/products')">
               <el-icon><Goods /></el-icon><span>商品管理</span>
@@ -214,6 +225,11 @@ const initApp = () => {
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
               <shop-switcher @change="handleStoreChange" />
+              <el-tooltip :content="buildInfo.buildTime ? ('构建时间：' + buildInfo.buildTime) : '版本信息读取中'" placement="bottom">
+                <el-tag size="small" :type="envLabel === '生产环境' ? 'success' : envLabel === '测试环境' ? 'warning' : 'info'">
+                  {{ envLabel }}<span v-if="buildInfo.version"> · {{ buildInfo.version }}</span>
+                </el-tag>
+              </el-tooltip>
               <span style="font-size: 13px; color: #666">
                 用户：<el-tag size="small">{{ currentUser.display_name || currentUser.username }}</el-tag>
               </span>
@@ -223,7 +239,18 @@ const initApp = () => {
           <el-main>
             <div v-if="routeName === 'dashboard'"><dashboard-view /></div>
             <div v-else-if="routeName === 'sourcing'"><sourcing-module-view /></div>
-            <div v-else-if="routeName === 'single-sourcing'"><sourcing-module-view /></div>
+            <div v-else-if="routeName === 'single-sourcing-frozen'" style="min-height:calc(100vh - 120px); display:grid; place-items:center; padding:24px; box-sizing:border-box">
+              <div style="max-width:520px; width:100%; background:#fff; border:1px solid #fde68a; border-radius:8px; padding:28px; box-sizing:border-box">
+                <div style="display:flex; align-items:center; gap:10px; color:#92400e; font-weight:700; font-size:18px">
+                  <el-icon><Lock /></el-icon><span>单品找货已冻结</span>
+                </div>
+                <p style="margin:14px 0 0; color:#5b6472; line-height:1.7">该实验功能暂不属于当前运营主线，已停止从菜单进入，也不会在此页面创建采集或找货任务。</p>
+                <div style="display:flex; gap:10px; margin-top:22px">
+                  <el-button type="primary" @click="goTo('#/collection')">进入采集箱</el-button>
+                  <el-button @click="goTo('#/sourcing')">进入选品中心</el-button>
+                </div>
+              </div>
+            </div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>

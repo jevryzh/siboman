@@ -33,6 +33,31 @@ window.ProductListView = {
       { label: '审核失败', value: 'FAILED_MODERATION' },
       { label: '已下架', value: 'IN_ACTIVE' },
     ];
+    const statusCn = (status) => ({
+      ALL: '全部',
+      VISIBLE: '销售中',
+      READY_TO_SUPPLY: '待补库存',
+      NEED_ATTENTION: '需修改',
+      NOT_MODERATED: '待审核',
+      FAILED_MODERATION: '审核失败',
+      IN_ACTIVE: '已下架',
+    }[status] || '未知状态');
+    const statusHint = (status) => ({
+      ALL: '全部本地商品缓存',
+      VISIBLE: 'Ozon 前台可见, 可正常售卖',
+      READY_TO_SUPPLY: '资料已准备, 待补库存或供货后销售',
+      NEED_ATTENTION: 'Ozon 要求补齐资料, 请先查看体检问题',
+      NOT_MODERATED: '已提交 Ozon, 正在审核中',
+      FAILED_MODERATION: '审核失败, 先查看失败/体检原因再保存同步',
+      IN_ACTIVE: '已下架或归档, 可用重新上架恢复',
+    }[status] || '未知状态');
+    const productStatusLabel = (row) => statusCn(row?.status) || row?.status_name || row?.status || '未知状态';
+    const issueSummary = (row) => {
+      const issues = Array.isArray(row.compliance_issues) ? row.compliance_issues.filter(Boolean) : [];
+      if (issues.length) return issues.join('；');
+      return row.status_name || row.status || '暂无后端返回的详细原因';
+    };
+    const syncFieldsNote = '保存会先更新本地商品资料，并尝试同步价格和图片到 Ozon；库存和仓库不在这里编辑，请到库存管理处理。';
 
     const fetchProducts = async () => {
       const sid = getStoreId();
@@ -83,37 +108,83 @@ window.ProductListView = {
       if (!Array.isArray(drawer.form.images)) {
         try { drawer.form.images = JSON.parse(drawer.form.images || '[]'); } catch { drawer.form.images = []; }
       }
-      // 若已有 category_name, 初始化 cascader 至末级 (整树加载后能高亮)
-      drawer.categoryPath = drawer.form.category_name ? [drawer.form.category_name] : [];
+      drawer.categoryPath = [];
       drawer.visible = true;
+      if (categoryTreeLoaded.value) syncCategoryPathFromForm();
+      else ensureCategoryTree(true);
     };
 
     // v0.3.5 类目三级 cascader
     const categoryTree = Vue.ref([]);
     const categoryTreeLoaded = Vue.ref(false);
+    const categoryLoading = Vue.ref(false);
+    const categoryNodeByKey = new Map();
+    const makeCategoryKey = (node, indexPath) => {
+      const categoryId = Number(node.description_category_id || 0);
+      const typeId = Number(node.type_id || 0);
+      if (categoryId > 0) return `cat:${categoryId}`;
+      if (typeId > 0) return `type:${typeId}`;
+      return `name:${indexPath.join('.')}:${node.category_name || node.type_name || 'unknown'}`;
+    };
+    const syncCategoryPathFromForm = () => {
+      if (!categoryTreeLoaded.value) return;
+      const categoryId = Number(drawer.form.description_category_id || 0);
+      const currentName = String(drawer.form.category_name || '').trim();
+      let foundPath = [];
+      const walk = (nodes, path = []) => {
+        for (const node of nodes || []) {
+          const nextPath = [...path, node.category_key];
+          if ((categoryId > 0 && Number(node.description_category_id || 0) === categoryId)
+            || (!categoryId && currentName && node.category_name === currentName)) {
+            foundPath = nextPath;
+            return true;
+          }
+          if (walk(node.children || [], nextPath)) return true;
+        }
+        return false;
+      };
+      walk(categoryTree.value);
+      drawer.categoryPath = foundPath;
+    };
     const ensureCategoryTree = async (visible) => {
       if (categoryTreeLoaded.value || !visible) return;
+      categoryLoading.value = true;
       try {
         const r = await axios.post('/api/seller/categories/tree', { store_id: getStoreId() });
         const raw = r.data?.data?.result || [];
-        // 清洗: 只保留非空 children 或叶子节点
-        const clean = (nodes) => (nodes || []).map(n => ({
-          category_name: n.category_name,
-          description_category_id: n.description_category_id,
-          type_id: n.type_id,
-          children: n.children && n.children.length ? clean(n.children) : undefined,
-        }));
+        categoryNodeByKey.clear();
+        const clean = (nodes, indexPath = []) => (nodes || []).map((n, index) => {
+          const nextIndexPath = [...indexPath, index];
+          const label = n.category_name || n.type_name || '未命名类目';
+          const categoryKey = makeCategoryKey(n, nextIndexPath);
+          const node = {
+            label,
+            category_key: categoryKey,
+            category_name: n.category_name || label,
+            description_category_id: Number(n.description_category_id || 0) || null,
+            type_id: Number(n.type_id || 0) || null,
+            children: n.children && n.children.length ? clean(n.children, nextIndexPath) : undefined,
+          };
+          categoryNodeByKey.set(categoryKey, node);
+          return node;
+        });
         categoryTree.value = clean(raw);
         categoryTreeLoaded.value = true;
+        syncCategoryPathFromForm();
       } catch (e) {
         notify.error('加载类目树失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        categoryLoading.value = false;
       }
     };
     const onCategoryChange = (path) => {
-      // 保存最叶子的名称 + 全路径
       if (Array.isArray(path) && path.length) {
-        drawer.form.category_name = path[path.length - 1];
-        drawer.form.category_path = path.join(' / ');
+        const selected = categoryNodeByKey.get(path[path.length - 1]);
+        const names = path.map((key) => categoryNodeByKey.get(key)?.label).filter(Boolean);
+        drawer.form.category_name = selected?.category_name || names[names.length - 1] || '';
+        drawer.form.category_path = names.join(' / ');
+        if (selected?.description_category_id) drawer.form.description_category_id = selected.description_category_id;
+        if (selected?.type_id) drawer.form.type_id = selected.type_id;
       }
     };
 
@@ -121,6 +192,11 @@ window.ProductListView = {
     const allPreviewList = () => {
       const imgs = Array.isArray(drawer.form.images) ? drawer.form.images : [];
       return imgs.length ? imgs : (drawer.form.image ? [drawer.form.image] : []);
+    };
+    const productPreviewList = (row) => {
+      const images = Array.isArray(row.images) ? row.images : [];
+      const list = [row.image, ...images].filter(Boolean);
+      return Array.from(new Set(list));
     };
     const uploadImage = async (opts, mode) => {
       const fd = new FormData();
@@ -201,7 +277,7 @@ window.ProductListView = {
     const archiveProduct = async (row) => {
       try {
         await window.ElementPlus.ElMessageBox.confirm(
-          `确定归档商品「${row.name}」？归档后 Ozon 前台不可见, 可再上架恢复。`,
+          `确定归档商品「${row.name || row.offer_id}」？归档会调用 Ozon archive 接口, 前台不可见, 可再上架恢复。`,
           '归档确认',
           { confirmButtonText: '确定归档', cancelButtonText: '取消', type: 'warning' },
         );
@@ -218,6 +294,13 @@ window.ProductListView = {
       }
     };
     const unarchiveProduct = async (row) => {
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `确定重新上架「${row.name || row.offer_id}」？这里仅恢复归档商品可见性, 不会新建商品。`,
+          '重新上架确认',
+          { confirmButtonText: '确认上架', cancelButtonText: '取消', type: 'warning' },
+        );
+      } catch { return; }
       try {
         await axios.post('/api/seller/products/unarchive', {
           store_id: getStoreId(),
@@ -332,9 +415,11 @@ window.ProductListView = {
       archiveProduct, unarchiveProduct,
       onPageChange, onSizeChange, onTabChange, onSearch, onSearchInput,
       copyOfferId, onSelectionChange, bulkArchive, exportCsv,
+      statusCn, statusHint, productStatusLabel, issueSummary, syncFieldsNote,
       // v0.3.5
-      categoryTree, ensureCategoryTree, onCategoryChange,
+      categoryTree, categoryLoading, ensureCategoryTree, onCategoryChange,
       allPreviewList, uploadImage, removeGalleryImage,
+      productPreviewList,
       aiRefineImage, aiFillProduct, aiPricing,
       aiImageLoading, aiFillLoading, aiPriceLoading,
     };
@@ -345,10 +430,10 @@ window.ProductListView = {
         <template #header>
           <div style="display:flex; justify-content:space-between; align-items:center">
             <div style="display:flex; align-items:center; gap:12px">
-              <span style="font-weight:bold; font-size:15px">商品管理 (v0.3.3)</span>
+              <span style="font-weight:bold; font-size:15px">商品管理</span>
               <el-tag size="small" type="info">共 {{ pagination.total }} 个 SKU</el-tag>
               <el-button type="success" size="small" @click="() => (window.location.hash = '#/collection')">
-                ➕ 新增商品 (采集箱)
+                从采集箱新增
               </el-button>
               <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">同步 Ozon 商品</el-button>
               <el-button size="small" :disabled="!selectedRows.length" :loading="bulkLoading" @click="bulkArchive">批量归档</el-button>
@@ -364,15 +449,33 @@ window.ProductListView = {
 
         <el-tabs v-model="activeTab" @tab-change="onTabChange">
           <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :name="tab.value">
-            <template #label>{{ tab.label }} <span style="color:#909399">({{ statusCounts[tab.value] || 0 }})</span></template>
+            <template #label>
+              <el-tooltip :content="statusHint(tab.value)" placement="top">
+                <span>{{ tab.label }} <span style="color:#909399">({{ statusCounts[tab.value] || 0 }})</span></span>
+              </el-tooltip>
+            </template>
           </el-tab-pane>
         </el-tabs>
 
-        <el-table :data="products" v-loading="loading" stripe border size="small" @selection-change="onSelectionChange">
+        <el-table :data="products" v-loading="loading" stripe border size="small" empty-text="暂无商品。请先选择店铺, 或点击同步 Ozon 商品刷新本地缓存。" @selection-change="onSelectionChange">
           <el-table-column type="selection" width="44" />
-          <el-table-column label="预览" width="70">
+          <el-table-column label="图片" width="86">
             <template #default="{ row }">
-              <el-image :src="row.image" style="width:44px; height:44px; border-radius:4px" fit="cover" preview-teleported />
+              <el-tooltip content="点击图片可放大查看图册" placement="top">
+                <el-image
+                  :src="row.image"
+                  style="width:56px; height:56px; border-radius:6px; border:1px solid #ebeef5; cursor:zoom-in"
+                  fit="cover"
+                  preview-teleported
+                  :preview-src-list="productPreviewList(row)"
+                  :initial-index="0">
+                  <template #error>
+                    <div style="width:56px; height:56px; background:#f5f7fa; display:flex; align-items:center; justify-content:center; color:#c0c4cc">
+                      <el-icon><Picture /></el-icon>
+                    </div>
+                  </template>
+                </el-image>
+              </el-tooltip>
             </template>
           </el-table-column>
           <el-table-column label="商品基本信息" min-width="240">
@@ -387,17 +490,25 @@ window.ProductListView = {
           </el-table-column>
           <el-table-column label="状态" width="120">
             <template #default="{ row }">
-              <el-tag size="small" :type="row.status === 'VISIBLE' ? 'success' : (['NEED_ATTENTION', 'FAILED_MODERATION'].includes(row.status) ? 'danger' : 'info')">
-                {{ row.status_name || row.status || '未知' }}
-              </el-tag>
+              <el-tooltip :content="statusHint(row.status) + (row.status_name ? '；Ozon 原始状态：' + row.status_name : '')" placement="top">
+                <el-tag size="small" :type="row.status === 'VISIBLE' ? 'success' : (['NEED_ATTENTION', 'FAILED_MODERATION'].includes(row.status) ? 'danger' : 'info')">
+                  {{ productStatusLabel(row) }}
+                </el-tag>
+              </el-tooltip>
             </template>
           </el-table-column>
           <el-table-column label="体检" width="110">
             <template #default="{ row }">
               <el-tag v-if="row.compliance_ok" size="small" type="success">通过</el-tag>
-              <el-tooltip v-else :content="(row.compliance_issues || []).join('；')" placement="top">
-                <el-tag size="small" type="danger">{{ row.compliance_issues.length }} 项问题</el-tag>
+              <el-tooltip v-else :content="issueSummary(row)" placement="top">
+                <el-tag size="small" type="danger">{{ (row.compliance_issues || []).length }} 项问题</el-tag>
               </el-tooltip>
+            </template>
+          </el-table-column>
+          <el-table-column label="失败/处理原因" min-width="180" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="['NEED_ATTENTION', 'FAILED_MODERATION'].includes(row.status)" style="color:#f56c6c; font-size:12px">{{ issueSummary(row) }}</span>
+              <span v-else style="color:#909399; font-size:12px">{{ statusHint(row.status) }}</span>
             </template>
           </el-table-column>
           <el-table-column label="价格" width="130" sortable prop="price">
@@ -410,6 +521,12 @@ window.ProductListView = {
           </el-table-column>
           <el-table-column label="库存" prop="stock" width="80" sortable />
           <el-table-column label="品牌" prop="brand" width="120" show-overflow-tooltip />
+          <el-table-column label="1688 货源" width="120">
+            <template #default="{ row }">
+              <a v-if="row.source_url_1688" :href="row.source_url_1688" target="_blank" rel="noopener noreferrer">查看货源</a>
+              <span v-else style="color:#c0c4cc">未维护</span>
+            </template>
+          </el-table-column>
           <el-table-column label="原产国" prop="country_of_origin" width="90" />
           <el-table-column label="尺寸(mm)" width="130">
             <template #default="{ row }">
@@ -447,8 +564,16 @@ window.ProductListView = {
       </el-card>
 
       <!-- 生产力级编辑抽屉 (v0.3.3 加主图预览 + 归档) -->
-      <el-drawer v-model="drawer.visible" title="商品深度编辑 & Ozon 同步" size="760px" destroy-on-close>
+      <el-drawer v-model="drawer.visible" title="商品资料编辑" size="760px" destroy-on-close>
         <el-form :model="drawer.form" label-position="top" size="small">
+          <el-alert :title="syncFieldsNote" type="info" :closable="false" show-icon style="margin-bottom:12px" />
+          <el-alert
+            v-if="drawer.form.status === 'FAILED_MODERATION' || drawer.form.status === 'NEED_ATTENTION'"
+            :title="issueSummary(drawer.form)"
+            type="warning"
+            :closable="false"
+            show-icon
+            style="margin-bottom:12px" />
           <!-- v0.3.4 主图 + 图册 + 编辑/替换/新增/删除 -->
           <el-divider content-position="left">
             商品主图与图册
@@ -553,13 +678,18 @@ window.ProductListView = {
                 <el-cascader
                   v-model="drawer.categoryPath"
                   :options="categoryTree"
-                  :props="{ label: 'category_name', value: 'category_name', children: 'children', checkStrictly: false, emitPath: true }"
+                  :props="{ label: 'label', value: 'category_key', children: 'children', checkStrictly: false, emitPath: true }"
                   filterable
                   clearable
+                  :loading="categoryLoading"
                   placeholder="选择或搜索 Ozon 类目"
                   style="width:100%"
                   @change="onCategoryChange"
                   @visible-change="ensureCategoryTree" />
+                <div style="margin-top:6px; font-size:12px; color:#909399">
+                  当前：{{ drawer.form.category_name || '未设置' }}
+                  <span v-if="drawer.form.description_category_id"> · 类目 ID {{ drawer.form.description_category_id }}</span>
+                </div>
               </el-form-item>
             </el-col>
             <el-col :span="8">
@@ -569,7 +699,7 @@ window.ProductListView = {
             </el-col>
           </el-row>
 
-          <el-divider content-position="left">价格与库存</el-divider>
+          <el-divider content-position="left">价格</el-divider>
           <el-row :gutter="16">
             <el-col :span="6">
               <el-form-item label="6. 售价">
@@ -595,36 +725,35 @@ window.ProductListView = {
                 </el-select>
               </el-form-item>
             </el-col>
-            <el-col :span="3">
-              <!-- v0.3.4: 库存不在此编辑, 迁移至库存管理→分仓修改 -->
-              <el-form-item label="10. 库存">
-                <div style="display:flex; align-items:center; height:32px; padding:0 10px; background:#f5f7fa; border-radius:4px; font-size:12px; color:#909399">
-                  <el-icon style="margin-right:4px"><Warning /></el-icon>
-                  <span>请至库存管理修改</span>
-                </div>
-              </el-form-item>
+            <el-col :span="9">
+              <el-alert
+                type="info"
+                :closable="false"
+                show-icon
+                style="margin-top:22px"
+                :title="'当前总库存 ' + (drawer.form.stock ?? 0) + '，库存和仓库请到库存管理修改'" />
             </el-col>
           </el-row>
 
           <el-divider content-position="left">物流尺寸 & 重量</el-divider>
           <el-row :gutter="16">
             <el-col :span="6">
-              <el-form-item label="11. 重量 (g)">
+              <el-form-item label="10. 重量 (g)">
                 <el-input-number v-model="drawer.form.weight" :min="0" style="width:100%" />
               </el-form-item>
             </el-col>
             <el-col :span="6">
-              <el-form-item label="12. 宽度 (mm)">
+              <el-form-item label="11. 宽度 (mm)">
                 <el-input-number v-model="drawer.form.width" :min="0" style="width:100%" />
               </el-form-item>
             </el-col>
             <el-col :span="6">
-              <el-form-item label="13. 深度 (mm)">
+              <el-form-item label="12. 深度 (mm)">
                 <el-input-number v-model="drawer.form.depth" :min="0" style="width:100%" />
               </el-form-item>
             </el-col>
             <el-col :span="6">
-              <el-form-item label="14. 高度 (mm)">
+              <el-form-item label="13. 高度 (mm)">
                 <el-input-number v-model="drawer.form.height" :min="0" style="width:100%" />
               </el-form-item>
             </el-col>
@@ -645,7 +774,7 @@ window.ProductListView = {
           </el-row>
 
           <el-divider content-position="left">商品描述</el-divider>
-          <el-form-item label="15. 详细描述 (Description)">
+          <el-form-item label="14. 详细描述 (Description)">
             <el-input v-model="drawer.form.description" type="textarea" :rows="8" placeholder="Ozon 详情页正文" />
           </el-form-item>
 
@@ -654,8 +783,9 @@ window.ProductListView = {
             <el-descriptions-item label="Ozon Product ID">{{ drawer.form.product_id || '-' }}</el-descriptions-item>
             <el-descriptions-item label="Ozon SKU">{{ drawer.form.sku || '-' }}</el-descriptions-item>
             <el-descriptions-item label="Ozon Model ID">{{ drawer.form.model_id || '-' }}</el-descriptions-item>
-            <el-descriptions-item label="内部状态">{{ drawer.form.status }}</el-descriptions-item>
+            <el-descriptions-item label="状态">{{ productStatusLabel(drawer.form) }}</el-descriptions-item>
             <el-descriptions-item label="Ozon 状态">{{ drawer.form.status_name || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="类目 ID">{{ drawer.form.description_category_id || '-' }}</el-descriptions-item>
             <el-descriptions-item label="价格指数">{{ drawer.form.price_index || '-' }}</el-descriptions-item>
             <el-descriptions-item label="本地更新" :span="3">{{ (drawer.form.updated_at || '').slice(0,19).replace('T',' ') }}</el-descriptions-item>
           </el-descriptions>

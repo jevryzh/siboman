@@ -11,6 +11,7 @@ window.BatchUploadView = {
     const publishLoading = Vue.ref(false);
     const selectedStores = Vue.ref([]);
     const allStores = Vue.ref([]);
+    const collectionPrefill = Vue.ref(null);
     const config = Vue.reactive({
       brand: 'no_brand', imageOrder: 'keep', currency: 'CNY',
       defaultStock: 0, watermark: false, aiRewrite: false, vat: '0',
@@ -39,6 +40,7 @@ window.BatchUploadView = {
       error: m => (window.ElementPlus?.ElMessage || console).error?.(m),
       info: m => (window.ElementPlus?.ElMessage || console).info?.(m),
     };
+    const COLLECTION_PREFILL_KEY = 'collection_box_listing_prefill';
     const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : '');
     const resolveStoreId = (value) => {
       const raw = String(value || '').trim();
@@ -356,6 +358,7 @@ window.BatchUploadView = {
     Vue.onMounted(async () => {
       await fetchStores();
       loadConfig();
+      await consumeCollectionPrefill();
       for (const sid of (selectedStores.value || [])) await fetchWarehousesForStore(sid);
       const ping = await pingExtension();
       if (ping) {
@@ -482,6 +485,11 @@ window.BatchUploadView = {
       const valid = rows.filter(r=>r.valid);
       const invalid = rows.filter(r=>!r.valid);
       items.value = rows;
+      if (collectionPrefill.value?.item?.id && rows.length === 1 && rows[0]?.valid) {
+        rows[0].collectId = collectionPrefill.value.item.id;
+        rows[0].collectTitle = collectionPrefill.value.item.title || '';
+        rows[0].sourceUrl1688 = collectionPrefill.value.item.source_url_1688 || '';
+      }
       appendLog(`解析完成: ${rows.length} 行, ${valid.length} 有效, ${invalid.length} 无效`, 'success');
       if(invalid.length) appendLog(`无效行: ${invalid.map(r=>`#${r.index} ${r.reason}`).join('; ')}`, 'warn');
       notify.success(`解析 ${valid.length} 行有效数据`);
@@ -491,6 +499,42 @@ window.BatchUploadView = {
       if(valid.length && !extensionConnected.value) {
         appendLog('提示: 插件未连接, 下一步点「采集」前请先安装插件并登录 seller.ozon.ru', 'warn');
       }
+    };
+
+    const consumeCollectionPrefill = async () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(localStorage.getItem(COLLECTION_PREFILL_KEY) || 'null');
+      } catch {
+        payload = null;
+      }
+      if (!payload || payload.from !== 'collection-box' || !payload.item) return;
+      localStorage.removeItem(COLLECTION_PREFILL_KEY);
+      const source = payload.item || {};
+      const sku = String(source.ozon_sku || String(source.ozon_url || '').match(/\/product\/(\d+)/)?.[1] || '').trim();
+      if (!sku) {
+        appendLog('采集箱送上架资料缺少 SKU, 请回采集箱检查该记录。', 'error');
+        return;
+      }
+      const price = Number(source.price_rub || 0);
+      collectionPrefill.value = {
+        ...payload,
+        item: { ...source, ozon_sku: sku },
+      };
+      if (price > 0) {
+        pasteText.value = `${sku},${price}`;
+        config.currency = 'RUB';
+        appendLog(`已从采集箱带入 SKU ${sku}。请核对售价 ${price} RUB、店铺、仓库和库存后再采集/上架。`, 'info');
+        await Vue.nextTick();
+        await parsePaste();
+      } else {
+        pasteText.value = `${sku},`;
+        appendLog(`已从采集箱带入 SKU ${sku}, 但缺少售价。请先补售价再解析。`, 'warn');
+      }
+    };
+    const clearCollectionPrefill = () => {
+      collectionPrefill.value = null;
+      appendLog('已关闭采集箱带入提示；不会影响当前表格数据。', 'info');
     };
 
     // ========== SKU 批采 (保留) ==========
@@ -642,10 +686,9 @@ window.BatchUploadView = {
         description_category_id: d.descriptionCategoryId, type_id: d.typeId,
         primary_image: images[0] || '',
         service_type: 'IS_CODE_SERVICE', complex_attributes: [],
-        // 跟卖源 SKU 仍保留在 payload 里做记录/后处理，但默认走完整 /v3/product/import。
-        // My ERP 的 followSell 实测也是把源商品图片、属性、尺寸完整提交，而不是只发 SKU。
+        // 跟卖源 SKU 仍保留在 payload 里。默认不强制 v3, 让后端优先走 Ozon 官方
+        // /v1/product/import-by-sku 复制源卡片；V3 作为后端保留回退路径。
         source_sku: Number(row.sku) || 0,
-        import_mode: 'v3',
       };
       if(opts.brand) item.scraped_brand = opts.brand;
       if(row.minPrice>0) item.min_price = row.minPrice.toFixed(2);
@@ -841,9 +884,10 @@ window.BatchUploadView = {
           continue;
         }
 
-        // v2.2.9.28: Seller portal 复制草稿发布只能代表浏览器当前 seller 店铺。
-        // 因此只在单店铺时启用, 多店铺继续走后端 API, 防止串店。
-        const canUsePortal = selectedStores.value.length === 1 && storeItems.every(x => x.item?._sourceVariant?._bundleItem);
+        // v2.2.9.54: 默认不走 Seller portal 内部 bundle 上传。
+        // MY 能稳定跟卖的关键是“复制源 SKU/卡片”, 后端已实现官方 import-by-sku；
+        // portal upload_task_id 只代表 Seller 页面内部上传任务, 用户反馈会出现“ERP 显示提交但 Ozon 后台无商品”。
+        const canUsePortal = false;
         if (canUsePortal) {
           try {
             appendLog(`  ℹ [${storeName}] 单店铺模式: 使用 Seller portal 复制草稿发布`, 'info');
@@ -857,6 +901,7 @@ window.BatchUploadView = {
               company_id: resp.result?.company_id || '',
               items: storeItems.map(({ row, item }) => ({
                 source_sku: row.sku,
+                collect_id: row.collectId || '',
                 offer_id: item.offer_id,
                 name: item.name,
                 image: item.primary_image || item.images?.[0] || '',
@@ -885,10 +930,17 @@ window.BatchUploadView = {
                 store_id: storeId,
                 item,
                 stocks: storeStocks.filter(s => s.offer_id === item.offer_id),  // 只发当前这个 offer 的 stock
+                meta: row.collectId ? { collectId: row.collectId } : undefined,
               }, { timeout: 60000 });
               const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
+              const importMode = res.data?.importMode || '';
+              const stockTip = whId && defaultStock > 0
+                ? (importMode === 'sku'
+                  ? ` + stock=${defaultStock} → wh=${whId}（商品创建后由库存同步确认）`
+                  : ` + stock=${defaultStock} → wh=${whId}`)
+                : '';
               // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
-              appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${whId && defaultStock > 0 ? ` + stock=${defaultStock} → wh=${whId}` : ''}`, 'info');
+              appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${importMode === 'sku' ? ' (复制源卡片)' : ''}${stockTip}`, 'info');
               // 后台 polling 每 60s 同步 Ozon 真实状态
               totalOk++;
             } catch(e) {
@@ -907,13 +959,13 @@ window.BatchUploadView = {
 
         appendLog(`--- [${storeName}] 完成 ---`, 'info');
       }
-      appendLog(`\n========== 全部完成: ${totalOk} 提交 Ozon, ${totalFail} 本地校验失败, ${totalSkipped} 未选类目跳过 ==========`, (totalFail||totalSkipped)?'warn':'success');
+      appendLog(`\n========== 本轮提交结束: ${totalOk} 已提交 Ozon（待创建结果）, ${totalFail} 本地校验失败, ${totalSkipped} 未选类目跳过 ==========`, (totalFail||totalSkipped)?'warn':'success');
       publishLoading.value = false;
       // v2.2.3: 上架后给一个明显的"→ 查看上架状态" 入口
       const skipMsg = totalSkipped ? `, ${totalSkipped} 个未选类目已跳过` : '';
       const tip = (totalFail || totalSkipped)
-        ? `已提交 ${totalOk} 个到 Ozon${skipMsg} (后台 60s 自动同步真实状态, 去 seller.ozon.ru 后台改类目)`
-        : `已提交 ${totalOk} 个到 Ozon。后台 60s 自动同步状态`;
+        ? `已提交 ${totalOk} 个到 Ozon${skipMsg}；这不是创建完成，Ozon 仍会异步处理，后台每 60 秒同步结果。`
+        : `已提交 ${totalOk} 个到 Ozon；这不是创建完成，Ozon 仍会异步处理，后台每 60 秒同步结果。`;
       notify.success({
         message: tip,
         duration: 8000,
@@ -927,10 +979,10 @@ window.BatchUploadView = {
       cta.style.cssText = 'margin-top:12px; padding:14px 18px; background:linear-gradient(90deg,#ecfdf5,#fff); border:1px solid #10b981; border-radius:8px; display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap';
       cta.innerHTML = `
         <div style="font-size:13px; color:#065f46">
-          <b>✓ ${totalOk}</b> 个已提交 Ozon · 后台 60s 后同步真实状态
+          <b>✓ ${totalOk}</b> 个已提交 Ozon · 当前可能处于排队、创建或审核中
         </div>
         <div style="display:flex; gap:8px">
-          <button id="zhumeng-go-listing" style="padding:8px 16px; background:#10b981; color:#fff; border:none; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600">📜 查看上架状态</button>
+          <button id="zhumeng-go-listing" style="padding:8px 16px; background:#10b981; color:#fff; border:none; border-radius:6px; cursor:pointer; font-size:13px; font-weight:600">📜 查看处理状态</button>
           <button id="zhumeng-stay" style="padding:8px 12px; background:#fff; color:#475569; border:1px solid #cbd5e1; border-radius:6px; cursor:pointer; font-size:13px">留在本页</button>
         </div>`;
       // 挂到日志区域下方
@@ -1013,7 +1065,10 @@ window.BatchUploadView = {
       } catch {}
     };
 
-    const fmtMoney = (v) => '¥'+Number(v||0).toFixed(2);
+    const fmtMoney = (v) => {
+      const symbol = ({ CNY: '¥', RUB: '₽', USD: '$', EUR: '€' })[config.currency] || '';
+      return symbol + Number(v || 0).toFixed(2);
+    };
     const clearAll = () => { pasteText.value=''; items.value=[]; logLines.value=[]; };
 
     // ========== v2.0 新增: Help drawer / 历史记录 ==========
@@ -1066,6 +1121,7 @@ window.BatchUploadView = {
     return {
       items, pasteText, parseLoading, publishLoading, logLines,
       selectedStores, allStores, config, FORMAT_LABELS, formatHints,
+      collectionPrefill, clearCollectionPrefill,
       extensionConnected, sellerTabReady, refreshing,
       parsePaste, collectSkus, addWatermarkAll, aiRewriteAll, publishBatch,
       fetchStores, saveConfig, loadConfig, fmtMoney, clearAll, appendLog,
@@ -1086,7 +1142,7 @@ window.BatchUploadView = {
           <span style="font-size:22px">🚀</span>
           <div>
             <div style="font-size:16px; font-weight:800; color:#0f172a; line-height:1.2">批量跟卖</div>
-            <div style="font-size:11px; color:#64748b; line-height:1.2">按 SKU 批采 → V3 跟卖</div>
+            <div style="font-size:11px; color:#64748b; line-height:1.2">按 SKU 批采 → 复制源卡片跟卖</div>
           </div>
         </div>
         <span style="width:1px; height:24px; background:#e2e8f0"></span>
@@ -1112,6 +1168,19 @@ window.BatchUploadView = {
 
         <!-- ========== 左列 ========== -->
         <div class="bu-col-main" style="display:flex; flex-direction:column; gap:16px; min-width:0">
+
+          <section v-if="collectionPrefill" class="bu-card" style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:10px; padding:12px 16px; display:flex; justify-content:space-between; gap:12px; align-items:flex-start">
+            <div style="min-width:0">
+              <div style="font-size:13px; font-weight:700; color:#1e3a8a">已从采集箱带入待上架商品</div>
+              <div style="font-size:12px; color:#475569; margin-top:4px; line-height:1.5">
+                SKU {{ collectionPrefill.item.ozon_sku }}<span v-if="collectionPrefill.item.title"> · {{ collectionPrefill.item.title }}</span>
+              </div>
+              <div style="font-size:11px; color:#64748b; margin-top:4px; line-height:1.5">
+                这里只做预填，不会自动提交 Ozon。请重新采集完整源包，并核对售价、货币、店铺、仓库和库存后再上架。
+              </div>
+            </div>
+            <button @click="clearCollectionPrefill" style="background:transparent; border:none; color:#2563eb; cursor:pointer; font-size:12px; white-space:nowrap">关闭提示</button>
+          </section>
 
           <!-- 粘贴批量数据 -->
           <section class="bu-card" style="background:#fff; border-radius:10px; box-shadow:0 1px 3px rgba(0,0,0,0.05); overflow:hidden">

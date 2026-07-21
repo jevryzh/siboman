@@ -1,0 +1,57 @@
+{
+  "taskId": "P1-3-BUG-02",
+  "description": "Local fixture for collection-box duplicate link/SKU merge behavior. This fixture never calls Ozon or the collector.",
+  "manualInputs": [
+    "https://www.ozon.ru/product/example-name-4425674396/",
+    "4425674396",
+    "https://www.ozon.ru/product/4425674396/?utm_source=fixture",
+    "https://www.ozon.ru/product/another-item-2906884816/"
+  ],
+  "expectedParsed": [
+    {
+      "sourceType": "ozon_url",
+      "sourceValue": "https://www.ozon.ru/product/example-name-4425674396/",
+      "ozonSku": "4425674396",
+      "ozonUrl": "https://www.ozon.ru/product/example-name-4425674396/"
+    },
+    {
+      "sourceType": "ozon_sku",
+      "sourceValue": "4425674396",
+      "ozonSku": "4425674396",
+      "ozonUrl": "https://www.ozon.ru/product/4425674396/"
+    },
+    {
+      "sourceType": "ozon_url",
+      "sourceValue": "https://www.ozon.ru/product/4425674396/?utm_source=fixture",
+      "ozonSku": "4425674396",
+      "ozonUrl": "https://www.ozon.ru/product/4425674396/?utm_source=fixture"
+    },
+    {
+      "sourceType": "ozon_url",
+      "sourceValue": "https://www.ozon.ru/product/another-item-2906884816/",
+      "ozonSku": "2906884816",
+      "ozonUrl": "https://www.ozon.ru/product/another-item-2906884816/"
+    }
+  ],
+  "extensionItems": [
+    {
+      "sku": "4425674396",
+      "ozon_url": "https://www.ozon.ru/product/example-name-4425674396/",
+      "name": "First scraped title",
+      "images": ["https://cdn.example.test/1.jpg"],
+      "attributes": { "color": "black" }
+    },
+    {
+      "product_id": "4425674396",
+      "source_url": "https://www.ozon.ru/product/4425674396/",
+      "title": "Updated scraped title",
+      "images": ["https://cdn.example.test/2.jpg"],
+      "attributes": { "size": "L" }
+    }
+  ],
+  "contract": {
+    "manualDuplicate": "Repeated links or SKUs must be skipped or restored instead of creating duplicate collection items.",
+    "extensionDuplicate": "Repeated extension payloads must update the existing non-uploaded item and report a skipped merge.",
+    "uploadedDuplicate": "Uploaded items must not be overwritten by later duplicate collector payloads."
+  }
+}

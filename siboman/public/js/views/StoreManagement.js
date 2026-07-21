@@ -10,6 +10,77 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
+    const PLUGIN_MANIFEST_VERSION = '2.2.9.53';
+    const PLUGIN_ZIP_VERSION = '2.2.9.53';
+    const pluginDetected = Vue.ref(false);
+    const pluginChecking = Vue.ref(false);
+    const installedPluginVersion = Vue.ref('');
+    const pluginStatusText = Vue.ref('尚未检测到已安装插件，请点击刷新状态。');
+    const PROTO = "__zhumeng_proto";
+    const PROTO_VAL = "zhumeng-v1";
+    window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
+
+    const compareVersion = (a, b) => {
+      const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+      const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const da = pa[i] || 0;
+        const db = pb[i] || 0;
+        if (da !== db) return da > db ? 1 : -1;
+      }
+      return 0;
+    };
+    const needsPluginRefresh = Vue.computed(() => !installedPluginVersion.value || compareVersion(installedPluginVersion.value, PLUGIN_MANIFEST_VERSION) < 0);
+    const sendToExtension = (kind, extra = {}, timeoutMs = 5000) => new Promise((resolve) => {
+      const reqId = `store-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      let resolved = false;
+      window.__zhumeng_pending__[reqId] = (data) => {
+        if (resolved) return;
+        resolved = true;
+        delete window.__zhumeng_pending__[reqId];
+        resolve(data);
+      };
+      try {
+        window.postMessage(JSON.parse(JSON.stringify({ [PROTO]: PROTO_VAL, reqId, kind, ...extra })), '*');
+      } catch (error) {
+        resolved = true;
+        delete window.__zhumeng_pending__[reqId];
+        resolve({ ok: false, error: error.message });
+        return;
+      }
+      setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        delete window.__zhumeng_pending__[reqId];
+        resolve(null);
+      }, timeoutMs);
+    });
+    const handleExtensionMessage = (event) => {
+      const d = event.data;
+      if (!d || typeof d !== 'object' || d[PROTO] !== PROTO_VAL) return;
+      if (typeof d.kind === 'string' && d.kind.endsWith('.request')) return;
+      const resolver = window.__zhumeng_pending__[d.reqId];
+      if (resolver) {
+        delete window.__zhumeng_pending__[d.reqId];
+        resolver(d);
+      }
+    };
+    window.addEventListener('message', handleExtensionMessage);
+
+    const refreshPluginStatus = async () => {
+      pluginChecking.value = true;
+      const ping = await sendToExtension('ping.request');
+      pluginDetected.value = Boolean(ping?.ok);
+      installedPluginVersion.value = String(ping?.background_version || ping?.version || '');
+      if (!pluginDetected.value) {
+        pluginStatusText.value = '未检测到 ERP 页面桥接，请确认已安装并在 chrome://extensions 重新加载插件。';
+      } else if (needsPluginRefresh.value) {
+        pluginStatusText.value = `当前插件 v${installedPluginVersion.value || '未知'} 低于发布包 v${PLUGIN_MANIFEST_VERSION}，需要重新下载或在扩展程序页点重新加载。`;
+      } else {
+        pluginStatusText.value = `当前插件 v${installedPluginVersion.value} 已与发布包一致。`;
+      }
+      pluginChecking.value = false;
+    };
 
     const fetchShops = async () => {
       loading.value = true;
@@ -52,12 +123,19 @@ window.StoreManagementView = {
 
     const handleDelete = async (row) => {
       try {
-        await ElementPlus.ElMessageBox.confirm(`确定移除店铺 "${row.name}" 吗？`, '提示', { type: 'warning' });
+        await ElementPlus.ElMessageBox.confirm(
+          `确定移除店铺 "${row.name}" 吗？这只会移除 ERP 内的授权配置，不会删除 Ozon 后台店铺。`,
+          '移除店铺授权',
+          { type: 'warning', confirmButtonText: '确认移除', cancelButtonText: '取消' },
+        );
         await axios.delete(`/api/seller/shops/${row.id}`);
         ElementPlus.ElMessage.success('已移除');
         fetchShops();
         window.dispatchEvent(new CustomEvent('shop-updated'));
-      } catch (e) {}
+      } catch (e) {
+        if (e === 'cancel' || e === 'close') return;
+        ElementPlus.ElMessage.error('移除失败: ' + (e.response?.data?.error || e.message));
+      }
     };
 
     const saveShopSettings = async (row) => {
@@ -76,7 +154,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = '/extension/zhumeng-collector.zip?v=2.2.9.37';
+      link.href = `/extension/zhumeng-collector.zip?v=${PLUGIN_ZIP_VERSION}`;
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -85,13 +163,26 @@ window.StoreManagementView = {
       if (!id) return '';
       return id.length > 8 ? id.slice(0, 4) + '****' + id.slice(-4) : id;
     };
+    const displayClientId = (row) => {
+      if (!row) return '';
+      if (row.client_id_masked) return row.client_id_masked;
+      if (row.client_id_last4) return `****${row.client_id_last4}`;
+      return maskClientId(row.client_id);
+    };
 
-    Vue.onMounted(fetchShops);
+    Vue.onMounted(() => { fetchShops(); refreshPluginStatus(); });
     const onShopChanged = () => fetchShops();
     window.addEventListener('shop-changed', onShopChanged);
-    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
+    Vue.onBeforeUnmount(() => {
+      window.removeEventListener('shop-changed', onShopChanged);
+      window.removeEventListener('message', handleExtensionMessage);
+    });
 
-    return { shops, loading, dialogVisible, submitLoading, form, handleAdd, submitForm, handleDelete, saveShopSettings, maskClientId, downloadExtension };
+    return {
+      shops, loading, dialogVisible, submitLoading, form,
+      PLUGIN_MANIFEST_VERSION, PLUGIN_ZIP_VERSION, pluginDetected, pluginChecking, installedPluginVersion, pluginStatusText, needsPluginRefresh,
+      handleAdd, submitForm, handleDelete, saveShopSettings, maskClientId, displayClientId, downloadExtension, refreshPluginStatus,
+    };
   },
   template: `
     <div class="store-management-container">
@@ -103,11 +194,11 @@ window.StoreManagementView = {
           </div>
         </template>
 
-        <el-table :data="shops" v-loading="loading" stripe>
+        <el-table :data="shops" v-loading="loading" stripe empty-text="暂无店铺授权。新增授权后才能同步商品、库存、订单和采集任务。">
           <el-table-column label="店铺名称" prop="name" />
           <el-table-column label="Client ID">
             <template #default="{ row }">
-              <code>{{ maskClientId(row.client_id) }}</code>
+              <code>{{ displayClientId(row) }}</code>
             </template>
           </el-table-column>
           <el-table-column label="状态" width="120">
@@ -128,6 +219,9 @@ window.StoreManagementView = {
                   @change="saveShopSettings(row)"
                   style="max-width:180px" />
               </div>
+              <div style="font-size:11px; color:#909399; margin-top:4px">
+                {{ row.watermark_enabled ? '批量上架开启水印增强时会使用此文字' : '未开启店铺水印，批量上架不会自动加店铺文字水印' }}
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="150" fixed="right">
@@ -141,14 +235,50 @@ window.StoreManagementView = {
       <!-- 插件下载引导 -->
       <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
         <template #header>
-          <div style="font-weight: bold; color: #e6a23c">
-            逐梦 Ozon 采集器 (v2.2.9.37)
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
+            <div style="font-weight: bold; color: #e6a23c">逐梦 Ozon 采集器</div>
+            <el-button size="small" :loading="pluginChecking" @click="refreshPluginStatus" icon="Refresh">刷新插件状态</el-button>
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
-          <p>当前最新版本：<el-tag size="small" type="warning">v2.2.9.37</el-tag></p>
-          <p>更新内容：</p>
+          <div style="display:grid; grid-template-columns:repeat(3, minmax(0, 1fr)); gap:10px; margin-bottom:12px">
+            <div style="background:#fff; border:1px solid #faecd8; border-radius:6px; padding:10px">
+              <div style="font-size:12px; color:#909399">当前插件</div>
+              <div style="margin-top:4px"><el-tag size="small" :type="pluginDetected && !needsPluginRefresh ? 'success' : 'warning'">v{{ installedPluginVersion || '未检测到' }}</el-tag></div>
+            </div>
+            <div style="background:#fff; border:1px solid #faecd8; border-radius:6px; padding:10px">
+              <div style="font-size:12px; color:#909399">manifest 版本</div>
+              <div style="margin-top:4px"><el-tag size="small" type="info">v{{ PLUGIN_MANIFEST_VERSION }}</el-tag></div>
+            </div>
+            <div style="background:#fff; border:1px solid #faecd8; border-radius:6px; padding:10px">
+              <div style="font-size:12px; color:#909399">zip 版本</div>
+              <div style="margin-top:4px"><el-tag size="small" type="info">v{{ PLUGIN_ZIP_VERSION }}</el-tag></div>
+            </div>
+          </div>
+          <el-alert :type="needsPluginRefresh ? 'warning' : 'success'" :closable="false" style="margin-bottom:12px" :title="needsPluginRefresh ? '需要刷新插件' : '插件版本一致'" :description="pluginStatusText" />
+          <div style="margin-bottom:12px; padding:10px 12px; background:#fff; border:1px solid #faecd8; border-radius:6px; font-size:12px; color:#606266; line-height:1.7">
+            <div style="font-weight:700; color:#303133; margin-bottom:4px">小白检查顺序</div>
+            <div>1. 下载 zip 并解压后，在 Chrome 扩展程序中加载解压后的文件夹。</div>
+            <div>2. 回到本页点击“刷新插件状态”，看到当前插件 v{{ PLUGIN_MANIFEST_VERSION }} 且“插件版本一致”再去批量上架。</div>
+            <div>3. 如果提示低于发布包，请在扩展程序页点“重新加载”，必要时重新下载本页 zip。</div>
+          </div>
+          <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.53 修复单品找货复用 1688 搜图页时 tab 失效导致 No tab with id 的问题，自动重建搜图页重试；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.52 恢复单品找货原默认参数：5 个候选、8-20 秒间隔、候选详情完整采集；保留页面会话搜图与 moqText 修复；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.50 修复单品找货 1688 页面候选归一化 moqText 未定义导致搜图失败；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.49 单品找货 1688 搜图禁用插件后台 direct MTOP 回退，并复用同一个 1688 搜图页，降低验证码触发；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.48 单品找货 1688 搜图页、结果页、详情页和 token 预热页增加模拟人工激活、滚动、停留，降低连续采集触发验证码概率；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.47 单品找货最终候选改为 exact 优先 + MOQ=1 + 质量分择优，并导出运费/重量来源诊断；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.46 单品找货强化 MOQ=1 硬规则、1688 运费模板字段识别、同款近似纠偏；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.45 单品找货最终货源强制明确一件起购；运费未知不再按 0 计入采购成本；仅水印/贴纸/标题/拍摄差异导致的近似会校正为完全一致；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.44 单品找货增强 MOQ 识别和 AI 规则约束，避免起批量不合规候选进入最终结果；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.43 单品找货独立为 #/single-sourcing；增强 1688 重量解析，从隐藏 JSON、物流/包装/SKU 字段和页面文本兜底读取；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.42 单品找货拿到 1688 imageId 后优先进入真实结果页读取候选，接口结果保留兜底；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.41 单品找货 1688 以图搜货优先使用真实 1688 页面会话，上传前压缩 Ozon 主图，direct MTOP 保留兜底；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.40 单品找货 1688 以图搜货改为串行执行、失败冷却、会话强制恢复，并压缩错误摘要，避免 AI 审核因 1688 连续失败被跳过。</li>
+            <li>✅ v2.2.9.39 增强 1688 token/非法请求/store image error 自动刷新重试；导出/进度明确显示无候选跳过 AI 原因。</li>
+            <li>✅ v2.2.9.38 修复单品找货 1688 搜图稳定性: Chrome 标签页瞬时不可编辑时自动重试, 1688 图片上传 store image error 会刷新令牌后重试并返回明确错误。</li>
             <li>✅ v2.2.9.37 修复单品找货导出缺字段: Ozon 重量/价格增加兜底映射, 1688 标题过滤公司名并补价格明细。</li>
             <li>✅ v2.2.9.36 增强单品找货 1688 详情解析: 从页面初始化数据读取标题、阶梯价、起批、尺寸、重量、运费和商品属性。</li>
             <li>✅ v2.2.9.35 修复 1688 搜图 token 获取: 插件会主动预热 MTOP cookie, 已登录 1688 时可自动拿到 _m_h5_tk。</li>

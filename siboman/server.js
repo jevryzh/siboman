@@ -69,6 +69,21 @@ const MINIMAX_IMAGE_PER_IMAGE_USD = Number(process.env.MINIMAX_IMAGE_PER_IMAGE_U
 const RUB_CNY_RATE = Number(process.env.RUB_CNY_RATE || 0.0862);  // 1 RUB = ¥0.0862
 const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY || "";
 const DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/api/v1";
+const DASHSCOPE_IMAGE_MODEL = process.env.DASHSCOPE_IMAGE_MODEL || "wan2.6-image";
+const DASHSCOPE_IMAGE_PER_IMAGE_USD = Number(process.env.DASHSCOPE_IMAGE_PER_IMAGE_USD || 0.03);
+const TOKENDUN_API_KEY = process.env.TOKENDUN_API_KEY || "";
+const TOKENDUN_BASE_URL = (process.env.TOKENDUN_BASE_URL || "https://api.tokendun.com/v1").replace(/\/$/, "");
+const TOKENDUN_IMAGE_MODEL = process.env.TOKENDUN_IMAGE_MODEL || "gpt-image-2";
+const TOKENDUN_IMAGE_QUALITY = process.env.TOKENDUN_IMAGE_QUALITY || "low";
+const TOKENDUN_IMAGE_PER_IMAGE_USD = Number(process.env.TOKENDUN_IMAGE_PER_IMAGE_USD || 0);
+const AI_IMAGE_PROVIDER = String(process.env.AI_IMAGE_PROVIDER || "agnes").trim().toLowerCase();
+const AGNES_API_KEY = process.env.AGNES_API_KEY || "";
+const AGNES_BASE_URL = (process.env.AGNES_BASE_URL || "https://apihub.agnes-ai.com/v1").replace(/\/$/, "");
+const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || "agnes-image-2.0-flash";
+const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD || 0);
+const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
+const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
+const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
 const DETAIL_DELAY_MIN_MS = Number(process.env.DETAIL_DELAY_MIN_MS || 2500);
@@ -139,6 +154,10 @@ app.use(async (req, res, next) => {
 });
 
 app.use(express.json({ limit: process.env.JSON_LIMIT || "120mb" }));
+app.use((req, res, next) => {
+  if (!enforceScopedWorkerAccess(req, res)) return;
+  next();
+});
 app.use(express.static(PUBLIC_DIR));
 
 /* ============================================================
@@ -167,14 +186,36 @@ async function validateOzonCredentials(clientId, apiKey) {
   return payload;
 }
 
+function serializeStoreForFrontend(store) {
+  const clientId = String(store?.client_id || "");
+  return {
+    id: store.id,
+    name: store.name,
+    active: store.active === true,
+    client_id_masked: maskSecret(clientId),
+    client_id_last4: clientId ? clientId.slice(-4) : "",
+    watermark_enabled: store.watermark_enabled === true,
+    watermark_text: store.watermark_text || "",
+    ai_image_provider: store.ai_image_provider || AI_IMAGE_PROVIDER,
+    ai_image_model: store.ai_image_model || "",
+  };
+}
+
+function normalizeStoreAiProvider(value) {
+  const provider = String(value || "").trim().toLowerCase();
+  if (!provider) return "";
+  return AI_IMAGE_PROVIDER_ORDER.includes(provider) ? provider : "";
+}
+
 app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const result = await db.query(
-      "SELECT id, name, client_id, active, watermark_enabled, watermark_text FROM app_stores WHERE user_id = $1 ORDER BY updated_at DESC",
+      "SELECT id, name, client_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model FROM app_stores WHERE user_id = $1 ORDER BY updated_at DESC",
       [req.user.id]
     );
-    res.json({ success: true, shops: result.rows });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, shops: result.rows.map(serializeStoreForFrontend) });
   } catch (error) { next(error); }
 });
 
@@ -184,19 +225,23 @@ app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
     const { name, client_id, api_key } = req.body;
     const watermarkEnabled = req.body?.watermark_enabled === true;
     const watermarkText = String(req.body?.watermark_text || name || "逐梦ERP").trim().slice(0, 80);
+    const aiImageProvider = normalizeStoreAiProvider(req.body?.ai_image_provider);
+    const aiImageModel = String(req.body?.ai_image_model || "").trim().slice(0, 80);
     if (!name || !client_id || !api_key) {
       return res.status(400).json({ success: false, error: "请填写完整信息" });
     }
     await validateOzonCredentials(client_id, api_key);
     const result = await db.query(
-      `INSERT INTO app_stores (user_id, name, client_id, api_key, watermark_enabled, watermark_text)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO app_stores (user_id, name, client_id, api_key, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (user_id, client_id) DO UPDATE
-         SET name = $2, api_key = $4, active = TRUE, watermark_enabled = $5, watermark_text = $6, updated_at = now()
-       RETURNING id, name, client_id, active, watermark_enabled, watermark_text`,
-      [req.user.id, name, client_id, api_key, watermarkEnabled, watermarkText]
+         SET name = $2, api_key = $4, active = TRUE, watermark_enabled = $5, watermark_text = $6,
+             ai_image_provider = $7, ai_image_model = $8, updated_at = now()
+       RETURNING id, name, client_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
+      [req.user.id, name, client_id, api_key, watermarkEnabled, watermarkText, aiImageProvider, aiImageModel]
     );
-    res.json({ success: true, shop: result.rows[0] });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, shop: serializeStoreForFrontend(result.rows[0]) });
   } catch (error) { next(error); }
 });
 
@@ -205,17 +250,22 @@ app.patch("/api/seller/shops/:id/settings", requireAuth, async (req, res, next) 
   try {
     const watermarkEnabled = req.body?.watermark_enabled === true;
     const watermarkText = String(req.body?.watermark_text || "").trim().slice(0, 80);
+    const aiImageProvider = normalizeStoreAiProvider(req.body?.ai_image_provider);
+    const aiImageModel = String(req.body?.ai_image_model || "").trim().slice(0, 80);
     const result = await db.query(
       `UPDATE app_stores
           SET watermark_enabled = $1,
               watermark_text = COALESCE(NULLIF($2, ''), name),
+              ai_image_provider = $5,
+              ai_image_model = $6,
               updated_at = now()
         WHERE id = $3 AND user_id = $4
-        RETURNING id, name, client_id, active, watermark_enabled, watermark_text`,
-      [watermarkEnabled, watermarkText, req.params.id, req.user.id],
+        RETURNING id, name, client_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
+      [watermarkEnabled, watermarkText, req.params.id, req.user.id, aiImageProvider, aiImageModel],
     );
     if (!result.rows[0]) return res.status(404).json({ success: false, error: "店铺不存在" });
-    res.json({ success: true, shop: result.rows[0] });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, shop: serializeStoreForFrontend(result.rows[0]) });
   } catch (error) { next(error); }
 });
 
@@ -231,6 +281,42 @@ app.delete("/api/seller/shops/:id", requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+app.post("/api/v1/plugin/tokens", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.body?.storeId || req.body?.store_id || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, code: "VALIDATION_ERROR", error: "storeId 必填" });
+    const store = await assertActiveStoreAccess(storeId, req.user.id, "id, name");
+    const issued = createScopedWorkerToken(req.user.id, {
+      storeId: store.id,
+      scope: ["collector:submit", "worker:poll"],
+    });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({
+      success: true,
+      code: "OK",
+      data: {
+        token: issued.token,
+        tokenType: "Bearer",
+        expiresIn: issued.expiresIn,
+        scope: issued.payload.scope,
+        storeId: store.id,
+        storeName: store.name,
+      },
+      requestId: req.headers["x-request-id"] || crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({
+      success: false,
+      code: error.statusCode === 404 ? "STORE_NOT_FOUND" : "INTERNAL_ERROR",
+      error: error.message,
+      requestId: req.headers["x-request-id"] || crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+    });
+  }
+});
+
 // v2.1: 给 Chrome 插件用的"拿卖家 API 凭证"端点
 // 严格校验: 仅返回当前用户对应 store 的凭证,且仅供插件采集使用
 app.get("/api/extension/seller-credentials", requireAuth, async (req, res, next) => {
@@ -238,17 +324,26 @@ app.get("/api/extension/seller-credentials", requireAuth, async (req, res, next)
   try {
     const storeId = String(req.query.store_id || "").trim();
     if (!storeId) return res.status(400).json({ success: false, error: "store_id 必填" });
-    const r = await db.query(
-      "SELECT id, name, client_id, api_key FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE",
-      [storeId, req.user.id]
-    );
-    if (!r.rows[0]) return res.status(404).json({ success: false, error: "店铺不存在或已停用" });
+    if (!ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS) {
+      return res.status(410).json({
+        success: false,
+        error: "插件直取 Ozon 凭证接口已关闭，请改用 /api/v1/plugin/tokens 短期 worker token。",
+        code: "PLUGIN_CREDENTIALS_DISABLED",
+      });
+    }
+    const store = await assertActiveStoreAccess(storeId, req.user.id, "id, name, client_id, api_key");
+    res.setHeader("Cache-Control", "no-store");
+    console.warn(`[extension-credentials] deprecated credential handoff user=${req.user.id} store=${store.id} client=${maskSecret(store.client_id)}`);
     res.json({
       success: true,
-      storeId: r.rows[0].id,
-      storeName: r.rows[0].name,
-      clientId: r.rows[0].client_id,
-      apiKey: r.rows[0].api_key,
+      deprecated: true,
+      replacement: "/api/v1/plugin/tokens",
+      storeId: store.id,
+      storeName: store.name,
+      clientId: store.client_id,
+      apiKey: store.api_key,
+      clientIdMasked: maskSecret(store.client_id),
+      credentialExpiresIn: 0,
     });
   } catch (error) { next(error); }
 });
@@ -423,6 +518,40 @@ function createAuthToken(userId) {
   return `${userId}.${expiresAt}.${createAuthSignature(userId, expiresAt)}`;
 }
 
+function createScopedWorkerToken(userId, options = {}) {
+  const ttlMs = Math.max(60 * 1000, Math.min(Number(options.ttlMs || PLUGIN_WORKER_TOKEN_TTL_MS), 60 * 60 * 1000));
+  const payload = {
+    sub: String(userId),
+    exp: Date.now() + ttlMs,
+    type: "plugin-worker",
+    scope: Array.isArray(options.scope) && options.scope.length
+      ? options.scope.map((value) => String(value)).slice(0, 8)
+      : ["collector:submit", "worker:poll"],
+    storeId: options.storeId ? String(options.storeId) : "",
+  };
+  const body = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const signature = crypto.createHmac("sha256", AUTH_SECRET).update(`scoped.${body}`).digest("base64url");
+  return { token: `scoped.${body}.${signature}`, payload, expiresIn: Math.floor(ttlMs / 1000) };
+}
+
+function verifyScopedWorkerToken(token) {
+  const [, body, signature] = String(token || "").split(".");
+  if (!body || !signature) return null;
+  const expected = crypto.createHmac("sha256", AUTH_SECRET).update(`scoped.${body}`).digest("base64url");
+  if (!safeEqual(signature, expected)) return null;
+  let payload = null;
+  try { payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8")); } catch { return null; }
+  if (!payload?.sub || Number(payload.exp || 0) < Date.now() || payload.type !== "plugin-worker") return null;
+  return payload;
+}
+
+function maskSecret(value, visible = 4) {
+  const text = String(value || "");
+  if (!text) return "";
+  if (text.length <= visible * 2) return `${text.slice(0, 1)}***`;
+  return `${text.slice(0, visible)}***${text.slice(-visible)}`;
+}
+
 function safeEqual(left, right) {
   const leftBuffer = Buffer.isBuffer(left) ? left : Buffer.from(String(left));
   const rightBuffer = Buffer.isBuffer(right) ? right : Buffer.from(String(right));
@@ -433,6 +562,20 @@ function safeEqual(left, right) {
 async function getAuthenticatedUser(req) {
   const bearer = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i)?.[1] || "";
   const token = bearer || parseCookies(req)[AUTH_COOKIE] || "";
+  if (token.startsWith("scoped.")) {
+    const payload = verifyScopedWorkerToken(token);
+    if (!payload) return null;
+    if (db) {
+      const result = await db.query(
+        "SELECT id, username, display_name, role FROM app_users WHERE id = $1 AND active = TRUE",
+        [payload.sub],
+      );
+      const user = result.rows[0] || null;
+      return user ? { ...user, tokenType: payload.type, tokenScope: payload.scope || [], tokenStoreId: payload.storeId || "" } : null;
+    }
+    if (!APP_PASSWORD || payload.sub !== "legacy") return null;
+    return { id: "legacy", username: "admin", display_name: "Admin", role: "admin", tokenType: payload.type, tokenScope: payload.scope || [], tokenStoreId: payload.storeId || "" };
+  }
   const [userId, expiresAtText, signature] = token.split(".");
   const expiresAt = Number(expiresAtText);
   if (!userId || !Number.isFinite(expiresAt) || expiresAt < Date.now() || !signature) return null;
@@ -452,6 +595,49 @@ async function getAuthenticatedUser(req) {
 
 async function isAuthenticated(req) {
   return Boolean(await getAuthenticatedUser(req));
+}
+
+function isScopedWorkerUser(user) {
+  return user?.tokenType === "plugin-worker";
+}
+
+function hasScopedWorkerScope(user, scope) {
+  return Array.isArray(user?.tokenScope) && user.tokenScope.includes(scope);
+}
+
+function enforceScopedWorkerAccess(req, res) {
+  if (!isScopedWorkerUser(req.user)) return true;
+  const pathName = req.path || "";
+  const method = String(req.method || "GET").toUpperCase();
+  const tokenStoreId = String(req.user.tokenStoreId || "").trim();
+
+  if (method === "POST" && pathName === "/api/collect-items" && hasScopedWorkerScope(req.user, "collector:submit")) {
+    const requestedStoreId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    if (!tokenStoreId) {
+      res.status(403).json({ success: false, code: "TOKEN_STORE_REQUIRED", error: "插件 token 缺少店铺作用域。" });
+      return false;
+    }
+    if (requestedStoreId && requestedStoreId !== tokenStoreId) {
+      res.status(403).json({ success: false, code: "STORE_SCOPE_DENIED", error: "插件 token 无权访问该店铺。" });
+      return false;
+    }
+    if (req.body && typeof req.body === "object") req.body.store_id = tokenStoreId;
+    return true;
+  }
+
+  const workerPathAllowed =
+    pathName === "/api/worker/status" ||
+    pathName === "/api/worker/heartbeat" ||
+    pathName === "/api/worker/jobs/next" ||
+    /^\/api\/worker\/jobs\/[^/]+\/(?:progress|complete)$/.test(pathName);
+  if (workerPathAllowed && hasScopedWorkerScope(req.user, "worker:poll")) return true;
+
+  res.status(403).json({
+    success: false,
+    code: "SCOPED_TOKEN_FORBIDDEN",
+    error: "插件 token 只能访问采集提交和 worker 队列接口。",
+  });
+  return false;
 }
 
 function isSecureRequest(req) {
@@ -502,6 +688,24 @@ async function requireAuth(req, res, next) {
   } catch (error) {
     next(error);
   }
+}
+
+async function assertActiveStoreAccess(storeId, userId, columns = "id, name") {
+  if (!db) {
+    const error = new Error("服务端未配置 DATABASE_URL。");
+    error.statusCode = 503;
+    throw error;
+  }
+  const result = await db.query(
+    `SELECT ${columns} FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE`,
+    [storeId, userId],
+  );
+  if (!result.rows[0]) {
+    const error = new Error("店铺不存在、已停用或无权限");
+    error.statusCode = 404;
+    throw error;
+  }
+  return result.rows[0];
 }
 
 function buildLoginHtml(message = "") {
@@ -648,6 +852,8 @@ async function initDatabase() {
         api_key TEXT NOT NULL,
         watermark_enabled BOOLEAN NOT NULL DEFAULT FALSE,
         watermark_text TEXT NOT NULL DEFAULT '',
+        ai_image_provider TEXT NOT NULL DEFAULT '',
+        ai_image_model TEXT NOT NULL DEFAULT '',
         active BOOLEAN NOT NULL DEFAULT TRUE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -784,6 +990,8 @@ async function initDatabase() {
     await db.query(`
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS watermark_enabled BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS watermark_text TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS ai_image_provider TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS ai_image_model TEXT NOT NULL DEFAULT '';
 
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS price_rub NUMERIC(12,2);
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS weight INTEGER;
@@ -1527,6 +1735,127 @@ function mapOzonStatus(info) {
   return "READY_TO_SUPPLY";
 }
 
+const PRODUCT_STATUS_DISPLAY = {
+  ALL: "全部",
+  VISIBLE: "销售中",
+  READY_TO_SUPPLY: "待销售",
+  NEED_ATTENTION: "需修改",
+  NOT_MODERATED: "待审核",
+  FAILED_MODERATION: "审核失败",
+  IN_ACTIVE: "已下架",
+  UNKNOWN: "未知状态",
+};
+
+const PRODUCT_STATUS_HINT = {
+  ALL: "全部本地商品缓存",
+  VISIBLE: "Ozon 前台可见，可正常售卖",
+  READY_TO_SUPPLY: "资料已准备，待补库存或供货后销售",
+  NEED_ATTENTION: "Ozon 要求补齐资料，请查看体检或审核原因",
+  NOT_MODERATED: "已提交 Ozon，正在审核中",
+  FAILED_MODERATION: "审核失败，请先处理 Ozon 返回的问题",
+  IN_ACTIVE: "已下架或归档，可重新上架恢复",
+  UNKNOWN: "Ozon 未返回明确业务状态",
+};
+
+function productStatusDisplay(status, rawName = "") {
+  const key = String(status || "UNKNOWN").trim().toUpperCase();
+  return PRODUCT_STATUS_DISPLAY[key] || String(rawName || status || "未知状态");
+}
+
+function productStatusHint(status) {
+  const key = String(status || "UNKNOWN").trim().toUpperCase();
+  return PRODUCT_STATUS_HINT[key] || PRODUCT_STATUS_HINT.UNKNOWN;
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (!value) return [];
+  try {
+    const parsed = typeof value === "string" ? JSON.parse(value) : value;
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function summarizeStocksJson(stocksJson) {
+  const stocks = parseJsonArray(stocksJson).filter((item) => item && typeof item === "object");
+  const warehouseIds = [...new Set(stocks
+    .map((item) => Number(item.warehouse_id || 0))
+    .filter((id) => Number.isFinite(id) && id > 0))];
+  return {
+    warehouse_count: warehouseIds.length,
+    warehouse_ids: warehouseIds,
+    total_stock: stocks.reduce((sum, item) => sum + (Number(item.present) || 0), 0),
+    total_reserved: stocks.reduce((sum, item) => sum + (Number(item.reserved) || 0), 0),
+    sources: [...new Set(stocks.map((item) => String(item.source || "").trim()).filter(Boolean))],
+    has_pool_stock: stocks.some((item) => !Number(item.warehouse_id || 0)),
+  };
+}
+
+function enrichProductReadModel(row = {}) {
+  const stockSummary = summarizeStocksJson(row.stocks_json);
+  const fallbackStock = Number(row.stock || 0);
+  const totalStock = stockSummary.warehouse_count || stockSummary.has_pool_stock
+    ? stockSummary.total_stock
+    : fallbackStock;
+  const categoryId = row.description_category_id == null ? null : Number(row.description_category_id);
+  const typeId = row.type_id == null ? null : Number(row.type_id);
+  return {
+    ...row,
+    status_display: productStatusDisplay(row.status, row.status_name),
+    status_hint: productStatusHint(row.status),
+    category_display: row.category_name || (categoryId ? `Ozon 类目 ${categoryId}` : "未设置"),
+    category_readonly: {
+      category_name: row.category_name || "",
+      description_category_id: Number.isFinite(categoryId) && categoryId > 0 ? categoryId : null,
+      type_id: Number.isFinite(typeId) && typeId > 0 ? typeId : null,
+      editable_via: "/api/seller/products/:offer_id/full-update",
+    },
+    stock_readonly: {
+      editable: false,
+      value: fallbackStock,
+      total_stock: totalStock,
+      total_reserved: stockSummary.total_reserved,
+      reason: "库存按仓库维护，请使用库存管理接口。",
+    },
+    warehouse_summary: stockSummary,
+  };
+}
+
+function warehouseStatusDisplay(status) {
+  const value = String(status || "active").trim().toLowerCase();
+  const map = {
+    active: "启用",
+    disabled: "停用",
+    blocked: "受限",
+    archived: "已归档",
+  };
+  return map[value] || status || "未知状态";
+}
+
+function warehouseSourceDisplay(source) {
+  const value = String(source || "").trim().toLowerCase();
+  const map = {
+    fbs: "FBS 仓库",
+    fbo: "FBO 仓库",
+    rfbs: "RFBS 仓库",
+    crossborder: "跨境仓",
+  };
+  return map[value] || source || "仓库";
+}
+
+function enrichWarehouseReadModel(warehouse = {}) {
+  const source = warehouse.source || (warehouse.is_rfbs ? "rfbs" : "fbs");
+  return {
+    ...warehouse,
+    warehouse_name: warehouse.warehouse_name || warehouse.name || `WH-${warehouse.warehouse_id || "?"}`,
+    source,
+    source_display: warehouseSourceDisplay(source),
+    status_display: warehouseStatusDisplay(warehouse.status),
+  };
+}
+
 /**
  * v0.3.4 仓库列表 - Ozon /v2/warehouse/list (卖家自有 FBS 仓库)
  * 返回: [{warehouse_id, name, status, is_kgt, address_info, first_mile, ...}]
@@ -1544,7 +1873,7 @@ app.get("/api/seller/warehouses", requireAuth, async (req, res) => {
       is_kgt: w.is_kgt === true,
       city: w.address_info?.address || "",
       phone: w.phone || "",
-    }));
+    })).map(enrichWarehouseReadModel);
     res.json({ success: true, warehouses });
   } catch (error) {
     console.error("[warehouses]", error.message, error.payload);
@@ -1693,7 +2022,7 @@ app.get("/api/seller/products/stocks/detail", requireAuth, async (req, res) => {
       product_id: prod.product_id,
       total_stock: merged.reduce((s, x) => s + (x.present || 0), 0),
       total_reserved: merged.reduce((s, x) => s + (x.reserved || 0), 0),
-      warehouses: merged,
+      warehouses: merged.map(enrichWarehouseReadModel),
     });
   } catch (error) {
     console.error("[stocks/detail]", error.message, error.payload);
@@ -2117,7 +2446,7 @@ app.get("/api/inventory", requireAuth, async (req, res, next) => {
       [...params, limit, offset]
     );
 
-    res.json({ success: true, items: result.rows, total });
+    res.json({ success: true, items: result.rows.map(enrichProductReadModel), total });
   } catch (e) { next(e); }
 });
 
@@ -2560,13 +2889,53 @@ app.post("/api/seller/analytics/categories", requireAuth, async (req, res, next)
 });
 
 app.post("/api/seller/analytics/bestsellers", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
   try {
-    const storeId = req.body?.store_id || req.body?.storeId;
-    const data = await callOzonSellerAPI("/v1/analytics/item_stock_forecast", {
-      limit: 100,
-      offset: 0
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 100)));
+    const offset = Math.max(0, Number(req.body?.offset || 0));
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const owned = await db.query(
+      "SELECT id FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE",
+      [storeId, req.user.id],
+    );
+    if (!owned.rowCount) return res.status(404).json({ success: false, error: "店铺不存在、已停用或无权限" });
+    const to = new Date();
+    const since = new Date(to.getTime() - 90 * 86400e3);
+    const ozonData = await callOzonSellerAPI("/v3/posting/fbs/list", {
+      dir: "DESC",
+      filter: { since: since.toISOString(), to: to.toISOString() },
+      limit: 1000,
+      offset: 0,
+      with: { financial_data: false, analytics_data: false },
     }, { storeId, userId: req.user.id });
-    res.json({ success: true, data });
+    const salesMap = new Map();
+    for (const posting of (ozonData?.result?.postings || [])) {
+      for (const product of (posting?.products || [])) {
+        const offerId = String(product?.offer_id || "").trim();
+        if (!offerId) continue;
+        const current = salesMap.get(offerId) || { offer_id: offerId, sku: String(product?.sku || ""), name: product?.name || offerId, sales: 0 };
+        current.sales += Math.max(0, Number(product?.quantity || 0));
+        salesMap.set(offerId, current);
+      }
+    }
+    const ranked = [...salesMap.values()].sort((a, b) => b.sales - a.sales || a.offer_id.localeCompare(b.offer_id));
+    const page = ranked.slice(offset, offset + limit);
+    const offerIds = page.map((row) => row.offer_id);
+    const local = offerIds.length ? await db.query(
+      `SELECT offer_id, name, sku, stock FROM app_products
+        WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+      [req.user.id, storeId, offerIds],
+    ) : { rows: [] };
+    const localMap = new Map(local.rows.map((row) => [row.offer_id, row]));
+    const items = page.map((row) => {
+      const product = localMap.get(row.offer_id) || {};
+      return { ...row, name: product.name || row.name, sku: String(product.sku || row.sku || ""), stock: Number(product.stock || 0) };
+    });
+    res.json({
+      success: true,
+      data: { result: { items, total: ranked.length, period_days: 90 } },
+    });
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
@@ -3207,6 +3576,9 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
     const search = String(req.body?.search || "").trim();
 
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    if (!OZON_VISIBILITY_ENUM.has(visibility)) {
+      return res.status(400).json({ success: false, error: "不支持的商品状态" });
+    }
 
     // 1. 构建过滤条件
     const where = ["user_id = $1 AND store_id = $2"];
@@ -3226,7 +3598,7 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
     const rows = await db.query(
       `SELECT id, offer_id, name, image, images, price, min_price, old_price, currency_code, vat, stock,
               brand, country_of_origin, description,
-              status, status_name, category_name, price_index,
+              status, status_name, category_name, description_category_id, type_id, price_index,
               product_id, sku, model_id, barcode,
               weight, depth, width, height, dimension_unit, weight_unit,
               stocks_json, purchase_price_cny, source_url_1688,
@@ -3267,7 +3639,7 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
       if (!row.image) issues.push("缺少主图");
       if (!row.brand) issues.push("缺少品牌");
       if (!row.description) issues.push("缺少描述");
-      return { ...row, compliance_issues: issues, compliance_ok: issues.length === 0 };
+      return enrichProductReadModel({ ...row, compliance_issues: issues, compliance_ok: issues.length === 0 });
     });
 
     res.json({
@@ -3678,6 +4050,38 @@ app.post("/api/ai/translate", requireAuth, async (req, res) => {
   }
 });
 
+function parseAiJsonObject(rawContent) {
+  const cleaned = String(rawContent || "")
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/```(?:json)?|```/gi, "")
+    .trim();
+
+  const starts = [];
+  for (let i = 0; i < cleaned.length; i += 1) {
+    if (cleaned[i] === "{") starts.push(i);
+  }
+  for (const start of starts) {
+    let depth = 0;
+    let quoted = false;
+    let escaped = false;
+    for (let i = start; i < cleaned.length; i += 1) {
+      const char = cleaned[i];
+      if (quoted) {
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') quoted = false;
+        continue;
+      }
+      if (char === '"') quoted = true;
+      else if (char === "{") depth += 1;
+      else if (char === "}" && --depth === 0) {
+        try { return JSON.parse(cleaned.slice(start, i + 1)); } catch { break; }
+      }
+    }
+  }
+  try { return JSON.parse(cleaned); } catch { return null; }
+}
+
 app.post("/api/ai/analyze", requireAuth, async (req, res) => {
   const abortController = new AbortController();
   const timeoutId = setTimeout(() => abortController.abort(), 120000);   // v0.3.7: 40s → 120s (MiniMax M3 多图常 60s+)
@@ -3729,11 +4133,14 @@ app.post("/api/ai/analyze", requireAuth, async (req, res) => {
       `3) ${titleKey}: ${marketProfile.title_lang_hint}`,
       `4) selling_points: 3-5 个核心卖点 (中文, 每条 8-20 字, 崇尚真实基于图片实际内容, 严禁瞎编)`,
       `5) image_prompt: 一段英文生图 prompt (60-120 词), 用于万相 2.7 生成主图, 融合平台风格关键词: ${marketProfile.image_style_kw}`,
+      `6) brand: 仅在标题或图片能明确识别品牌时填写, 无法确认则留空, 严禁猜测`,
+      `7) category_name: 商品类目中文名称 (2-10 字)`,
+      `8) description: ${marketProfile.title_lang}商品描述 (80-180 字, 只写可确认的信息, 不使用 HTML)`,
       ``,
       `【输出格式 - 必须严格遵守】`,
       `只输出一个 JSON 对象, 不要任何解释文字、不要前后说明、不要 markdown code fence。`,
       `格式如下:`,
-      `{"product_type":"", "title_zh":"", "${titleKey}":"", "selling_points":[], "image_prompt":""}`,
+      `{"product_type":"", "title_zh":"", "${titleKey}":"", "selling_points":[], "image_prompt":"", "brand":"", "category_name":"", "description":""}`,
     ].filter(Boolean).join("\n");
 
     // v0.3.7: MiniMax M3 需要 data URL 或 公网 URL, 本地 /uploads/xxx 须读盘转 base64
@@ -3796,6 +4203,7 @@ app.post("/api/ai/analyze", requireAuth, async (req, res) => {
         messages: [{ role: "user", content }],
         temperature: 0.3,
         max_completion_tokens: 2400,
+        ...buildMiniMaxThinkingOptions(MINIMAX_THINKING_TYPE),
       }),
     });
     clearTimeout(timeoutId);
@@ -3807,17 +4215,39 @@ app.post("/api/ai/analyze", requireAuth, async (req, res) => {
     }
     const payload = JSON.parse(raw);
     let resultText = payload?.choices?.[0]?.message?.content || "";
-    // 清洗 markdown 围栏
-    resultText = resultText.replace(/```json|```/g, "").trim();
+    let parsed = parseAiJsonObject(resultText);
 
-    // 提取首个 JSON 对象
-    const jsonMatch = resultText.match(/\{[\s\S]*\}/);
-    let parsed;
-    try {
-      parsed = JSON.parse(jsonMatch ? jsonMatch[0] : resultText);
-    } catch (e) {
-      console.error("[AI-Analyze] JSON 解析失败, 原始:", resultText.slice(0, 500));
-      return res.status(502).json({ success: false, error: "AI 返回非 JSON, 请重试", raw: resultText.slice(0, 500) });
+    if (!parsed) {
+      console.warn("[AI-Analyze] 首次返回非 JSON, 自动纠正一次:", resultText.slice(0, 300));
+      const repairResp = await fetch(`${MINIMAX_BASE_URL}/chat/completions`, {
+        method: "POST",
+        signal: abortController.signal,
+        headers: {
+          "Authorization": `Bearer ${process.env.MINIMAX_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: MINIMAX_MODEL,
+          messages: [{
+            role: "user",
+            content: `把下面内容整理成合法 JSON。只输出 JSON 对象，不要思考过程、解释或代码围栏。必须包含 product_type、title_zh、${titleKey}、selling_points、image_prompt、brand、category_name、description。\n\n${resultText.slice(0, 8000)}`,
+          }],
+          temperature: 0.1,
+          max_completion_tokens: 1600,
+          ...buildMiniMaxThinkingOptions("disabled"),
+        }),
+      });
+      const repairRaw = await repairResp.text();
+      if (repairResp.ok) {
+        const repairPayload = JSON.parse(repairRaw);
+        resultText = repairPayload?.choices?.[0]?.message?.content || "";
+        parsed = parseAiJsonObject(resultText);
+      }
+    }
+
+    if (!parsed) {
+      console.error("[AI-Analyze] JSON 纠正后仍解析失败, 原始:", resultText.slice(0, 500));
+      return res.status(502).json({ success: false, error: "AI 分析结果格式异常，请重新生成", raw: resultText.slice(0, 500) });
     }
 
     // 结构规范化
@@ -3828,6 +4258,9 @@ app.post("/api/ai/analyze", requireAuth, async (req, res) => {
       title_en: String(parsed.title_en || "").trim(),
       selling_points: Array.isArray(parsed.selling_points) ? parsed.selling_points.slice(0, 6) : [],
       image_prompt: String(parsed.image_prompt || "").trim(),
+      brand: String(parsed.brand || "").trim(),
+      category_name: String(parsed.category_name || parsed.product_type || "").trim(),
+      description: String(parsed.description || "").trim(),
       target_market: targetMarket,
       model: MINIMAX_MODEL,
     };
@@ -4324,10 +4757,27 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
         `UPDATE app_listing_history SET status = $1, errors_json = $2::jsonb, updated_at = now() WHERE task_id = $3 AND user_id = $4`,
         [localStatus, JSON.stringify(errors), String(taskId), req.user.id],
       );
-      res.json({ success: true, ozonStatus, localStatus, errors, pictureResult, attributeResult, stockResult });
+      res.json({
+        success: true,
+        ozonStatus,
+        localStatus,
+        status_canonical: listingStatusToContractStatus(localStatus),
+        status_display: listingDisplayStatus(listingStatusToContractStatus(localStatus)),
+        errors,
+        pictureResult,
+        attributeResult,
+        stockResult,
+      });
       return;
     }
-    res.json({ success: true, ozonStatus, localStatus, errors });
+    res.json({
+      success: true,
+      ozonStatus,
+      localStatus,
+      status_canonical: listingStatusToContractStatus(localStatus),
+      status_display: listingDisplayStatus(listingStatusToContractStatus(localStatus)),
+      errors,
+    });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 
@@ -4356,6 +4806,93 @@ function enrichListingErrors(errors) {
   }));
 }
 
+function listingErrorSummary(errors) {
+  const enriched = enrichListingErrors(errors);
+  const first = enriched[0] || {};
+  const readable = enriched
+    .map((error) => error.message_zh || error.message || error.description || error.code || "")
+    .filter(Boolean);
+  return {
+    errors_json: enriched,
+    error_count: enriched.length,
+    error_summary: readable.slice(0, 3).join("；"),
+    first_error_code: first.code || "",
+    first_error_message: first.message || first.description || "",
+    first_error_message_zh: first.message_zh || "",
+  };
+}
+
+const LISTING_STATUS_CONTRACT = ["queued", "claimed", "running", "ozon_processing", "partial_success", "success", "failed", "cancelled"];
+
+function listingStatusToContractStatus(status, partialSuccess = false) {
+  if (partialSuccess) return "partial_success";
+  const value = String(status || "").trim().toLowerCase();
+  const map = {
+    queued: "queued",
+    claimed: "claimed",
+    running: "running",
+    pending: "ozon_processing",
+    processing: "ozon_processing",
+    moderating: "ozon_processing",
+    ozon_processing: "ozon_processing",
+    imported: "success",
+    success: "success",
+    done: "success",
+    failed: "failed",
+    error: "failed",
+    cancelled: "cancelled",
+    canceled: "cancelled",
+  };
+  return map[value] || "ozon_processing";
+}
+
+function listingDisplayStatus(contractStatus) {
+  const map = {
+    queued: "处理中",
+    claimed: "处理中",
+    running: "处理中",
+    ozon_processing: "处理中",
+    partial_success: "部分成功",
+    success: "已完成",
+    failed: "失败",
+    cancelled: "失败",
+  };
+  return map[contractStatus] || "处理中";
+}
+
+function listingStatusSqlCondition(status, alias, params) {
+  const value = String(status || "").trim();
+  if (!value || value === "all") return "";
+  if (["processing", "pending", "ozon_processing"].includes(value)) return `${alias}.status IN ('processing','pending','moderating','ozon_processing')`;
+  if (value === "success") return `${alias}.status IN ('imported','success')`;
+  if (value === "partial_success") return `${alias}.partial_success = TRUE`;
+  if (value === "cancelled" || value === "canceled") return `${alias}.status IN ('cancelled','canceled')`;
+  params.push(value);
+  return `${alias}.status = $${params.length}`;
+}
+
+app.get("/api/v1/listings/status-contract", requireAuth, async (_req, res) => {
+  res.json({
+    success: true,
+    code: "OK",
+    data: {
+      statuses: LISTING_STATUS_CONTRACT,
+      legacyMapping: {
+        pending: "ozon_processing",
+        processing: "ozon_processing",
+        moderating: "ozon_processing",
+        imported: "success",
+        done: "success",
+        error: "failed",
+        canceled: "cancelled",
+      },
+      display: Object.fromEntries(LISTING_STATUS_CONTRACT.map((status) => [status, listingDisplayStatus(status)])),
+    },
+    requestId: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
 // v2.1.9: 上架历史列表 (含统计) - 用户在前端"上架记录"页用
 app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
   try {
@@ -4370,15 +4907,8 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
 
     const conds = ["lh.user_id = $1"];
     const params = [userId];
-    if (status && status !== "all") {
-      // 兼容: 处理中 = processing + pending
-      if (status === "processing") {
-        conds.push(`lh.status IN ('processing','pending')`);
-      } else {
-        params.push(status);
-        conds.push(`lh.status = $${params.length}`);
-      }
-    }
+    const statusCondition = listingStatusSqlCondition(status, "lh", params);
+    if (statusCondition) conds.push(statusCondition);
     if (storeId) { params.push(storeId); conds.push(`lh.store_id = $${params.length}`); }
     if (sku) { params.push(`%${sku}%`); conds.push(`(lh.offer_id ILIKE $${params.length} OR lh.product_name ILIKE $${params.length} OR lh.task_id ILIKE $${params.length})`); }
     if (startDate) { params.push(startDate); conds.push(`lh.created_at >= $${params.length}`); }
@@ -4404,9 +4934,9 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
     const statsSql = `
       SELECT
         COUNT(*) AS total,
-        COUNT(*) FILTER (WHERE lh.status = 'imported') AS imported,
+        COUNT(*) FILTER (WHERE lh.status IN ('imported','success')) AS imported,
         COUNT(*) FILTER (WHERE lh.status = 'failed') AS failed,
-        COUNT(*) FILTER (WHERE lh.status IN ('processing','pending')) AS processing,
+        COUNT(*) FILTER (WHERE lh.status IN ('processing','pending','moderating','ozon_processing')) AS processing,
         COUNT(*) FILTER (WHERE lh.created_at >= CURRENT_DATE) AS today
       FROM app_listing_history lh
       WHERE ${where}`;
@@ -4423,10 +4953,16 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
 
     res.json({
       success: true,
-      items: listRes.rows.map(r => ({
-        ...r,
-        errors_json: enrichListingErrors(r.errors_json),
-      })),
+      items: listRes.rows.map(r => {
+        const statusCanonical = listingStatusToContractStatus(r.status, r.partial_success);
+        return {
+          ...r,
+          ...listingErrorSummary(r.errors_json),
+          status_canonical: statusCanonical,
+          status_display: listingDisplayStatus(statusCanonical),
+        };
+      }),
+      status_contract: LISTING_STATUS_CONTRACT,
       total: Number(stats.total || 0),
       stats: {
         total: Number(stats.total || 0),
@@ -4454,10 +4990,8 @@ app.post("/api/seller/listing-history/export", requireAuth, async (req, res) => 
     const startDate = String(req.body?.start_date || "").trim();
     const endDate = String(req.body?.end_date || "").trim();
     if (storeId) { params.push(storeId); conditions.push(`lh.store_id = $${params.length}`); }
-    if (status && status !== "all") {
-      if (status === "processing") conditions.push("lh.status IN ('processing','pending')");
-      else { params.push(status); conditions.push(`lh.status = $${params.length}`); }
-    }
+    const statusCondition = listingStatusSqlCondition(status, "lh", params);
+    if (statusCondition) conditions.push(statusCondition);
     if (sku) { params.push(`%${sku}%`); conditions.push(`(lh.offer_id ILIKE $${params.length} OR lh.product_name ILIKE $${params.length} OR lh.task_id ILIKE $${params.length})`); }
     if (startDate) { params.push(startDate); conditions.push(`lh.created_at >= $${params.length}`); }
     if (endDate) { params.push(endDate); conditions.push(`lh.created_at < ($${params.length}::date + interval '1 day')`); }
@@ -4637,7 +5171,27 @@ app.post("/api/seller/products/stocks", requireAuth, async (req, res, next) => {
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null }); }
 });
 
-app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
+app.get("/api/v1/ai/images/providers", requireAuth, async (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    success: true,
+    code: "OK",
+    data: {
+      defaultProvider: AI_IMAGE_PROVIDER,
+      providerOrder: AI_IMAGE_PROVIDER_ORDER,
+      providers: {
+        agnes: { configured: Boolean(AGNES_API_KEY), model: AGNES_IMAGE_MODEL },
+        tokendun: { configured: Boolean(TOKENDUN_API_KEY), model: TOKENDUN_IMAGE_MODEL },
+        wanxiang: { configured: Boolean(DASHSCOPE_API_KEY), model: DASHSCOPE_IMAGE_MODEL },
+        minimax: { configured: Boolean(process.env.MINIMAX_API_KEY), model: MINIMAX_IMAGE_MODEL },
+      },
+    },
+    requestId: crypto.randomUUID(),
+    timestamp: new Date().toISOString(),
+  });
+});
+
+async function handleAiImageGenerate(req, res, next) {
   const userKey = String(req.user.id);
   const activeCount = Number(aiImageActiveByUser.get(userKey) || 0);
   if (activeCount >= 2) {
@@ -4645,64 +5199,237 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
   }
   aiImageActiveByUser.set(userKey, activeCount + 1);
   try {
-    const apiKey = process.env.MINIMAX_API_KEY;
-    if (!apiKey) {
-      res.status(503).json({ success: false, error: "未配置 MINIMAX_API_KEY（请在 .env 里填写）" });
-      return;
-    }
     const { prompt, image: refImage, aspectRatio = "3:4", n = 1, model: reqModel, scenePreset = "" } = req.body || {};
     const storeId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    let storeAiModel = "";
     if (storeId && db) {
-      const store = await db.query("SELECT id FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE", [storeId, req.user.id]);
+      const store = await db.query("SELECT id, ai_image_model FROM app_stores WHERE id = $1 AND user_id = $2 AND active = TRUE", [storeId, req.user.id]);
       if (!store.rowCount) return res.status(404).json({ success: false, error: "店铺不存在、已停用或无权限" });
+      storeAiModel = String(store.rows[0]?.ai_image_model || "").trim();
     }
+    const requestedModel = String(reqModel || storeAiModel || "").trim();
     if (!prompt) {
       res.status(400).json({ success: false, error: "需要 prompt 字段" });
       return;
     }
-    // MiniMax image-01 官方 n 上限是 9
     const requestedN = Math.min(9, Math.max(1, Number(n) || 1));
-    const body = {
-      model: reqModel || MINIMAX_IMAGE_MODEL,
-      prompt: String(prompt).slice(0, 2000),
-      n: requestedN,
-      aspect_ratio: aspectRatio,
-      prompt_optimizer: true,  // 让 MiniMax 自动优化 prompt，更好地理解参考图中的商品
-    };
-    // MiniMax image-01 i2i: subject_reference 锁定主体
-    // type: "character" = 锁定人物 | "object" = 锁定物体/商品
-    // 格式: [{ type: "object", image_file: "url_or_base64" }]
+    const normalizedPrompt = String(prompt).slice(0, 1500);
     const rawReference = Array.isArray(refImage) ? refImage[0] : refImage;
+    let accessibleReference = "";
     if (rawReference) {
       const reference = String(rawReference).trim();
       const publicBaseUrl = getRequestPublicBaseUrl(req);
-      const accessibleReference = /^\/uploads\//i.test(reference) && publicBaseUrl ? `${publicBaseUrl}${reference}` : reference;
+      accessibleReference = /^\/uploads\//i.test(reference) && publicBaseUrl ? `${publicBaseUrl}${reference}` : reference;
       if (!/^https:\/\//i.test(accessibleReference) && !/^data:image\//i.test(accessibleReference)) {
         return res.status(400).json({ success: false, error: "参考图必须是公网 HTTPS 图片或 Base64 图片" });
       }
-      body.subject_reference = [{ type: "object", image_file: accessibleReference }];
     }
-    const response = await fetch(`${MINIMAX_BASE_URL}/image_generation`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const text = await response.text();
+
     let payload = null;
-    try { payload = JSON.parse(text); } catch { payload = { raw: text.slice(0, 4000) }; }
-    if (!response.ok) {
-      const friendlyError = /illegal|safety|content|sensitive|违规|敏感/i.test(text)
-        ? "生成失败：Prompt 或素材触发内容安全限制，请调整后重试"
-        : `MiniMax 图生 ${response.status}：${text.slice(0, 500)}`;
-      res.status(response.status || 502).json({ success: false, error: friendlyError, payload });
-      return;
+    let providerModel = "";
+    const providerAttempts = [];
+    const recordProviderAttempt = (provider, status, model = "", reason = "") => {
+      providerAttempts.push({
+        provider,
+        status,
+        ...(model ? { model: String(model).slice(0, 80) } : {}),
+        ...(reason ? { reason: String(reason).slice(0, 500) } : {}),
+      });
+    };
+    let remoteUrls = [];
+    let generatedBuffers = [];
+    let perImageCostUsd = MINIMAX_IMAGE_PER_IMAGE_USD;
+    if (AI_IMAGE_PROVIDER === "agnes" && !AGNES_API_KEY) {
+      recordProviderAttempt("Agnes 2.0", "skipped", AGNES_IMAGE_MODEL, "未配置 Agnes API Key");
     }
-    const remoteUrls = payload?.data?.image_urls || [];
-    if (!remoteUrls.length) {
-      return res.status(502).json({ success: false, error: "MiniMax 未返回生成图片，请稍后重试", payload });
+    if (AI_IMAGE_PROVIDER === "agnes" && AGNES_API_KEY) {
+      try {
+        providerModel = AGNES_IMAGE_MODEL;
+        perImageCostUsd = AGNES_IMAGE_PER_IMAGE_USD;
+        for (let index = 0; index < requestedN; index += 1) {
+          const extraBody = { response_format: "url" };
+          if (accessibleReference) extraBody.image = [accessibleReference];
+          const response = await fetch(`${AGNES_BASE_URL}/images/generations`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${AGNES_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: providerModel,
+              prompt: normalizedPrompt,
+              size: "1K",
+              ratio: ["1:1", "3:4", "9:16"].includes(aspectRatio) ? aspectRatio : "3:4",
+              extra_body: extraBody,
+            }),
+            signal: AbortSignal.timeout(240000),
+          });
+          const text = await response.text();
+          let imagePayload = null;
+          try { imagePayload = JSON.parse(text); } catch { imagePayload = { raw: text.slice(0, 4000) }; }
+          if (!response.ok || imagePayload?.error) {
+            throw new Error(imagePayload?.error?.message || imagePayload?.message || `HTTP ${response.status}`);
+          }
+          const imageUrl = imagePayload?.data?.[0]?.url;
+          const imageBase64 = imagePayload?.data?.[0]?.b64_json;
+          if (imageUrl) remoteUrls.push(imageUrl);
+          else if (imageBase64) generatedBuffers.push(Buffer.from(imageBase64, "base64"));
+          else throw new Error("未返回图片数据");
+          payload = imagePayload;
+        }
+        recordProviderAttempt("Agnes 2.0", "success", providerModel);
+      } catch (error) {
+        recordProviderAttempt("Agnes 2.0", "failed", providerModel || AGNES_IMAGE_MODEL, error.message);
+        console.warn(`[AI-Images] Agnes 失败，切换 TokenDun: ${error.message}`);
+        providerModel = "";
+        remoteUrls = [];
+        generatedBuffers = [];
+      }
+    }
+
+    if (!remoteUrls.length && !generatedBuffers.length && ["tokendun", "agnes"].includes(AI_IMAGE_PROVIDER) && TOKENDUN_API_KEY) {
+      try {
+        providerModel = TOKENDUN_IMAGE_MODEL;
+        perImageCostUsd = TOKENDUN_IMAGE_PER_IMAGE_USD;
+        const sizeByRatio = { "1:1": "1024x1024", "3:4": "1024x1536", "9:16": "1024x1536" };
+        let response;
+        if (accessibleReference) {
+          const imageResponse = await fetch(accessibleReference, { signal: AbortSignal.timeout(60000) });
+          if (!imageResponse.ok) throw new Error(`参考图下载失败 HTTP ${imageResponse.status}`);
+          const imageType = String(imageResponse.headers.get("content-type") || "image/png").split(";")[0];
+          const form = new FormData();
+          form.append("model", providerModel);
+          form.append("prompt", normalizedPrompt);
+          form.append("size", sizeByRatio[aspectRatio] || "1024x1536");
+          form.append("quality", TOKENDUN_IMAGE_QUALITY);
+          form.append("n", String(requestedN));
+          form.append("image", new Blob([await imageResponse.arrayBuffer()], { type: imageType }), "reference.png");
+          response = await fetch(`${TOKENDUN_BASE_URL}/images/edits`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${TOKENDUN_API_KEY}` },
+            body: form,
+            signal: AbortSignal.timeout(180000),
+          });
+        } else {
+          response = await fetch(`${TOKENDUN_BASE_URL}/images/generations`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${TOKENDUN_API_KEY}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: providerModel,
+              prompt: normalizedPrompt,
+              size: sizeByRatio[aspectRatio] || "1024x1536",
+              quality: TOKENDUN_IMAGE_QUALITY,
+              n: requestedN,
+            }),
+            signal: AbortSignal.timeout(180000),
+          });
+        }
+        const text = await response.text();
+        try { payload = JSON.parse(text); } catch { payload = { raw: text.slice(0, 4000) }; }
+        if (!response.ok || payload?.error) {
+          throw new Error(payload?.error?.message || payload?.message || `HTTP ${response.status}`);
+        }
+        remoteUrls = (payload?.data || []).map((item) => item?.url).filter(Boolean);
+        generatedBuffers = (payload?.data || [])
+          .map((item) => item?.b64_json)
+          .filter(Boolean)
+          .map((value) => Buffer.from(value, "base64"));
+        if (!remoteUrls.length && !generatedBuffers.length) throw new Error("未返回图片数据");
+        recordProviderAttempt("TokenDun", "success", providerModel);
+      } catch (error) {
+        recordProviderAttempt("TokenDun", "failed", providerModel || TOKENDUN_IMAGE_MODEL, error.message);
+        console.warn(`[AI-Images] TokenDun 失败，切换备用供应商: ${error.message}`);
+        providerModel = "";
+        remoteUrls = [];
+        generatedBuffers = [];
+      }
+    }
+
+    if (!remoteUrls.length && !generatedBuffers.length && accessibleReference) {
+      if (DASHSCOPE_API_KEY) {
+        try {
+          providerModel = requestedModel && /^wan/i.test(String(requestedModel)) ? String(requestedModel) : DASHSCOPE_IMAGE_MODEL;
+          perImageCostUsd = DASHSCOPE_IMAGE_PER_IMAGE_USD;
+          const sizeByRatio = { "1:1": "1280*1280", "3:4": "960*1280", "9:16": "720*1280" };
+          for (let remaining = requestedN; remaining > 0; remaining -= 4) {
+            const batchSize = Math.min(4, remaining);
+            const response = await fetch(`${DASHSCOPE_BASE_URL}/services/aigc/multimodal-generation/generation`, {
+              method: "POST",
+              headers: { Authorization: `Bearer ${DASHSCOPE_API_KEY}`, "Content-Type": "application/json" },
+              body: JSON.stringify({
+                model: providerModel,
+                input: { messages: [{ role: "user", content: [{ image: accessibleReference }, { text: normalizedPrompt }] }] },
+                parameters: {
+                  size: sizeByRatio[aspectRatio] || "960*1280",
+                  n: batchSize,
+                  enable_interleave: false,
+                  prompt_extend: false,
+                  watermark: false,
+                },
+              }),
+              signal: AbortSignal.timeout(180000),
+            });
+            const text = await response.text();
+            let batchPayload = null;
+            try { batchPayload = JSON.parse(text); } catch { batchPayload = { raw: text.slice(0, 4000) }; }
+            payload = batchPayload;
+            const batchUrls = (batchPayload?.output?.choices || [])
+              .flatMap((choice) => choice?.message?.content || [])
+              .map((item) => item?.image)
+              .filter(Boolean);
+            if (!response.ok || !batchUrls.length) {
+              const detail = batchPayload?.message || batchPayload?.code || batchPayload?.output?.message || text.slice(0, 500);
+              throw new Error(`万相图像编辑失败：${detail}`);
+            }
+            remoteUrls.push(...batchUrls);
+          }
+          recordProviderAttempt("万相", "success", providerModel);
+        } catch (error) {
+          recordProviderAttempt("万相", "failed", providerModel || DASHSCOPE_IMAGE_MODEL, error.message);
+          console.warn(`[AI-Images] 万相失败，切换 MiniMax: ${error.message}`);
+          providerModel = "";
+          remoteUrls = [];
+          generatedBuffers = [];
+        }
+      } else {
+        recordProviderAttempt("万相", "skipped", DASHSCOPE_IMAGE_MODEL, "未配置 DASHSCOPE_API_KEY");
+        console.warn("[AI-Images] 未配置 DASHSCOPE_API_KEY，跳过万相并切换 MiniMax");
+      }
+    }
+
+    if (!remoteUrls.length && !generatedBuffers.length) {
+      const apiKey = process.env.MINIMAX_API_KEY;
+      if (!apiKey) {
+        recordProviderAttempt("MiniMax", "skipped", requestedModel || MINIMAX_IMAGE_MODEL, "未配置 MINIMAX_API_KEY");
+        return res.status(503).json({ success: false, error: "未配置 MINIMAX_API_KEY", usage: { providerAttempts } });
+      }
+      providerModel = requestedModel || MINIMAX_IMAGE_MODEL;
+      const body = {
+        model: providerModel,
+        prompt: normalizedPrompt,
+        n: requestedN,
+        aspect_ratio: aspectRatio,
+        response_format: "url",
+        prompt_optimizer: true,
+      };
+      const response = await fetch(`${MINIMAX_BASE_URL}/image_generation`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(180000),
+      });
+      const text = await response.text();
+      try { payload = JSON.parse(text); } catch { payload = { raw: text.slice(0, 4000) }; }
+      const businessCode = Number(payload?.base_resp?.status_code || 0);
+      if (!response.ok || businessCode !== 0) {
+        const detail = payload?.base_resp?.status_msg || text.slice(0, 500);
+        throw new Error(`MiniMax 图片生成失败：${detail}`);
+      }
+      remoteUrls = payload?.data?.image_urls || [];
+      recordProviderAttempt("MiniMax", "success", providerModel);
+    }
+    if (!remoteUrls.length && !generatedBuffers.length) {
+      return res.status(502).json({ success: false, error: "图片服务未返回生成结果，请稍后重试", payload, usage: { providerAttempts } });
     }
     const urls = [];
-    const uploadsDir = await ensureUploadsDir();
+    const uploadsDir = await ensureUploadDir();
     for (const remoteUrl of remoteUrls) {
       try {
         const imageResponse = await fetch(remoteUrl);
@@ -4716,9 +5443,15 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
         throw new Error(`生成图永久保存失败：${error.message}`);
       }
     }
-    const estimatedCostUsd = Number((remoteUrls.length * MINIMAX_IMAGE_PER_IMAGE_USD).toFixed(6));
+    for (const buffer of generatedBuffers) {
+      const filename = `ai-${crypto.randomUUID()}.png`;
+      await fs.writeFile(path.join(uploadsDir, filename), buffer);
+      urls.push(`/uploads/${filename}`);
+    }
+    const estimatedCostUsd = Number((urls.length * perImageCostUsd).toFixed(6));
     const usage = {
-      model: payload?.model || body.model,
+      model: providerModel,
+      providerAttempts,
       promptTokens: (payload?.usage?.prompt_tokens || 0),
       totalTokens: (payload?.usage?.total_tokens || 0),
       images: urls.length,
@@ -4735,11 +5468,11 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
           [
             req.user.id,
             storeId || null,
-            body.model,
-            body.prompt,
+            providerModel,
+            normalizedPrompt,
             aspectRatio,
             urls.length,
-            Boolean(body.subject_reference),
+            Boolean(accessibleReference),
             JSON.stringify(urls),
             estimatedCostUsd,
             String(scenePreset || "").slice(0, 40),
@@ -4754,7 +5487,7 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
 
     res.json({
       success: true,
-      data: { images: urls, prompt: body.prompt, aspectRatio, n: requestedN, hasRefImage: Boolean(body.subject_reference), recordId },
+      data: { images: urls, prompt: normalizedPrompt, aspectRatio, n: urls.length, hasRefImage: Boolean(accessibleReference), recordId },
       usage,
     });
   } catch (error) {
@@ -4764,7 +5497,10 @@ app.post("/api/seller/images/generate", requireAuth, async (req, res, next) => {
     if (remaining > 0) aiImageActiveByUser.set(userKey, remaining);
     else aiImageActiveByUser.delete(userKey);
   }
-});
+}
+
+app.post("/api/seller/images/generate", requireAuth, handleAiImageGenerate);
+app.post("/api/v1/ai/images/generate", requireAuth, handleAiImageGenerate);
 
 app.post("/api/seller/images/publish-to-ozon", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
@@ -6148,9 +6884,21 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             ],
           );
         } catch (e) { console.error("[listing-history] insert import-by-sku failed:", e.message); }
+
+        const collectId = String(req.body?.meta?.collectId || "").trim();
+        if (collectId) {
+          try {
+            await db.query(
+              `UPDATE collect_items
+                  SET status = 'uploaded', linked_offer_id = $1, updated_at = now()
+                WHERE id = $2 AND user_id = $3`,
+              [String(skuItem.offer_id || ""), collectId, req.user.id],
+            );
+          } catch (e) { console.error("[collect-items] mark uploaded after import-by-sku failed:", e.message); }
+        }
       }
 
-      res.json({ success: true, data, taskId, importMode: "sku" });
+      res.json({ success: true, data, taskId, importMode: "sku", stockDeferred: rawStocks?.length || 0 });
       return;
     }
 
@@ -6605,7 +7353,7 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       since: req.body?.since || new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString(),
       to: req.body?.to || new Date().toISOString(),
     };
-    if (status) filter.status = status;
+    if (status && status.toLowerCase() !== "all") filter.status = status;
     const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
       filter, limit, with: { financial_data: true, analytics_data: true },
     }, { storeId, userId: req.user.id });
@@ -11606,6 +12354,7 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
   const kinds = Array.isArray(options.kinds)
     ? options.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
     : [];
+  const tokenStoreId = isScopedWorkerUser(user) ? String(user.tokenStoreId || "").trim() : "";
   try {
     await client.query("BEGIN");
     const selected = await client.query(
@@ -11613,10 +12362,11 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
        FROM app_jobs j
        WHERE j.user_id = $1 AND j.status = 'queued'
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
+         AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
        ORDER BY j.created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`,
-      [user?.id || "", kinds],
+      [user?.id || "", kinds, tokenStoreId || null],
     );
     if (!selected.rowCount) {
       await client.query("COMMIT");
@@ -11717,6 +12467,10 @@ async function getDbJobForUser(id, user) {
   if (user?.role !== "admin") {
     params.push(user?.id || "");
     where += " AND j.user_id = $2";
+  }
+  if (isScopedWorkerUser(user)) {
+    params.push(String(user.tokenStoreId || ""));
+    where += ` AND j.store_id = $${params.length}`;
   }
   const result = await db.query(
     `SELECT j.*, u.username, u.display_name

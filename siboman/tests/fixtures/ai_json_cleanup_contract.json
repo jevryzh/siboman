@@ -1,0 +1,35 @@
+{
+  "taskId": "P1-3-BUG-03",
+  "description": "Local fixture for AI JSON cleanup and structured validation. These cases never call AI providers.",
+  "requiredKeys": [
+    "product_type",
+    "title_zh",
+    "selling_points",
+    "image_prompt",
+    "brand",
+    "category_name",
+    "description"
+  ],
+  "cases": [
+    {
+      "name": "think-wrapper",
+      "valid": true,
+      "raw": "<think>internal chain must be discarded</think>{\"product_type\":\"背包\",\"title_zh\":\"轻便通勤双肩包\",\"selling_points\":[\"防泼水面料\",\"多隔层收纳\"],\"image_prompt\":\"clean ecommerce backpack hero image\",\"brand\":\"\",\"category_name\":\"双肩包\",\"description\":\"适合通勤和短途出行。\"}"
+    },
+    {
+      "name": "markdown-json-fence",
+      "valid": true,
+      "raw": "```json\n{\"product_type\":\"手机壳\",\"title_zh\":\"透明防摔手机壳\",\"selling_points\":[\"四角缓震\"],\"image_prompt\":\"transparent phone case on white background\",\"brand\":\"\",\"category_name\":\"手机配件\",\"description\":\"透明外壳展示机身颜色。\"}\n```"
+    },
+    {
+      "name": "prefix-suffix-noise",
+      "valid": true,
+      "raw": "下面是结果：{\"product_type\":\"水杯\",\"title_zh\":\"便携保温水杯\",\"selling_points\":[\"长效保温\"],\"image_prompt\":\"insulated bottle studio product photo\",\"brand\":\"\",\"category_name\":\"水杯\",\"description\":\"适合办公室和户外使用。\"}谢谢"
+    },
+    {
+      "name": "incomplete-json",
+      "valid": false,
+      "raw": "{\"product_type\":\"台灯\",\"title_zh\":\"护眼台灯\",\"selling_points\":[\"无频闪\"],\"image_prompt\":\"desk lamp"
+    }
+  ]
+}

@@ -26,10 +26,20 @@ window.ShopSwitcher = {
       emit('change', val);
       window.dispatchEvent(new CustomEvent('shop-changed', { detail: val }));
     };
+    const maskClientId = (id) => {
+      if (!id) return '';
+      return id.length > 8 ? id.slice(0, 4) + '****' + id.slice(-4) : id;
+    };
+    const displayClientId = (shop) => {
+      if (!shop) return '';
+      if (shop.client_id_masked) return shop.client_id_masked;
+      if (shop.client_id_last4) return `****${shop.client_id_last4}`;
+      return maskClientId(shop.client_id);
+    };
 
     Vue.onMounted(fetchShops);
 
-    return { shops, currentStoreId, loading, handleStoreChange };
+    return { shops, currentStoreId, loading, handleStoreChange, displayClientId };
   },
   template: `
     <div class="shop-switcher">
@@ -48,7 +58,7 @@ window.ShopSwitcher = {
         >
           <div style="display: flex; justify-content: space-between; align-items: center">
             <span>{{ shop.name }}</span>
-            <el-tag size="small" type="info">{{ shop.client_id.slice(0, 4) }}...{{ shop.client_id.slice(-4) }}</el-tag>
+            <el-tag size="small" type="info">{{ displayClientId(shop) }}</el-tag>
           </div>
         </el-option>
         <template #footer>

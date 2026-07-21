@@ -1,0 +1,290 @@
+{
+  "schemaVersion": 1,
+  "title": "Formal user acceptance checklist and local guards",
+  "scope": "v2.2.9.53-test-p1-product-ux formal ERP user acceptance",
+  "executionPolicy": {
+    "localGuardMode": "static_local_only",
+    "forbiddenInLocalGuard": [
+      "Do not call Ozon Seller APIs.",
+      "Do not call AI providers.",
+      "Do not deploy.",
+      "Do not mutate production data."
+    ],
+    "requiredManualEvidence": [
+      "screenshot_or_recording",
+      "store_id_used",
+      "test_account",
+      "observed_error_or_success_copy"
+    ]
+  },
+  "existingTestAudit": [
+    {
+      "area": "route_and_module_presence",
+      "currentCoverage": "Mostly string checks for menu routes, registered view files, and endpoint names.",
+      "experienceGap": "Does not prove that a seller can complete the workflow or understand the result."
+    },
+    {
+      "area": "ui_copy_and_visibility",
+      "currentCoverage": "Checks that important labels and helper names remain in source files.",
+      "experienceGap": "Does not prove layout, clickability, modal behavior, or real error display in a browser."
+    },
+    {
+      "area": "dangerous_external_workflows",
+      "currentCoverage": "Checks guard strings and confirmation code without executing Ozon, AI, stock, or order writes.",
+      "experienceGap": "Does not prove external provider success; formal acceptance must use an authorized test store."
+    }
+  ],
+  "items": [
+    {
+      "id": "FA-001-product-image-zoom",
+      "module": "product-management",
+      "route": "#/products",
+      "riskLevel": "requires_authorization",
+      "acceptanceSteps": [
+        "Open 商品管理 in an authorized test store with products that have 商品图片 main and gallery images.",
+        "Click a product image in the list and verify the full gallery opens in an enlarged preview.",
+        "Open the edit drawer and verify the main image and gallery images also open in enlarged preview."
+      ],
+      "manualEvidence": [
+        "Screenshot of the list image preview overlay.",
+        "Screenshot of the edit drawer gallery preview."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/ProductList.js"
+        ],
+        "mustContain": [
+          "点击图片可放大查看图册",
+          "preview-teleported",
+          ":preview-src-list=\"productPreviewList(row)\"",
+          "productPreviewList(row)",
+          "cursor:zoom-in",
+          ":preview-src-list=\"allPreviewList()\""
+        ],
+        "mustNotContain": []
+      }
+    },
+    {
+      "id": "FA-002-product-status-chinese",
+      "module": "product-management",
+      "route": "#/products",
+      "riskLevel": "requires_authorization",
+      "acceptanceSteps": [
+        "Open 商品管理 with products covering visible, ready, attention, moderation failed, and inactive states.",
+        "Verify tabs and row tags show Chinese operator labels instead of raw Ozon enum text.",
+        "Hover or inspect the status and verify raw Ozon status remains available as diagnostic context."
+      ],
+      "manualEvidence": [
+        "Screenshot showing Chinese status tabs and row status tags.",
+        "Screenshot or note showing raw Ozon status in diagnostic context."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/ProductList.js"
+        ],
+        "mustContain": [
+          "statusCn",
+          "productStatusLabel(row)",
+          "Ozon 原始状态",
+          "失败/处理原因",
+          "issueSummary(row)",
+          "审核失败",
+          "已下架"
+        ],
+        "mustNotContain": [
+          "{{ row.status }}"
+        ]
+      }
+    },
+    {
+      "id": "FA-003-product-category-prefill",
+      "module": "product-management",
+      "route": "#/products",
+      "riskLevel": "requires_authorization",
+      "acceptanceSteps": [
+        "Open the edit drawer for a product that already has category ids returned by Ozon.",
+        "Wait for the category tree to load and verify the current category is preselected.",
+        "Change category and verify description_category_id/type_id are preserved in the form before saving."
+      ],
+      "manualEvidence": [
+        "Screenshot of the drawer with current category and category id visible.",
+        "Note of the product offer_id and selected description_category_id."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/ProductList.js",
+          "server.js"
+        ],
+        "mustContain": [
+          "syncCategoryPathFromForm",
+          ":props=\"{ label: 'label', value: 'category_key'",
+          "description_category_id",
+          "type_id",
+          "category_name, description_category_id, type_id, price_index"
+        ],
+        "mustNotContain": []
+      }
+    },
+    {
+      "id": "FA-004-product-stock-readonly",
+      "module": "product-management",
+      "route": "#/products",
+      "riskLevel": "external_write_impact",
+      "acceptanceSteps": [
+        "Open the product edit drawer for a product with stock.",
+        "Verify stock is shown as context only and the copy sends operators to 库存管理 for changes.",
+        "Verify there is no editable stock field in the product drawer."
+      ],
+      "manualEvidence": [
+        "Screenshot of the stock context alert in the product drawer.",
+        "Confirmation that no stock input is present in the product edit form."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/ProductList.js"
+        ],
+        "mustContain": [
+          "当前总库存",
+          "库存和仓库请到库存管理修改",
+          "syncFieldsNote"
+        ],
+        "mustNotContain": [
+          "<el-input-number v-model=\"drawer.form.stock\"",
+          "<el-form-item label=\"10. 库存\">"
+        ]
+      }
+    },
+    {
+      "id": "FA-005-collection-errors-visible",
+      "module": "collection-box",
+      "route": "#/collection",
+      "riskLevel": "requires_authorization",
+      "acceptanceSteps": [
+        "Open 采集箱 with at least one failed collection item.",
+        "Verify the row shows a failed state and an operator-readable reason.",
+        "Open the edit drawer and verify the same failure reason remains visible before retry."
+      ],
+      "manualEvidence": [
+        "Screenshot of a failed row with reason visible.",
+        "Screenshot of the drawer failure alert."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/CollectionBox.js",
+          "server.js"
+        ],
+        "mustContain": [
+          "rowFailureReason",
+          "row.note",
+          "采集任务",
+          "重新采集",
+          "type=\"error\"",
+          "SET status = 'failed'"
+        ],
+        "mustNotContain": []
+      }
+    },
+    {
+      "id": "FA-006-listing-task-error-visible",
+      "module": "listing-history",
+      "route": "#/listing-history",
+      "riskLevel": "requires_authorization",
+      "acceptanceSteps": [
+        "Open 上架记录 with failed, processing, and partial-success listing tasks.",
+        "Verify task_id, canonical status, Chinese detail, raw Ozon error, and translated message are visible.",
+        "Open task detail and verify errors_json is still inspectable before retry."
+      ],
+      "manualEvidence": [
+        "Screenshot of listing rows with task id/status/error.",
+        "Screenshot of task detail with raw and Chinese Ozon errors."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/ListingHistory.js",
+          "server.js"
+        ],
+        "mustContain": [
+          "detailDialog.row.task_id",
+          "displayStatus(row)",
+          "errors_json",
+          "message_zh",
+          "Ozon 返回错误",
+          "部分商品需处理后重试",
+          "translateOzonListingError",
+          "LISTING_STATUS_CONTRACT"
+        ],
+        "mustNotContain": []
+      }
+    },
+    {
+      "id": "FA-007-dangerous-stock-order-confirmation",
+      "module": "inventory-and-orders",
+      "route": "#/inventory,#/orders",
+      "riskLevel": "external_write_impact",
+      "acceptanceSteps": [
+        "In 库存管理, attempt to submit all stock drafts and verify explicit confirmation appears before Ozon stock submission.",
+        "Trigger a stock conflict fixture or authorized test case and verify overwrite confirmation appears.",
+        "In 订单管理, select shippable orders and verify irreversible batch shipment confirmation appears.",
+        "Verify cancelled orders cannot be selected for dangerous shipping actions."
+      ],
+      "manualEvidence": [
+        "Screenshot of stock draft confirmation.",
+        "Screenshot of stock conflict overwrite confirmation.",
+        "Screenshot of batch shipment confirmation and cancelled-order disabled state."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/InventoryManagement.js",
+          "public/js/views/OrderList.js",
+          "server.js"
+        ],
+        "mustContain": [
+          "确定将 ${drafts.value.length} 条库存草稿提交到 Ozon？",
+          "发现 Ozon 实时库存冲突",
+          "确认覆盖",
+          "将对 ${eligible.length} 个订单执行不可逆的发货操作",
+          "批量发货确认",
+          "row.status !== 'cancelled'",
+          "Ozon 已接收发货，但本地库存更新失败",
+          "code: \"STOCK_CONFLICT\""
+        ],
+        "mustNotContain": []
+      }
+    },
+    {
+      "id": "FA-008-ai-provider-failure-reason",
+      "module": "ai-product-images",
+      "route": "#/ai-generator",
+      "riskLevel": "external_write_impact",
+      "acceptanceSteps": [
+        "Open AI 套图 without running generation and verify default provider and fallback order are visible.",
+        "Use a mocked/local failed response or authorized non-billable test to verify provider attempts and failure reason are shown.",
+        "Verify history shows the provider used for completed records."
+      ],
+      "manualEvidence": [
+        "Screenshot of default provider and fallback order.",
+        "Screenshot of visible provider failure reason/attempt chain.",
+        "Screenshot of history provider column."
+      ],
+      "localGuard": {
+        "sourceFiles": [
+          "public/js/views/AIImageGenerator.js",
+          "server.js"
+        ],
+        "mustContain": [
+          "默认 provider：<strong>Agnes 2.0</strong>",
+          "TokenDun → 万相 → MiniMax",
+          "generationFailure",
+          "generationAttempts",
+          "generationDescription",
+          "providerLabel(row.model)",
+          "providerAttempts",
+          "Agnes 失败，切换 TokenDun",
+          "TokenDun 失败，切换备用供应商",
+          "万相失败，切换 MiniMax"
+        ],
+        "mustNotContain": []
+      }
+    }
+  ]
+}

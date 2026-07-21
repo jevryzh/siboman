@@ -9,6 +9,8 @@ window.InventoryManagementView = {
     const importInput = Vue.ref(null);
     const importLoading = Vue.ref(false);
     const logDialog = Vue.reactive({ visible: false, loading: false, items: [] });
+    const lastImportResult = Vue.ref(null);
+    const lastSubmitResult = Vue.ref(null);
     const threshold = Vue.ref(Math.max(1, Number(localStorage.getItem('inventoryLowStockThreshold') || 5)));
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 50, total: 0 });
 
@@ -240,6 +242,12 @@ window.InventoryManagementView = {
       try {
         const res = await submitWithConflictCheck('/api/seller/products/stocks/bulk', { store_id: getStoreId() }, { validateStatus: (status) => status === 200 || status === 207 });
         const message = `提交 ${res.data.submitted || 0} 条：成功 ${res.data.succeeded || 0}，失败 ${res.data.failed || 0}`;
+        lastSubmitResult.value = {
+          submitted: res.data.submitted || 0,
+          succeeded: res.data.succeeded || 0,
+          failed: res.data.failed || 0,
+          errors: Array.isArray(res.data.errors) ? res.data.errors : [],
+        };
         if (res.data.failed) notify.warning(message); else notify.success(message);
         await refreshAll();
       } catch (e) {
@@ -273,6 +281,11 @@ window.InventoryManagementView = {
         if (!rows.length) return notify.warning('文件中没有数据');
         const res = await axios.post('/api/seller/stocks/import', { store_id: getStoreId(), rows });
         const message = `导入完成：成功 ${res.data.imported || 0}，失败 ${res.data.failed || 0}`;
+        lastImportResult.value = {
+          imported: res.data.imported || 0,
+          failed: res.data.failed || 0,
+          errors: Array.isArray(res.data.errors) ? res.data.errors : [],
+        };
         if (res.data.failed) {
           const sample = (res.data.errors || []).slice(0, 3).map(item => `第${item.row}行 ${item.offer_id || ''}: ${item.error}`).join('；');
           notify.warning(`${message}。${sample}`);
@@ -346,7 +359,7 @@ window.InventoryManagementView = {
 
     return {
       inventory, loading, syncLoading, search, pagination, stockDialog,
-      drafts, draftLoading, importInput, importLoading, logDialog, threshold, inventoryStats,
+      drafts, draftLoading, importInput, importLoading, logDialog, threshold, inventoryStats, lastImportResult, lastSubmitResult,
       fetchInventory, handleSyncAll, openStockEditor, submitStockChanges,
       fetchDrafts, refreshAll, onThresholdChange, saveStockDrafts, submitAllDrafts, clearDrafts, importStocks, downloadTemplate, exportReplenishment, openChangeLogs,
       onPageChange, onSizeChange, onSearch, onSearchInput,
@@ -386,7 +399,40 @@ window.InventoryManagementView = {
           <div style="padding:14px 18px"><div style="font-size:12px;color:#909399">暂存待提交</div><strong style="font-size:24px;color:#409eff">{{ inventoryStats.drafts }}</strong></div>
         </div>
 
-        <el-table :data="inventory" v-loading="loading" stripe border size="small">
+        <el-alert
+          v-if="lastImportResult && lastImportResult.failed"
+          type="warning"
+          :closable="false"
+          show-icon
+          style="margin-bottom:12px"
+          title="上次库存导入有失败行"
+          :description="'成功 ' + lastImportResult.imported + '，失败 ' + lastImportResult.failed + '。请根据下方失败明细修正 Excel 后重新导入。'" />
+        <div v-if="lastImportResult && lastImportResult.errors && lastImportResult.errors.length" style="margin-bottom:12px; border:1px solid #faecd8; background:#fffaf0; padding:10px 12px; border-radius:6px">
+          <div style="font-size:12px; font-weight:700; color:#a16207; margin-bottom:6px">库存导入失败明细</div>
+          <div v-for="(item, index) in lastImportResult.errors.slice(0, 8)" :key="'import-' + index" style="font-size:12px; color:#7c2d12; line-height:1.7">
+            第 {{ item.row || '-' }} 行 <code>{{ item.offer_id || '-' }}</code>：{{ item.error || item.message || '未知错误' }}
+          </div>
+          <div v-if="lastImportResult.errors.length > 8" style="font-size:12px; color:#909399; margin-top:4px">其余 {{ lastImportResult.errors.length - 8 }} 条请查看后端返回或分批修正。</div>
+        </div>
+
+        <el-alert
+          v-if="lastSubmitResult && lastSubmitResult.failed"
+          type="error"
+          :closable="false"
+          show-icon
+          style="margin-bottom:12px"
+          title="上次提交 Ozon 库存有失败"
+          :description="'已提交 ' + lastSubmitResult.submitted + '，成功 ' + lastSubmitResult.succeeded + '，失败 ' + lastSubmitResult.failed + '。失败草稿不会自动消失，请按明细处理后重试。'" />
+        <div v-if="lastSubmitResult && lastSubmitResult.errors && lastSubmitResult.errors.length" style="margin-bottom:12px; border:1px solid #fde2e2; background:#fef0f0; padding:10px 12px; border-radius:6px">
+          <div style="font-size:12px; font-weight:700; color:#b91c1c; margin-bottom:6px">库存提交失败明细</div>
+          <div v-for="(item, index) in lastSubmitResult.errors.slice(0, 8)" :key="'submit-' + index" style="font-size:12px; color:#991b1b; line-height:1.7">
+            <code>{{ item.offer_id || '-' }}</code>
+            <span v-if="item.warehouse_id"> / 仓 {{ item.warehouse_id }}</span>：{{ item.error || item.message || '未知错误' }}
+          </div>
+          <div v-if="lastSubmitResult.errors.length > 8" style="font-size:12px; color:#909399; margin-top:4px">仅展示前 8 条，完整记录可打开“变更记录”。</div>
+        </div>
+
+        <el-table :data="inventory" v-loading="loading" stripe border size="small" empty-text="暂无库存数据。请先选择店铺并点击同步 Ozon 全量；如已同步，可调整搜索条件。">
           <!-- v0.3.4: 图片放大 60x60 + 点击预览大图 -->
           <el-table-column label="图片" width="80">
             <template #default="{ row }">

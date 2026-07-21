@@ -1,5 +1,5 @@
 /**
- * 逐梦 Ozon 采集器 - Content Bridge (ISOLATED world) v2.1.4
+ * 逐梦 Ozon 采集器 - Content Bridge (ISOLATED world) v2.2.9.53
  *
  * v2.1.4 终极修复 - forward + reply 双向全用 window.postMessage:
  *   - 之前 v2.1.3 仍用 document CustomEvent `__zhumeng_request__` 跨世界投递, 在 Chrome MV3
@@ -15,7 +15,7 @@
   "use strict";
   const PROTO = "__zhumeng_proto";
   const PROTO_VAL = "zhumeng-v1";
-  const VERSION = "2.1.4";
+  const VERSION = "2.2.9.53";
 
   console.log(`[逐梦采集器 v${VERSION}][ISO] 启动, 监听 window message`);
 

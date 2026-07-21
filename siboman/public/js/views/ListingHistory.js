@@ -37,15 +37,16 @@ window.ListingHistoryView = {
     const fetchList = async () => {
       loading.value = true;
       try {
-        const params = new URLSearchParams();
-        if (filter.sku) params.set('sku', filter.sku);
-        if (filter.status && filter.status !== 'all') params.set('status', filter.status);
-        if (filter.start_date) params.set('start_date', filter.start_date);
-        if (filter.end_date) params.set('end_date', filter.end_date);
-        if (getStoreId()) params.set('store_id', getStoreId());
-        params.set('limit', String(pagination.pageSize));
-        params.set('offset', String((pagination.currentPage - 1) * pagination.pageSize));
-        const r = await axios.get(`/api/seller/listing-history?${params}`);
+        const params = {
+          sku: filter.sku || undefined,
+          status: filter.status && filter.status !== 'all' ? filter.status : undefined,
+          start_date: filter.start_date || undefined,
+          end_date: filter.end_date || undefined,
+          store_id: getStoreId() || undefined,
+          limit: pagination.pageSize,
+          offset: (pagination.currentPage - 1) * pagination.pageSize,
+        };
+        const r = await axios.get('/api/seller/listing-history', { params });
         if (r.data.success) {
           items.value = r.data.items;
           total.value = r.data.total;
@@ -103,17 +104,35 @@ window.ListingHistoryView = {
 
     const statusBadge = (s) => {
       const map = {
-        imported: { label: '已完成', bg: '#f0f9eb', color: '#67c23a' },
+        imported: { label: '已完成', detail: 'Ozon 已确认创建', bg: '#f0f9eb', color: '#67c23a' },
+        success: { label: '已完成', detail: 'Ozon 已确认创建', bg: '#f0f9eb', color: '#67c23a' },
         failed: { label: '失败', bg: '#fef0f0', color: '#f56c6c' },
-        processing: { label: '处理中', bg: '#fdf6ec', color: '#e6a23c' },
-        pending: { label: '处理中', bg: '#fdf6ec', color: '#e6a23c' },
+        cancelled: { label: '已取消', detail: '任务未继续提交', bg: '#f4f4f5', color: '#909399' },
+        partial_success: { label: '部分成功', detail: '部分商品需处理后重试', bg: '#fff7ed', color: '#ea580c' },
+        queued: { label: '处理中', detail: '已排队，等待创建', bg: '#fdf6ec', color: '#e6a23c' },
+        claimed: { label: '处理中', detail: '任务已被处理器领取', bg: '#fdf6ec', color: '#e6a23c' },
+        running: { label: '处理中', detail: '正在提交 Ozon', bg: '#fdf6ec', color: '#e6a23c' },
+        ozon_processing: { label: '处理中', detail: 'Ozon 正在创建商品', bg: '#fdf6ec', color: '#e6a23c' },
+        processing: { label: '处理中', detail: 'Ozon 正在创建商品', bg: '#fdf6ec', color: '#e6a23c' },
+        pending: { label: '处理中', detail: '等待 Ozon 返回结果', bg: '#fdf6ec', color: '#e6a23c' },
+        moderating: { label: '处理中', detail: 'Ozon 审核中', bg: '#fdf6ec', color: '#e6a23c' },
       };
       return map[s] || { label: s, bg: '#f4f4f5', color: '#909399' };
     };
 
     const displayStatus = (row) => row.partial_success
-      ? { label: '部分成功', bg: '#fdf6ec', color: '#e6a23c' }
+      ? statusBadge('partial_success')
       : statusBadge(row.status);
+    const firstErrorText = (row) => row.error_summary
+      || row.first_error_message_zh
+      || row.first_error_message
+      || row.errors_json?.[0]?.message_zh
+      || row.errors_json?.[0]?.message
+      || row.errors_json?.[0]?.description
+      || row.errors_json?.[0]?.code
+      || '';
+    const isProcessingStatus = (row) => ['queued', 'claimed', 'running', 'ozon_processing', 'processing', 'pending', 'moderating'].includes(String(row.status || ''));
+    const canRetry = (row) => String(row.status || '') === 'failed' || String(row.status || '') === 'partial_success' || row.partial_success;
 
     const syncTask = async (row) => {
       if (String(row.task_id || '').startsWith('portal-')) return window.ElementPlus.ElMessage.warning('该记录由门户上架，后台会自动按货号同步');
@@ -194,7 +213,7 @@ window.ListingHistoryView = {
     return {
       loading, items, total, stats, filter, selectedIds, pagination, detailDialog, syncingTaskId, retryingId, exporting, lastRefreshAt,
       fetchList, onQuery, onReset, deleteOne, batchDelete,
-      statusBadge, displayStatus, fmtMoney, fmtDate, onSelectionChange,
+      statusBadge, displayStatus, firstErrorText, isProcessingStatus, canRetry, fmtMoney, fmtDate, onSelectionChange,
       syncTask, showDetail, retryTask, exportHistory, onPageChange, onSizeChange,
     };
   },
@@ -231,6 +250,7 @@ window.ListingHistoryView = {
         <el-radio-group v-model="filter.status" size="small">
           <el-radio-button label="all">全部</el-radio-button>
           <el-radio-button label="imported">已完成</el-radio-button>
+          <el-radio-button label="partial_success">部分成功</el-radio-button>
           <el-radio-button label="processing">处理中</el-radio-button>
           <el-radio-button label="failed">失败</el-radio-button>
         </el-radio-group>
@@ -246,7 +266,7 @@ window.ListingHistoryView = {
       <div style="background:#fff; border-radius:10px; padding:8px 4px; margin:16px 24px 24px; box-shadow:0 1px 4px rgba(0,0,0,0.04)">
         <div style="padding:8px 16px; display:flex; justify-content:space-between; align-items:center">
           <div style="font-size:14px; font-weight:700; color:#303133">
-            导入批次列表 <span style="font-size:12px; color:#909399; font-weight:400">共 {{ total }} 条</span>
+            上架记录列表 <span style="font-size:12px; color:#909399; font-weight:400">共 {{ total }} 条</span>
             <span v-if="selectedIds.length" style="margin-left:12px; font-size:12px; color:#409eff">已选 {{ selectedIds.length }} 条</span>
           </div>
           <div style="display:flex; gap:8px">
@@ -256,7 +276,7 @@ window.ListingHistoryView = {
           </div>
         </div>
 
-        <el-table :data="items" v-loading="loading" stripe border style="width:100%" @selection-change="onSelectionChange" empty-text="暂无上架记录, 去批量跟卖页发起一次试试">
+        <el-table :data="items" v-loading="loading" stripe border style="width:100%" @selection-change="onSelectionChange" empty-text="暂无匹配的上架记录。可调整筛选条件；新记录会在批量上架提交后出现。">
           <el-table-column type="selection" width="44" />
           <el-table-column label="商品信息" min-width="280">
             <template #default="{ row }">
@@ -286,11 +306,12 @@ window.ListingHistoryView = {
               <span v-else style="color:#c0c4cc">-</span>
             </template>
           </el-table-column>
-          <el-table-column label="状态" width="100">
+          <el-table-column label="状态" width="150">
             <template #default="{ row }">
-              <span :style="{ background: displayStatus(row).bg, color: displayStatus(row).color, padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600 }">
-                {{ displayStatus(row).label }}
-              </span>
+              <div>
+                <span :style="{ background: displayStatus(row).bg, color: displayStatus(row).color, padding: '3px 10px', borderRadius: '12px', fontSize: '12px', fontWeight: 600 }">{{ displayStatus(row).label }}</span>
+                <div v-if="displayStatus(row).detail" style="font-size:11px; color:#909399; margin-top:4px">{{ displayStatus(row).detail }}</div>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="售价" width="90">
@@ -308,11 +329,12 @@ window.ListingHistoryView = {
           </el-table-column>
           <el-table-column label="Ozon 错误" min-width="200">
             <template #default="{ row }">
-              <el-popover v-if="row.errors_json && row.errors_json.length" placement="top" :width="380" trigger="hover">
+              <el-popover v-if="firstErrorText(row) || (row.errors_json && row.errors_json.length)" placement="top" :width="420" trigger="hover">
                 <template #reference>
-                  <span style="color:#f56c6c; cursor:help; font-size:12px">{{ row.errors_json[0]?.message?.slice(0, 30) || row.errors_json[0]?.code || '查看' }}<span v-if="row.errors_json.length > 1" style="color:#909399"> (+{{ row.errors_json.length - 1 }})</span></span>
+                  <span style="color:#f56c6c; cursor:help; font-size:12px">{{ firstErrorText(row).slice(0, 42) || '查看错误' }}<span v-if="row.errors_json && row.errors_json.length > 1" style="color:#909399"> (+{{ row.errors_json.length - 1 }})</span></span>
                 </template>
                 <div style="font-size:12px; max-height:200px; overflow:auto">
+                  <div v-if="firstErrorText(row)" style="padding:0 0 8px; margin-bottom:4px; border-bottom:1px solid #eee; color:#b91c1c">{{ firstErrorText(row) }}</div>
                   <div v-for="(e, i) in row.errors_json" :key="i" style="padding:6px 0; border-bottom:1px dashed #eee">
                     <div v-if="e.code" style="color:#909399; font-family:monospace">{{ e.code }}</div>
                     <div>{{ e.message || e.description }}</div>
@@ -326,8 +348,8 @@ window.ListingHistoryView = {
           <el-table-column label="操作" width="180" fixed="right">
             <template #default="{ row }">
               <el-button type="primary" link size="small" @click="showDetail(row)">详情</el-button>
-              <el-button v-if="row.status === 'processing' || row.status === 'pending'" type="warning" link size="small" :loading="syncingTaskId === row.task_id" @click="syncTask(row)">同步</el-button>
-              <el-button v-if="row.status === 'failed' || row.partial_success" type="warning" link size="small" :loading="retryingId === row.id" @click="retryTask(row)">重试</el-button>
+              <el-button v-if="isProcessingStatus(row)" type="warning" link size="small" :loading="syncingTaskId === row.task_id" @click="syncTask(row)">同步状态</el-button>
+              <el-button v-if="canRetry(row)" type="warning" link size="small" :loading="retryingId === row.id" @click="retryTask(row)">重试</el-button>
               <el-button type="danger" link size="small" @click="deleteOne(row)" icon="Delete">删除</el-button>
             </template>
           </el-table-column>
@@ -350,14 +372,15 @@ window.ListingHistoryView = {
             <el-descriptions-item label="任务 ID" :span="2">{{ detailDialog.row.task_id }}</el-descriptions-item>
             <el-descriptions-item label="店铺">{{ detailDialog.row.store_name || '-' }}</el-descriptions-item>
             <el-descriptions-item label="货号">{{ detailDialog.row.offer_id || '-' }}</el-descriptions-item>
-            <el-descriptions-item label="状态">{{ displayStatus(detailDialog.row).label }}</el-descriptions-item>
+            <el-descriptions-item label="状态">{{ displayStatus(detailDialog.row).label }}{{ displayStatus(detailDialog.row).detail ? ' · ' + displayStatus(detailDialog.row).detail : '' }}</el-descriptions-item>
             <el-descriptions-item label="变体">{{ detailDialog.row.variants_count || 0 }} 个，失败 {{ detailDialog.row.failed_variants_count || 0 }} 个</el-descriptions-item>
           </el-descriptions>
           <el-divider>Ozon 返回错误</el-divider>
-          <el-empty v-if="!detailDialog.row.errors_json?.length" description="没有错误" :image-size="60" />
+          <el-alert v-if="firstErrorText(detailDialog.row)" type="error" :closable="false" style="margin-bottom:8px" title="错误摘要" :description="firstErrorText(detailDialog.row)" />
+          <el-empty v-if="!firstErrorText(detailDialog.row) && !detailDialog.row.errors_json?.length" description="没有错误" :image-size="60" />
           <el-alert v-for="(error, index) in (detailDialog.row.errors_json || [])" :key="index" type="error" :closable="false" style="margin-bottom:8px" :title="error.message || error.description || error.code || '未知错误'" :description="[error.code ? '错误代码：' + error.code : '', error.message_zh || ''].filter(Boolean).join(' · ')" />
         </template>
-        <template #footer><el-button @click="detailDialog.visible=false">关闭</el-button><el-button v-if="detailDialog.row && (detailDialog.row.status === 'failed' || detailDialog.row.partial_success)" type="warning" :loading="retryingId === detailDialog.row.id" @click="retryTask(detailDialog.row)">重试上架</el-button></template>
+        <template #footer><el-button @click="detailDialog.visible=false">关闭</el-button><el-button v-if="detailDialog.row && canRetry(detailDialog.row)" type="warning" :loading="retryingId === detailDialog.row.id" @click="retryTask(detailDialog.row)">重试上架</el-button></template>
       </el-dialog>
     </div>
   `,

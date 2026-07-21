@@ -9,6 +9,7 @@ window.OrderListView = {
     const notes = Vue.reactive({});
     const batchLoading = Vue.ref(false);
     const noteDialog = Vue.reactive({ visible: false, posting_number: '', note: '', saving: false });
+    const lastBatchResult = Vue.ref(null);
 
     // v0.3.5: 时窗筛选 (Ozon 限制窗口 ≤ 1 年)
     const now = new Date();
@@ -227,6 +228,12 @@ window.OrderListView = {
       }
       batchLoading.value = false;
       if (errors.length) notify.warning(`成功 ${succeeded} 单，失败 ${errors.length} 单`); else notify.success(`已提交 ${succeeded} 个订单`);
+      lastBatchResult.value = {
+        action: '批量发货',
+        succeeded,
+        failed: errors.length,
+        errors,
+      };
       selectedOrders.value = [];
       fetchOrders();
     };
@@ -258,6 +265,7 @@ window.OrderListView = {
     return {
       orders, loading, activeTab, statusTabs, pagination,
       selectedOrders, notes, batchLoading, noteDialog,
+      lastBatchResult,
       detailDrawer, shipDialog,
       fetchOrders, openDetail, openShipDialog, confirmShip, statusTagType, statusText,
       onSelectionChange, openNoteDialog, saveNote, exportOrders, printLabels, batchShip, deadlineInfo,
@@ -299,7 +307,21 @@ window.OrderListView = {
           <div><el-button type="primary" size="small" :loading="batchLoading" @click="printLabels()">批量面单</el-button><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
         </div>
 
-        <el-table :data="orders" v-loading="loading" stripe border size="small" @selection-change="onSelectionChange">
+        <el-alert
+          v-if="lastBatchResult"
+          :type="lastBatchResult.failed ? 'warning' : 'success'"
+          :closable="false"
+          show-icon
+          style="margin-bottom:10px"
+          :title="lastBatchResult.action + '结果'"
+          :description="'成功 ' + lastBatchResult.succeeded + ' 单，失败 ' + lastBatchResult.failed + ' 单。' + (lastBatchResult.failed ? '失败订单仍停留在原状态，请按下方明细处理。' : '')" />
+        <div v-if="lastBatchResult && lastBatchResult.errors && lastBatchResult.errors.length" style="margin-bottom:10px; border:1px solid #faecd8; background:#fffaf0; padding:10px 12px; border-radius:6px">
+          <div style="font-size:12px; font-weight:700; color:#a16207; margin-bottom:6px">订单操作失败明细</div>
+          <div v-for="(message, index) in lastBatchResult.errors.slice(0, 10)" :key="'order-error-' + index" style="font-size:12px; color:#7c2d12; line-height:1.7">{{ message }}</div>
+          <div v-if="lastBatchResult.errors.length > 10" style="font-size:12px; color:#909399; margin-top:4px">其余 {{ lastBatchResult.errors.length - 10 }} 条请缩小筛选范围后重试。</div>
+        </div>
+
+        <el-table :data="orders" v-loading="loading" stripe border size="small" empty-text="暂无匹配订单。可调整状态或日期范围后刷新；这里只显示当前店铺订单。" @selection-change="onSelectionChange">
           <el-table-column type="selection" width="44" :selectable="(row) => row.status !== 'cancelled'" />
           <el-table-column label="货件单号" prop="posting_number" width="180" fixed="left" />
           <el-table-column label="下单时间" width="160">
@@ -467,6 +489,7 @@ window.OrderListView = {
         <div style="font-size:13px; margin-bottom:10px">
           货件号: <b>{{ shipDialog.posting_number }}</b>
         </div>
+        <el-alert type="warning" :closable="false" show-icon style="margin-bottom:10px" title="发货提交后不可逆" description="请确认已经备货并可交给 Ozon，提交成功后订单状态会进入发货流程。" />
         <el-table :data="shipDialog.products" size="small" border>
           <el-table-column label="商品" prop="name" show-overflow-tooltip />
           <el-table-column label="货号" prop="offer_id" width="140" />
@@ -479,7 +502,7 @@ window.OrderListView = {
         <template #footer>
           <el-button @click="shipDialog.visible = false">取消</el-button>
           <el-button type="warning" :loading="shipDialog.loading" @click="confirmShip">
-            确认发货 (POST /v3/posting/fbs/ship)
+            确认发货至 Ozon
           </el-button>
         </template>
       </el-dialog>

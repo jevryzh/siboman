@@ -20,6 +20,12 @@ window.AIImageGeneratorView = {
     const previewVisible = Vue.ref(false);
     const previewUrl = Vue.ref('');
     const previewIndex = Vue.ref(0);
+    const generationState = Vue.ref('idle');
+    const generationProvider = Vue.ref('Agnes 2.0');
+    const generationMessage = Vue.ref('默认使用 Agnes 2.0；服务端不可用时会按既定顺序回退。');
+    const generationFailure = Vue.ref('');
+    const generationAttempts = Vue.ref([]);
+    const analyzeFailure = Vue.ref('');
 
     const form = Vue.reactive({
       title_zh: '',
@@ -28,7 +34,7 @@ window.AIImageGeneratorView = {
       selling_points: '',
       image_type: 'main',
       target_market: 'ozon',
-      model: 'wanxiang-2.7',
+      model: 'agnes-image-2.0-flash',
       count: 3,
       template_id: 'white-clean',
       aspect_ratio: '1:1',
@@ -66,6 +72,24 @@ window.AIImageGeneratorView = {
     ];
 
     const estimatedCost = Vue.computed(() => (Number(form.count || 0) * 0.03).toFixed(2));
+    const providerLabel = (model) => {
+      const value = String(model || '').toLowerCase();
+      if (value.includes('agnes')) return 'Agnes 2.0';
+      if (value.includes('tokendun') || value.includes('gpt-image')) return 'TokenDun';
+      if (value.includes('wan')) return '万相';
+      if (value.includes('minimax')) return 'MiniMax';
+      return model || '未知 provider';
+    };
+    const generationDescription = Vue.computed(() => {
+      const attempts = generationAttempts.value
+        .map((item) => {
+          const status = item.status === 'success' ? '成功' : item.status === 'skipped' ? '跳过' : '失败';
+          return `${item.provider || providerLabel(item.model)} ${status}${item.reason ? `：${item.reason}` : ''}`;
+        })
+        .join('；');
+      const reason = generationFailure.value ? `${generationMessage.value} 原因：${generationFailure.value}` : generationMessage.value;
+      return attempts ? `${reason} 执行链路：${attempts}` : reason;
+    });
     const finalPrompt = Vue.computed(() => {
       const preset = templates.find((item) => item.id === form.template_id)?.prompt || '';
       const subject = form.title_ru || form.title_zh || 'the reference product';
@@ -139,23 +163,33 @@ window.AIImageGeneratorView = {
 
     const analyzeSellingPoints = async () => {
       analyzing.value = true;
+      analyzeFailure.value = '';
       try {
         const r = await axios.post('/api/ai/analyze', {
           store_id: getStoreId(),
           title: form.title_zh,
           images: form.material_images,
+          target_market: form.target_market,
         });
         const d = r.data?.data || {};
         form.selling_points = (Array.isArray(d.selling_points) ? d.selling_points : []).join('\n');
         if (d.title_ru) form.title_ru = d.title_ru;
         notify.success('AI 分析完成');
-      } catch (e) { notify.error('分析失败'); }
+      } catch (e) {
+        analyzeFailure.value = e.response?.data?.error || e.message || '未知错误';
+        notify.error('分析失败：' + analyzeFailure.value);
+      }
       finally { analyzing.value = false; }
     };
 
     const generateImages = async () => {
       if (!form.material_images.length) return notify.warning('请上传素材');
       generating.value = true;
+      generationState.value = 'running';
+      generationProvider.value = 'Agnes 2.0';
+      generationFailure.value = '';
+      generationAttempts.value = [];
+      generationMessage.value = '正在生成。可继续填写或调整其他表单内容，结果会在此处更新。';
       resultImages.value = Array(form.count).fill({ loading: true });
       try {
         const r = await axios.post('/api/seller/images/generate', {
@@ -170,11 +204,21 @@ window.AIImageGeneratorView = {
         resultImages.value = urls.map(u => ({ url: typeof u === 'string' ? u : u.url, loading: false }));
         selectedResults.value = urls.map((_u, index) => index);
         currentRecordId.value = r.data?.data?.recordId || '';
+        generationState.value = 'completed';
+        generationProvider.value = providerLabel(r.data?.usage?.model);
+        generationMessage.value = generationProvider.value === 'Agnes 2.0'
+          ? '已由 Agnes 2.0 完成生成。'
+          : `Agnes 2.0 未完成本次请求，已自动回退至 ${generationProvider.value}。`;
+        generationAttempts.value = Array.isArray(r.data?.usage?.providerAttempts) ? r.data.usage.providerAttempts : [];
         notify.success(`已生成 ${urls.length} 张，预估费用 $${r.data?.usage?.estimatedCostUsd ?? estimatedCost.value}`);
         await fetchHistory();
       } catch (e) {
         resultImages.value = [];
-        notify.error('生成失败：' + (e.response?.data?.error || e.message));
+        generationState.value = 'failed';
+        generationFailure.value = e.response?.data?.error || e.message || '未知错误';
+        generationAttempts.value = Array.isArray(e.response?.data?.usage?.providerAttempts) ? e.response.data.usage.providerAttempts : [];
+        generationMessage.value = '所有可用 provider 均未返回图片。';
+        notify.error('生成失败：' + generationFailure.value);
       } finally { generating.value = false; }
     };
 
@@ -227,6 +271,13 @@ window.AIImageGeneratorView = {
     };
 
     const deleteHistory = async (id) => {
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          '确定删除这条 AI 套图历史？已推送到 Ozon 的图片不会被删除。',
+          '删除生成历史',
+          { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+        );
+      } catch { return; }
       try {
         await axios.delete(`/api/ai-images/${id}`);
         notify.success('历史记录已删除');
@@ -307,6 +358,7 @@ window.AIImageGeneratorView = {
     return {
       form, analyzing, generating, uploading, publishing, materialInput, resultImages, templates, finalPrompt, estimatedCost,
       history, historyStats, historyLimit, selectedResults, currentRecordId,
+      generationState, generationProvider, generationMessage, generationFailure, generationAttempts, generationDescription, providerLabel, analyzeFailure,
       previewVisible, previewUrl, previewIndex,
       handlePaste, handleMaterialFiles, cropMaterial, removeMaterial, analyzeSellingPoints, generateImages, showPreview, downloadImage,
       fetchHistory, toggleResult, batchDownload, publishToOzon, deleteHistory, loadHistoryResult, loadMoreHistory,
@@ -341,6 +393,7 @@ window.AIImageGeneratorView = {
           </el-form-item>
           <el-form-item label="卖点关键词">
             <el-button type="warning" size="small" :loading="analyzing" @click="analyzeSellingPoints" style="width:100%; margin-bottom:8px">✨ AI 自动分析</el-button>
+            <el-alert v-if="analyzeFailure" type="error" :closable="false" show-icon style="margin-bottom:8px" title="AI 分析失败" :description="analyzeFailure" />
             <el-input v-model="form.selling_points" type="textarea" :rows="5" />
           </el-form-item>
         </el-form>
@@ -355,6 +408,11 @@ window.AIImageGeneratorView = {
               <el-radio-button value="etsy">Etsy</el-radio-button>
             </el-radio-group>
           </el-form-item>
+          <div style="margin:-4px 0 12px; font-size:12px; color:#606266; line-height:1.5">目标市场会传给 AI 分析，用于俄语/Ozon 或 Etsy 场景卖点判断。</div>
+          <div style="margin:-2px 0 12px; padding:9px 10px; background:#f0f9ff; border:1px solid #bae6fd; border-radius:6px; font-size:12px; color:#075985">
+            默认 provider：<strong>Agnes 2.0</strong><br />
+            回退顺序：TokenDun → 万相 → MiniMax
+          </div>
           <el-form-item label="场景模板">
             <el-select v-model="form.template_id" style="width:100%">
               <el-option v-for="item in templates" :key="item.id" :label="item.name" :value="item.id" />
@@ -387,7 +445,13 @@ window.AIImageGeneratorView = {
             </div>
           </div>
         </template>
-        <div v-if="!resultImages.length && !generating"><el-empty /></div>
+        <el-alert
+          :type="generationState === 'failed' ? 'error' : generationState === 'completed' ? 'success' : 'info'"
+          :closable="false"
+          style="margin-bottom:12px"
+          :title="'执行通道：' + generationProvider"
+          :description="generationDescription" />
+        <div v-if="!resultImages.length && !generating"><el-empty description="暂无生成结果。上传素材并点击生成套图后，图片会显示在这里。" /></div>
         <div style="display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:12px">
           <div v-for="(img, i) in resultImages" :key="i" class="image-card-wrapper">
             <div v-if="img.loading" style="height:240px; display:flex; align-items:center; justify-content:center; background:#f5f7fa"><el-icon class="is-loading" size="30"><Loading /></el-icon></div>
@@ -401,12 +465,16 @@ window.AIImageGeneratorView = {
           <span>{{ historyStats.total || 0 }} 次任务</span><span>{{ historyStats.total_images || 0 }} 张图片</span><span>累计 USD {{ Number(historyStats.total_cost_usd || 0).toFixed(2) }}</span>
         </div>
         <el-table :data="history" size="small" max-height="280">
+          <template #empty>
+            <el-empty description="暂无生成历史。生成成功后会记录 provider、费用和是否推送到 Ozon。" :image-size="80" />
+          </template>
           <el-table-column label="图片" width="120">
             <template #default="{ row }"><el-image :src="row.image_urls?.[0]" style="width:52px; height:52px" fit="cover" preview-teleported :preview-src-list="row.image_urls || []" /></template>
           </el-table-column>
           <el-table-column label="模板 / Prompt" min-width="220" show-overflow-tooltip>
             <template #default="{ row }"><div>{{ row.scene_preset || '-' }}</div><small style="color:#909399">{{ row.prompt }}</small></template>
           </el-table-column>
+          <el-table-column label="Provider" width="120"><template #default="{ row }">{{ providerLabel(row.model) }}</template></el-table-column>
           <el-table-column label="张数" prop="n" width="65" />
           <el-table-column label="费用" width="90"><template #default="{ row }">USD {{ Number(row.estimated_cost_usd || 0).toFixed(2) }}</template></el-table-column>
           <el-table-column label="Ozon 推送" width="120"><template #default="{ row }"><el-tag size="small" :type="row.ozon_sync_status ? 'success' : 'info'">{{ row.ozon_sync_status ? ('已推送 ' + (row.offer_id || '')) : '未推送' }}</el-tag></template></el-table-column>

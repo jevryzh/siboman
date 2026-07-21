@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.37";
+const VERSION = "2.2.9.53";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -22,6 +22,44 @@ const MTOP_APP_KEY = "12574478";
 const WORKER_NAME = `zhumeng-plugin-${chrome.runtime.id.slice(0, 8)}`;
 let sourcingBusy = false;
 let workerAuthToken = "";
+let imageSearchQueue = Promise.resolve();
+let last1688SearchAt = 0;
+let last1688FailureAt = 0;
+let shared1688SearchTabId = 0;
+
+function isTransientTabEditError(error) {
+  const message = String(error?.message || error || "");
+  return /Tabs cannot be edited|user may be dragging a tab/i.test(message);
+}
+
+function isMissingChromeTabError(error) {
+  const message = String(error?.message || error || "");
+  return /No tab with id|Cannot find tab|Tabs? not found|No such tab/i.test(message);
+}
+
+async function withChromeTabEditRetry(label, fn, attempts = 5) {
+  let lastError;
+  const delays = [300, 700, 1200, 2000, 3000];
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientTabEditError(error) || attempt === attempts - 1) throw error;
+      console.warn(`[SW ${VERSION}] ${label} 遇到 Chrome tab 临时锁定，第 ${attempt + 1}/${attempts} 次重试: ${error.message || error}`);
+      await sleep(delays[attempt] || 3000);
+    }
+  }
+  throw lastError;
+}
+
+async function createTabWithRetry(createProperties, label = "创建标签页") {
+  return withChromeTabEditRetry(label, () => chrome.tabs.create(createProperties));
+}
+
+async function removeTabWithRetry(tabId, label = "关闭标签页") {
+  return withChromeTabEditRetry(label, () => chrome.tabs.remove(tabId), 4);
+}
 
 // ========== 采集核心: 打开 Ozon 商品前端页 + executeScript 提取 ==========
 async function collectSku(sku, storeIds = []) {
@@ -29,7 +67,7 @@ async function collectSku(sku, storeIds = []) {
   console.log(`[SW ${VERSION}] 采集 SKU ${sku}: 准备打开 ${url}, stores=${storeIds.length}`);
   
   // 1. 打开 Ozon 商品页 (后台 tab, 不打扰用户)
-  const tab = await chrome.tabs.create({ url, active: false });
+  const tab = await createTabWithRetry({ url, active: false }, "打开 Ozon 商品页");
   console.log(`[SW ${VERSION}] 已创建 tab id=${tab.id}, 等待页面加载...`);
   
   // 2. 等待页面加载完成 (最多 30s)
@@ -264,6 +302,93 @@ function randomInt(min, max) {
   return Math.floor(min + Math.random() * (max - min + 1));
 }
 
+async function humanBrowse1688TabInPlugin(tabId, label = "1688 页面", options = {}) {
+  if (!tabId) return null;
+  const config = {
+    minDurationMs: options.minDurationMs ?? 4500,
+    maxDurationMs: options.maxDurationMs ?? 11000,
+    minStep: options.minStep ?? 180,
+    maxStep: options.maxStep ?? 620,
+    minDelay: options.minDelay ?? 260,
+    maxDelay: options.maxDelay ?? 950,
+    dwellChance: options.dwellChance ?? 0.28,
+    dwellMinMs: options.dwellMinMs ?? 900,
+    dwellMaxMs: options.dwellMaxMs ?? 2800,
+    returnTop: Boolean(options.returnTop),
+    mouseMoves: options.mouseMoves ?? randomInt(2, 5),
+  };
+  try {
+    await withChromeTabEditRetry(`激活 ${label}`, () => chrome.tabs.update(tabId, { active: true }), 4);
+    await sleep(randomInt(700, 1800));
+    const [execResult] = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: humanBrowse1688PageContext,
+      args: [config],
+    });
+    const result = execResult?.result || {};
+    if (result.verification) {
+      console.warn(`[SW ${VERSION}] ${label} 检测到 1688 验证提示: ${result.verificationText || "verification"}`);
+    }
+    await sleep(randomInt(600, 1600));
+    return result;
+  } catch (e) {
+    console.warn(`[SW ${VERSION}] ${label} 人工浏览动作跳过: ${compact1688ErrorInPlugin(e.message || e)}`);
+    return null;
+  }
+}
+
+async function humanBrowse1688PageContext(options = {}) {
+  const sleepInPage = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const rand = (min, max) => Math.floor(Number(min) + Math.random() * (Number(max) - Number(min) + 1));
+  const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+  const text = String(document.body?.innerText || "").replace(/\s+/g, " ").trim();
+  const verification = /验证码|滑块|安全验证|人机验证|拖动滑块|captcha|verify|robot/i.test(text) || /captcha|verify|punish|security/i.test(location.href);
+  const viewportW = Math.max(320, window.innerWidth || 1280);
+  const viewportH = Math.max(320, window.innerHeight || 800);
+  const scrollHeight = Math.max(document.documentElement?.scrollHeight || 0, document.body?.scrollHeight || 0, viewportH);
+  const maxY = Math.max(0, scrollHeight - viewportH);
+  const startedAt = Date.now();
+  const minDurationMs = Math.max(1500, Number(options.minDurationMs) || 4500);
+  const maxDurationMs = Math.max(minDurationMs, Number(options.maxDurationMs) || 11000);
+  const targetDuration = rand(minDurationMs, maxDurationMs);
+
+  for (let i = 0; i < Math.max(1, Number(options.mouseMoves) || 2); i += 1) {
+    const x = rand(Math.floor(viewportW * 0.2), Math.floor(viewportW * 0.85));
+    const y = rand(Math.floor(viewportH * 0.18), Math.floor(viewportH * 0.82));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, clientX: x, clientY: y }));
+    await sleepInPage(rand(180, 620));
+  }
+
+  let direction = 1;
+  while (Date.now() - startedAt < targetDuration && maxY > 0) {
+    const step = rand(Number(options.minStep) || 180, Number(options.maxStep) || 620) * direction;
+    const nextY = clamp(window.scrollY + step, 0, maxY);
+    window.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: step, clientX: rand(80, viewportW - 80), clientY: rand(120, viewportH - 80) }));
+    window.scrollTo({ top: nextY, behavior: "smooth" });
+    await sleepInPage(rand(Number(options.minDelay) || 260, Number(options.maxDelay) || 950));
+    if (Math.random() < Number(options.dwellChance ?? 0.28)) {
+      await sleepInPage(rand(Number(options.dwellMinMs) || 900, Number(options.dwellMaxMs) || 2800));
+    }
+    if (nextY >= maxY - 24) direction = -1;
+    if (nextY <= 24) direction = 1;
+  }
+
+  if (options.returnTop) {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    await sleepInPage(rand(800, 1700));
+  }
+
+  return {
+    ok: true,
+    verification,
+    verificationText: verification ? text.slice(0, 140) : "",
+    scrollHeight,
+    finalY: Math.round(window.scrollY || 0),
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 async function erpApi(path, { method = "GET", body } = {}) {
   if (!workerAuthToken) {
     const stored = await chrome.storage.local.get(["workerAuthToken"]).catch(() => ({}));
@@ -491,33 +616,385 @@ function startSourcingQueueLoop() {
   setTimeout(() => pollSourcingQueueOnce(), 1500);
 }
 
-async function search1688ByImageInPlugin(imageUrl, maxCandidates) {
+async function run1688ImageSearchQueued(fn) {
+  const previous = imageSearchQueue.catch(() => {});
+  let release = () => {};
+  imageSearchQueue = new Promise((resolve) => { release = resolve; });
+  await previous;
   try {
-    const base64Image = await fetchImageAsBase64(imageUrl);
-    let cookieState = await ensure1688CookieStateInPlugin();
-    if (!cookieState.token) {
-      return { success: false, error: "没有拿到 1688 搜图 token，请先在 Chrome 登录 1688.com" };
-    }
-    try {
-      return { success: true, candidates: await collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) };
-    } catch (e) {
-      if (/FAIL_SYS_TOKEN|_m_h5_tk|token|令牌/i.test(e.message || "")) {
-        cookieState = await ensure1688CookieStateInPlugin(true);
-        if (cookieState.token) {
-          return { success: true, candidates: await collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) };
-        }
-      }
-      return { success: false, error: e.message || String(e) };
-    }
-  } catch (e) {
-    return { success: false, error: e.message || String(e) };
+    const normalCooldown = randomInt(7000, 14000);
+    const failureCooldown = Date.now() - last1688FailureAt < 60000 ? randomInt(12000, 22000) : 0;
+    const waitMs = Math.max(0, last1688SearchAt + Math.max(normalCooldown, failureCooldown) - Date.now());
+    if (waitMs > 0) await sleep(waitMs);
+    return await fn();
+  } finally {
+    last1688SearchAt = Date.now();
+    release();
   }
+}
+
+function compact1688ErrorInPlugin(message) {
+  const text = String(message || "").replace(/\s+/g, " ").trim();
+  if (!text) return "1688 搜图失败";
+  if (/store image error/i.test(text)) return "1688 图片入库失败（store image error），已触发会话恢复";
+  if (/FAIL_SYS_ILLEGAL_ACCESS|非法请求/i.test(text)) return "1688 接口非法请求，已触发 token/cookie 刷新";
+  if (/没有 imageId|未返回 imageId|imageId/i.test(text)) return "1688 上传图片后未返回 imageId";
+  if (/token|_m_h5_tk|令牌/i.test(text)) return "1688 token 失效或未获取";
+  if (/Tabs cannot be edited|user may be dragging a tab/i.test(text)) return "Chrome 标签页临时锁定，请稍后重试";
+  return text.length > 180 ? `${text.slice(0, 180)}...` : text;
+}
+
+async function recover1688SessionInPlugin(reason, attempt) {
+  last1688FailureAt = Date.now();
+  console.warn(`[SW ${VERSION}] 1688 会话恢复 attempt=${attempt}: ${compact1688ErrorInPlugin(reason)}`);
+  await sleep(randomInt(3500, 8000) * Math.min(attempt, 3));
+  await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 恢复失败: ${e.message}`));
+  await ensure1688CookieStateInPlugin(true).catch((e) => console.warn(`[SW ${VERSION}] 1688 cookie 恢复失败: ${e.message}`));
+}
+
+async function search1688ByImageInPlugin(imageUrl, maxCandidates) {
+  return run1688ImageSearchQueued(() => search1688ByImageInPluginInternal(imageUrl, maxCandidates));
+}
+
+async function search1688ByImageInPluginInternal(imageUrl, maxCandidates) {
+  try {
+    try {
+      const pageResult = await search1688ByImageViaPageInPlugin(imageUrl, maxCandidates);
+      if (pageResult?.success && Array.isArray(pageResult.candidates) && pageResult.candidates.length) {
+        return pageResult;
+      }
+      if (pageResult?.error) {
+        return { success: false, error: compact1688ErrorInPlugin(pageResult.error) };
+      }
+    } catch (pageError) {
+      return { success: false, error: compact1688ErrorInPlugin(pageError.message || pageError) };
+    }
+    return { success: false, error: "1688 页面会话候选为空" };
+  } catch (e) {
+    return { success: false, error: compact1688ErrorInPlugin(e.message || String(e)) };
+  }
+}
+
+async function getShared1688SearchTabInPlugin(searchUrl) {
+  if (shared1688SearchTabId) {
+    const existing = await chrome.tabs.get(shared1688SearchTabId).catch(() => null);
+    if (existing && /:\/\/([^/]+\.)?1688\.com\//i.test(existing.url || "")) {
+      await withChromeTabEditRetry("复用 1688 搜图页", () => chrome.tabs.update(shared1688SearchTabId, { url: searchUrl, active: false }));
+      return { id: shared1688SearchTabId, reused: true };
+    }
+    shared1688SearchTabId = 0;
+  }
+
+  const candidates = await chrome.tabs.query({ url: ["https://*.1688.com/*", "https://1688.com/*"] }).catch(() => []);
+  const reusable = candidates.find((tab) => /:\/\/s\.1688\.com\//i.test(tab.url || ""))
+    || candidates.find((tab) => /:\/\/([^/]+\.)?1688\.com\//i.test(tab.url || ""));
+  if (reusable?.id) {
+    shared1688SearchTabId = reusable.id;
+    await withChromeTabEditRetry("复用已有 1688 页面", () => chrome.tabs.update(shared1688SearchTabId, { url: searchUrl, active: false }));
+    return { id: shared1688SearchTabId, reused: true };
+  }
+
+  const tab = await createTabWithRetry({ url: searchUrl, active: false }, "打开 1688 以图搜货页");
+  shared1688SearchTabId = tab.id;
+  return { id: tab.id, reused: false };
+}
+
+async function search1688ByImageViaPageInPlugin(imageUrl, maxCandidates) {
+  const searchUrl = `https://s.1688.com/youyuan/index.htm?tab=imageSearch&__jzcOzonImg=${encodeURIComponent(imageUrl)}`;
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const tab = await getShared1688SearchTabInPlugin(searchUrl);
+    try {
+      await waitForTabComplete(tab.id, 45000);
+      await sleep(randomInt(2500, 5500));
+      await humanBrowse1688TabInPlugin(tab.id, "1688 以图搜货页", {
+        minDurationMs: 3500,
+        maxDurationMs: 8000,
+        returnTop: true,
+      });
+      const base64Image = await fetchImageAsBase64(imageUrl);
+      const [execResult] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        world: "MAIN",
+        func: search1688ImageInPageContext,
+        args: [base64Image, Math.max(1, Number(maxCandidates) || 5)],
+      });
+      const result = execResult?.result || {};
+      if (!result.success) {
+        return { success: false, error: result.error || "1688 页面会话未返回结果" };
+      }
+      const rawItems = Array.isArray(result.items) ? result.items : [];
+      const pageItems = result.imageId
+        ? await collect1688RenderedPageItemsInPlugin(tab.id, result.imageId, maxCandidates).catch((error) => {
+            console.warn(`[SW ${VERSION}] 1688 结果页 DOM 读取失败: ${compact1688ErrorInPlugin(error.message || error)}`);
+            return [];
+          })
+        : [];
+      const candidates = (pageItems.length ? pageItems : rawItems)
+        .map((item, index) => normalize1688OfferItemInPlugin(item, index))
+        .filter(item => item.link || item.title);
+      if (!candidates.length) {
+        return { success: false, error: result.imageId ? `1688 页面会话 imageId=${result.imageId} 未返回候选` : "1688 页面会话候选为空" };
+      }
+      return { success: true, candidates: await enrich1688CandidatesInPlugin(candidates.slice(0, maxCandidates)) };
+    } catch (error) {
+      lastError = error;
+      if (!isMissingChromeTabError(error) || attempt >= 2) throw error;
+      console.warn(`[SW ${VERSION}] 1688 搜图页 tab 已失效，清空共享 tab 后重试一次: ${error.message || error}`);
+      shared1688SearchTabId = 0;
+      await sleep(randomInt(800, 1800));
+    }
+  }
+  throw lastError || new Error("1688 页面会话搜图失败");
+}
+
+async function collect1688RenderedPageItemsInPlugin(tabId, imageId, maxCandidates) {
+  const resultUrl = `https://s.1688.com/youyuan/index.htm?tab=imageSearch&imageId=${encodeURIComponent(String(imageId))}&imageIdList=${encodeURIComponent(String(imageId))}`;
+  await withChromeTabEditRetry("打开 1688 搜图结果页", () => chrome.tabs.update(tabId, { url: resultUrl, active: false }));
+  await waitForTabComplete(tabId, 60000);
+  await sleep(randomInt(2500, 5000));
+  await humanBrowse1688TabInPlugin(tabId, "1688 搜图结果页", {
+    minDurationMs: 5500,
+    maxDurationMs: 13000,
+    dwellChance: 0.34,
+  });
+  const [execResult] = await chrome.scripting.executeScript({
+    target: { tabId },
+    func: extract1688RenderedOffersInPageContext,
+    args: [Math.max(1, Number(maxCandidates) || 5)],
+  });
+  return Array.isArray(execResult?.result) ? execResult.result : [];
+}
+
+function extract1688RenderedOffersInPageContext(maxCandidates) {
+  const normalizeUrl = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    if (text.startsWith("//")) return `https:${text}`;
+    if (/^https?:\/\//i.test(text)) return text;
+    try { return new URL(text, location.href).href; } catch (_) { return text; }
+  };
+  const cleanText = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const looksLikeOffer = (value) => {
+    if (!value || typeof value !== "object") return false;
+    const data = value.data || value;
+    return Boolean(data.offerId || data.linkUrl || data.detailUrl || data.sameDesignUrl || data.title || data.subject || data.offerTitle || data.picUrl || data.offerPicUrl);
+  };
+  const findItems = (value, depth = 0) => {
+    if (!value || depth > 8) return [];
+    if (Array.isArray(value)) {
+      const offers = value.filter(looksLikeOffer);
+      if (offers.length >= 2) return offers;
+      for (const child of value) {
+        const found = findItems(child, depth + 1);
+        if (found.length) return found;
+      }
+      return offers;
+    }
+    if (typeof value === "object") {
+      const direct = value.OFFER?.items || value.offer?.items || value.items || value.list || value.result || value.data?.items || value.data?.list;
+      const foundDirect = findItems(direct, depth + 1);
+      if (foundDirect.length) return foundDirect;
+      for (const child of Object.values(value).slice(0, 120)) {
+        const found = findItems(child, depth + 1);
+        if (found.length) return found;
+      }
+    }
+    return [];
+  };
+  const parseJsonCandidates = () => {
+    const out = [];
+    const scripts = Array.from(document.scripts || []);
+    for (const script of scripts) {
+      const text = script.textContent || "";
+      if (!/offerId|imageSearch|sameDesignUrl|detail\.1688\.com/.test(text)) continue;
+      const assignments = [
+        /window\.__INIT_DATA\s*=\s*({[\s\S]*?})\s*<\/script>/,
+        /window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*;/,
+        /window\.searchData\s*=\s*({[\s\S]*?})\s*;/,
+      ];
+      for (const re of assignments) {
+        const match = text.match(re);
+        if (!match) continue;
+        try {
+          const found = findItems(JSON.parse(match[1]));
+          if (found.length) out.push(...found);
+        } catch (_) {}
+      }
+      if (out.length) break;
+    }
+    return out;
+  };
+  const parseDomCandidates = () => {
+    const anchors = Array.from(document.querySelectorAll('a[href*="detail.1688.com/offer/"]'));
+    const seen = new Set();
+    const items = [];
+    for (const anchor of anchors) {
+      const link = normalizeUrl(anchor.getAttribute("href") || anchor.href);
+      const offerId = (link.match(/offer\/(\d+)/) || [])[1] || "";
+      const key = offerId || link;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const card = anchor.closest('[class*="offer"], [class*="item"], [class*="card"], [class*="list"], li, div') || anchor;
+      const img = card.querySelector("img") || anchor.querySelector("img");
+      const title = cleanText(anchor.getAttribute("title") || anchor.textContent || card.querySelector('[title]')?.getAttribute("title") || card.textContent).slice(0, 180);
+      const cardText = cleanText(card.textContent);
+      const price = (cardText.match(/(?:¥|￥)\s*([0-9]+(?:\.[0-9]+)?)/) || cardText.match(/([0-9]+(?:\.[0-9]+)?)\s*元/ ) || [])[1] || "";
+      items.push({ offerId, title, subject: title, linkUrl: link, picUrl: normalizeUrl(img?.currentSrc || img?.src || img?.getAttribute("data-src") || ""), price });
+      if (items.length >= Math.max(1, Number(maxCandidates) || 5)) break;
+    }
+    return items;
+  };
+  const items = parseJsonCandidates().concat(parseDomCandidates());
+  const seen = new Set();
+  return items.filter((item) => {
+    const data = item?.data || item || {};
+    const link = data.linkUrl || data.detailUrl || data.sameDesignUrl || data.url || "";
+    const offerId = data.offerId || (String(link).match(/offer\/(\d+)/) || [])[1] || "";
+    const key = offerId || link || data.title || data.subject;
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).slice(0, Math.max(1, Number(maxCandidates) || 5));
+}
+
+async function search1688ImageInPageContext(base64Image, maxCandidates) {
+  const sleepInPage = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const getRequestCandidates = () => {
+    const candidates = [];
+    const mtop = (((window || {}).lib || {}).mtop || {});
+    const searchSpace = ((window || {}).searchSpace || {});
+    if (mtop.config) {
+      mtop.config.prefix = "h5api";
+      mtop.config.mainDomain = "1688.com";
+      mtop.config.subDomain = location.href.includes("__mtop_subdomain__=wapa") ? "wapa" : "m";
+    }
+    if (typeof mtop.request === "function") candidates.push({ name: "lib.mtop.request", owner: mtop, request: mtop.request });
+    if (typeof searchSpace.request === "function" && searchSpace.request !== mtop.request) candidates.push({ name: "searchSpace.request", owner: searchSpace, request: searchSpace.request });
+    return candidates;
+  };
+  const waitForRequestCandidates = async () => {
+    const deadline = Date.now() + 25000;
+    while (Date.now() < deadline) {
+      const candidates = getRequestCandidates();
+      if (candidates.length) return candidates;
+      await sleepInPage(500);
+    }
+    return [];
+  };
+  const extractPayload = (response) => response && response.data ? response.data : response;
+  const requestWithCandidates = async (requestCandidates, options, label) => {
+    let lastError = null;
+    for (const candidate of requestCandidates) {
+      try {
+        return await candidate.request.call(candidate.owner || window, options);
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError || new Error(`${label} failed`);
+  };
+  const findItems = (value, depth = 0) => {
+    if (!value || depth > 6) return [];
+    if (Array.isArray(value)) {
+      const looksLikeOffers = value.filter(item => item && typeof item === "object" && (item.data?.offerId || item.data?.linkUrl || item.offerId || item.linkUrl || item.title || item.subject));
+      if (looksLikeOffers.length) return looksLikeOffers;
+      for (const child of value) {
+        const found = findItems(child, depth + 1);
+        if (found.length) return found;
+      }
+      return [];
+    }
+    if (typeof value === "object") {
+      const direct = value.OFFER?.items || value.offer?.items || value.items || value.list || value.result;
+      const foundDirect = findItems(direct, depth + 1);
+      if (foundDirect.length) return foundDirect;
+      for (const child of Object.values(value).slice(0, 80)) {
+        const found = findItems(child, depth + 1);
+        if (found.length) return found;
+      }
+    }
+    return [];
+  };
+
+  try {
+    const imageBase64 = String(base64Image || "").replace(/^data:image\/[^;]+;base64,/i, "");
+    if (!imageBase64) return { success: false, error: "missing image base64" };
+    const requestCandidates = await waitForRequestCandidates();
+    if (!requestCandidates.length) return { success: false, error: "1688 页面 mtop/searchSpace request 不可用" };
+
+    const uploadResponse = await requestWithCandidates(requestCandidates, {
+      api: "mtop.relationrecommend.WirelessRecommend.recommend",
+      ignoreLogin: true,
+      prefix: "h5api",
+      data: {
+        appId: 32517,
+        params: JSON.stringify({
+          searchScene: "imageEx",
+          interfaceName: "imageBase64ToImageId",
+          "serviceParam.extendParam[imageBase64]": imageBase64,
+          subChannel: "pc_image_search_image_id",
+        }),
+      },
+      v: "2.0",
+      ecode: 0,
+      type: "POST",
+      dataType: "jsonp",
+      jsonpIncPrefix: "search1688",
+      timeout: 20000,
+      trackerConfig: { requestCode: "32517_imageBase64ToImageId" },
+    }, "upload image");
+    const uploadData = extractPayload(uploadResponse);
+    const imageId = uploadData?.imageId || uploadData?.data?.imageId || uploadData?.result?.[0]?.imageId;
+    if (!imageId) return { success: false, error: `页面上传成功但没有 imageId: ${JSON.stringify(uploadData).slice(0, 500)}` };
+
+    await sleepInPage(800);
+    const searchResponse = await requestWithCandidates(requestCandidates, {
+      api: "mtop.relationrecommend.WirelessRecommend.recommend",
+      ignoreLogin: true,
+      prefix: "h5api",
+      data: {
+        appId: 32517,
+        params: JSON.stringify({
+          beginPage: 1,
+          pageSize: Math.max(20, Math.min(60, Number(maxCandidates) || 5)),
+          method: "imageOfferSearchService",
+          searchScene: "pcImageSearch",
+          appName: "pctusou",
+          tab: "imageSearch",
+          imageId: String(imageId),
+          imageIdList: String(imageId),
+          sortType: "normal",
+        }),
+      },
+      v: "2.0",
+      ecode: 0,
+      type: "GET",
+      dataType: "jsonp",
+      jsonpIncPrefix: "reqTppId_32517_getOfferList",
+      timeout: 20000,
+      trackerConfig: { requestCode: "32517_imageOfferSearchService" },
+    }, "search offers");
+    const searchData = extractPayload(searchResponse);
+    const items = findItems(searchData).slice(0, Math.max(1, Number(maxCandidates) || 5));
+    return { success: true, imageId: String(imageId), items };
+  } catch (error) {
+    return { success: false, error: (error && error.message) || String(error) };
+  }
+}
+
+function is1688RefreshableError(message) {
+  return /FAIL_SYS_ILLEGAL_ACCESS|非法请求|FAIL_SYS_TOKEN|FAIL_SYS_TOKEN_EXPIRED|FAIL_SYS_TOKEN_EXOIRED|_m_h5_tk|token|令牌|store image error|没有 imageId|未返回 imageId|imageId|cookie|login|401|403|TOKEN/i.test(String(message || ""));
 }
 
 async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) {
   const imageId = await uploadImageTo1688InPlugin(base64Image, cookieState);
   await sleep(randomInt(1200, 2800));
   const candidates = (await searchOffersByImageIdInPlugin(imageId, cookieState)).slice(0, maxCandidates);
+  return enrich1688CandidatesInPlugin(candidates);
+}
+
+async function enrich1688CandidatesInPlugin(candidates) {
   const enriched = [];
   for (const [index, candidate] of candidates.entries()) {
     if (index > 0) await sleep(randomInt(2500, 6500));
@@ -527,10 +1004,74 @@ async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandid
   return enriched;
 }
 
+function normalize1688OfferItemInPlugin(item, index) {
+  const data = item?.data || item || {};
+  const offerId = data.offerId || data.skuId || data.id || item?.offerId || "";
+  const cleanTitle = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const isCompanyTitle = (value) => /(?:有限公司|有限责任公司|商行|工厂|厂|经营部|贸易商|旗舰店|专营店)\s*$/.test(cleanTitle(value));
+  const titleCandidates = [
+    data.title,
+    data.subject,
+    data.offerTitle,
+    data.shortTitle,
+    data.simpleSubject,
+    data.name,
+    data.itemTitle,
+    data.productTitle,
+  ].map(cleanTitle).filter(Boolean);
+  const moqItem = Array.isArray(data.afterPriceList)
+    ? data.afterPriceList.find((entry) => entry.matKey === "quantity_begin")
+    : null;
+  const title = titleCandidates.find((value) => !isCompanyTitle(value)) || titleCandidates[0] || "";
+  const promotionText = collectPromotionTextFromValueInPlugin(data);
+  const pack = inferPackQuantityFromTextInPlugin([title, promotionText].join(" "));
+  const moqText = moqItem?.text || data.minOrderQuantity || data.moq || data.quantityBegin || data.beginAmount || "";
+  return {
+    rank: index + 1,
+    title,
+    price: data.priceInfo?.price || data.price || data.discountPrice || data.salePrice || "",
+    image: normalizeUrlInPlugin(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || data.imageUrl || data.imgUrl || ""),
+    link: normalizeUrlInPlugin(data.linkUrl || data.sameDesignUrl || data.detailUrl || data.url || (offerId ? `https://detail.1688.com/offer/${offerId}.html` : "")),
+    shopName: data.shop?.text || data.shopAddition?.text || data.loginId || data.sellerName || data.companyName || "",
+    moq: moqText,
+    minOrderQuantity: moqText,
+    promotionText,
+    packQuantity: pack.quantity,
+    packQuantityEvidence: pack.evidence,
+    shippingFee: "",
+    dimensionsText: "",
+    weightText: "",
+    priceDetails: "",
+  };
+}
+
 async function fetchImageAsBase64(url) {
   const resp = await fetch(url, { credentials: "omit", headers: { Referer: "https://www.ozon.ru/" } });
   if (!resp.ok) throw new Error(`主图下载失败 ${resp.status}`);
-  const buffer = await resp.arrayBuffer();
+  const blob = await resp.blob();
+  const compressed = await compressImageBlobFor1688InPlugin(blob).catch((error) => {
+    console.warn(`[SW ${VERSION}] 1688 搜图主图压缩失败，使用原图: ${error.message || error}`);
+    return null;
+  });
+  const buffer = compressed ? await compressed.arrayBuffer() : await blob.arrayBuffer();
+  return arrayBufferToBase64InPlugin(buffer);
+}
+
+async function compressImageBlobFor1688InPlugin(blob) {
+  if (!blob || typeof createImageBitmap !== "function" || typeof OffscreenCanvas === "undefined") return null;
+  const bitmap = await createImageBitmap(blob);
+  const maxSide = 900;
+  const ratio = Math.min(1, maxSide / Math.max(bitmap.width || 1, bitmap.height || 1));
+  const width = Math.max(1, Math.round((bitmap.width || 1) * ratio));
+  const height = Math.max(1, Math.round((bitmap.height || 1) * ratio));
+  const canvas = new OffscreenCanvas(width, height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(bitmap, 0, 0, width, height);
+  if (typeof bitmap.close === "function") bitmap.close();
+  return canvas.convertToBlob({ type: "image/jpeg", quality: 0.82 });
+}
+
+function arrayBufferToBase64InPlugin(buffer) {
   let binary = "";
   const bytes = new Uint8Array(buffer);
   for (let i = 0; i < bytes.length; i += 0x8000) {
@@ -561,16 +1102,33 @@ async function get1688CookieStateInPlugin() {
 async function ensure1688CookieStateInPlugin(forceRefresh = false) {
   let state = await get1688CookieStateInPlugin();
   if (state.token && !forceRefresh) return state;
+
   await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 失败: ${e.message}`));
   state = await get1688CookieStateInPlugin();
   if (state.token && !forceRefresh) return state;
-  const tab = await chrome.tabs.create({ url: "https://h5api.m.1688.com/", active: false });
-  try {
-    await waitForTabComplete(tab.id, 30000).catch(() => {});
-    await sleep(2500);
-  } finally {
-    await safeRemoveTab(tab.id);
+
+  const preheatUrls = [
+    "https://www.1688.com/",
+    "https://s.1688.com/",
+    "https://s.1688.com/selloffer/offer_search.htm",
+    "https://h5api.m.1688.com/",
+  ];
+  for (const url of preheatUrls) {
+    const tab = await createTabWithRetry({ url, active: false }, `打开 1688 token 预热页 ${url}`);
+    try {
+      await waitForTabComplete(tab.id, 30000).catch(() => {});
+      await sleep(randomInt(1200, 2600));
+      await humanBrowse1688TabInPlugin(tab.id, `1688 token 预热页 ${url}`, {
+        minDurationMs: 2500,
+        maxDurationMs: 6500,
+      });
+    } finally {
+      await safeRemoveTab(tab.id);
+    }
+    state = await get1688CookieStateInPlugin();
+    if (state.token && !forceRefresh) return state;
   }
+
   await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed retry 失败: ${e.message}`));
   return get1688CookieStateInPlugin();
 }
@@ -595,6 +1153,7 @@ async function seed1688MtopTokenInPlugin() {
 }
 
 async function uploadImageTo1688InPlugin(base64Image, cookieState) {
+  const imageBase64 = String(base64Image || "").replace(/^data:image\/[^;]+;base64,/i, "");
   const uploadParams = {
     appId: 32517,
     params: JSON.stringify({
@@ -603,32 +1162,46 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState) {
       searchScene: "pcImageSearch",
       method: "uploadBase64WithRequest",
       appName: "pctusou",
-      imageBase64: base64Image,
+      imageBase64,
       tab: "imageSearch",
       spm: "a26352.b28411319/2508.imagesearch.upload",
       sortType: "normal",
     }),
   };
-  const dataStr = JSON.stringify(uploadParams);
-  const timestamp = String(Date.now());
-  const url = buildMtopUrlInPlugin({
-    t: timestamp,
-    sign: signMtopInPlugin(cookieState.token, timestamp, dataStr),
-    type: "originaljson",
-    dataType: "jsonp",
-    jsonpIncPrefix: "reqTppId_32517_getOfferList",
-  });
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: build1688HeadersInPlugin(cookieState.cookieHeader, { "Content-Type": "application/x-www-form-urlencoded" }),
-    credentials: "include",
-    body: `data=${encodeURIComponent(dataStr)}`,
-  });
-  const json = parseMtopTextInPlugin(await resp.text());
-  assertMtopSuccessInPlugin(json, "上传图片失败");
-  const imageId = json.data?.data?.imageId || json.data?.imageId || json.data?.result?.[0]?.imageId;
-  if (!imageId) throw new Error(`上传成功但没有 imageId: ${JSON.stringify(json).slice(0, 300)}`);
-  return imageId;
+  let state = cookieState;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const dataStr = JSON.stringify(uploadParams);
+      const timestamp = String(Date.now());
+      const url = buildMtopUrlInPlugin({
+        t: timestamp,
+        sign: signMtopInPlugin(state.token, timestamp, dataStr),
+        type: "originaljson",
+        dataType: "jsonp",
+        jsonpIncPrefix: "reqTppId_32517_getOfferList",
+      });
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: build1688HeadersInPlugin(state.cookieHeader, { "Content-Type": "application/x-www-form-urlencoded" }),
+        credentials: "include",
+        body: `data=${encodeURIComponent(dataStr)}`,
+      });
+      const json = parseMtopTextInPlugin(await resp.text());
+      assertMtopSuccessInPlugin(json, "上传图片失败");
+      const imageId = json.data?.data?.imageId || json.data?.imageId || json.data?.result?.[0]?.imageId;
+      if (!imageId) throw new Error(`上传图片失败：${get1688MtopBusinessError(json) || "未返回 imageId"}`);
+      return imageId;
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || error || "");
+      if (attempt >= 3 || !is1688RefreshableError(message)) throw error;
+      console.warn(`[SW ${VERSION}] 1688 图片上传失败，第 ${attempt}/3 次重试: ${message}`);
+      await sleep(1000 * attempt);
+      state = await ensure1688CookieStateInPlugin(true);
+    }
+  }
+  throw lastError;
 }
 
 async function searchOffersByImageIdInPlugin(imageId, cookieState) {
@@ -686,6 +1259,7 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState) {
     const title = titleCandidates.find((value) => !isCompanyTitle(value)) || titleCandidates[0] || "";
     const promotionText = collectPromotionTextFromValueInPlugin(data);
     const pack = inferPackQuantityFromTextInPlugin([title, promotionText].join(" "));
+    const moqText = moqItem?.text || data.minOrderQuantity || data.moq || "";
     return {
       rank: index + 1,
       title,
@@ -693,8 +1267,8 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState) {
       image: normalizeUrlInPlugin(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || ""),
       link: normalizeUrlInPlugin(data.linkUrl || data.sameDesignUrl || (offerId ? `https://detail.1688.com/offer/${offerId}.html` : "")),
       shopName: data.shop?.text || data.shopAddition?.text || data.loginId || data.sellerName || "",
-      moq: moqItem?.text || "1件起批",
-      minOrderQuantity: moqItem?.text || "1件起批",
+      moq: moqText,
+      minOrderQuantity: moqText,
       promotionText,
       packQuantity: pack.quantity,
       packQuantityEvidence: pack.evidence,
@@ -708,10 +1282,15 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState) {
 
 async function scrape1688CandidateDetailsInPlugin(candidate) {
   if (!candidate.link) return { detailError: "没有候选链接" };
-  const tab = await chrome.tabs.create({ url: candidate.link, active: false });
+  const tab = await createTabWithRetry({ url: candidate.link, active: false }, "打开 1688 候选详情页");
   try {
     await waitForTabComplete(tab.id, 70000);
     await sleep(randomInt(3500, 8000));
+    await humanBrowse1688TabInPlugin(tab.id, "1688 候选详情页", {
+      minDurationMs: 6500,
+      maxDurationMs: 15000,
+      dwellChance: 0.38,
+    });
     const [execResult] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extract1688DetailData,
@@ -798,6 +1377,191 @@ function extract1688DetailData(fallback) {
     }
     return "";
   };
+  const weightKeyPattern = /(?:weight|unitweight|skuweight|grossweight|netweight|packageweight|pieceweight|重量|克重|毛重|净重|包装重|发货重|商品重|计费重)/i;
+  const shippingKeyPattern = /(?:shippingfee|shipping|shiptemplate|postage|postfee|postfeevalue|freight|freightfee|freightprice|freighttemplate|freightmodule|logisticsfee|logisticsinfo|deliveryfee|deliverytemplate|expressfee|templatefee|carriage|totalcost|logistics|delivery|express|运费|物流费|物流|快递费|快递|配送费|配送|发货费|邮费|邮资|运费模板|物流模板)/i;
+  const moqKeyPattern = /(?:minorder|minorderqty|minorderquantity|minimumorder|minimumorderquantity|minorderqty|min\s*order\s*qty|min\s*order\s*quantity|minimum\s*purchase|beginamount|startamount|batchnumber|moq|起批|起订|起购|起拍|起订量|起购量|最小起订|最少起批|可批|拿样|代发)/i;
+  const primitiveWeightValue = (value) => {
+    if (typeof value === "string" || typeof value === "number") return value;
+    if (!value || typeof value !== "object") return "";
+    return pick(value.value, value.text, value.name, value.title, value.displayValue, value.displayName, value.content);
+  };
+  const primitiveShippingValue = (value) => {
+    if (typeof value === "string" || typeof value === "number") return value;
+    if (!value || typeof value !== "object") return "";
+    return pick(value.value, value.text, value.name, value.title, value.displayValue, value.displayName, value.displayText, value.content, value.amount, value.price, value.fee, value.cost, value.freight, value.deliveryTemplate, value.templateFee, value.freightTemplate, value.freightModule, value.logisticsInfo, value.postage, value.carriage, value.shipTemplate);
+  };
+  const pickSourcedWeight = (items) => {
+    for (const item of items) {
+      const value = item?.value;
+      if (value && normalizeWeightGrams(value)) return { value, source: item.source || "" };
+    }
+    return { value: "", source: "" };
+  };
+  const findWeightInRaw = (root) => {
+    const seen = new Set();
+    const stack = [{ key: "", value: root, depth: 0 }];
+    const candidates = [];
+    let visited = 0;
+    while (stack.length && candidates.length < 24 && visited < 2500) {
+      const item = stack.pop();
+      visited += 1;
+      const key = clean(item.key);
+      const value = item.value;
+      if (value == null || item.depth > 7) continue;
+      const candidate = primitiveWeightValue(value);
+      if (candidate && weightKeyPattern.test(key) && normalizeWeightGrams(candidate)) {
+        candidates.push({ value: candidate, source: `1688原始字段 ${key}` });
+      }
+      if (typeof value !== "object") continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      const entries = Array.isArray(value) ? value.map((child, index) => [String(index), child]) : Object.entries(value);
+      for (const [childKey, childValue] of entries.slice(0, 160)) {
+        stack.push({ key: key ? `${key}.${childKey}` : childKey, value: childValue, depth: item.depth + 1 });
+      }
+    }
+    return candidates.find((item) => normalizeWeightGrams(item.value)) || { value: "", source: "" };
+  };
+  const findWeightInBody = () => {
+    const match = bodyText.match(/(?:包装重量|发货重量|商品重量|产品重量|计费重量|毛重|净重|克重|重量)\s*[:：]?\s*(\d+(?:[.,]\d+)?\s*(?:kg|公斤|千克|g|克|mg|毫克))/i);
+    return match ? { value: match[1], source: "1688页面文本重量" } : { value: "", source: "" };
+  };
+  const normalizeShippingFee = (value, depth = 0) => {
+    if (value == null || depth > 4) return "";
+    if (typeof value === "object") {
+      const candidates = [
+        value.totalCost,
+        value.postFeeValue,
+        value.shippingFee,
+        value.shipTemplate,
+        value.postage,
+        value.freightFee,
+        value.freightPrice,
+        value.freightTemplate,
+        value.freightModule,
+        value.logisticsFee,
+        value.logisticsInfo,
+        value.deliveryFee,
+        value.deliveryTemplate,
+        value.expressFee,
+        value.templateFee,
+        value.carriage,
+        value.amount,
+        value.price,
+        value.fee,
+        value.cost,
+        value.freight,
+        value.value,
+        value.displayValue,
+        value.displayText,
+        value.content,
+        value.text,
+        value.name,
+        value.title,
+      ];
+      for (const candidate of candidates) {
+        const normalized = normalizeShippingFee(candidate, depth + 1);
+        if (normalized) return normalized;
+      }
+      return "";
+    }
+    const text = clean(value);
+    if (!text) return "";
+    if (/包邮|免运费|免费配送|卖家承担|free\s*shipping|运费\s*0|物流费\s*0/i.test(text)) return "0";
+    const match = text.match(/(?:¥|￥|RMB|CNY)?\s*(\d+(?:[.,]\d+)?)(?:\s*(?:元|块|rmb|cny))?/i);
+    if (!match) return "";
+    const number = Number(match[1].replace(",", "."));
+    if (!Number.isFinite(number) || number > 9999) return "";
+    return String(number);
+  };
+  const pickSourcedShippingFee = (items) => {
+    for (const item of items) {
+      const value = item?.value;
+      if (value) return { value, source: item.source || "" };
+    }
+    return { value: "", source: "" };
+  };
+  const findShippingInRaw = (root) => {
+    const seen = new Set();
+    const stack = [{ key: "", value: root, depth: 0 }];
+    let visited = 0;
+    while (stack.length && visited < 3000) {
+      const item = stack.pop();
+      visited += 1;
+      const key = clean(item.key);
+      const value = item.value;
+      if (value == null || item.depth > 7) continue;
+      if (shippingKeyPattern.test(key)) {
+        const normalized = normalizeShippingFee(value) || normalizeShippingFee(primitiveShippingValue(value));
+        if (normalized) return { value: normalized, source: `1688原始字段 ${key}` };
+      }
+      if (typeof value !== "object") continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      const entries = Array.isArray(value) ? value.map((child, index) => [String(index), child]) : Object.entries(value);
+      for (const [childKey, childValue] of entries.slice(0, 160)) {
+        stack.push({ key: key ? `${key}.${childKey}` : childKey, value: childValue, depth: item.depth + 1 });
+      }
+    }
+    return { value: "", source: "" };
+  };
+  const findShippingInBody = () => {
+    if (/包邮|免运费|免费配送|卖家承担运费/i.test(bodyText)) return { value: "0", source: "1688页面文本包邮" };
+    const match = bodyText.match(/(?:运费|物流费用|物流费|快递费|配送费|发货费用|邮费)\s*[:：]?\s*(?:¥|￥|RMB|CNY)?\s*(\d+(?:[.,]\d+)?)(?:\s*(?:元|块|rmb|cny))?/i);
+    if (match) return { value: normalizeShippingFee(match[1]), source: "1688页面文本运费" };
+    if (/运费模板|物流模板|按地区|按地址|选择地区|选择收货地|联系卖家|待议|到付|运费|物流|快递|配送/i.test(bodyText)) {
+      return { value: "未公开/需选择地区", source: "1688页面提示存在运费但金额未公开" };
+    }
+    return { value: "", source: "" };
+  };
+  const primitiveMoqValue = (value) => {
+    if (typeof value === "string" || typeof value === "number") return value;
+    if (!value || typeof value !== "object") return "";
+    return pick(value.value, value.text, value.name, value.title, value.displayValue, value.displayName, value.content, value.beginAmount, value.startAmount, value.quantity, value.amount);
+  };
+  const normalizeMoq = (value) => {
+    const text = clean(value).replace(/,/g, " ").replace(/\s+/g, " ").trim();
+    if (!text) return "";
+    if (/^\d+(?:\.\d+)?$/.test(text)) {
+      const number = Number(text);
+      return Number.isFinite(number) && number > 0 ? `${Math.ceil(number)}件起批` : "";
+    }
+    if (/(?:一|1)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发)|(?:起批|起订|起购|起拍|起订量|起购量|最少起批|最小起订|可批|拿样|代发)\s*[:：]?\s*(?:一|1)(?:\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces))?|(?:min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)\s*[:：]?\s*1(?:\s*(?:pcs?|piece|pieces))?/i.test(text)) {
+      return "1件起批";
+    }
+    const match = text.match(/(?:^|[^\d])(\d+(?:\.\d+)?)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发|min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)/i)
+      || text.match(/(?:起批|起订|起购|起拍|起订量|起购量|最少起批|最小起订|可批|拿样|代发|min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)\s*[:：]?\s*(\d+(?:\.\d+)?)/i);
+    if (!match) return "";
+    const number = Number(match[1]);
+    return Number.isFinite(number) && number > 0 ? `${Math.ceil(number)}件起批` : "";
+  };
+  const findMoqInRaw = (root) => {
+    const seen = new Set();
+    const stack = [{ key: "", value: root, depth: 0 }];
+    let visited = 0;
+    while (stack.length && visited < 3000) {
+      const item = stack.pop();
+      visited += 1;
+      const key = clean(item.key);
+      const value = item.value;
+      if (value == null || item.depth > 7) continue;
+      const candidate = primitiveMoqValue(value);
+      if (candidate && moqKeyPattern.test(key)) {
+        const normalized = normalizeMoq(candidate);
+        if (normalized) return normalized;
+        const text = clean(candidate);
+        if (text) return text;
+      }
+      if (typeof value !== "object") continue;
+      if (seen.has(value)) continue;
+      seen.add(value);
+      const entries = Array.isArray(value) ? value.map((child, index) => [String(index), child]) : Object.entries(value);
+      for (const [childKey, childValue] of entries.slice(0, 160)) {
+        stack.push({ key: key ? `${key}.${childKey}` : childKey, value: childValue, depth: item.depth + 1 });
+      }
+    }
+    return "";
+  };
 
   const mainPrice = unwrap(raw.mainPrice || {});
   const orderParamModel = unwrap(raw.orderParamModel || {});
@@ -853,7 +1617,13 @@ function extract1688DetailData(fallback) {
     .filter((value) => Number.isFinite(value) && value > 0)
     .sort((a, b) => a - b)[0];
   const moqFromDom = bodyText.match(/(\d+)\s*(?:件|个|只|套|箱|包)\s*起批/);
-  const minOrderQuantity = pick(moqFromPriceRange ? `${moqFromPriceRange}件起批` : "", moqFromDom ? `${moqFromDom[1]}件起批` : "", fallback.moq);
+  const minOrderQuantity = pick(
+    moqFromPriceRange ? `${moqFromPriceRange}件起批` : "",
+    moqFromDom ? `${moqFromDom[1]}件起批` : "",
+    getAttr("起批", "起订", "起购", "最小起订", "最少起批", "min order", "moq"),
+    findMoqInRaw(raw),
+    fallback.moq,
+  );
 
   const packInfo = unwrap(raw.productPackInfo || raw.pieceWeightScale || raw.offerDetail?.pieceWeightScale || {});
   const pieceWeightScale = packInfo.pieceWeightScale || packInfo;
@@ -884,9 +1654,39 @@ function extract1688DetailData(fallback) {
   const skuWeight = freightInfo.skuWeight && typeof freightInfo.skuWeight === "object"
     ? Object.values(freightInfo.skuWeight).find(Boolean)
     : "";
-  const weightRaw = pick(firstScale[colMap.weight], firstScale.weight, packInfo.unitWeight, shipping.unitWeight, skuWeight, getAttr("重量", "克重", "毛重", "净重", "weight"));
+  const pickedWeight = pickSourcedWeight([
+    { value: firstScale[colMap.weight], source: "1688规格重量列" },
+    { value: firstScale.weight, source: "1688规格weight" },
+    { value: firstScale.unitWeight, source: "1688规格unitWeight" },
+    { value: firstScale.grossWeight, source: "1688规格grossWeight" },
+    { value: firstScale.netWeight, source: "1688规格netWeight" },
+    { value: packInfo.unitWeight, source: "1688包装unitWeight" },
+    { value: packInfo.grossWeight, source: "1688包装grossWeight" },
+    { value: packInfo.netWeight, source: "1688包装netWeight" },
+    { value: packInfo.packageWeight, source: "1688包装packageWeight" },
+    { value: shipping.unitWeight, source: "1688运费unitWeight" },
+    { value: shipping.grossWeight, source: "1688运费grossWeight" },
+    { value: shipping.netWeight, source: "1688运费netWeight" },
+    { value: shipping.packageWeight, source: "1688运费packageWeight" },
+    { value: skuWeight, source: "1688运费skuWeight" },
+    { value: getAttr("包装重量", "发货重量", "商品重量", "产品重量", "计费重量", "重量", "克重", "毛重", "净重", "weight"), source: "1688属性重量" },
+    findWeightInRaw(raw),
+    findWeightInBody(),
+  ]);
+  const weightRaw = pickedWeight.value;
   const weightGrams = normalizeWeightGrams(weightRaw);
-  const shippingFee = pick(freightInfo.totalCost, freightInfo.postFeeValue, shipping.totalCost, shipping.postFeeValue, getAttr("运费", "物流费用", "快递费"), /包邮|免运费/.test(rawText) ? "0" : "");
+  const pickedShipping = pickSourcedShippingFee([
+    { value: normalizeShippingFee(freightInfo), source: "1688运费freightInfo" },
+    { value: normalizeShippingFee(shipping), source: "1688运费shippingServices" },
+    { value: normalizeShippingFee(freightInfo.totalCost), source: "1688运费freightInfo.totalCost" },
+    { value: normalizeShippingFee(freightInfo.postFeeValue), source: "1688运费freightInfo.postFeeValue" },
+    { value: normalizeShippingFee(shipping.totalCost), source: "1688运费shippingServices.totalCost" },
+    { value: normalizeShippingFee(shipping.postFeeValue), source: "1688运费shippingServices.postFeeValue" },
+    { value: normalizeShippingFee(getAttr("运费", "物流费用", "物流费", "快递费", "配送费", "邮费")), source: "1688属性运费" },
+    findShippingInRaw(raw),
+    findShippingInBody(),
+  ]);
+  const shippingFee = pickedShipping.value;
   const selectorTitle = pick(
     document.querySelector('[class*="title-text"]')?.innerText,
     document.querySelector('[class*="titleText"]')?.innerText,
@@ -916,9 +1716,11 @@ function extract1688DetailData(fallback) {
     minOrderQuantity,
     moq: minOrderQuantity,
     shippingFee,
+    shippingFeeSource: pickedShipping.source || (shippingFee ? "页面提示存在运费但金额未公开" : ""),
     dimensionsText,
     weightText: weightGrams ? `${weightGrams} g` : "",
     weightGrams,
+    weightSource: pickedWeight.source,
     promotionText,
     detailAttributes: attrs,
   };
@@ -969,9 +1771,25 @@ function parseMtopTextInPlugin(text) {
 
 function assertMtopSuccessInPlugin(json, message) {
   const ret = Array.isArray(json?.ret) ? json.ret.join("; ") : "";
-  if (!ret.includes("SUCCESS")) {
-    throw new Error(`${message}：${ret || JSON.stringify(json).slice(0, 500)}`);
+  const businessError = get1688MtopBusinessError(json);
+  if (businessError) {
+    throw new Error(`${message}：${businessError}`);
   }
+  if (!ret.includes("SUCCESS")) {
+    throw new Error(`${message}：${ret || "1688 接口未返回 SUCCESS"}`);
+  }
+}
+
+function get1688MtopBusinessError(json) {
+  const data = json?.data;
+  const nested = data?.data;
+  const success = json?.success ?? data?.success ?? nested?.success;
+  const code = json?.code ?? data?.code ?? nested?.code;
+  const errorMessage = json?.errorMessage || data?.errorMessage || nested?.errorMessage || "";
+  if (success === false || String(code) === "-1" || errorMessage) {
+    return errorMessage || `code=${code}`;
+  }
+  return "";
 }
 
 function normalizeUrlInPlugin(url) {
@@ -1028,9 +1846,11 @@ function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
     minOrderQuantity: details.minOrderQuantity || candidate.minOrderQuantity || candidate.moq,
     moq: details.moq || details.minOrderQuantity || candidate.moq,
     shippingFee: details.shippingFee || candidate.shippingFee || "",
+    shippingFeeSource: details.shippingFeeSource || candidate.shippingFeeSource || "",
     dimensionsText: details.dimensionsText || candidate.dimensionsText || "",
     weightText: details.weightText || candidate.weightText || "",
     weightGrams: details.weightGrams || candidate.weightGrams || normalizeWeightGramsInPlugin(details.weightText || candidate.weightText),
+    weightSource: details.weightSource || candidate.weightSource || "",
     priceDetails: details.priceDetails || candidate.priceDetails || "",
     promotionText: [candidate.promotionText, details.promotionText].filter(Boolean).join("；"),
     packQuantity: pack,
@@ -1987,7 +2807,7 @@ function waitForTabComplete(tabId, timeoutMs) {
 
 async function safeRemoveTab(tabId) {
   try {
-    await chrome.tabs.remove(tabId);
+    await removeTabWithRetry(tabId);
   } catch (e) {
     // tab 已关闭, 忽略
   }

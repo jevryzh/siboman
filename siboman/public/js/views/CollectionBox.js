@@ -24,9 +24,21 @@ window.CollectionBoxView = {
       { label: '失败', value: 'failed' },
       { label: '已忽略', value: 'ignored' },
     ];
+    const statusDescriptions = {
+      pending: '已入库, 等待采集端领取或重试',
+      scraped: '采集完成, 可编辑资料后送去批量上架',
+      uploaded: '已由上架流程标记为完成',
+      failed: '采集失败, 请先查看失败原因后重试',
+      ignored: '已忽略, 默认不参与处理',
+    };
 
     const currentStoreId = Vue.computed(() => String(window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '').split(',')[0].trim());
     let searchTimer = null;
+    const rowFailureReason = (row) => row.note || row.error || row.fail_reason || '暂无失败原因';
+    const taskSummary = (row) => {
+      if (row.linked_job_id) return `任务 ${String(row.linked_job_id).slice(0, 8)} · ${statusDescriptions[row.status] || statusLabel(row.status)}`;
+      return statusDescriptions[row.status] || statusLabel(row.status);
+    };
 
     const fetchItems = async () => {
       loading.value = true;
@@ -87,16 +99,17 @@ window.CollectionBoxView = {
     const saveDraft = async () => {
       try {
         await axios.put(`/api/collect-items/${drawer.itemId}`, drawer.form);
-        ElementPlus.ElMessage.success('草稿已物理落地');
+        ElementPlus.ElMessage.success('采集资料已保存到本地, 尚未上架');
         drawer.visible = false;
         fetchItems();
       } catch (e) {
-        ElementPlus.ElMessage.error('保存失败');
+        ElementPlus.ElMessage.error('保存失败：' + (e.response?.data?.error || e.message));
       }
     };
 
     const onTabChange = () => { pagination.currentPage = 1; fetchItems(); };
     const onSearch = () => { pagination.currentPage = 1; fetchItems(); };
+    const onSizeChange = () => { pagination.currentPage = 1; fetchItems(); };
     const onSearchInput = () => {
       clearTimeout(searchTimer);
       searchTimer = setTimeout(onSearch, 350);
@@ -131,6 +144,22 @@ window.CollectionBoxView = {
         ElementPlus.ElMessage.error('删除失败：' + (e.response?.data?.error || e.message));
       }
     };
+    const deleteItem = async (row) => {
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          `确定删除「${row.title || row.ozon_sku || row.id}」？删除后不会影响已上架商品, 但采集箱记录不可恢复。`,
+          '删除采集项',
+          { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      try {
+        await axios.delete(`/api/collect-items/${row.id}`);
+        ElementPlus.ElMessage.success('采集项已删除');
+        fetchItems();
+      } catch (e) {
+        ElementPlus.ElMessage.error('删除失败：' + (e.response?.data?.error || e.message));
+      }
+    };
 
     const retryItem = async (row) => {
       try {
@@ -138,6 +167,37 @@ window.CollectionBoxView = {
         ElementPlus.ElMessage.success(`已重新创建采集任务 ${res.data.job_id || ''}`);
         fetchItems();
       } catch (e) { ElementPlus.ElMessage.error('重试失败：' + (e.response?.data?.error || e.message)); }
+    };
+    const sendToListing = async (row) => {
+      if (row.status === 'failed') return ElementPlus.ElMessage.warning('失败采集项请先重新采集, 成功后再送上架');
+      if (!row.ozon_sku && !row.ozon_url) return ElementPlus.ElMessage.warning('缺少 Ozon SKU 或链接, 暂不能送上架');
+      try {
+        await ElementPlus.ElMessageBox.confirm(
+          '将把这条采集资料放入本地待上架暂存, 并跳转到批量上架页。不会自动提交 Ozon。',
+          '送入上架确认',
+          { type: 'info', confirmButtonText: '去上架页', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      const payload = {
+        from: 'collection-box',
+        created_at: new Date().toISOString(),
+        item: {
+          id: row.id,
+          ozon_sku: row.ozon_sku,
+          ozon_url: row.ozon_url,
+          title: row.title,
+          price_rub: row.price_rub,
+          source_url_1688: row.source_url_1688,
+          price_cny: row.price_cny,
+          weight: row.weight,
+          depth: row.depth,
+          width: row.width,
+          height: row.height,
+        },
+      };
+      try { localStorage.setItem('collection_box_listing_prefill', JSON.stringify(payload)); } catch {}
+      ElementPlus.ElMessage.success('已暂存采集资料, 请在批量上架页确认后提交');
+      window.location.hash = '#/upload';
     };
 
     const exportCsv = () => {
@@ -171,7 +231,8 @@ window.CollectionBoxView = {
       items, loading, importText, handleImport, editItem, drawer,
       activeTab, search, selectedRows, statusCounts, statusTabs,
       pagination, fetchItems, getProfitStyle, suggestedPrice, applySuggestedPrice, saveDraft,
-      onTabChange, onSearch, onSearchInput, onSelectionChange, updateStatus, bulkDelete, retryItem, exportCsv, statusLabel, statusType,
+      onTabChange, onSearch, onSearchInput, onSizeChange, onSelectionChange, updateStatus, bulkDelete, deleteItem, retryItem, sendToListing, exportCsv,
+      statusLabel, statusType, statusDescriptions, rowFailureReason, taskSummary,
     };
   },
   template: `
@@ -181,6 +242,7 @@ window.CollectionBoxView = {
           <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon 链接或 SKU，每行一条" />
           <el-button type="primary" @click="handleImport" style="height:32px">加入采集箱</el-button>
         </div>
+        <div style="margin-top:8px; color:#909399; font-size:12px">加入后只创建采集箱记录和采集任务；送上架需要在采集完成后手动确认。</div>
       </el-card>
 
       <el-card>
@@ -202,7 +264,7 @@ window.CollectionBoxView = {
           </el-tab-pane>
         </el-tabs>
 
-        <el-table :data="items" v-loading="loading" stripe border @selection-change="onSelectionChange">
+        <el-table :data="items" v-loading="loading" stripe border empty-text="暂无采集项。请粘贴 Ozon 链接或 SKU 后加入采集箱。" @selection-change="onSelectionChange">
           <el-table-column type="selection" width="44" />
           <el-table-column label="商品信息" min-width="250">
             <template #default="{ row }">
@@ -212,9 +274,15 @@ window.CollectionBoxView = {
                 <div style="flex: 1; min-width: 0">
                   <div class="text-ellipsis" style="font-size: 13px">{{ row.title || '正在采集...' }}</div>
                   <div style="font-size:11px; color:#999">SKU: {{ row.ozon_sku || '-' }}</div>
-                  <div v-if="row.note" style="font-size:11px; color:#f56c6c; margin-top:3px">{{ row.note }}</div>
+                  <div v-if="row.status === 'failed'" style="font-size:11px; color:#f56c6c; margin-top:3px">{{ rowFailureReason(row) }}</div>
                 </div>
               </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="采集任务" min-width="170" show-overflow-tooltip>
+            <template #default="{ row }">
+              <div style="font-size:12px; color:#606266">{{ taskSummary(row) }}</div>
+              <div v-if="row.status === 'failed'" style="font-size:11px; color:#f56c6c">{{ rowFailureReason(row) }}</div>
             </template>
           </el-table-column>
           <el-table-column label="1688 货源" width="120">
@@ -224,15 +292,21 @@ window.CollectionBoxView = {
                 <div v-else-if="!row.source_url_1688" style="color:#ccc">未匹配</div>
              </template>
           </el-table-column>
-          <el-table-column label="状态" width="100">
-            <template #default="{ row }"><el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag></template>
+          <el-table-column label="状态" width="110">
+            <template #default="{ row }">
+              <el-tooltip :content="statusDescriptions[row.status] || statusLabel(row.status)" placement="top">
+                <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
+              </el-tooltip>
+            </template>
           </el-table-column>
-          <el-table-column label="操作" width="190" fixed="right">
+          <el-table-column label="操作" width="240" fixed="right">
             <template #default="{ row }">
               <el-button link type="primary" @click="editItem(row)">编辑</el-button>
+              <el-button v-if="row.status === 'scraped'" link type="success" @click="sendToListing(row)">送上架</el-button>
               <el-button v-if="row.status === 'failed'" link type="danger" @click="retryItem(row)">重新采集</el-button>
               <el-button v-if="row.status !== 'ignored'" link type="warning" @click="updateStatus(row, 'ignored')">忽略</el-button>
               <el-button v-else link type="success" @click="updateStatus(row, 'pending')">恢复</el-button>
+              <el-button link type="danger" @click="deleteItem(row)">删除</el-button>
             </template>
           </el-table-column>
         </el-table>
@@ -242,14 +316,18 @@ window.CollectionBoxView = {
             v-model:current-page="pagination.currentPage"
             v-model:page-size="pagination.pageSize"
             :total="pagination.total"
-            layout="total, prev, pager, next"
+            :page-sizes="[20, 50, 100]"
+            layout="total, sizes, prev, pager, next"
             @current-change="fetchItems"
+            @size-change="onSizeChange"
           />
         </div>
       </el-card>
 
       <!-- 补全 Ozon 死穴字段的编辑抽屉 -->
       <el-drawer v-model="drawer.visible" title="编辑采集商品" size="650px">
+        <el-alert title="保存采集资料只写入本地采集箱；上架需要点击送上架并在批量上架页确认。" type="info" :closable="false" show-icon style="margin-bottom:12px" />
+        <el-alert v-if="drawer.form.status === 'failed'" :title="rowFailureReason(drawer.form)" type="error" :closable="false" show-icon style="margin-bottom:12px" />
         <el-form :model="drawer.form" label-position="top">
           <el-form-item label="商品名称 (俄/英)" required><el-input v-model="drawer.form.title" /></el-form-item>
           
@@ -284,6 +362,7 @@ window.CollectionBoxView = {
         </el-form>
         
         <template #footer>
+          <el-button @click="drawer.visible = false">取消</el-button>
           <el-button type="primary" @click="saveDraft">保存采集资料</el-button>
         </template>
       </el-drawer>
