@@ -7774,10 +7774,17 @@ app.post("/api/jobs/:id/review/confirm", async (req, res, next) => {
         candidateImage: String(row.candidateImage || "").slice(0, 2000),
         purchasePriceRmb: Number.isFinite(Number(row.purchasePriceRmb)) ? Number(Number(row.purchasePriceRmb).toFixed(2)) : null,
         listingPriceRub: Number.isFinite(Number(row.listingPriceRub)) ? Number(Number(row.listingPriceRub).toFixed(2)) : null,
+        candidatePriceDetails: String(row.candidatePriceDetails || "").slice(0, 1000),
+        estimatedPurchasePriceRmb: Number.isFinite(Number(row.estimatedPurchasePriceRmb)) ? Number(Number(row.estimatedPurchasePriceRmb).toFixed(2)) : null,
+        purchaseMultiplier: String(row.purchaseMultiplier || "").slice(0, 100),
         candidateMoq: String(row.candidateMoq || "").slice(0, 200),
         candidateFreight: String(row.candidateFreight || "").slice(0, 200),
         candidateWeight: String(row.candidateWeight || "").slice(0, 200),
+        candidateDimensions: String(row.candidateDimensions || "").slice(0, 500),
+        candidatePackQuantity: String(row.candidatePackQuantity || "").slice(0, 200),
         risk: String(row.risk || "").slice(0, 500),
+        aiDecision: String(row.aiDecision || "").slice(0, 100),
+        aiReason: String(row.aiReason || "").slice(0, 1000),
         note: String(row.note || "").slice(0, 500),
         confirmed: row.confirmed !== false,
         confirmedAt: new Date().toISOString(),
@@ -12689,6 +12696,10 @@ function buildSingleSourcingReviewPayload(job = {}) {
     const purchasePrice = finalCandidate
       ? normalize1688PriceOnly(finalCandidate.priceDetails || finalCandidate.price)
       : "";
+    const unitPriceNumber = Number(purchasePrice);
+    const estimatedPurchasePrice = Number.isFinite(unitPriceNumber) && unitPriceNumber > 0 && finalCandidate?.purchaseMultiplier
+      ? Number((unitPriceNumber * Number(finalCandidate.purchaseMultiplier)).toFixed(2))
+      : finalCandidate?.estimatedPurchasePriceRmb;
     const finalDecision = finalCandidate?.finalMatchType || result.aiReview?.decision || "";
     rows.push({
       sourceRow: result.sourceRow || rows.length + 1,
@@ -12698,7 +12709,9 @@ function buildSingleSourcingReviewPayload(job = {}) {
       ozonTitle: ozon.title || "",
       ozonImage: ozon.mainImage?.publicUrl || ozon.mainImageUrl || "",
       ozonPrice,
+      ozonBlackPrice,
       ozonWeight: formatNumberForSheet(ozon.weightGrams || normalizeWeightGrams(ozon.weightText)),
+      aiEstimatedWeight: formatNumberForSheet(result.aiReview?.estimated_weight_grams),
       ozonPackQuantity: ozon.packQuantity || result.aiReview?.ozon_pack_quantity || "",
       selectedRank: confirmed?.selectedRank || finalCandidate?.rank || result.aiReview?.selected_rank || "",
       candidateTitle: confirmed?.candidateTitle || finalCandidate?.title || "",
@@ -12706,12 +12719,17 @@ function buildSingleSourcingReviewPayload(job = {}) {
       candidateImage: confirmed?.candidateImage || finalCandidate?.localImage?.publicUrl || finalCandidate?.image || finalCandidate?.imageUrl || "",
       purchasePriceRmb: confirmed?.purchasePriceRmb ?? purchasePrice,
       listingPriceRub,
+      candidatePriceDetails: confirmed?.candidatePriceDetails || finalCandidate?.priceDetails || "",
+      estimatedPurchasePriceRmb: confirmed?.estimatedPurchasePriceRmb ?? estimatedPurchasePrice ?? "",
+      purchaseMultiplier: confirmed?.purchaseMultiplier || finalCandidate?.purchaseMultiplier || "",
       candidateMoq: confirmed?.candidateMoq || finalCandidate?.minOrderQuantity || finalCandidate?.moq || "",
       candidateFreight: confirmed?.candidateFreight || finalCandidate?.shippingFee || "",
       candidateWeight: confirmed?.candidateWeight || formatNumberForSheet(finalCandidate?.weightGrams || normalizeWeightGrams(finalCandidate?.weightText)),
+      candidateDimensions: confirmed?.candidateDimensions || finalCandidate?.dimensionsText || "",
+      candidatePackQuantity: confirmed?.candidatePackQuantity || finalCandidate?.candidatePackQuantity || finalCandidate?.packQuantity || "",
       risk: confirmed?.risk || compactRiskText(finalCandidate || {}),
-      aiDecision: finalDecision,
-      aiReason: result.aiReview?.reason || finalCandidate?.finalReason || finalCandidate?.aiReason || "",
+      aiDecision: confirmed?.aiDecision || finalDecision,
+      aiReason: confirmed?.aiReason || result.aiReview?.reason || finalCandidate?.finalReason || finalCandidate?.aiReason || "",
       note: confirmed?.note || "",
       error: result.error || result.searchError || "",
     });
@@ -12724,13 +12742,16 @@ function buildSingleSourcingReviewPayload(job = {}) {
         image: candidate.localImage?.publicUrl || candidate.image || candidate.imageUrl || "",
         price: normalize1688PriceOnly(candidate.priceDetails || candidate.price),
         priceDetails: candidate.priceDetails || "",
+        estimatedPurchasePriceRmb: candidate.estimatedPurchasePriceRmb || "",
+        purchaseMultiplier: candidate.purchaseMultiplier || "",
         moq: candidate.minOrderQuantity || candidate.moq || "",
         freight: candidate.shippingFee || "",
         weight: formatNumberForSheet(candidate.weightGrams || normalizeWeightGrams(candidate.weightText)),
         dimensions: candidate.dimensionsText || "",
+        packQuantity: candidate.candidatePackQuantity || candidate.packQuantity || "",
         risk: compactRiskText(candidate),
-        aiDecision: candidate.aiVerdict || "",
-        aiReason: candidate.aiReason || candidate.finalReason || "",
+        aiDecision: candidate.finalMatchType || candidate.aiVerdict || "",
+        aiReason: candidate.finalReason || candidate.aiReason || "",
         selected: Number(candidate.rank) === Number(finalCandidate?.rank || result.aiReview?.selected_rank || 0),
       });
     }

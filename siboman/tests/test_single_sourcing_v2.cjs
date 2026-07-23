@@ -112,7 +112,9 @@ assert(server.includes('buildBatchUploadTextFromConfirmations'), 'server must bu
 assert(review.includes('复制货号价格'), 'review page must let operators copy sku and price');
 assert(review.includes('送批量上架'), 'review page must send confirmed rows to batch upload');
 assert(review.includes('候选明细'), 'review page must expose the candidate detail table');
-assert(review.includes('确认清单'), 'review page must expose the final confirmation table');
+assert(review.includes('Excel 核对表'), 'review page must expose the spreadsheet-style review table');
+assert(review.includes('头程物流费') && review.includes('总成本') && review.includes('ozon上架格式'), 'review page must merge logistics calculation columns into the main table');
+assert(review.includes('✓ 已选'), 'review page must mark the selected candidate with a visible check');
 assert(review.includes('single_sourcing_batch_prefill'), 'review page must save batch-upload prefill data');
 assert(batch.includes('single_sourcing_batch_prefill'), 'BatchUpload must consume single-sourcing review prefill data');
 assert(batch.includes('已从找货核对页带入'), 'BatchUpload must explain review prefill to the operator');
