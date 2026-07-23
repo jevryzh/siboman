@@ -12689,6 +12689,7 @@ function buildSingleSourcingReviewPayload(job = {}) {
     const confirmed = confirmationMap.get(Number(result.sourceRow || 0));
     const ozonSku = String(ozon.sku || ozon.productId || extractOzonProductId(result.url || ozon.sourceUrl || "") || "").replace(/[^\d]/g, "");
     const ozonPrice = getOzonBestBlackPriceText(ozon) || getOzonDisplayPriceText(ozon);
+    const ozonBlackPrice = getOzonBestBlackPriceText(ozon);
     const listingPriceRub = confirmed?.listingPriceRub
       ?? parseRmbNumber(ozonPrice)
       ?? parseRmbNumber(ozon.currentGreenPriceCny)
