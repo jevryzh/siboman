@@ -34,7 +34,8 @@ assert(!report.includes('Single sourcing remains frozen'), 'testing docs must no
 
 // Plugin auth: ERP page grants a scoped worker token; the extension must not ask for ERP username/password.
 assert(sourcing.includes('authorizePluginWorker'), 'single sourcing page must authorize the plugin worker');
-assert(sourcing.includes("axios.get('/api/worker/plugin-token')"), 'single sourcing page must fetch a scoped plugin worker token');
+assert(sourcing.includes("axios.get('/api/worker/plugin-token')"), 'single sourcing page must fetch an ERP-user scoped plugin worker token');
+assert(sourcing.includes('refreshAndAuthorizePlugin'), 'single sourcing refresh action must also re-authorize the plugin worker');
 assert(sourcing.includes("sendToExtension('workerAuth.request'"), 'single sourcing page must pass the scoped token through the bridge');
 assert(bridge.includes('kind === "workerAuth.request"'), 'content bridge must handle worker auth messages');
 assert(background.includes('let workerAuthToken = ""'), 'extension must use a worker auth token instead of an ERP password');
@@ -46,6 +47,8 @@ assert(server.includes('function verifyScopedWorkerToken'), 'server must verify 
 assert(server.includes('payload.type !== "plugin-worker"'), 'server must reject non-worker token types for worker APIs');
 assert(server.includes('scope: ["collector:submit", "worker:poll"]'), 'plugin worker token scope must be limited to collector submit and worker polling');
 assert(server.includes('tokenStoreId'), 'scoped worker token must carry the selected store id');
+const singleJobPost = sourcing.slice(sourcing.indexOf("axios.post('/api/jobs'"), sourcing.indexOf("});", sourcing.indexOf("axios.post('/api/jobs'")));
+assert(!singleJobPost.includes("store_id"), 'single-sourcing jobs must remain ERP-user scoped, not selected-store scoped');
 
 // Queue and store scope: jobs are created for the selected store and claimed only by a matching scoped worker.
 assert(sourcing.includes('const getStoreId = () =>'), 'single sourcing view must read current store id');
@@ -53,12 +56,15 @@ assert(sourcing.includes('window.addEventListener(\'shop-changed\', onShopChange
 assert(server.includes('const storeId = String(job.storeId || payload?.storeId || payload?.store_id'), 'queued jobs must persist store_id');
 assert(server.includes('id, user_id, store_id, kind, status'), 'app_jobs insert must include store_id');
 assert(server.includes('AND ($3::uuid IS NULL OR j.store_id = $3::uuid)'), 'worker claim must filter queued jobs by scoped store id');
+assert(server.includes('idx_app_worker_heartbeats_store_seen'), 'worker heartbeat status must be indexable by current store');
+assert(server.includes('storeMatch'), 'worker status must expose whether the plugin is authorized for the selected store');
 assert(server.includes('where += ` AND j.store_id = $${params.length}`'), 'worker job lookup must remain store-scoped');
 assert(background.includes('kinds: ["run"]'), 'extension single-sourcing worker may only claim run jobs');
 assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION'), 'server must define a minimum plugin version for single-sourcing workers');
 assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.57"'), 'server must force the current stable single-sourcing plugin version');
 assert(server.includes('versionTooOld'), 'server must block outdated extension workers from claiming single-sourcing jobs');
 assert(server.includes('blocked: true'), 'outdated extension workers must receive a blocked response instead of a job');
+assert(server.includes('version: req.body?.version'), 'worker heartbeat must persist the reported plugin version');
 assert(background.includes('pluginVersion: VERSION'), 'extension worker heartbeat must report its real plugin version');
 
 // Candidate count and operator controls: default remains 5 and is passed through, never hard-coded to 3.
@@ -83,7 +89,7 @@ assert(sourcing.includes('/api/history'), 'single sourcing history must come fro
 assert(sourcing.includes('下载 Excel'), 'single sourcing page must expose Excel downloads');
 assert(sourcing.includes("currentJobId.value = '';"), 'single sourcing must clear stale saved job ids before restoring active jobs');
 assert(sourcing.includes('job.value = null;'), 'single sourcing must reset stale terminal jobs before scanning active history');
-assert(sourcing.includes('fetchJobHistory();') && sourcing.includes('fetchCollectorStatus();'), 'active polling must refresh history and worker status while a job is running');
+assert(sourcing.includes('refreshHistorySilently();') && sourcing.includes('fetchCollectorStatus();'), 'active polling must refresh history and worker status while a job is running');
 assert(sourcing.includes('candidate?.localImage?.publicUrl'), 'candidate table must prefer locally cached 1688 candidate images');
 assert(server.includes('res.download(filePath, `${downloadPrefix}-${shortId}.xlsx`)'), 'history download must use ozon-1688/ozon-batch file names');
 assert(server.includes('const downloadPrefix = kind === "batch-ozon" ? "ozon-batch" : "ozon-1688"'), 'single-sourcing downloads must use ozon-1688 prefix');

@@ -1212,7 +1212,9 @@ async function initDatabase() {
       CREATE TABLE IF NOT EXISTS app_worker_heartbeats (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL,
         worker_name TEXT NOT NULL,
+        version TEXT NOT NULL DEFAULT '',
         platform TEXT NOT NULL DEFAULT '',
         hostname TEXT NOT NULL DEFAULT '',
         profile_dir TEXT NOT NULL DEFAULT '',
@@ -1222,7 +1224,10 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE(user_id, worker_name)
       );
+      ALTER TABLE app_worker_heartbeats ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE SET NULL;
+      ALTER TABLE app_worker_heartbeats ADD COLUMN IF NOT EXISTS version TEXT NOT NULL DEFAULT '';
       CREATE INDEX IF NOT EXISTS idx_app_worker_heartbeats_user_seen ON app_worker_heartbeats(user_id, last_seen_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_app_worker_heartbeats_store_seen ON app_worker_heartbeats(user_id, store_id, last_seen_at DESC);
     `);
 
     await seedInitialUsers();
@@ -7782,6 +7787,8 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       && compareNumericVersion(workerVersion, MIN_SINGLE_SOURCING_PLUGIN_VERSION) < 0;
     const blockedPhase = `插件版本 ${workerVersion || "未知"} 低于单品找货最低版本 v${MIN_SINGLE_SOURCING_PLUGIN_VERSION}，请在店铺管理下载新版插件。`;
     await upsertWorkerHeartbeat(req.user, workerName, {
+      version: req.body?.version,
+      pluginVersion: req.body?.pluginVersion,
       platform: req.body?.platform,
       hostname: req.body?.hostname,
       profileDir: req.body?.profileDir,
@@ -7800,6 +7807,8 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
     const job = await claimNextDbJob(req.user, workerName, { kinds });
     if (job) {
       await upsertWorkerHeartbeat(req.user, workerName, {
+        version: req.body?.version,
+        pluginVersion: req.body?.pluginVersion,
         platform: req.body?.platform,
         hostname: req.body?.hostname,
         profileDir: req.body?.profileDir,
@@ -7819,8 +7828,12 @@ app.get("/api/worker/status", async (req, res, next) => {
       res.status(409).json({ success: false, error: "服务器没有启用任务队列。" });
       return;
     }
+    const requestedStoreId = String(req.query.store_id || req.query.storeId || "").split(",")[0].trim();
+    if (requestedStoreId) {
+      await assertActiveStoreAccess(requestedStoreId, req.user.id, "id");
+    }
     const workersResult = await db.query(
-      `SELECT worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+      `SELECT worker_name, store_id, version, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
        FROM app_worker_heartbeats
        WHERE user_id = $1
        ORDER BY last_seen_at DESC
@@ -7832,8 +7845,9 @@ app.get("/api/worker/status", async (req, res, next) => {
          count(*) FILTER (WHERE status = 'queued')::int AS queued,
          count(*) FILTER (WHERE status IN ('claimed','running'))::int AS active
        FROM app_jobs
-       WHERE user_id = $1`,
-      [req.user?.id || ""],
+       WHERE user_id = $1
+         AND ($2::uuid IS NULL OR store_id = $2::uuid)`,
+      [req.user?.id || "", requestedStoreId || null],
     );
     const now = Date.now();
     const onlineWindow = Math.max(30000, WORKER_ONLINE_WINDOW_MS);
@@ -7841,15 +7855,25 @@ app.get("/api/worker/status", async (req, res, next) => {
       const lastSeenAt = row.last_seen_at ? new Date(row.last_seen_at).toISOString() : "";
       const ageMs = lastSeenAt ? now - new Date(lastSeenAt).getTime() : Infinity;
       const currentPhase = row.current_phase || "";
-      const canClaimJobs = !/预览版|暂不领取|不领取任务|未开启领取任务/i.test(currentPhase);
+      const version = String(row.version || "").trim();
+      const storeId = String(row.store_id || "").trim();
+      const storeMatch = !requestedStoreId || storeId === requestedStoreId;
+      const versionTooOld = compareNumericVersion(version, MIN_SINGLE_SOURCING_PLUGIN_VERSION) < 0;
+      const blockedByPhase = /预览版|暂不领取|不领取任务|未开启领取任务|低于单品找货最低版本|版本\s*未知/i.test(currentPhase);
+      const canClaimJobs = storeMatch && !versionTooOld && !blockedByPhase;
       return {
         workerName: row.worker_name,
+        storeId,
+        storeMatch,
+        version,
         platform: row.platform || "",
         hostname: row.hostname || "",
         profileDir: row.profile_dir || "",
         currentJobId: row.current_job_id || "",
         currentPhase,
         canClaimJobs,
+        versionTooOld,
+        minVersion: MIN_SINGLE_SOURCING_PLUGIN_VERSION,
         lastSeenAt,
         online: ageMs <= onlineWindow,
         ageSeconds: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null,
@@ -7899,6 +7923,8 @@ app.post("/api/worker/heartbeat", async (req, res, next) => {
       return;
     }
     await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      version: req.body?.version,
+      pluginVersion: req.body?.pluginVersion,
       platform: req.body?.platform,
       hostname: req.body?.hostname,
       profileDir: req.body?.profileDir,
@@ -12385,6 +12411,8 @@ async function createQueuedDbJob(user, job, payload) {
 async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
   if (!db || !user?.id) return;
   const workerLabel = String(workerName || "").trim().slice(0, 80) || "本机采集端";
+  const storeId = String(meta.storeId || meta.store_id || user.tokenStoreId || "").trim() || null;
+  const version = String(meta.version || meta.pluginVersion || "").trim().slice(0, 40);
   const platform = String(meta.platform || "").trim().slice(0, 40);
   const hostname = String(meta.hostname || "").trim().slice(0, 120);
   const profileDir = String(meta.profileDir || "").trim().slice(0, 500);
@@ -12392,17 +12420,19 @@ async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
   const currentJobId = isSafeJobId(meta.currentJobId) ? meta.currentJobId : null;
   await db.query(
     `INSERT INTO app_worker_heartbeats (
-       user_id, worker_name, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+       user_id, store_id, worker_name, version, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
      ON CONFLICT (user_id, worker_name)
      DO UPDATE SET
+       store_id = EXCLUDED.store_id,
+       version = COALESCE(NULLIF(EXCLUDED.version, ''), app_worker_heartbeats.version),
        platform = EXCLUDED.platform,
        hostname = EXCLUDED.hostname,
        profile_dir = EXCLUDED.profile_dir,
        current_job_id = EXCLUDED.current_job_id,
        current_phase = COALESCE(NULLIF(EXCLUDED.current_phase, ''), app_worker_heartbeats.current_phase),
        last_seen_at = now()`,
-    [user.id, workerLabel, platform, hostname, profileDir, currentJobId, currentPhase],
+    [user.id, storeId, workerLabel, version, platform, hostname, profileDir, currentJobId, currentPhase],
   );
 }
 

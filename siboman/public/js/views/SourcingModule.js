@@ -29,10 +29,12 @@ window.SourcingModuleView = {
     const jobHistory = Vue.ref([]);
     let pollTimer = null;
     let collectorTimer = null;
+    let lastHistoryRefreshAt = 0;
 
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
+    const PLUGIN_ZIP_VERSION = "2.2.9.57";
     window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
 
     const handleExtensionMessage = (event) => {
@@ -135,7 +137,7 @@ window.SourcingModuleView = {
 
     const canRun = Vue.computed(() => {
       const workers = collectorStatus.value.workers || [];
-      return workers.some(w => w.online && w.canClaimJobs);
+      return workers.some(w => w.online && w.canClaimJobs && !w.versionTooOld && w.storeMatch !== false);
     });
     const onlineWorkers = Vue.computed(() => (collectorStatus.value.workers || []).filter(w => w.online));
     const currentWorker = Vue.computed(() => onlineWorkers.value.find(w => w.canClaimJobs) || onlineWorkers.value[0] || null);
@@ -155,9 +157,21 @@ window.SourcingModuleView = {
     const collectorHealthText = Vue.computed(() => {
       if (collectorStatus.value.error) return `采集端状态读取失败：${collectorStatus.value.error}`;
       if (canRun.value) return '当前采集插件可领取任务';
-      if (onlineWorkers.value.length) return '插件已在线，但还没有拿到当前账号/店铺的短期授权';
+      const oldWorker = onlineWorkers.value.find(w => w.versionTooOld);
+      if (oldWorker) return `插件版本 ${oldWorker.version || '未知'} 低于最低版本 v${oldWorker.minVersion || '未知'}`;
+      if (onlineWorkers.value.length) return '插件已在线，但还没有拿到当前账号授权';
       return '未检测到当前在线采集插件';
     });
+
+    const refreshAndAuthorizePlugin = async () => {
+      collectorLoading.value = true;
+      try {
+        await authorizePluginWorker();
+        await fetchCollectorStatus();
+      } finally {
+        collectorLoading.value = false;
+      }
+    };
 
     const jobStatusText = Vue.computed(() => {
       const j = job.value;
@@ -229,16 +243,24 @@ window.SourcingModuleView = {
     const isRunning = Vue.computed(() => ['queued', 'claimed', 'running', 'exporting'].includes(job.value?.status || ''));
     const isTerminal = Vue.computed(() => ['done', 'error', 'canceled'].includes(job.value?.status || ''));
 
-    const fetchJobHistory = async () => {
-      historyLoading.value = true;
+    const fetchJobHistory = async (options = {}) => {
+      const silent = Boolean(options.silent);
+      if (!silent) historyLoading.value = true;
       try {
         const res = await axios.get('/api/history');
         jobHistory.value = (res.data.items || []).filter(item => item.kind === 'run').slice(0, 20);
       } catch (error) {
         console.warn('[single-sourcing] 历史记录加载失败:', apiError(error));
       } finally {
-        historyLoading.value = false;
+        if (!silent) historyLoading.value = false;
       }
+    };
+
+    const refreshHistorySilently = () => {
+      const now = Date.now();
+      if (now - lastHistoryRefreshAt < 5000) return;
+      lastHistoryRefreshAt = now;
+      fetchJobHistory({ silent: true });
     };
 
     const historyDownloadUrl = (item) => item?.downloadUrl || (item?.excelExists && item?.id ? `/api/history/${encodeURIComponent(item.id)}/download` : '');
@@ -295,7 +317,7 @@ window.SourcingModuleView = {
       pollJob();
       pollTimer = setInterval(() => {
         pollJob();
-        fetchJobHistory();
+        refreshHistorySilently();
         fetchCollectorStatus();
       }, 1500);
     };
@@ -332,7 +354,7 @@ window.SourcingModuleView = {
         ElementPlus.ElMessage.warning('请先粘贴 Ozon 商品链接');
         return;
       }
-      authorizePluginWorker().catch(() => {});
+      await authorizePluginWorker().catch(() => false);
       fetchCollectorStatus().catch(() => {});
       creating.value = true;
       try {
@@ -379,6 +401,12 @@ window.SourcingModuleView = {
     const open1688 = () => {
       window.open('https://www.1688.com/', '_blank', 'noopener');
     };
+    const downloadExtension = () => {
+      const link = document.createElement('a');
+      link.href = `/extension/zhumeng-collector.zip?v=${PLUGIN_ZIP_VERSION}`;
+      link.download = 'zhumeng-collector.zip';
+      link.click();
+    };
 
     const handlePageChange = () => { fetchData(); };
     const handleTabChange = () => {
@@ -419,6 +447,11 @@ window.SourcingModuleView = {
       tableData.value = [];
       pagination.total = 0;
       if (activeTab.value !== 'single') fetchData();
+      if (activeTab.value === 'single') {
+        authorizePluginWorker().catch(() => {});
+        fetchCollectorStatus();
+        fetchJobHistory();
+      }
     };
     window.addEventListener('shop-changed', onShopChanged);
 
@@ -482,7 +515,7 @@ window.SourcingModuleView = {
       enable1688, enableAI, creating, currentJobId, job, collectorLoading,
       collectorStatus, canRun, onlineWorkers, currentWorker, collectorStatusText, collectorHealthType,
       collectorHealthText, operatorAlert, jobStatusText, recentLogs, jobResults, isRunning,
-      startSingleSourcing, cancelJob, downloadUrl, open1688, formatWorkerPlatform,
+      refreshAndAuthorizePlugin, startSingleSourcing, cancelJob, downloadUrl, open1688, downloadExtension, formatWorkerPlatform,
       formatTime, money, topCandidates, ozonImage, historyLoading, jobHistory,
       historyDownloadUrl, loadHistoryJob, jobStatusTagType, formatHistoryRange,
       percent, aiDecisionText, aiTagType, rowStatusType, rowStatusText,
@@ -537,7 +570,8 @@ window.SourcingModuleView = {
               <el-tooltip placement="bottom" :content="collectorStatusText">
                 <el-tag :type="collectorHealthType" effect="light">{{ collectorHealthText }}</el-tag>
               </el-tooltip>
-              <el-button size="small" :loading="collectorLoading" @click="fetchCollectorStatus">刷新/重新授权插件</el-button>
+              <el-button type="warning" size="small" @click="downloadExtension">下载插件</el-button>
+              <el-button size="small" :loading="collectorLoading" @click="refreshAndAuthorizePlugin">刷新/重新授权插件</el-button>
             </div>
           </div>
 
