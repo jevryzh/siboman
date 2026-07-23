@@ -40,6 +40,8 @@ ssh root@test.renwz.cn "mkdir -p '$BACKUP_DIR' && rsync -a /opt/ozon/app-test/ '
 rsync -a --delete \
   --exclude node_modules \
   --exclude .git \
+  --exclude .env \
+  --exclude '.env.*' \
   /Users/eason/Documents/OZON/siboman/ \
   root@test.renwz.cn:/opt/ozon/app-test/
 
@@ -54,6 +56,8 @@ BUILD_VERSION=vX.Y.Z-test-描述
 EOF
 systemctl restart ozon-app-test"
 ```
+
+注意：不要从本地同步 `.env` 到测试服务器。测试环境数据库、端口、登录密码等私密配置以服务器 `/opt/ozon/app-test/.env` 为准，部署只允许按需写入 `.env.build`。
 
 ## 部署后 Smoke
 
