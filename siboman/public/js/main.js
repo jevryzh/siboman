@@ -150,6 +150,7 @@ const initApp = () => {
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
         if (path.includes('dashboard')) return 'dashboard';
+        if (path.includes('single-sourcing-review')) return 'single-sourcing-review';
         if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
@@ -187,6 +188,9 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')">
               <el-icon><Search /></el-icon><span>单品找货</span>
+            </el-menu-item>
+            <el-menu-item index="#/single-sourcing-review" @click="goTo('#/single-sourcing-review')">
+              <el-icon><Tickets /></el-icon><span>找货核对</span>
             </el-menu-item>
             <el-menu-item index="#/products" @click="goTo('#/products')">
               <el-icon><Goods /></el-icon><span>商品管理</span>
@@ -243,6 +247,7 @@ const initApp = () => {
             <div v-if="routeName === 'dashboard'"><dashboard-view /></div>
             <div v-else-if="routeName === 'sourcing'"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'single-sourcing'"><sourcing-module-view /></div>
+            <div v-else-if="routeName === 'single-sourcing-review'"><single-sourcing-review-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
@@ -278,6 +283,7 @@ const initApp = () => {
   register('collection-edit-drawer', window.CollectionEditDrawer);
   register('dashboard-view', window.DashboardView);
   register('sourcing-module-view', window.SourcingModuleView);
+  register('single-sourcing-review-view', window.SingleSourcingReviewView);
   register('product-list-view', window.ProductListView);
   register('inventory-management-view', window.InventoryManagementView);
   register('order-list-view', window.OrderListView);

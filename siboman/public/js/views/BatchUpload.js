@@ -41,6 +41,7 @@ window.BatchUploadView = {
       info: m => (window.ElementPlus?.ElMessage || console).info?.(m),
     };
     const COLLECTION_PREFILL_KEY = 'collection_box_listing_prefill';
+    const SINGLE_SOURCING_PREFILL_KEY = 'single_sourcing_batch_prefill';
     const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : '');
     const resolveStoreId = (value) => {
       const raw = String(value || '').trim();
@@ -359,6 +360,7 @@ window.BatchUploadView = {
       await fetchStores();
       loadConfig();
       await consumeCollectionPrefill();
+      await consumeSingleSourcingPrefill();
       for (const sid of (selectedStores.value || [])) await fetchWarehousesForStore(sid);
       const ping = await pingExtension();
       if (ping) {
@@ -531,6 +533,26 @@ window.BatchUploadView = {
         pasteText.value = `${sku},`;
         appendLog(`已从采集箱带入 SKU ${sku}, 但缺少售价。请先补售价再解析。`, 'warn');
       }
+    };
+    const consumeSingleSourcingPrefill = async () => {
+      let payload = null;
+      try {
+        payload = JSON.parse(localStorage.getItem(SINGLE_SOURCING_PREFILL_KEY) || 'null');
+      } catch {
+        payload = null;
+      }
+      if (!payload || payload.from !== 'single-sourcing-review') return;
+      localStorage.removeItem(SINGLE_SOURCING_PREFILL_KEY);
+      const text = String(payload.batchText || '').trim();
+      if (!text) {
+        appendLog('找货核对送上架资料为空，请回找货核对页重新确认。', 'warn');
+        return;
+      }
+      pasteText.value = text;
+      config.currency = 'CNY';
+      appendLog(`已从找货核对页带入 ${text.split(/\r?\n/).filter(Boolean).length} 条货号和价格。请核对店铺、仓库、库存、货币后再采集/上架。`, 'info');
+      await Vue.nextTick();
+      await parsePaste();
     };
     const clearCollectionPrefill = () => {
       collectionPrefill.value = null;

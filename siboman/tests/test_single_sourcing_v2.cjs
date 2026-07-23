@@ -8,6 +8,9 @@ const readJson = (relativePath) => JSON.parse(read(relativePath));
 
 const main = read('public/js/main.js');
 const sourcing = read('public/js/views/SourcingModule.js');
+const review = read('public/js/views/SingleSourcingReview.js');
+const batch = read('public/js/views/BatchUpload.js');
+const indexHtml = read('public/index.html');
 const server = read('server.js');
 const background = read('public/extension/zhumeng-collector/background.js');
 const bridge = read('public/extension/zhumeng-collector/content-bridge-iso.js');
@@ -25,6 +28,11 @@ assert.strictEqual(singleModule.riskLevel, 'requires_authorization', 'single sou
 assert(main.includes('index="#/single-sourcing"'), 'main sidebar must expose an independent single-sourcing entry');
 assert(main.includes("goTo('#/single-sourcing')"), 'main sidebar must navigate directly to #/single-sourcing');
 assert(main.includes("routeName === 'single-sourcing'"), 'main shell must render single sourcing route');
+assert(main.includes('index="#/single-sourcing-review"'), 'main sidebar must expose the single-sourcing review page');
+assert(main.includes("routeName === 'single-sourcing-review'"), 'main shell must render the single-sourcing review page');
+assert(main.indexOf("path.includes('single-sourcing-review')") < main.indexOf("path.includes('single-sourcing')"), 'review route must be matched before single-sourcing route');
+assert(main.includes("register('single-sourcing-review-view'"), 'main must register the review component');
+assert(indexHtml.includes('/js/views/SingleSourcingReview.js'), 'index must load the review component script');
 assert(!main.includes("routeName === 'single-sourcing-frozen'"), 'old frozen placeholder route must stay removed');
 assert(main.indexOf("goTo('#/single-sourcing')") > main.indexOf("goTo('#/collection')"), 'single sourcing must sit beside collection workflow, not under selection center');
 assert(sourcing.includes("if (hash.includes('/single-sourcing')) return 'single';"), 'SourcingModule must enter single mode from the independent hash');
@@ -84,6 +92,8 @@ assert(sourcing.includes('level = String(entry?.level || \'info\').toUpperCase()
 assert(sourcing.includes('第 ${itemNo}${total ? `/${total}` : \'\'} 条'), 'logs must render source row / total progress');
 assert(sourcing.includes('sourceRow || $index + 1'), 'result table must show source row');
 assert(sourcing.includes('historyDownloadUrl'), 'history rows must expose an Excel download URL');
+assert(sourcing.includes('openReviewJob'), 'history rows must expose a review action');
+assert(sourcing.includes('#/single-sourcing-review?id='), 'history review action must deep-link to a job review');
 assert(sourcing.includes('fetchJobHistory'), 'single sourcing must load durable history');
 assert(sourcing.includes('/api/history'), 'single sourcing history must come from the shared history API');
 assert(sourcing.includes('下载 Excel'), 'single sourcing page must expose Excel downloads');
@@ -95,6 +105,64 @@ assert(server.includes('res.download(filePath, `${downloadPrefix}-${shortId}.xls
 assert(server.includes('const downloadPrefix = kind === "batch-ozon" ? "ozon-batch" : "ozon-1688"'), 'single-sourcing downloads must use ozon-1688 prefix');
 assert(server.includes('downloadUrl: job.downloadUrl'), 'DB history must expose downloadUrl');
 assert(server.includes('await markJobDownloaded(id)'), 'download endpoint must record downloads');
+assert(server.includes('app.get("/api/jobs/:id/review"'), 'server must expose single-sourcing review payloads');
+assert(server.includes('app.post("/api/jobs/:id/review/confirm"'), 'server must save manual review confirmations');
+assert(server.includes('review_confirmations'), 'server must persist review confirmations in the job payload');
+assert(server.includes('buildBatchUploadTextFromConfirmations'), 'server must build batch-upload text from confirmations');
+assert(review.includes('复制货号价格'), 'review page must let operators copy sku and price');
+assert(review.includes('送批量上架'), 'review page must send confirmed rows to batch upload');
+assert(review.includes('候选明细'), 'review page must expose the candidate detail table');
+assert(review.includes('确认清单'), 'review page must expose the final confirmation table');
+assert(review.includes('single_sourcing_batch_prefill'), 'review page must save batch-upload prefill data');
+assert(batch.includes('single_sourcing_batch_prefill'), 'BatchUpload must consume single-sourcing review prefill data');
+assert(batch.includes('已从找货核对页带入'), 'BatchUpload must explain review prefill to the operator');
+
+for (const hiddenLabel of [
+  'AI最终结果',
+  '匹配类型',
+  'AI是否选中',
+  'AI候选判断',
+  '疑似引流款',
+  '引流款原因',
+  '疑似优惠价',
+  '优惠价原因',
+  '优惠信息',
+  'Ozon跟卖数量',
+  'Ozon价格采集备注',
+  'Ozon重量来源',
+  'Ozon重量依据',
+  'AI估算重量置信度',
+  'AI估算重量依据',
+  'Ozon件数核对',
+  'Ozon件数依据',
+  '1688件数依据',
+  'AI最终置信度',
+  'AI模型',
+  'AI思考模式',
+  'AI耗时秒',
+  'AI输入Tokens',
+  'AI输出Tokens',
+  'AI总Tokens',
+  'AI估算费用USD',
+  '1688详情采集状态',
+  '1688图片下载状态',
+  'Ozon属性',
+  'Ozon描述',
+  'Ozon主图链接',
+  '1688图片链接',
+  '本地主图文件',
+  'Ozon错误',
+  '1688搜索错误',
+  'AI选中候选',
+  'MOQ解析值',
+  'MOQ规则状态',
+  '候选跳过原因',
+  '候选质量分',
+  '1688运费来源',
+  '1688重量来源',
+]) {
+  assert(!review.includes(hiddenLabel), `review page must hide noisy Excel field: ${hiddenLabel}`);
+}
 
 // Excel contract: these fields are part of the formal v2 output and must not disappear.
 for (const needle of [

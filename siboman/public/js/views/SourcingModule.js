@@ -275,6 +275,10 @@ window.SourcingModuleView = {
     };
 
     const historyDownloadUrl = (item) => item?.downloadUrl || (item?.excelExists && item?.id ? `/api/history/${encodeURIComponent(item.id)}/download` : '');
+    const openReviewJob = (item) => {
+      if (!item?.id) return;
+      window.location.hash = `#/single-sourcing-review?id=${encodeURIComponent(item.id)}`;
+    };
 
     const loadHistoryJob = async (item) => {
       if (!item?.id) return;
@@ -546,7 +550,7 @@ window.SourcingModuleView = {
       collectorHealthText, activeJobWorker, operatorAlert, jobStatusText, recentLogs, jobResults, isRunning,
       refreshAndAuthorizePlugin, startSingleSourcing, cancelJob, downloadUrl, open1688, downloadExtension, formatWorkerPlatform,
       formatTime, money, topCandidates, ozonImage, historyLoading, jobHistory,
-      historyDownloadUrl, loadHistoryJob, jobStatusTagType, formatHistoryRange,
+      historyDownloadUrl, openReviewJob, loadHistoryJob, jobStatusTagType, formatHistoryRange,
       percent, aiDecisionText, aiTagType, rowStatusType, rowStatusText,
       candidateReview, selectedCandidateText, candidateImage, candidateMoq, candidateFreight, candidateWeight,
     };
@@ -749,8 +753,9 @@ window.SourcingModuleView = {
               <el-table-column label="状态" width="110">
                 <template #default="{ row }"><el-tag size="small" :type="jobStatusTagType(row.status)">{{ row.status || '-' }}</el-tag></template>
               </el-table-column>
-              <el-table-column label="操作" width="190" fixed="right">
+              <el-table-column label="操作" width="250" fixed="right">
                 <template #default="{ row }">
+                  <el-button size="small" type="primary" @click="openReviewJob(row)">核对</el-button>
                   <el-button size="small" @click="loadHistoryJob(row)">查看</el-button>
                   <el-button
                     v-if="historyDownloadUrl(row)"

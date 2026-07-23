@@ -7735,6 +7735,71 @@ app.get("/api/jobs/:id", async (req, res, next) => {
   }
 });
 
+app.get("/api/jobs/:id/review", async (req, res, next) => {
+  try {
+    const job = db
+      ? await getDbJobForUser(req.params.id, req.user)
+      : (jobs.get(req.params.id) || await loadStoredJob(req.params.id));
+    if (!job || job.kind !== "run") {
+      res.status(404).json({ success: false, error: "单品找货任务不存在。" });
+      return;
+    }
+    res.json({ success: true, review: buildSingleSourcingReviewPayload(job) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/jobs/:id/review/confirm", async (req, res, next) => {
+  try {
+    if (!db) {
+      res.status(409).json({ success: false, error: "当前环境不支持保存确认结果。" });
+      return;
+    }
+    const job = await getDbJobForUser(req.params.id, req.user);
+    if (!job || job.kind !== "run") {
+      res.status(404).json({ success: false, error: "单品找货任务不存在。" });
+      return;
+    }
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 1000) : [];
+    const confirmations = rows
+      .map((row) => ({
+        sourceRow: clampInt(row.sourceRow, 1, 999999, 0),
+        ozonSku: String(row.ozonSku || "").replace(/[^\d]/g, "").slice(0, 32),
+        ozonUrl: normalizeOzonProductUrl(row.ozonUrl || ""),
+        ozonTitle: String(row.ozonTitle || "").slice(0, 500),
+        selectedRank: clampInt(row.selectedRank, 0, 999999, 0),
+        candidateTitle: String(row.candidateTitle || "").slice(0, 500),
+        candidateUrl: String(row.candidateUrl || "").slice(0, 2000),
+        candidateImage: String(row.candidateImage || "").slice(0, 2000),
+        purchasePriceRmb: Number.isFinite(Number(row.purchasePriceRmb)) ? Number(Number(row.purchasePriceRmb).toFixed(2)) : null,
+        listingPriceRub: Number.isFinite(Number(row.listingPriceRub)) ? Number(Number(row.listingPriceRub).toFixed(2)) : null,
+        candidateMoq: String(row.candidateMoq || "").slice(0, 200),
+        candidateFreight: String(row.candidateFreight || "").slice(0, 200),
+        candidateWeight: String(row.candidateWeight || "").slice(0, 200),
+        risk: String(row.risk || "").slice(0, 500),
+        note: String(row.note || "").slice(0, 500),
+        confirmed: row.confirmed !== false,
+        confirmedAt: new Date().toISOString(),
+      }))
+      .filter((row) => row.confirmed && row.ozonSku && Number.isFinite(Number(row.listingPriceRub)) && Number(row.listingPriceRub) > 0);
+    const payload = job.payload && typeof job.payload === "object" ? job.payload : {};
+    payload.review_confirmations = confirmations;
+    payload.review_confirmed_at = new Date().toISOString();
+    await db.query(
+      `UPDATE app_jobs SET payload = $1::jsonb, updated_at = now() WHERE id = $2`,
+      [JSON.stringify(payload), req.params.id],
+    );
+    res.json({
+      success: true,
+      confirmed: confirmations,
+      batchText: buildBatchUploadTextFromConfirmations(confirmations),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/jobs/:id/cancel", async (req, res, next) => {
   try {
     const runtimeJob = jobs.get(req.params.id);
@@ -12581,6 +12646,111 @@ function normalizeWorkerJobUpdate(input = {}, existing = {}) {
   if (input.error !== undefined) updates.error = String(input.error || "").slice(0, 2000);
   if (input.downloadUrl !== undefined) updates.downloadUrl = String(input.downloadUrl || "");
   return updates;
+}
+
+function buildBatchUploadTextFromConfirmations(rows = []) {
+  return rows
+    .filter((row) => row?.ozonSku && Number(row.listingPriceRub) > 0)
+    .map((row) => `${row.ozonSku}\t${Number(row.listingPriceRub).toFixed(2)}`)
+    .join("\n");
+}
+
+function pickSingleSourcingFinalCandidate(result = {}) {
+  const selectedRank = Number(result.aiReview?.selected_rank || result.selectedCandidate?.rank || 0);
+  const byRank = selectedRank
+    ? (result.candidates || []).find((candidate) => Number(candidate.rank) === selectedRank)
+    : null;
+  return result.selectedCandidate || byRank || findBestFallbackCandidate(result.candidates || []) || (result.candidates || [])[0] || null;
+}
+
+function compactRiskText(candidate = {}) {
+  const parts = [];
+  if (candidate.trafficBaitRisk) parts.push(candidate.trafficBaitReason || "疑似引流款");
+  if (candidate.promotionRisk) parts.push(candidate.promotionReason || candidate.promotionText || "疑似优惠价");
+  if (candidate.avoidForSourcing && !parts.length) parts.push(getCandidateAvoidReason(candidate) || "候选存在风险");
+  return parts.join("；");
+}
+
+function buildSingleSourcingReviewPayload(job = {}) {
+  const confirmations = Array.isArray(job.payload?.review_confirmations) ? job.payload.review_confirmations : [];
+  const confirmationMap = new Map(confirmations.map((row) => [Number(row.sourceRow), row]));
+  const rows = [];
+  const candidateRows = [];
+  for (const result of job.results || []) {
+    const ozon = result.ozon || {};
+    const finalCandidate = pickSingleSourcingFinalCandidate(result);
+    const confirmed = confirmationMap.get(Number(result.sourceRow || 0));
+    const ozonSku = String(ozon.sku || ozon.productId || extractOzonProductId(result.url || ozon.sourceUrl || "") || "").replace(/[^\d]/g, "");
+    const ozonPrice = getOzonBestBlackPriceText(ozon) || getOzonDisplayPriceText(ozon);
+    const listingPriceRub = confirmed?.listingPriceRub
+      ?? parseRmbNumber(ozonPrice)
+      ?? parseRmbNumber(ozon.currentGreenPriceCny)
+      ?? "";
+    const purchasePrice = finalCandidate
+      ? normalize1688PriceOnly(finalCandidate.priceDetails || finalCandidate.price)
+      : "";
+    const finalDecision = finalCandidate?.finalMatchType || result.aiReview?.decision || "";
+    rows.push({
+      sourceRow: result.sourceRow || rows.length + 1,
+      confirmed: Boolean(confirmed),
+      ozonSku,
+      ozonUrl: result.url || ozon.sourceUrl || "",
+      ozonTitle: ozon.title || "",
+      ozonImage: ozon.mainImage?.publicUrl || ozon.mainImageUrl || "",
+      ozonPrice,
+      ozonWeight: formatNumberForSheet(ozon.weightGrams || normalizeWeightGrams(ozon.weightText)),
+      ozonPackQuantity: ozon.packQuantity || result.aiReview?.ozon_pack_quantity || "",
+      selectedRank: confirmed?.selectedRank || finalCandidate?.rank || result.aiReview?.selected_rank || "",
+      candidateTitle: confirmed?.candidateTitle || finalCandidate?.title || "",
+      candidateUrl: confirmed?.candidateUrl || finalCandidate?.link || "",
+      candidateImage: confirmed?.candidateImage || finalCandidate?.localImage?.publicUrl || finalCandidate?.image || finalCandidate?.imageUrl || "",
+      purchasePriceRmb: confirmed?.purchasePriceRmb ?? purchasePrice,
+      listingPriceRub,
+      candidateMoq: confirmed?.candidateMoq || finalCandidate?.minOrderQuantity || finalCandidate?.moq || "",
+      candidateFreight: confirmed?.candidateFreight || finalCandidate?.shippingFee || "",
+      candidateWeight: confirmed?.candidateWeight || formatNumberForSheet(finalCandidate?.weightGrams || normalizeWeightGrams(finalCandidate?.weightText)),
+      risk: confirmed?.risk || compactRiskText(finalCandidate || {}),
+      aiDecision: finalDecision,
+      aiReason: result.aiReview?.reason || finalCandidate?.finalReason || finalCandidate?.aiReason || "",
+      note: confirmed?.note || "",
+      error: result.error || result.searchError || "",
+    });
+    for (const candidate of result.candidates || []) {
+      candidateRows.push({
+        sourceRow: result.sourceRow || rows.length,
+        rank: candidate.rank || "",
+        title: candidate.title || "",
+        url: candidate.link || "",
+        image: candidate.localImage?.publicUrl || candidate.image || candidate.imageUrl || "",
+        price: normalize1688PriceOnly(candidate.priceDetails || candidate.price),
+        priceDetails: candidate.priceDetails || "",
+        moq: candidate.minOrderQuantity || candidate.moq || "",
+        freight: candidate.shippingFee || "",
+        weight: formatNumberForSheet(candidate.weightGrams || normalizeWeightGrams(candidate.weightText)),
+        dimensions: candidate.dimensionsText || "",
+        risk: compactRiskText(candidate),
+        aiDecision: candidate.aiVerdict || "",
+        aiReason: candidate.aiReason || candidate.finalReason || "",
+        selected: Number(candidate.rank) === Number(finalCandidate?.rank || result.aiReview?.selected_rank || 0),
+      });
+    }
+  }
+  return {
+    job: {
+      id: job.id,
+      status: job.status,
+      phase: job.phase,
+      total: job.total,
+      processed: job.processed,
+      updatedAt: job.updatedAt,
+      downloadUrl: job.downloadUrl,
+      confirmedAt: job.payload?.review_confirmed_at || "",
+    },
+    rows,
+    candidateRows,
+    confirmedRows: rows.filter((row) => row.confirmed),
+    batchText: buildBatchUploadTextFromConfirmations(confirmations),
+  };
 }
 
 function normalizeLogEntryForDb(entry) {
