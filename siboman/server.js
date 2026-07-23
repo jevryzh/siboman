@@ -7957,6 +7957,8 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       return;
     }
     await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      version: req.body?.version,
+      pluginVersion: req.body?.pluginVersion,
       platform: req.body?.platform,
       hostname: req.body?.hostname,
       profileDir: req.body?.profileDir,
@@ -7987,6 +7989,15 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};
     const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon" ? "batch-ozon" : "run";
+    await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
+      version: req.body?.version,
+      pluginVersion: req.body?.pluginVersion,
+      platform: req.body?.platform,
+      hostname: req.body?.hostname,
+      profileDir: req.body?.profileDir,
+      currentJobId: req.params.id,
+      currentPhase: job.phase || existing.phase || "任务完成",
+    });
     if (kind === "run") {
       await finalizeWorkerRunJob(existing, job);
     }

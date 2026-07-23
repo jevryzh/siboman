@@ -120,8 +120,9 @@ window.SourcingModuleView = {
       }
     };
 
-    const fetchCollectorStatus = async () => {
-      collectorLoading.value = true;
+    const fetchCollectorStatus = async (options = {}) => {
+      const silent = Boolean(options.silent);
+      if (!silent) collectorLoading.value = true;
       try {
         const res = await axios.get('/api/worker/status');
         collectorStatus.value = {
@@ -131,7 +132,7 @@ window.SourcingModuleView = {
       } catch (error) {
         collectorStatus.value = { workers: [], queue: { queued: 0, active: 0 }, error: apiError(error) };
       } finally {
-        collectorLoading.value = false;
+        if (!silent) collectorLoading.value = false;
       }
     };
 
@@ -140,22 +141,30 @@ window.SourcingModuleView = {
       return workers.some(w => w.online && w.canClaimJobs && !w.versionTooOld && w.storeMatch !== false);
     });
     const onlineWorkers = Vue.computed(() => (collectorStatus.value.workers || []).filter(w => w.online));
-    const currentWorker = Vue.computed(() => onlineWorkers.value.find(w => w.canClaimJobs) || onlineWorkers.value[0] || null);
+    const activeJobWorker = Vue.computed(() => {
+      const id = currentJobId.value || job.value?.id || '';
+      if (!id) return null;
+      return (collectorStatus.value.workers || []).find(w => w.currentJobId === id) || null;
+    });
+    const currentWorker = Vue.computed(() => activeJobWorker.value || onlineWorkers.value.find(w => w.canClaimJobs) || onlineWorkers.value[0] || null);
     const collectorStatusText = Vue.computed(() => {
       const onlineCount = onlineWorkers.value.length;
       const queued = collectorStatus.value.queue?.queued || 0;
       const active = collectorStatus.value.queue?.active || 0;
+      if (activeJobWorker.value) return `采集插件 v${activeJobWorker.value.version || '未知'} 正在执行 · 排队 ${queued} · 执行 ${active}`;
       if (canRun.value) return `采集插件在线${onlineCount > 1 ? ` ${onlineCount}` : ''} · 排队 ${queued} · 执行 ${active}`;
       return onlineCount ? `采集端在线但不可领取 · 排队 ${queued}` : '采集插件离线';
     });
     const collectorHealthType = Vue.computed(() => {
       if (collectorStatus.value.error) return 'danger';
+      if (activeJobWorker.value) return 'success';
       if (canRun.value) return 'success';
       if (onlineWorkers.value.length) return 'warning';
       return 'info';
     });
     const collectorHealthText = Vue.computed(() => {
       if (collectorStatus.value.error) return `采集端状态读取失败：${collectorStatus.value.error}`;
+      if (activeJobWorker.value) return `插件 v${activeJobWorker.value.version || '未知'} 正在执行任务`;
       if (canRun.value) return '当前采集插件可领取任务';
       const oldWorker = onlineWorkers.value.find(w => w.versionTooOld);
       if (oldWorker) return `插件版本 ${oldWorker.version || '未知'} 低于最低版本 v${oldWorker.minVersion || '未知'}`;
@@ -214,7 +223,7 @@ window.SourcingModuleView = {
       if (collectorStatus.value.error) {
         return { type: 'error', title: '采集插件状态异常', message: collectorStatus.value.error };
       }
-      if (!canRun.value) {
+      if (!activeJobWorker.value && !canRun.value) {
         return {
           type: onlineWorkers.value.length ? 'warning' : 'info',
           title: onlineWorkers.value.length ? '插件需要重新授权' : '未检测到当前在线插件',
@@ -318,7 +327,7 @@ window.SourcingModuleView = {
       pollTimer = setInterval(() => {
         pollJob();
         refreshHistorySilently();
-        fetchCollectorStatus();
+        fetchCollectorStatus({ silent: true });
       }, 1500);
     };
 
@@ -514,7 +523,7 @@ window.SourcingModuleView = {
       urlsText, maxCandidates, startRow, delayMin, delayMax, maxConsecutiveFailures,
       enable1688, enableAI, creating, currentJobId, job, collectorLoading,
       collectorStatus, canRun, onlineWorkers, currentWorker, collectorStatusText, collectorHealthType,
-      collectorHealthText, operatorAlert, jobStatusText, recentLogs, jobResults, isRunning,
+      collectorHealthText, activeJobWorker, operatorAlert, jobStatusText, recentLogs, jobResults, isRunning,
       refreshAndAuthorizePlugin, startSingleSourcing, cancelJob, downloadUrl, open1688, downloadExtension, formatWorkerPlatform,
       formatTime, money, topCandidates, ozonImage, historyLoading, jobHistory,
       historyDownloadUrl, loadHistoryJob, jobStatusTagType, formatHistoryRange,
