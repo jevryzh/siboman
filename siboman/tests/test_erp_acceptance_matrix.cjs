@@ -17,6 +17,7 @@ const requiredModuleIds = [
   'store-management',
   'product-management',
   'collection-box',
+  'single-sourcing',
   'batch-upload',
   'listing-history',
   'inventory-management',
@@ -52,8 +53,10 @@ assert(formalReport.includes('本地 guard 不触发 Ozon 发布、库存提交�
 assert(formalChecklist.executionPolicy?.localGuardMode === 'static_local_only', 'formal checklist must declare static local guard mode');
 assert((formalChecklist.executionPolicy?.forbiddenInLocalGuard || []).join(' ').includes('Do not call Ozon Seller APIs.'), 'formal checklist must forbid Ozon calls');
 assert((formalChecklist.executionPolicy?.forbiddenInLocalGuard || []).join(' ').includes('Do not call AI providers.'), 'formal checklist must forbid AI provider calls');
-assert(!main.includes('<span>单品找货</span>'), 'single sourcing must remain frozen out of the normal sidebar');
-assert(main.includes("routeName === 'single-sourcing-frozen'"), 'frozen single-sourcing route must still render a notice');
+assert(main.includes('index="#/single-sourcing"'), 'single sourcing v2 must have an independent sidebar entry');
+assert(main.includes("routeName === 'single-sourcing'"), 'single sourcing v2 must render its real workflow route');
+assert(!main.includes("routeName === 'single-sourcing-frozen'"), 'single sourcing v2 must not render the old frozen placeholder');
+assert(main.indexOf("goTo('#/single-sourcing')") > main.indexOf("goTo('#/collection')"), 'single sourcing must sit outside selection center and near collection workflow');
 assert(main.includes("axios.get('/api/version')"), 'main shell must fetch build version for acceptance traceability');
 assert(main.includes('envLabel'), 'main shell must expose environment label for test/prod clarity');
 assert(main.includes('测试环境') && main.includes('生产环境'), 'main shell must label test and production environments');

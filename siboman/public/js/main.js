@@ -150,7 +150,7 @@ const initApp = () => {
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
         if (path.includes('dashboard')) return 'dashboard';
-        if (path.includes('single-sourcing')) return 'single-sourcing-frozen';
+        if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
         if (path.includes('product')) return 'products';
@@ -184,6 +184,9 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/collection" @click="goTo('#/collection')">
               <el-icon><Box /></el-icon><span>采集箱</span>
+            </el-menu-item>
+            <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')">
+              <el-icon><Search /></el-icon><span>单品找货</span>
             </el-menu-item>
             <el-menu-item index="#/products" @click="goTo('#/products')">
               <el-icon><Goods /></el-icon><span>商品管理</span>
@@ -239,18 +242,7 @@ const initApp = () => {
           <el-main>
             <div v-if="routeName === 'dashboard'"><dashboard-view /></div>
             <div v-else-if="routeName === 'sourcing'"><sourcing-module-view /></div>
-            <div v-else-if="routeName === 'single-sourcing-frozen'" style="min-height:calc(100vh - 120px); display:grid; place-items:center; padding:24px; box-sizing:border-box">
-              <div style="max-width:520px; width:100%; background:#fff; border:1px solid #fde68a; border-radius:8px; padding:28px; box-sizing:border-box">
-                <div style="display:flex; align-items:center; gap:10px; color:#92400e; font-weight:700; font-size:18px">
-                  <el-icon><Lock /></el-icon><span>单品找货已冻结</span>
-                </div>
-                <p style="margin:14px 0 0; color:#5b6472; line-height:1.7">该实验功能暂不属于当前运营主线，已停止从菜单进入，也不会在此页面创建采集或找货任务。</p>
-                <div style="display:flex; gap:10px; margin-top:22px">
-                  <el-button type="primary" @click="goTo('#/collection')">进入采集箱</el-button>
-                  <el-button @click="goTo('#/sourcing')">进入选品中心</el-button>
-                </div>
-              </div>
-            </div>
+            <div v-else-if="routeName === 'single-sourcing'"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>

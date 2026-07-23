@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.53";
+const VERSION = "2.2.9.56";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -25,7 +25,6 @@ let workerAuthToken = "";
 let imageSearchQueue = Promise.resolve();
 let last1688SearchAt = 0;
 let last1688FailureAt = 0;
-let shared1688SearchTabId = 0;
 
 function isTransientTabEditError(error) {
   const message = String(error?.message || error || "");
@@ -426,6 +425,8 @@ async function configureWorkerAuth(token) {
 function workerMeta(currentPhase = "") {
   return {
     workerName: WORKER_NAME,
+    version: VERSION,
+    pluginVersion: VERSION,
     platform: "chrome-extension",
     hostname: "Chrome",
     profileDir: chrome.runtime.id,
@@ -536,6 +537,7 @@ async function runQueuedSourcingJob(remoteJob) {
   const enable1688 = options.enable1688 !== false;
   const delayMinMs = Math.max(1000, Number(options.delayMinMs || 8000));
   const delayMaxMs = Math.max(delayMinMs, Number(options.delayMaxMs || 20000));
+  let fatalStop = false;
 
   for (let index = job.processed; index < rows.length; index += 1) {
     if (job.cancelRequested) break;
@@ -568,6 +570,12 @@ async function runQueuedSourcingJob(remoteJob) {
         } else {
           result.searchError = searchResult.error;
           job.logs.push(makeLog(`1688 搜图失败：${searchResult.error}`, "warn"));
+          if (isCritical1688BlockerInPlugin(searchResult.error)) {
+            fatalStop = true;
+            job.error = searchResult.error;
+            job.phase = "已自动停止：1688 需要人工登录/验证";
+            job.logs.push(makeLog("检测到 1688 登录/验证码/安全验证阻塞，已停止后续采集，避免继续触发风控。", "error"));
+          }
         }
       } else if (enable1688) {
         result.searchError = "Ozon 主图为空，无法 1688 搜图";
@@ -579,14 +587,15 @@ async function runQueuedSourcingJob(remoteJob) {
     }
     job.results.push(result);
     job.processed = index + 1;
-    job.phase = `已完成 ${job.processed}/${job.total}`;
+    if (!fatalStop) job.phase = `已完成 ${job.processed}/${job.total}`;
     await reportSourcingProgress(job);
+    if (fatalStop) break;
     if (index < rows.length - 1) await sleep(randomInt(delayMinMs, delayMaxMs));
   }
 
-  job.status = job.cancelRequested ? "canceled" : (job.results.some(r => !r.error) ? "done" : "error");
-  job.phase = job.status === "done" ? "已完成，正在生成 Excel" : (job.status === "canceled" ? "已停止" : "全部失败");
-  job.error = job.status === "error" ? "单品找货全部失败" : "";
+  job.status = fatalStop ? "error" : (job.cancelRequested ? "canceled" : (job.results.some(r => !r.error) ? "done" : "error"));
+  job.phase = fatalStop ? job.phase : (job.status === "done" ? "已完成，正在生成 Excel" : (job.status === "canceled" ? "已停止" : "全部失败"));
+  job.error = fatalStop ? (job.error || "1688 需要人工登录/验证") : (job.status === "error" ? "单品找货全部失败" : "");
   job.logs.push(makeLog(job.status === "done" ? "单品找货完成。" : job.phase, job.status === "error" ? "error" : "info"));
   await completeSourcingJob(job);
 }
@@ -644,6 +653,10 @@ function compact1688ErrorInPlugin(message) {
   return text.length > 180 ? `${text.slice(0, 180)}...` : text;
 }
 
+function isCritical1688BlockerInPlugin(message) {
+  return /验证码|滑块|安全验证|人机验证|captcha|verify|robot|punish|请先.*1688.*登录|1688.*登录|没有拿到 1688 搜图 token|token 失效/i.test(String(message || ""));
+}
+
 async function recover1688SessionInPlugin(reason, attempt) {
   last1688FailureAt = Date.now();
   console.warn(`[SW ${VERSION}] 1688 会话恢复 attempt=${attempt}: ${compact1688ErrorInPlugin(reason)}`);
@@ -658,60 +671,60 @@ async function search1688ByImageInPlugin(imageUrl, maxCandidates) {
 
 async function search1688ByImageInPluginInternal(imageUrl, maxCandidates) {
   try {
-    try {
-      const pageResult = await search1688ByImageViaPageInPlugin(imageUrl, maxCandidates);
-      if (pageResult?.success && Array.isArray(pageResult.candidates) && pageResult.candidates.length) {
-        return pageResult;
-      }
-      if (pageResult?.error) {
-        return { success: false, error: compact1688ErrorInPlugin(pageResult.error) };
-      }
-    } catch (pageError) {
-      return { success: false, error: compact1688ErrorInPlugin(pageError.message || pageError) };
+    let state = await ensure1688CookieStateInPlugin(false);
+    if (!state.token) {
+      return { success: false, error: "没有拿到 1688 搜图 token。请先在当前 Chrome 登录 1688，再回到 ERP 重新执行任务。" };
     }
-    return { success: false, error: "1688 页面会话候选为空" };
+    const base64Image = await fetchImageAsBase64(imageUrl);
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const candidates = await collect1688CandidatesInPlugin(base64Image, state, maxCandidates);
+        const ranked = rank1688CandidatesForOzonInPlugin(candidates).slice(0, maxCandidates);
+        return ranked.length
+          ? { success: true, candidates: ranked }
+          : { success: false, error: "1688 接口搜图未返回候选" };
+      } catch (error) {
+        lastError = error;
+        const message = error?.message || String(error);
+        if (attempt >= 2 || !is1688RefreshableError(message) || isCritical1688BlockerInPlugin(message)) break;
+        await recover1688SessionInPlugin(message, attempt);
+        state = await ensure1688CookieStateInPlugin(false);
+      }
+    }
+    return { success: false, error: compact1688ErrorInPlugin(lastError?.message || lastError || "1688 搜图失败") };
   } catch (e) {
     return { success: false, error: compact1688ErrorInPlugin(e.message || String(e)) };
   }
 }
 
-async function getShared1688SearchTabInPlugin(searchUrl) {
-  if (shared1688SearchTabId) {
-    const existing = await chrome.tabs.get(shared1688SearchTabId).catch(() => null);
-    if (existing && /:\/\/([^/]+\.)?1688\.com\//i.test(existing.url || "")) {
-      await withChromeTabEditRetry("复用 1688 搜图页", () => chrome.tabs.update(shared1688SearchTabId, { url: searchUrl, active: false }));
-      return { id: shared1688SearchTabId, reused: true };
-    }
-    shared1688SearchTabId = 0;
-  }
-
-  const candidates = await chrome.tabs.query({ url: ["https://*.1688.com/*", "https://1688.com/*"] }).catch(() => []);
-  const reusable = candidates.find((tab) => /:\/\/s\.1688\.com\//i.test(tab.url || ""))
-    || candidates.find((tab) => /:\/\/([^/]+\.)?1688\.com\//i.test(tab.url || ""));
-  if (reusable?.id) {
-    shared1688SearchTabId = reusable.id;
-    await withChromeTabEditRetry("复用已有 1688 页面", () => chrome.tabs.update(shared1688SearchTabId, { url: searchUrl, active: false }));
-    return { id: shared1688SearchTabId, reused: true };
-  }
-
+async function create1688SearchTabInPlugin(searchUrl) {
+  // 单品找货只使用插件自建临时 tab，避免改写用户手动登录/验证中的 1688 页面。
   const tab = await createTabWithRetry({ url: searchUrl, active: false }, "打开 1688 以图搜货页");
-  shared1688SearchTabId = tab.id;
-  return { id: tab.id, reused: false };
+  return { id: tab.id, ephemeral: true };
+}
+
+async function close1688SearchTabInPlugin(tab) {
+  if (!tab?.id || !tab.ephemeral) return;
+  await safeRemoveTab(tab.id);
 }
 
 async function search1688ByImageViaPageInPlugin(imageUrl, maxCandidates) {
   const searchUrl = `https://s.1688.com/youyuan/index.htm?tab=imageSearch&__jzcOzonImg=${encodeURIComponent(imageUrl)}`;
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
-    const tab = await getShared1688SearchTabInPlugin(searchUrl);
+    const tab = await create1688SearchTabInPlugin(searchUrl);
     try {
       await waitForTabComplete(tab.id, 45000);
       await sleep(randomInt(2500, 5500));
-      await humanBrowse1688TabInPlugin(tab.id, "1688 以图搜货页", {
+      const browseResult = await humanBrowse1688TabInPlugin(tab.id, "1688 以图搜货页", {
         minDurationMs: 3500,
         maxDurationMs: 8000,
         returnTop: true,
       });
+      if (browseResult?.verification) {
+        return { success: false, error: "1688 出现验证码/安全验证，请在当前 Chrome 手动完成验证后重试" };
+      }
       const base64Image = await fetchImageAsBase64(imageUrl);
       const [execResult] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -736,13 +749,15 @@ async function search1688ByImageViaPageInPlugin(imageUrl, maxCandidates) {
       if (!candidates.length) {
         return { success: false, error: result.imageId ? `1688 页面会话 imageId=${result.imageId} 未返回候选` : "1688 页面会话候选为空" };
       }
-      return { success: true, candidates: await enrich1688CandidatesInPlugin(candidates.slice(0, maxCandidates)) };
+      const enriched = await enrich1688CandidatesInPlugin(candidates.slice(0, maxCandidates));
+      return { success: true, candidates: rank1688CandidatesForOzonInPlugin(enriched).slice(0, maxCandidates) };
     } catch (error) {
       lastError = error;
       if (!isMissingChromeTabError(error) || attempt >= 2) throw error;
-      console.warn(`[SW ${VERSION}] 1688 搜图页 tab 已失效，清空共享 tab 后重试一次: ${error.message || error}`);
-      shared1688SearchTabId = 0;
+      console.warn(`[SW ${VERSION}] 1688 搜图页 tab 已失效，重建临时 tab 后重试一次: ${error.message || error}`);
       await sleep(randomInt(800, 1800));
+    } finally {
+      await close1688SearchTabInPlugin(tab);
     }
   }
   throw lastError || new Error("1688 页面会话搜图失败");
@@ -753,11 +768,14 @@ async function collect1688RenderedPageItemsInPlugin(tabId, imageId, maxCandidate
   await withChromeTabEditRetry("打开 1688 搜图结果页", () => chrome.tabs.update(tabId, { url: resultUrl, active: false }));
   await waitForTabComplete(tabId, 60000);
   await sleep(randomInt(2500, 5000));
-  await humanBrowse1688TabInPlugin(tabId, "1688 搜图结果页", {
+  const browseResult = await humanBrowse1688TabInPlugin(tabId, "1688 搜图结果页", {
     minDurationMs: 5500,
     maxDurationMs: 13000,
     dwellChance: 0.34,
   });
+  if (browseResult?.verification) {
+    throw new Error("1688 搜图结果页出现验证码/安全验证，请手动完成验证后重试");
+  }
   const [execResult] = await chrome.scripting.executeScript({
     target: { tabId },
     func: extract1688RenderedOffersInPageContext,
@@ -1105,7 +1123,7 @@ async function ensure1688CookieStateInPlugin(forceRefresh = false) {
 
   await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 失败: ${e.message}`));
   state = await get1688CookieStateInPlugin();
-  if (state.token && !forceRefresh) return state;
+  if (state.token) return state;
 
   const preheatUrls = [
     "https://www.1688.com/",
@@ -1857,6 +1875,41 @@ function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
     packQuantityEvidence: details.packQuantityEvidence || candidate.packQuantityEvidence || inferredPack.evidence || "",
     detailError: details.detailError || "",
   };
+}
+
+function parseMoqQuantityInPlugin(value) {
+  const text = String(value || "").replace(/,/g, " ").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  if (/(?:一|1)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发)|(?:起批|起订|起购|起拍|起订量|起购量|最少起批|最小起订|可批|拿样|代发)\s*[:：]?\s*(?:一|1)(?:\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces))?|(?:min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)\s*[:：]?\s*1(?:\s*(?:pcs?|piece|pieces))?/i.test(text)) {
+    return 1;
+  }
+  const direct = text.match(/^\s*(\d+(?:\.\d+)?)\s*$/)
+    || text.match(/(?:^|[^\d])(\d+(?:\.\d+)?)\s*(?:件|个|只|套|箱|包|pcs?|piece|pieces)?\s*(?:起批|起订|起购|起拍|可批|拿样|代发|min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)/i)
+    || text.match(/(?:起批|起订|起购|起拍|起订量|起购量|最少起批|最小起订|可批|拿样|代发|min\s*order\s*qty|min\s*order\s*quantity|min(?:imum)?\s*order|minimum\s*purchase|moq)\s*[:：]?\s*(\d+(?:\.\d+)?)/i);
+  if (!direct) return null;
+  const n = Number(direct[1]);
+  return Number.isFinite(n) && n > 0 ? Math.ceil(n) : null;
+}
+
+function rank1688CandidatesForOzonInPlugin(candidates) {
+  return (Array.isArray(candidates) ? candidates : []).map((candidate, index) => {
+    const moqQuantity = parseMoqQuantityInPlugin(candidate.minOrderQuantity || candidate.moq);
+    const ozonMoqPenalty = moqQuantity === 1 ? 0 : (moqQuantity === null ? 1 : 2);
+    return {
+      ...candidate,
+      moqQuantity,
+      ozonMoqOk: moqQuantity === 1,
+      ozonMoqWarning: moqQuantity && moqQuantity > 1 ? `起批量 ${moqQuantity}，不适合 Ozon 一件代发优先采购` : "",
+      _ozonCandidateRank: { index, ozonMoqPenalty },
+    };
+  }).sort((a, b) => (
+    (a._ozonCandidateRank?.ozonMoqPenalty || 0) - (b._ozonCandidateRank?.ozonMoqPenalty || 0)
+    || (a.avoidForSourcing ? 1 : 0) - (b.avoidForSourcing ? 1 : 0)
+    || (a._ozonCandidateRank?.index || 0) - (b._ozonCandidateRank?.index || 0)
+  )).map((candidate, index) => {
+    const { _ozonCandidateRank, ...rest } = candidate;
+    return { ...rest, rank: index + 1 };
+  });
 }
 
 function addTrafficBaitAssessmentInPlugin(candidate) {

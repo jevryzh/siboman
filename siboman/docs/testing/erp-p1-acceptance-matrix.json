@@ -12,7 +12,7 @@
     "Every store-scoped request must carry a current store id or prove server-side user/store ownership filtering.",
     "External write impact modules require an explicit operator confirmation, visible error result, and no real execution in local smoke.",
     "Unavailable analytics, ranking, AI, Ozon Seller, or plugin data sources must degrade visibly instead of blanking the page.",
-    "Single sourcing remains frozen and must not reappear as a normal sidebar entry."
+    "Single sourcing v2 must be restored as an independent collection-workflow entry, not as a selection-center tab."
   ],
   "modules": [
     {
@@ -133,6 +133,61 @@
           "severity": "P1",
           "owner": "backend-engineer",
           "summary": "Local fixture and structure guard now cover duplicate URL/SKU parse, merge, and skip behavior; authorized collector-chain testing is still required."
+        }
+      ]
+    },
+    {
+      "id": "single-sourcing",
+      "menuLabel": "单品找货",
+      "route": "#/single-sourcing",
+      "viewFile": "public/js/views/SourcingModule.js",
+      "riskLevel": "requires_authorization",
+      "readonlyAcceptance": [
+        "Single sourcing is an independent menu entry and route, not a tab inside the selection center.",
+        "Task logs show timestamp, severity, source row, total progress, and the current Ozon/1688/AI stage.",
+        "Results and Excel history expose Ozon image, 1688 candidates, MOQ, freight, weight, AI decision, confidence, and failure reason."
+      ],
+      "authorizationAcceptance": [
+        "The ERP page grants the extension a short-lived worker token; the extension does not ask for or store an ERP username/password.",
+        "Queued jobs are scoped to the current user and store so only the current online worker can claim them.",
+        "1688 login or captcha is surfaced as an operator-visible status instead of a silent generic failure."
+      ],
+      "externalWriteAcceptance": [
+        "Local smoke must not scrape Ozon/1688 or call AI providers; live 9/20-row tests require explicit operator authorization.",
+        "Single sourcing must not touch BatchUpload import payload, rich content, stock, warehouse, watermark, or import-by-sku flow."
+      ],
+      "localSmoke": {
+        "viewContains": [
+          "activeTab.value === 'single'",
+          "authorizePluginWorker",
+          "'/api/worker/plugin-token'",
+          "open1688",
+          "https://www.1688.com/",
+          "formatLogClock",
+          "第 ${itemNo}${total ? `/${total}` : ''} 条",
+          "historyDownloadUrl",
+          "AI 审核",
+          "下载 Excel",
+          "每商品候选数",
+          "maxCandidates"
+        ],
+        "serverContains": [
+          "createScopedWorkerToken(req.user.id",
+          "scope: [\"collector:submit\", \"worker:poll\"]",
+          "storeId",
+          "claimNextDbJob",
+          "reviewCandidatesWithMiniMax",
+          "MOQ解析值",
+          "1688运费来源",
+          "1688重量（克）",
+          "writeXlsxWithEmbeddedImages"
+        ]
+      },
+      "bugsOrGaps": [
+        {
+          "severity": "P0",
+          "owner": "testing-engineer",
+          "summary": "Static guards only prove the single-sourcing contract is wired. Real 1688 login/captcha behavior, AI review, and Excel image/freight/weight completeness still need authorized test-environment evidence."
         }
       ]
     },

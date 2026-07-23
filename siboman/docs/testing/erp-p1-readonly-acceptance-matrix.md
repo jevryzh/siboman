@@ -1,8 +1,8 @@
 # ERP P1 全功能只读验收矩阵
 
 任务：P1-3  
-范围：店铺管理、商品管理、采集箱、批量上架保护、上架记录、库存、订单、AI 套图、经营分析、数据大屏、市场榜单。  
-本地可执行源：`docs/testing/erp-p1-acceptance-matrix.json` + `tests/test_erp_acceptance_matrix.cjs`。
+范围：店铺管理、商品管理、采集箱、单品找货、批量上架保护、上架记录、库存、订单、AI 套图、经营分析、数据大屏、市场榜单。
+本地可执行源：`docs/testing/erp-p1-acceptance-matrix.json` + `tests/test_erp_acceptance_matrix.cjs`。单品找货 v2 另有专项守卫 `tests/test_single_sourcing_v2.cjs` 和真实链路清单 `docs/testing/single-sourcing-v2-qa-checklist.md`。
 
 ## 分级口径
 
@@ -19,6 +19,7 @@
 | 店铺管理 | `#/stores` | requires_authorization | 店铺列表按用户权限返回；Client ID 脱敏；API Key 不渲染；manifest/zip/已安装插件版本可刷新并提示不一致 |
 | 商品管理 | `#/products` | requires_authorization | 商品状态 Tab、搜索/分页/导出、1688 链接、体检问题、批量 100 上限、字段编辑 ownership 过滤、Ozon 同步结果可见 |
 | 采集箱 | `#/collection` | requires_authorization | 按店铺/状态/搜索分页；失败原因、忽略/恢复、重试、CSV、多图、成本与利润风险可见；导入/删除只影响授权店铺 |
+| 单品找货 | `#/single-sourcing` | requires_authorization | 独立入口且不在选品中心 Tab；ERP 页面短期授权插件、插件无需 ERP 密码；任务领取、日志时间/行号、1688 验证码可见、MOQ=1、图片/运费/重量、AI 审核、历史 Excel 下载可验证 |
 | 批量上架 | `#/upload` | external_write_impact | 发布前插件版本、单店约束、Seller category/type_id、多图、rich content、仓库/库存/价格完整；提交慢显示处理中，不能当完成 |
 | 上架记录 | `#/listing-history` | requires_authorization | task_id、canonical status、原始错误、中文错误、部分成功说明、同步/重试/删除/CSV、筛选分页与店铺隔离 |
 | 库存管理 | `#/inventory` | external_write_impact | 草稿持久化、低库存阈值、分仓、Excel 导入、冲突确认、负数阻断、批量提交结果、库存变更日志、店铺仓库隔离 |
@@ -26,7 +27,7 @@
 | AI 套图 | `#/ai-generator` | external_write_impact | 默认 Agnes，按 TokenDun、万相、MiniMax 回退；provider 状态、失败原因、历史可见；本地 smoke 不触发计费生成 |
 | 经营分析 | `#/analytics` | read_only | dashboard/category/bestseller/profit/cost/exchange-rate 数据源可见；成本缺失不猜利润；失败有降级提示 |
 | 数据大屏 | `#/data-screen` | read_only | 实时指标、订单流、库存告警、状态分布、全屏、零数据、断网降级，不写订单/库存/商品 |
-| 市场榜单 | `#/market-discovery` | requires_authorization | 独立公共数据源、source/capture/confidence、不可用降级、加入采集箱显式触发；不得恢复单品找货入口 |
+| 市场榜单 | `#/market-discovery` | requires_authorization | 独立公共数据源、source/capture/confidence、不可用降级、加入采集箱显式触发；不得混入单品找货的 1688 搜图链路 |
 
 ## 本地 Smoke
 
@@ -42,7 +43,8 @@ npm run test:p1-smoke
 - 每个模块至少有业务链路级验收点，不接受只有 route/menu 的条目。
 - `external_write_impact` 模块必须声明外部写验收点和本地禁止真实执行的约束。
 - 关键视图/后端护栏字符串存在，例如库存冲突、批量上架 Seller category/type_id、上架记录 raw error、AI provider fallback、榜单独立数据源。
-- 单品找货不能作为普通侧边栏入口出现。
+- 单品找货必须作为独立侧边栏入口出现，不得回到选品中心 Tab；本地 smoke 只验证结构，真实 1688/Ozon 链路需授权测试。
+- 单品找货专项守卫会检查 worker token scoped、job store_id、日志时间/行号、历史下载、Excel 字段、MOQ=1、候选数不固定为 3、插件无需 ERP 密码，并确认批量上架保护仍在主测试脚本内。
 
 ## 当前发现
 

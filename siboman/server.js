@@ -83,6 +83,7 @@ const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || "agnes-image-2.0-flas
 const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD || 0);
 const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
+const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.55";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -7495,8 +7496,13 @@ app.post("/api/jobs", async (req, res, next) => {
     const urls = urlRows.map((entry) => entry.url);
 
     const id = crypto.randomUUID();
+    const storeId = String(req.body.store_id || req.body.storeId || req.query.store_id || req.query.storeId || "").split(",")[0].trim();
+    if (storeId && db) {
+      await assertActiveStoreAccess(storeId, req.user.id, "id");
+    }
     const job = {
       id,
+      storeId,
       status: "queued",
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -7531,6 +7537,7 @@ app.post("/api/jobs", async (req, res, next) => {
       startRow,
       sourceTotal: allUrlRows.length,
       maxCandidates: clampInt(req.body.maxCandidates, 1, 20, 5),
+      storeId,
       enable1688: req.body.enable1688 !== false,
       enableAI: req.body.enableAI !== false,
       delayMinMs,
@@ -7543,6 +7550,7 @@ app.post("/api/jobs", async (req, res, next) => {
       const queued = await createQueuedDbJob(req.user, job, {
         urls,
         urlRows,
+        storeId,
         options,
         raw: { urlsText: req.body.urlsText || "" },
       });
@@ -7766,12 +7774,29 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
     const kinds = Array.isArray(req.body?.kinds)
       ? req.body.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
       : [];
+    const workerVersion = String(req.body?.version || req.body?.pluginVersion || "").trim();
+    const isChromeExtensionWorker = String(req.body?.platform || "").trim() === "chrome-extension";
+    const wantsSingleSourcing = !kinds.length || kinds.includes("run");
+    const versionTooOld = isChromeExtensionWorker
+      && wantsSingleSourcing
+      && compareNumericVersion(workerVersion, MIN_SINGLE_SOURCING_PLUGIN_VERSION) < 0;
+    const blockedPhase = `插件版本 ${workerVersion || "未知"} 低于单品找货最低版本 v${MIN_SINGLE_SOURCING_PLUGIN_VERSION}，请在店铺管理下载新版插件。`;
     await upsertWorkerHeartbeat(req.user, workerName, {
       platform: req.body?.platform,
       hostname: req.body?.hostname,
       profileDir: req.body?.profileDir,
-      currentPhase: req.body?.currentPhase || "本机采集端在线，可领取任务",
+      currentPhase: versionTooOld ? blockedPhase : (req.body?.currentPhase || "本机采集端在线，可领取任务"),
     });
+    if (versionTooOld) {
+      res.json({
+        success: true,
+        job: null,
+        blocked: true,
+        error: blockedPhase,
+        minVersion: MIN_SINGLE_SOURCING_PLUGIN_VERSION,
+      });
+      return;
+    }
     const job = await claimNextDbJob(req.user, workerName, { kinds });
     if (job) {
       await upsertWorkerHeartbeat(req.user, workerName, {
@@ -7842,11 +7867,28 @@ app.get("/api/worker/status", async (req, res, next) => {
 });
 
 app.get("/api/worker/plugin-token", async (req, res) => {
+  const storeId = String(req.query.store_id || req.query.storeId || req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+  if (storeId && db) {
+    try {
+      await assertActiveStoreAccess(storeId, req.user.id, "id");
+    } catch (error) {
+      res.status(error.statusCode || 403).json({ success: false, error: error.message });
+      return;
+    }
+  }
+  const issued = createScopedWorkerToken(req.user.id, {
+    storeId,
+    scope: ["collector:submit", "worker:poll"],
+  });
+  res.setHeader("Cache-Control", "no-store");
   res.json({
     success: true,
-    token: createAuthToken(req.user.id),
+    token: issued.token,
+    tokenType: "Bearer",
     userId: req.user.id,
-    expiresIn: Math.floor(AUTH_MAX_AGE_MS / 1000),
+    storeId,
+    scope: issued.payload.scope,
+    expiresIn: issued.expiresIn,
   });
 });
 
@@ -7926,6 +7968,9 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     const updates = normalizeWorkerJobUpdate({ ...job, downloadUrl }, existing);
     updates.status = normalizeWorkerStatus(job.status) || "done";
     updates.downloadUrl = downloadUrl;
+    if (updates.status === "done" && downloadUrl) {
+      updates.phase = "已完成，可下载 Excel";
+    }
     const updated = await updateDbJob(req.params.id, updates);
     res.json({ success: true, job: updated, downloadUrl });
   } catch (error) {
@@ -12265,11 +12310,22 @@ function makeLogEntry(message, level = "info") {
   return { at: new Date().toISOString(), level, message };
 }
 
+function compareNumericVersion(a, b) {
+  const left = String(a || "").split(".").map((part) => Number.parseInt(part, 10) || 0);
+  const right = String(b || "").split(".").map((part) => Number.parseInt(part, 10) || 0);
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const diff = (left[index] || 0) - (right[index] || 0);
+    if (diff !== 0) return diff > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
 function dbRowToJob(row) {
   if (!row) return null;
   return {
     id: row.id,
     status: row.status,
+    storeId: row.store_id || "",
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     phase: row.phase || "",
@@ -12298,18 +12354,20 @@ async function createQueuedDbJob(user, job, payload) {
   const logs = [
     makeLogEntry("任务已创建，等待本机采集端领取。"),
   ];
+  const storeId = String(job.storeId || payload?.storeId || payload?.store_id || payload?.options?.storeId || payload?.options?.store_id || "").trim() || null;
   const result = await db.query(
     `INSERT INTO app_jobs (
-      id, user_id, kind, status, phase, total, processed, source_total, source_start_row,
+      id, user_id, store_id, kind, status, phase, total, processed, source_total, source_start_row,
       payload, logs, results, error, download_url, created_at, updated_at
     ) VALUES (
-      $1, $2, $3, $4, $5, $6, $7, $8, $9,
-      $10::jsonb, $11::jsonb, '[]'::jsonb, '', '', now(), now()
+      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+      $11::jsonb, $12::jsonb, '[]'::jsonb, '', '', now(), now()
     )
     RETURNING *`,
     [
       job.id,
       user?.id || null,
+      storeId,
       job.kind,
       "queued",
       job.phase || "等待本机采集端领取",
@@ -12341,7 +12399,7 @@ async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
        platform = EXCLUDED.platform,
        hostname = EXCLUDED.hostname,
        profile_dir = EXCLUDED.profile_dir,
-       current_job_id = COALESCE(EXCLUDED.current_job_id, app_worker_heartbeats.current_job_id),
+       current_job_id = EXCLUDED.current_job_id,
        current_phase = COALESCE(NULLIF(EXCLUDED.current_phase, ''), app_worker_heartbeats.current_phase),
        last_seen_at = now()`,
     [user.id, workerLabel, platform, hostname, profileDir, currentJobId, currentPhase],

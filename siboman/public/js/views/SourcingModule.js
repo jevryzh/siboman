@@ -138,12 +138,25 @@ window.SourcingModuleView = {
       return workers.some(w => w.online && w.canClaimJobs);
     });
     const onlineWorkers = Vue.computed(() => (collectorStatus.value.workers || []).filter(w => w.online));
+    const currentWorker = Vue.computed(() => onlineWorkers.value.find(w => w.canClaimJobs) || onlineWorkers.value[0] || null);
     const collectorStatusText = Vue.computed(() => {
       const onlineCount = onlineWorkers.value.length;
       const queued = collectorStatus.value.queue?.queued || 0;
       const active = collectorStatus.value.queue?.active || 0;
       if (canRun.value) return `采集插件在线${onlineCount > 1 ? ` ${onlineCount}` : ''} · 排队 ${queued} · 执行 ${active}`;
       return onlineCount ? `采集端在线但不可领取 · 排队 ${queued}` : '采集插件离线';
+    });
+    const collectorHealthType = Vue.computed(() => {
+      if (collectorStatus.value.error) return 'danger';
+      if (canRun.value) return 'success';
+      if (onlineWorkers.value.length) return 'warning';
+      return 'info';
+    });
+    const collectorHealthText = Vue.computed(() => {
+      if (collectorStatus.value.error) return `采集端状态读取失败：${collectorStatus.value.error}`;
+      if (canRun.value) return '当前采集插件可领取任务';
+      if (onlineWorkers.value.length) return '插件已在线，但还没有拿到当前账号/店铺的短期授权';
+      return '未检测到当前在线采集插件';
     });
 
     const jobStatusText = Vue.computed(() => {
@@ -182,6 +195,34 @@ window.SourcingModuleView = {
         return `${formatLogClock(entry?.at)} [${level}]${progress} ${message}`;
       });
       return allLines.slice(-160).join('\n') || '暂无日志';
+    });
+    const operatorAlert = Vue.computed(() => {
+      if (collectorStatus.value.error) {
+        return { type: 'error', title: '采集插件状态异常', message: collectorStatus.value.error };
+      }
+      if (!canRun.value) {
+        return {
+          type: onlineWorkers.value.length ? 'warning' : 'info',
+          title: onlineWorkers.value.length ? '插件需要重新授权' : '未检测到当前在线插件',
+          message: onlineWorkers.value.length
+            ? '请保持本页打开，点击“刷新/重新授权插件”；插件不需要登录 ERP 账号，但必须接收当前页面签发的短期授权。'
+            : '请在店铺管理下载并重载最新版逐梦采集插件，然后回到本页刷新状态。',
+        };
+      }
+      const text = (job.value?.logs || []).map(entry => String(entry?.message || entry || '')).join('\n');
+      if (/验证码|滑块|captcha|verify|验证/.test(text)) {
+        return { type: 'warning', title: '1688 需要人工验证', message: '请点击“打开 1688 首页”在当前 Chrome 里完成登录或验证码，再从失败行继续跑。' };
+      }
+      if (/未登录|login|请登录|登录/.test(text)) {
+        return { type: 'warning', title: '1688 登录状态不可用', message: '请先打开 1688 首页确认已登录；插件会使用当前 Chrome 会话，不需要 ERP 账号密码。' };
+      }
+      if (/AI.*失败|provider|模型|AI_PROVIDER|AI_ALL_PROVIDERS/.test(text)) {
+        return { type: 'error', title: 'AI 审核失败', message: '货源候选已保留，请查看日志中的 provider/model 错误并下载 Excel 做人工复核。' };
+      }
+      if (/无候选|没有候选|result\[\]/.test(text)) {
+        return { type: 'info', title: '部分商品没有 1688 候选', message: '这通常和 Ozon 主图、1688 搜图结果或验证码有关；结果表会保留失败原因，方便断点续跑。' };
+      }
+      return null;
     });
 
     const jobResults = Vue.computed(() => job.value?.results || []);
@@ -252,20 +293,31 @@ window.SourcingModuleView = {
     const startPolling = () => {
       stopPolling();
       pollJob();
-      pollTimer = setInterval(pollJob, 1500);
+      pollTimer = setInterval(() => {
+        pollJob();
+        fetchJobHistory();
+        fetchCollectorStatus();
+      }, 1500);
     };
 
     const restoreActiveJob = async () => {
       const savedId = localStorage.getItem('singleSourcingJobId') || '';
+      const activeStatuses = new Set(['queued', 'claimed', 'running', 'exporting']);
       if (savedId) {
         currentJobId.value = savedId;
-        await pollJob();
-        if (job.value && !['done', 'error', 'canceled'].includes(job.value.status)) startPolling();
-        return;
+        try {
+          await pollJob();
+          if (job.value && activeStatuses.has(job.value.status)) {
+            startPolling();
+            return;
+          }
+        } catch {}
+        currentJobId.value = '';
+        job.value = null;
+        localStorage.removeItem('singleSourcingJobId');
       }
       try {
         const history = await axios.get('/api/history');
-        const activeStatuses = new Set(['queued', 'claimed', 'running', 'exporting']);
         const item = (history.data.items || []).find(it => it.kind === 'run' && activeStatuses.has(it.status));
         if (!item?.id) return;
         currentJobId.value = item.id;
@@ -379,8 +431,20 @@ window.SourcingModuleView = {
 
     const formatTime = (value) => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '-';
     const money = (value) => value ? String(value) : '';
-    const topCandidates = (row) => (row.candidates || []).slice(0, 3);
+    const topCandidates = (row) => (row.candidates || []).slice(0, Math.max(1, Number(maxCandidates.value || 5)));
     const ozonImage = (row) => row.ozon?.mainImage?.publicUrl || row.ozon?.mainImageUrl || '';
+    const candidateImage = (candidate) => (
+      candidate?.localImage?.publicUrl
+      || candidate?.localImage?.url
+      || candidate?.image
+      || candidate?.imageUrl
+      || candidate?.picUrl
+      || candidate?.mainImage
+      || ''
+    );
+    const candidateMoq = (candidate) => candidate?.moqText || candidate?.minOrderText || candidate?.minOrderQuantity || candidate?.moq || candidate?.minOrder || '';
+    const candidateFreight = (candidate) => candidate?.freightText || candidate?.shippingFeeText || candidate?.freight || candidate?.shippingFee || candidate?.logisticsFee || '';
+    const candidateWeight = (candidate) => candidate?.weightText || candidate?.weightGram || candidate?.weight || candidate?.packageWeight || '';
     const percent = (value) => {
       const n = Number(value);
       return Number.isFinite(n) ? `${Math.round(n * 100)}%` : '';
@@ -416,17 +480,18 @@ window.SourcingModuleView = {
       activeTab, tableData, loading, pagination, fetchData, handlePageChange, handleTabChange,
       urlsText, maxCandidates, startRow, delayMin, delayMax, maxConsecutiveFailures,
       enable1688, enableAI, creating, currentJobId, job, collectorLoading,
-      collectorStatus, canRun, onlineWorkers, collectorStatusText, jobStatusText, recentLogs, jobResults, isRunning,
+      collectorStatus, canRun, onlineWorkers, currentWorker, collectorStatusText, collectorHealthType,
+      collectorHealthText, operatorAlert, jobStatusText, recentLogs, jobResults, isRunning,
       startSingleSourcing, cancelJob, downloadUrl, open1688, formatWorkerPlatform,
       formatTime, money, topCandidates, ozonImage, historyLoading, jobHistory,
       historyDownloadUrl, loadHistoryJob, jobStatusTagType, formatHistoryRange,
       percent, aiDecisionText, aiTagType, rowStatusType, rowStatusText,
-      candidateReview, selectedCandidateText,
+      candidateReview, selectedCandidateText, candidateImage, candidateMoq, candidateFreight, candidateWeight,
     };
   },
   template: `
     <div class="sourcing-view">
-      <el-card>
+      <el-card v-if="activeTab !== 'single'">
         <template v-if="activeTab !== 'single'" #header>
           <el-tabs v-model="activeTab" @tab-change="handleTabChange">
             <el-tab-pane label="类目分析" name="category" />
@@ -459,149 +524,185 @@ window.SourcingModuleView = {
             />
           </div>
         </template>
+      </el-card>
 
-        <template v-else>
-          <div style="display:flex; flex-direction:column; gap:16px; width:100%">
-              <el-card shadow="never">
-                <template #header>
-                  <div style="display:flex; justify-content:space-between; align-items:center; gap:12px">
-                    <strong>单品找货</strong>
-                    <el-tooltip placement="bottom" :content="collectorStatusText">
-                      <el-tag :type="canRun ? 'success' : 'info'" effect="light">{{ canRun ? '采集插件在线' : '采集插件离线' }}</el-tag>
-                    </el-tooltip>
+      <template v-else>
+        <div style="display:flex; flex-direction:column; gap:16px; width:100%">
+          <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap">
+            <div>
+              <h2 style="margin:0; font-size:22px; line-height:1.3">单品找货工作台</h2>
+              <div style="margin-top:6px; color:#606266; font-size:13px">Ozon 商品采集、1688 以图搜货、MOQ/运费/重量诊断、AI 审核和 Excel 导出</div>
+            </div>
+            <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end">
+              <el-tooltip placement="bottom" :content="collectorStatusText">
+                <el-tag :type="collectorHealthType" effect="light">{{ collectorHealthText }}</el-tag>
+              </el-tooltip>
+              <el-button size="small" :loading="collectorLoading" @click="fetchCollectorStatus">刷新/重新授权插件</el-button>
+            </div>
+          </div>
+
+          <el-alert
+            v-if="operatorAlert"
+            :type="operatorAlert.type"
+            :title="operatorAlert.title"
+            :description="operatorAlert.message"
+            show-icon
+            :closable="false"
+          />
+
+          <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(360px, 1fr)); gap:16px; align-items:start">
+            <section style="background:#fff; border:1px solid #ebeef5; border-radius:6px; padding:16px">
+              <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:14px">
+                <strong>任务参数</strong>
+                <el-tag size="small" type="info">默认候选数 5</el-tag>
+              </div>
+              <el-form label-position="top">
+                <el-form-item label="Ozon 链接（每行一个）">
+                  <el-input v-model="urlsText" type="textarea" :rows="10" spellcheck="false" placeholder="https://www.ozon.ru/product/..." />
+                </el-form-item>
+                <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px">
+                  <el-form-item label="每商品候选数"><el-input-number v-model="maxCandidates" :min="1" :max="20" style="width:100%" /></el-form-item>
+                  <el-form-item label="从第几行开始"><el-input-number v-model="startRow" :min="1" style="width:100%" /></el-form-item>
+                  <el-form-item label="连续异常停止"><el-input-number v-model="maxConsecutiveFailures" :min="1" :max="20" style="width:100%" /></el-form-item>
+                  <el-form-item label="间隔最小（秒）"><el-input-number v-model="delayMin" :min="1" style="width:100%" /></el-form-item>
+                  <el-form-item label="间隔最大（秒）"><el-input-number v-model="delayMax" :min="1" style="width:100%" /></el-form-item>
+                </div>
+                <div style="display:flex; gap:18px; align-items:center; margin:4px 0 16px; flex-wrap:wrap">
+                  <el-checkbox v-model="enable1688">1688 以图搜货</el-checkbox>
+                  <el-checkbox v-model="enableAI">AI 严格审核</el-checkbox>
+                </div>
+                <div style="display:flex; gap:10px; flex-wrap:wrap">
+                  <el-button type="primary" :loading="creating" :disabled="isRunning" @click="startSingleSourcing">开始采集</el-button>
+                  <el-button type="danger" :disabled="!currentJobId || !isRunning" @click="cancelJob">停止</el-button>
+                  <el-button @click="open1688">打开 1688 首页</el-button>
+                  <el-button v-if="downloadUrl" type="success" tag="a" :href="downloadUrl">下载 Excel</el-button>
+                </div>
+              </el-form>
+            </section>
+
+            <section style="background:#fff; border:1px solid #ebeef5; border-radius:6px; padding:16px; min-width:0">
+              <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:14px">
+                <div>
+                  <strong>实时进度</strong>
+                  <div style="color:#909399; font-size:12px; margin-top:4px">{{ jobStatusText }}</div>
+                </div>
+                <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end">
+                  <el-tag size="small" :type="canRun ? 'success' : 'info'">当前在线 {{ onlineWorkers.length }}</el-tag>
+                  <el-tag v-if="currentWorker" size="small" type="info">{{ currentWorker.workerName || currentWorker.name || currentWorker.id || '当前采集端' }}</el-tag>
+                </div>
+              </div>
+              <pre style="margin:0; width:100%; box-sizing:border-box; min-height:318px; max-height:520px; overflow:auto; background:#172033; color:#d8e3f0; padding:14px 18px; border-radius:6px; line-height:1.55; white-space:pre-wrap; word-break:break-word">{{ recentLogs }}</pre>
+            </section>
+          </div>
+
+          <section style="background:#fff; border:1px solid #ebeef5; border-radius:6px; padding:16px; min-width:0">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:14px">
+              <strong>结果</strong>
+              <span style="color:#909399; font-size:13px">{{ jobResults.length }} 条 · 最多展示 {{ maxCandidates }} 个候选/商品</span>
+            </div>
+            <el-table :data="jobResults" border stripe empty-text="还没有结果。开始任务后会逐行显示 Ozon、1688 候选、MOQ、运费、重量、AI 审核和失败原因。" style="width:100%">
+              <el-table-column label="行" width="70">
+                <template #default="{ row, $index }">
+                  {{ row.sourceRow || $index + 1 }}
+                </template>
+              </el-table-column>
+              <el-table-column label="Ozon 商品" min-width="300">
+                <template #default="{ row }">
+                  <a :href="row.url" target="_blank" rel="noreferrer">{{ row.ozon?.title || row.url }}</a>
+                  <div style="color:#909399; font-size:12px; margin-top:4px">
+                    SKU {{ row.ozon?.sku || row.ozon?.productId || '-' }} · {{ money(row.ozon?.currentBlackPriceCny || row.ozon?.finalBlackPriceCny) || '-' }}
                   </div>
                 </template>
-                <el-form label-position="top">
-                  <el-form-item label="Ozon 链接（每行一个）">
-                    <el-input v-model="urlsText" type="textarea" :rows="8" spellcheck="false" placeholder="https://www.ozon.ru/product/..." />
-                  </el-form-item>
-                  <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px">
-                    <el-form-item label="每商品候选数"><el-input-number v-model="maxCandidates" :min="1" :max="20" style="width:100%" /></el-form-item>
-                    <el-form-item label="从第几行开始"><el-input-number v-model="startRow" :min="1" style="width:100%" /></el-form-item>
-                    <el-form-item label="连续异常停止"><el-input-number v-model="maxConsecutiveFailures" :min="1" :max="20" style="width:100%" /></el-form-item>
-                    <el-form-item label="间隔最小（秒）"><el-input-number v-model="delayMin" :min="1" style="width:100%" /></el-form-item>
-                    <el-form-item label="间隔最大（秒）"><el-input-number v-model="delayMax" :min="1" style="width:100%" /></el-form-item>
-                  </div>
-                  <div style="display:flex; gap:18px; align-items:center; margin:4px 0 16px">
-                    <el-checkbox v-model="enable1688">1688 以图搜货</el-checkbox>
-                    <el-checkbox v-model="enableAI">AI 严格审核</el-checkbox>
-                  </div>
-                  <div style="display:flex; gap:10px">
-                    <el-button type="primary" :loading="creating" :disabled="isRunning" @click="startSingleSourcing">开始采集</el-button>
-                    <el-button type="danger" :disabled="!currentJobId || !isRunning" @click="cancelJob">停止</el-button>
-                    <el-button @click="open1688">打开 1688 首页</el-button>
-                    <el-button v-if="downloadUrl" type="success" tag="a" :href="downloadUrl">下载 Excel</el-button>
-                  </div>
-                </el-form>
-              </el-card>
-
-              <el-card shadow="never">
-                <template #header>
-                  <div style="display:flex; justify-content:space-between; align-items:center">
-                    <strong>实时进度</strong>
-                    <span style="color:#606266; font-size:13px">{{ jobStatusText }}</span>
-                  </div>
+              </el-table-column>
+              <el-table-column label="主图" width="96">
+                <template #default="{ row }">
+                  <el-image v-if="ozonImage(row)" :src="ozonImage(row)" style="width:56px;height:56px;border-radius:6px" fit="cover" :preview-src-list="[ozonImage(row)]" preview-teleported />
                 </template>
-                <pre style="margin:0; width:100%; box-sizing:border-box; min-height:220px; max-height:460px; overflow:auto; background:#172033; color:#d8e3f0; padding:14px 18px; border-radius:6px; line-height:1.55; white-space:pre-wrap; word-break:break-word">{{ recentLogs }}</pre>
-              </el-card>
-
-              <el-card shadow="never">
-                <template #header>
-                  <div style="display:flex; justify-content:space-between; align-items:center">
-                    <strong>结果</strong>
-                    <span style="color:#909399; font-size:13px">{{ jobResults.length }} 条</span>
-                  </div>
-                </template>
-                <el-table :data="jobResults" border stripe empty-text="还没有结果" style="width:100%">
-                  <el-table-column label="行" width="70">
-                    <template #default="{ row, $index }">
-                      {{ row.sourceRow || $index + 1 }}
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="Ozon 商品" min-width="340">
-                    <template #default="{ row }">
-                      <a :href="row.url" target="_blank" rel="noreferrer">{{ row.ozon?.title || row.url }}</a>
-                      <div style="color:#909399; font-size:12px; margin-top:4px">
-                        SKU {{ row.ozon?.sku || row.ozon?.productId || '-' }} · {{ money(row.ozon?.currentBlackPriceCny || row.ozon?.finalBlackPriceCny) || '-' }}
-                      </div>
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="主图" width="96">
-                    <template #default="{ row }">
-                      <el-image v-if="ozonImage(row)" :src="ozonImage(row)" style="width:56px;height:56px;border-radius:6px" fit="cover" />
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="1688 候选" min-width="460">
-                    <template #default="{ row }">
-                      <div v-if="topCandidates(row).length">
-                        <div v-for="c in topCandidates(row)" :key="c.rank + c.link" style="margin-bottom:6px">
-                          <a :href="c.link" target="_blank" rel="noreferrer">{{ c.rank }}. {{ c.title }}</a>
-                          <div style="color:#909399; font-size:12px">
-                            {{ c.price || c.priceDetails || '-' }}
-                            <span v-if="candidateReview(row, c.rank)?.verdict"> · {{ candidateReview(row, c.rank).verdict }}</span>
-                            <span v-if="candidateReview(row, c.rank)?.confidence"> · {{ percent(candidateReview(row, c.rank).confidence) }}</span>
-                          </div>
+              </el-table-column>
+              <el-table-column label="1688 候选" min-width="560">
+                <template #default="{ row }">
+                  <div v-if="topCandidates(row).length">
+                    <div v-for="c in topCandidates(row)" :key="c.rank + c.link" style="display:grid; grid-template-columns:52px minmax(0, 1fr); gap:10px; margin-bottom:10px">
+                      <el-image v-if="candidateImage(c)" :src="candidateImage(c)" style="width:48px;height:48px;border-radius:6px" fit="cover" :preview-src-list="[candidateImage(c)]" preview-teleported />
+                      <div style="min-width:0">
+                        <a :href="c.link" target="_blank" rel="noreferrer">{{ c.rank }}. {{ c.title }}</a>
+                        <div style="color:#606266; font-size:12px; margin-top:4px; display:flex; gap:8px; flex-wrap:wrap">
+                          <span>价格 {{ c.price || c.priceDetails || '-' }}</span>
+                          <span>MOQ {{ candidateMoq(c) || '未取到' }}</span>
+                          <span>运费 {{ candidateFreight(c) || '未公开/需地区' }}</span>
+                          <span>重量 {{ candidateWeight(c) || '未取到' }}</span>
+                        </div>
+                        <div v-if="candidateReview(row, c.rank)?.verdict || candidateReview(row, c.rank)?.reason" style="color:#909399; font-size:12px; margin-top:4px">
+                          {{ candidateReview(row, c.rank)?.verdict || 'AI 诊断' }}
+                          <span v-if="candidateReview(row, c.rank)?.confidence"> · {{ percent(candidateReview(row, c.rank).confidence) }}</span>
+                          <span v-if="candidateReview(row, c.rank)?.reason"> · {{ candidateReview(row, c.rank).reason }}</span>
                         </div>
                       </div>
-                      <span v-else style="color:#909399">{{ row.searchError || '无候选' }}</span>
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="AI 审核" min-width="360">
-                    <template #default="{ row }">
-                      <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">
-                        <el-tag :type="aiTagType(row.aiReview?.decision)">{{ aiDecisionText(row.aiReview?.decision) }}</el-tag>
-                        <span v-if="selectedCandidateText(row)" style="font-size:12px; color:#606266">{{ selectedCandidateText(row) }}</span>
-                        <span v-if="row.aiReview?.confidence !== undefined" style="font-size:12px; color:#909399">置信度 {{ percent(row.aiReview.confidence) }}</span>
-                      </div>
-                      <div v-if="row.aiReview?.reason" style="color:#606266; font-size:12px; margin-top:6px; line-height:1.45">{{ row.aiReview.reason }}</div>
-                    </template>
-                  </el-table-column>
-                  <el-table-column label="状态 / 错误" min-width="220">
-                    <template #default="{ row }">
-                      <el-tag :type="rowStatusType(row)">{{ rowStatusText(row) }}</el-tag>
-                    </template>
-                  </el-table-column>
-                </el-table>
-              </el-card>
-
-            <el-card shadow="never" v-loading="historyLoading">
-              <template #header>
-                <div style="display:flex; justify-content:space-between; align-items:center; gap:10px">
-                  <strong>历史记录</strong>
-                  <el-button size="small" text @click="fetchJobHistory">刷新</el-button>
-                </div>
-              </template>
-              <el-empty v-if="!jobHistory.length" description="暂无单品找货记录" :image-size="80" />
-              <div v-for="item in jobHistory" :key="item.id" style="border-bottom:1px solid #ebeef5; padding:10px 0">
-                <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:8px">
-                  <div style="min-width:0">
-                    <div style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">
-                      {{ item.firstUrl || item.id }}
                     </div>
-                    <div style="color:#909399; font-size:12px; margin-top:4px">
-                      {{ formatHistoryRange(item) }} · {{ item.processed || 0 }}/{{ item.total || item.sourceTotal || 0 }} · {{ formatTime(item.updatedAt || item.createdAt) }}
-                    </div>
-                    <div v-if="item.phase" style="color:#606266; font-size:12px; margin-top:4px">{{ item.phase }}</div>
                   </div>
-                  <el-tag size="small" :type="jobStatusTagType(item.status)">{{ item.status || '-' }}</el-tag>
-                </div>
-                <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap">
-                  <el-button size="small" @click="loadHistoryJob(item)">查看</el-button>
+                  <span v-else style="color:#909399">{{ row.searchError || '无候选，建议打开 1688 检查登录/验证码后从该行继续' }}</span>
+                </template>
+              </el-table-column>
+              <el-table-column label="AI 审核" min-width="340">
+                <template #default="{ row }">
+                  <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap">
+                    <el-tag :type="aiTagType(row.aiReview?.decision)">{{ aiDecisionText(row.aiReview?.decision) }}</el-tag>
+                    <span v-if="selectedCandidateText(row)" style="font-size:12px; color:#606266">{{ selectedCandidateText(row) }}</span>
+                    <span v-if="row.aiReview?.confidence !== undefined" style="font-size:12px; color:#909399">置信度 {{ percent(row.aiReview.confidence) }}</span>
+                  </div>
+                  <div v-if="row.aiReview?.reason" style="color:#606266; font-size:12px; margin-top:6px; line-height:1.45">{{ row.aiReview.reason }}</div>
+                </template>
+              </el-table-column>
+              <el-table-column label="状态 / 错误" min-width="240">
+                <template #default="{ row }">
+                  <el-tag :type="rowStatusType(row)">{{ rowStatusText(row) }}</el-tag>
+                </template>
+              </el-table-column>
+            </el-table>
+          </section>
+
+          <section style="background:#fff; border:1px solid #ebeef5; border-radius:6px; padding:16px; min-width:0" v-loading="historyLoading">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px">
+              <strong>历史记录</strong>
+              <el-button size="small" text @click="fetchJobHistory">刷新</el-button>
+            </div>
+            <el-empty v-if="!jobHistory.length" description="暂无单品找货记录。任务完成、失败或中断后都会保留在这里下载 Excel。" :image-size="80" />
+            <el-table v-else :data="jobHistory" border stripe style="width:100%">
+              <el-table-column label="最近任务" min-width="360">
+                <template #default="{ row }">
+                  <div style="font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.firstUrl || row.id }}</div>
+                  <div v-if="row.phase" style="color:#606266; font-size:12px; margin-top:4px">{{ row.phase }}</div>
+                </template>
+              </el-table-column>
+              <el-table-column label="范围" width="140">
+                <template #default="{ row }">{{ formatHistoryRange(row) }}</template>
+              </el-table-column>
+              <el-table-column label="进度" width="130">
+                <template #default="{ row }">{{ row.processed || 0 }}/{{ row.total || row.sourceTotal || 0 }}</template>
+              </el-table-column>
+              <el-table-column label="更新时间" width="190">
+                <template #default="{ row }">{{ formatTime(row.updatedAt || row.createdAt) }}</template>
+              </el-table-column>
+              <el-table-column label="状态" width="110">
+                <template #default="{ row }"><el-tag size="small" :type="jobStatusTagType(row.status)">{{ row.status || '-' }}</el-tag></template>
+              </el-table-column>
+              <el-table-column label="操作" width="190" fixed="right">
+                <template #default="{ row }">
+                  <el-button size="small" @click="loadHistoryJob(row)">查看</el-button>
                   <el-button
-                    v-if="historyDownloadUrl(item)"
+                    v-if="historyDownloadUrl(row)"
                     size="small"
                     tag="a"
-                    :href="historyDownloadUrl(item)"
+                    :href="historyDownloadUrl(row)"
                     target="_blank"
                     rel="noreferrer"
                   >下载 Excel</el-button>
-                </div>
-              </div>
-            </el-card>
-            </div>
-          </div>
-        </template>
-      </el-card>
+                </template>
+              </el-table-column>
+            </el-table>
+          </section>
+        </div>
+      </template>
     </div>
   `
 };

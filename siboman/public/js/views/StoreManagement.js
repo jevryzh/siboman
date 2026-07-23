@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = '2.2.9.53';
-    const PLUGIN_ZIP_VERSION = '2.2.9.53';
+    const PLUGIN_MANIFEST_VERSION = '2.2.9.56';
+    const PLUGIN_ZIP_VERSION = '2.2.9.56';
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -237,7 +237,12 @@ window.StoreManagementView = {
         <template #header>
           <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
             <div style="font-weight: bold; color: #e6a23c">逐梦 Ozon 采集器</div>
-            <el-button size="small" :loading="pluginChecking" @click="refreshPluginStatus" icon="Refresh">刷新插件状态</el-button>
+            <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap">
+              <el-button type="warning" size="small" icon="Download" @click="downloadExtension">
+                立即下载插件
+              </el-button>
+              <el-button size="small" :loading="pluginChecking" @click="refreshPluginStatus" icon="Refresh">刷新插件状态</el-button>
+            </div>
           </div>
         </template>
         <div style="font-size: 14px; color: #666; line-height: 1.6">
@@ -264,6 +269,9 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.56 单品找货增加服务端插件版本闸门：低于 v2.2.9.55 或未上报版本的旧插件只能心跳，不能领取任务，避免旧扩展触发 1688 验证；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.55 单品找货 1688 搜图切回生产同款 MTOP 接口主链路，减少真实搜图页触发验证；遇到 1688 登录/验证码阻塞会自动停止后续采集，批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.54 恢复单品找货独立入口，插件使用 ERP 页面短期授权领取任务，并改为临时 1688 搜图页 + MOQ=1 优先排序；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.53 修复单品找货复用 1688 搜图页时 tab 失效导致 No tab with id 的问题，自动重建搜图页重试；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.52 恢复单品找货原默认参数：5 个候选、8-20 秒间隔、候选详情完整采集；保留页面会话搜图与 moqText 修复；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.50 修复单品找货 1688 页面候选归一化 moqText 未定义导致搜图失败；批量上架逻辑未调整。</li>
@@ -329,11 +337,6 @@ window.StoreManagementView = {
             <li>✅ v2.1.0 重磅: 辅源 OPI 上线! 调 api-seller.ozon.ru 找店铺里同款商品, 复用 attributes + 修正 type/cat (基于 0.13.48.1 opi-client.js)</li>
             <li>✅ v2.0 UI 重构: 顶部 toolbar + 10 格式面板 + Help drawer + 实时日志 (参考 MY 批量上架)</li>
           </ul>
-          <div style="margin-top: 15px">
-            <el-button type="warning" icon="Download" @click="downloadExtension">
-              立即下载插件 (.zip)
-            </el-button>
-          </div>
           <p style="margin-top: 10px; font-size: 12px; color: #999">
             安装方法：解压后在 Chrome 扩展程序页面开启“开发者模式”，点击“加载已解压的扩展程序”选择文件夹即可。
           </p>
