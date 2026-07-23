@@ -30,6 +30,7 @@ window.SourcingModuleView = {
     let pollTimer = null;
     let collectorTimer = null;
     let lastHistoryRefreshAt = 0;
+    const activeStatuses = new Set(['queued', 'claimed', 'running', 'exporting']);
 
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
     const PROTO = "__zhumeng_proto";
@@ -258,6 +259,7 @@ window.SourcingModuleView = {
       try {
         const res = await axios.get('/api/history');
         jobHistory.value = (res.data.items || []).filter(item => item.kind === 'run').slice(0, 20);
+        adoptLatestActiveJob();
       } catch (error) {
         console.warn('[single-sourcing] 历史记录加载失败:', apiError(error));
       } finally {
@@ -277,7 +279,6 @@ window.SourcingModuleView = {
     const loadHistoryJob = async (item) => {
       if (!item?.id) return;
       currentJobId.value = item.id;
-      const activeStatuses = new Set(['queued', 'claimed', 'running', 'exporting']);
       if (activeStatuses.has(item.status)) localStorage.setItem('singleSourcingJobId', item.id);
       else localStorage.removeItem('singleSourcingJobId');
       await pollJob();
@@ -333,7 +334,6 @@ window.SourcingModuleView = {
 
     const restoreActiveJob = async () => {
       const savedId = localStorage.getItem('singleSourcingJobId') || '';
-      const activeStatuses = new Set(['queued', 'claimed', 'running', 'exporting']);
       if (savedId) {
         currentJobId.value = savedId;
         try {
@@ -349,12 +349,24 @@ window.SourcingModuleView = {
       }
       try {
         const history = await axios.get('/api/history');
-        const item = (history.data.items || []).find(it => it.kind === 'run' && activeStatuses.has(it.status));
+        jobHistory.value = (history.data.items || []).filter(item => item.kind === 'run').slice(0, 20);
+        const item = jobHistory.value.find(it => activeStatuses.has(it.status));
         if (!item?.id) return;
         currentJobId.value = item.id;
         localStorage.setItem('singleSourcingJobId', item.id);
         startPolling();
       } catch {}
+    };
+
+    const adoptLatestActiveJob = () => {
+      const active = jobHistory.value.find(item => activeStatuses.has(item.status));
+      if (!active?.id) return;
+      const currentIsActive = job.value && activeStatuses.has(job.value.status) && currentJobId.value === job.value.id;
+      if (currentIsActive && currentJobId.value === active.id) return;
+      if (currentJobId.value === active.id && pollTimer) return;
+      currentJobId.value = active.id;
+      localStorage.setItem('singleSourcingJobId', active.id);
+      startPolling();
     };
 
     const startSingleSourcing = async () => {
