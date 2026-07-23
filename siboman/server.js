@@ -13349,19 +13349,21 @@ function buildLogisticsTemplateRowXml(rowNumber, data = {}) {
 
 function logisticsFormula(column, rowNumber) {
   const r = rowNumber;
-  const weightValue = `IF(TRIM(B${r}&"")="",IFERROR(VALUE(C${r}),0),IFERROR(VALUE(B${r}),0))`;
+  const weightKg = `IF(TRIM(B${r}&"")="",IFERROR(VALUE(C${r})/1000,0),IFERROR(VALUE(B${r})/1000,0))`;
+  const rubValue = `IFERROR(VALUE(D${r})*$S$2,0)`;
+  const volumeKg = `(20*20*20/12000)`;
   const formulas = {
-    F: `IF(OR(AND(TRIM(B${r}&"")="",TRIM(C${r}&"")=""),TRIM(D${r}&"")=""),"",IF(P${r}="无法匹配","无法匹配",IF(P${r}="Big","未上线",IF(P${r}="Extra Small",ROUND(Q${r}*1000*0.025+3,2),IF(P${r}="Budget",ROUND(Q${r}*1000*0.017+23,2),IF(P${r}="Small",ROUND(Q${r}*1000*0.025+16,2),IF(P${r}="Premium Small",ROUND(Q${r}*1000*0.025+22,2),IF(P${r}="Premium Big",ROUND(Q${r}*1000*0.023+62,2),""))))))))`,
-    G: `IF(TRIM(D${r}&"")="","",ROUND(IFERROR(VALUE(D${r}),0)*IF((IFERROR(VALUE(D${r}),0)*$S$2)<1500,12%,20%),2))`,
+    F: `IF(OR(AND(TRIM(B${r}&"")="",TRIM(C${r}&"")=""),TRIM(D${r}&"")=""),"",IF(P${r}="无法匹配","无法匹配",IF(P${r}="Extra Small",ROUND(Q${r}*28.1+3.37,2),IF(P${r}="Budget",ROUND(Q${r}*19.1+25.83,2),IF(P${r}="Small",ROUND(Q${r}*28.1+17.97,2),IF(P${r}="Big",ROUND(Q${r}*19.1+40.44,2),IF(P${r}="Premium Small",ROUND(Q${r}*28.1+24.71,2),IF(P${r}="Premium Big",ROUND(Q${r}*25.8+69.64,2),""))))))))`,
+    G: `IF(TRIM(D${r}&"")="","",ROUND(IFERROR(VALUE(D${r}),0)*IF(${rubValue}<1500,12%,20%),2))`,
     H: `IF(TRIM(D${r}&"")="","",3)`,
     I: `IF(TRIM(D${r}&"")="","",ROUND(IFERROR(VALUE(D${r}),0)*2%,2))`,
     K: `IF(TRIM(D${r}&"")="","",ROUND(IFERROR(VALUE(D${r}),0)*2%,2))`,
-    L: `IF(TRIM(D${r}&"")="","",IF(OR(F${r}="未上线",F${r}="无法匹配"),F${r},ROUND(IFERROR(VALUE(E${r}),0)+N(F${r})+N(G${r})+N(H${r})+N(I${r})+IFERROR(VALUE(J${r}),0)+N(K${r}),2)))`,
-    M: `IF(TRIM(D${r}&"")="","",IF(OR(F${r}="未上线",F${r}="无法匹配"),F${r},ROUND(IFERROR(VALUE(D${r}),0)-L${r},2)))`,
-    N: `IF(TRIM(D${r}&"")="","",IF(OR(F${r}="未上线",F${r}="无法匹配"),"",IF(IFERROR(VALUE(D${r}),0)=0,"",M${r}/IFERROR(VALUE(D${r}),0))))`,
+    L: `IF(TRIM(D${r}&"")="","",IF(F${r}="无法匹配",F${r},ROUND(IFERROR(VALUE(E${r}),0)+N(F${r})+N(G${r})+N(H${r})+N(I${r})+IFERROR(VALUE(J${r}),0)+N(K${r}),2)))`,
+    M: `IF(TRIM(D${r}&"")="","",IF(F${r}="无法匹配",F${r},ROUND(IFERROR(VALUE(D${r}),0)-L${r},2)))`,
+    N: `IF(TRIM(D${r}&"")="","",IF(F${r}="无法匹配","",IF(IFERROR(VALUE(D${r}),0)=0,"",M${r}/IFERROR(VALUE(D${r}),0))))`,
     O: `IF(OR(TRIM(A${r}&"")="",TRIM(D${r}&"")=""),"",A${r}&","&ROUND(IFERROR(VALUE(D${r}),0)*2,0))`,
-    P: `IF(OR(AND(TRIM(B${r}&"")="",TRIM(C${r}&"")=""),TRIM(D${r}&"")=""),"",IF(AND((IFERROR(VALUE(D${r}),0)*$S$2)>=0,(IFERROR(VALUE(D${r}),0)*$S$2)<1500,${weightValue}>=0,${weightValue}<=500),"Extra Small",IF(AND((IFERROR(VALUE(D${r}),0)*$S$2)>=0,(IFERROR(VALUE(D${r}),0)*$S$2)<1500,${weightValue}>500,${weightValue}<=30000),"Budget",IF(AND((IFERROR(VALUE(D${r}),0)*$S$2)>=1500,(IFERROR(VALUE(D${r}),0)*$S$2)<7000,${weightValue}>=0,${weightValue}<=2000),"Small",IF(AND((IFERROR(VALUE(D${r}),0)*$S$2)>=1500,(IFERROR(VALUE(D${r}),0)*$S$2)<7000,${weightValue}>2000,${weightValue}<=30000),"Big",IF(AND((IFERROR(VALUE(D${r}),0)*$S$2)>=7000,(IFERROR(VALUE(D${r}),0)*$S$2)<=250000,${weightValue}>=0,${weightValue}<=5000),"Premium Small",IF(AND((IFERROR(VALUE(D${r}),0)*$S$2)>=7000,(IFERROR(VALUE(D${r}),0)*$S$2)<=250000,${weightValue}>5000,${weightValue}<=30000),"Premium Big","无法匹配")))))))`,
-    Q: `IF(P${r}="","",IF(P${r}="无法匹配","",IF(OR(P${r}="Extra Small",P${r}="Budget"),ROUND(${weightValue}/1000,3),ROUND(MAX(${weightValue}/1000,(20*20*20/12000)),3))))`,
+    P: `IF(OR(AND(TRIM(B${r}&"")="",TRIM(C${r}&"")=""),TRIM(D${r}&"")=""),"",IF(AND(${rubValue}<=1500,${weightKg}<=0.5),"Extra Small",IF(AND(${rubValue}<=1500,${weightKg}>0.5,${weightKg}<=25),"Budget",IF(AND(${rubValue}>1500,${rubValue}<=7000,${weightKg}<=2),"Small",IF(AND(${rubValue}>1500,${rubValue}<=7000,${weightKg}>2,${weightKg}<=30,MAX(${weightKg},${volumeKg})<=31),"Big",IF(AND(${rubValue}>7000,${rubValue}<=250000,${weightKg}<=5),"Premium Small",IF(AND(${rubValue}>7000,${rubValue}<=250000,${weightKg}>5,${weightKg}<=30,MAX(${weightKg},${volumeKg})<=31),"Premium Big","无法匹配")))))))`,
+    Q: `IF(P${r}="","",IF(P${r}="无法匹配","",ROUND(IF(OR(P${r}="Big",P${r}="Premium Big"),MAX(${weightKg},${volumeKg}),${weightKg}),3)))`,
   };
   return formulas[column] || "";
 }
