@@ -7999,6 +7999,14 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       currentPhase: job.phase || existing.phase || "任务完成",
     });
     if (kind === "run") {
+      await updateDbJob(req.params.id, {
+        status: "running",
+        phase: "服务器 AI 审核/生成 Excel",
+        processed: job.processed ?? existing.processed,
+        total: job.total ?? existing.total,
+        logs: Array.isArray(job.logs) ? job.logs : existing.logs,
+        results: Array.isArray(job.results) ? job.results : existing.results,
+      });
       await finalizeWorkerRunJob(existing, job);
     }
     const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, job, req.body?.excelBase64 || "");
@@ -8215,9 +8223,28 @@ async function finalizeWorkerRunJob(existing, job) {
     if (Array.isArray(result.candidates) && result.candidates.length) {
       result.candidates = result.candidates.map((candidate) => normalizeSourcingCandidateForReview(candidate, result.ozon));
       if (enableAI && shouldReviewWorkerResultWithAi(result)) {
-        job.logs.push(makeLogEntry(`服务器 AI 审核第 ${result.sourceRow || ""} 行候选。`));
+        const rowLabel = result.sourceRow || "";
+        job.logs.push(makeLogEntry(`服务器 AI 审核第 ${rowLabel} 行候选。`));
+        await updateDbJob(jobId, {
+          status: "running",
+          phase: `服务器 AI 审核第 ${rowLabel} 行`,
+          processed: job.processed,
+          total: job.total,
+          logs: job.logs,
+          results: job.results,
+        });
         result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
         applyAiReview(result);
+        const decisionText = result.aiReview?.decision || "unknown";
+        job.logs.push(makeLogEntry(`服务器 AI 审核第 ${rowLabel} 行完成：${decisionText}${result.aiReview?.reason ? `，${result.aiReview.reason}` : ""}`));
+        await updateDbJob(jobId, {
+          status: "running",
+          phase: `服务器 AI 审核第 ${rowLabel} 行完成`,
+          processed: job.processed,
+          total: job.total,
+          logs: job.logs,
+          results: job.results,
+        });
       } else if (!result.selectedCandidate && !hasStrictNoneAiDecision(result)) {
         const fallback = findBestFallbackCandidate(result.candidates);
         if (fallback) {

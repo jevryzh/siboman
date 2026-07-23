@@ -131,6 +131,8 @@ assert(server.includes('if (parseMoqQuantity(candidate.minOrderQuantity || candi
 assert(server.includes('1688 候选的 MOQ/起批量大于 1 是硬性淘汰条件'), 'AI prompt must enforce MOQ>1 as a hard reject');
 assert(server.includes('起批量大于 1 或起批量未取到的候选都必须判为 not_match'), 'AI prompt must reject MOQ>1 or unknown MOQ as not_match');
 assert(server.includes('reviewCandidatesWithMiniMax'), 'server-side AI candidate review must remain connected');
+assert(server.includes('phase: `服务器 AI 审核第 ${rowLabel} 行`'), 'server-side AI review must write live progress before each row review');
+assert(server.includes('服务器 AI 审核第 ${rowLabel} 行完成'), 'server-side AI review must write live completion logs for each row review');
 assert(!background.includes('AI 严格审核待接入后端评估。') || server.includes('reviewCandidatesWithMiniMax'), 'plugin placeholder AI review is allowed only when server-side AI review remains present');
 
 // 1688 login/captcha must be visible instead of being collapsed into a generic failure.
