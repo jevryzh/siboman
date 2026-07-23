@@ -12849,12 +12849,39 @@ async function sendJobDownload(id, res) {
   const downloadPrefix = kind === "batch-ozon" ? "ozon-batch" : "ozon-1688";
   const filePath = path.join(JOBS_DIR, id, excelName);
   if (!existsSync(filePath)) {
-    res.status(404).send("文件不存在");
-    return;
+    const rebuilt = await rebuildJobArtifactsFromDb(id).catch((error) => {
+      console.warn(`[history-download] rebuild failed job=${id}: ${error.message}`);
+      return false;
+    });
+    if (!rebuilt || !existsSync(filePath)) {
+      res.status(404).send("文件不存在");
+      return;
+    }
   }
   await markJobDownloaded(id).catch(() => {});
   const shortId = id.length > 18 ? id.slice(0, 18) : id;
   res.download(filePath, `${downloadPrefix}-${shortId}.xlsx`);
+}
+
+async function rebuildJobArtifactsFromDb(id) {
+  if (!db || !isSafeJobId(id)) return false;
+  const result = await db.query(`SELECT * FROM app_jobs WHERE id = $1 LIMIT 1`, [id]);
+  const job = dbRowToJob(result.rows[0]);
+  if (!job || !Array.isArray(job.results) || !job.results.length) return false;
+  await writeJobArtifacts({
+    ...job,
+    id,
+    kind: job.kind || "run",
+    status: job.status || "done",
+    phase: job.phase || "已完成",
+    total: job.total || job.results.length,
+    processed: job.processed || job.results.length,
+    logs: Array.isArray(job.logs) ? job.logs : [],
+    results: job.results,
+    downloadUrl: job.downloadUrl || `/api/history/${id}/download`,
+    cancelRequested: false,
+  });
+  return true;
 }
 
 async function loadStoredJob(id) {
