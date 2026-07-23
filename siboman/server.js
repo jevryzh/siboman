@@ -2793,6 +2793,49 @@ app.get("/api/utils/download-proxy", requireAuth, async (req, res) => {
     res.status(500).send(error.message);
   }
 });
+
+app.get("/api/utils/image-proxy", requireAuth, async (req, res) => {
+  try {
+    const rawUrl = String(req.query.url || "").trim();
+    if (!rawUrl) return res.status(400).send("Missing URL");
+    const target = await assertSafeExternalUrl(rawUrl);
+    const hostname = target.hostname.toLowerCase();
+    const allowed = hostname.endsWith(".1688.com")
+      || hostname === "1688.com"
+      || hostname.endsWith(".alicdn.com")
+      || hostname === "alicdn.com"
+      || hostname.endsWith(".alibaba.com")
+      || hostname === "alibaba.com";
+    if (!allowed) return res.status(400).send("不支持代理该图片域名");
+    const response = await fetch(target, {
+      signal: AbortSignal.timeout(30000),
+      headers: {
+        "User-Agent": USER_AGENT,
+        Referer: "https://www.1688.com/",
+        Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+      },
+    });
+    if (!response.ok) throw new Error(`图片读取失败 ${response.status}`);
+    const contentType = response.headers.get("content-type") || "image/jpeg";
+    if (!/^image\//i.test(contentType)) throw new Error("目标不是图片");
+    const maxBytes = 8 * 1024 * 1024;
+    const declaredSize = Number(response.headers.get("content-length") || 0);
+    if (declaredSize > maxBytes) throw new Error("图片超过 8MB 限制");
+    const chunks = [];
+    let total = 0;
+    for await (const chunk of response.body) {
+      total += chunk.length;
+      if (total > maxBytes) throw new Error("图片超过 8MB 限制");
+      chunks.push(chunk);
+    }
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "private, max-age=86400");
+    res.send(Buffer.concat(chunks));
+  } catch (error) {
+    console.warn(`[image-proxy] 失败: ${error.message}`);
+    res.status(502).send("图片代理失败");
+  }
+});
 app.patch("/api/products/:offer_id/field", requireAuth, updateProductField);
 
 /**

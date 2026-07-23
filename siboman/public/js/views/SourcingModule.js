@@ -487,14 +487,22 @@ window.SourcingModuleView = {
     const money = (value) => value ? String(value) : '';
     const topCandidates = (row) => (row.candidates || []).slice(0, Math.max(1, Number(maxCandidates.value || 5)));
     const ozonImage = (row) => row.ozon?.mainImage?.publicUrl || row.ozon?.mainImageUrl || '';
+    const proxiedCandidateImage = (url) => {
+      const text = String(url || '').trim();
+      if (!text || text.startsWith('/')) return text;
+      if (/^https?:\/\/([^/]+\.)?(1688|alicdn|alibaba)\.com\//i.test(text)) {
+        return `/api/utils/image-proxy?url=${encodeURIComponent(text)}`;
+      }
+      return text;
+    };
     const candidateImage = (candidate) => (
-      candidate?.localImage?.publicUrl
+      proxiedCandidateImage(candidate?.localImage?.publicUrl
       || candidate?.localImage?.url
       || candidate?.image
       || candidate?.imageUrl
       || candidate?.picUrl
       || candidate?.mainImage
-      || ''
+      || '')
     );
     const candidateMoq = (candidate) => candidate?.moqText || candidate?.minOrderText || candidate?.minOrderQuantity || candidate?.moq || candidate?.minOrder || '';
     const candidateFreight = (candidate) => candidate?.freightText || candidate?.shippingFeeText || candidate?.freight || candidate?.shippingFee || candidate?.logisticsFee || '';
