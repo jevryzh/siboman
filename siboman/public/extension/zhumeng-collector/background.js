@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.56";
+const VERSION = "2.2.9.57";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -317,8 +317,9 @@ async function humanBrowse1688TabInPlugin(tabId, label = "1688 页面", options 
     mouseMoves: options.mouseMoves ?? randomInt(2, 5),
   };
   try {
-    await withChromeTabEditRetry(`激活 ${label}`, () => chrome.tabs.update(tabId, { active: true }), 4);
-    await sleep(randomInt(700, 1800));
+    // Keep 1688 detail/search tabs passive. Production's stable collector does not
+    // foreground every 1688 tab; repeatedly activating tabs makes verification more likely.
+    await sleep(randomInt(500, 1200));
     const [execResult] = await chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
@@ -662,7 +663,7 @@ async function recover1688SessionInPlugin(reason, attempt) {
   console.warn(`[SW ${VERSION}] 1688 会话恢复 attempt=${attempt}: ${compact1688ErrorInPlugin(reason)}`);
   await sleep(randomInt(3500, 8000) * Math.min(attempt, 3));
   await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 恢复失败: ${e.message}`));
-  await ensure1688CookieStateInPlugin(true).catch((e) => console.warn(`[SW ${VERSION}] 1688 cookie 恢复失败: ${e.message}`));
+  await get1688CookieStateInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 cookie 读取失败: ${e.message}`));
 }
 
 async function search1688ByImageInPlugin(imageUrl, maxCandidates) {
@@ -1123,31 +1124,6 @@ async function ensure1688CookieStateInPlugin(forceRefresh = false) {
 
   await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 失败: ${e.message}`));
   state = await get1688CookieStateInPlugin();
-  if (state.token) return state;
-
-  const preheatUrls = [
-    "https://www.1688.com/",
-    "https://s.1688.com/",
-    "https://s.1688.com/selloffer/offer_search.htm",
-    "https://h5api.m.1688.com/",
-  ];
-  for (const url of preheatUrls) {
-    const tab = await createTabWithRetry({ url, active: false }, `打开 1688 token 预热页 ${url}`);
-    try {
-      await waitForTabComplete(tab.id, 30000).catch(() => {});
-      await sleep(randomInt(1200, 2600));
-      await humanBrowse1688TabInPlugin(tab.id, `1688 token 预热页 ${url}`, {
-        minDurationMs: 2500,
-        maxDurationMs: 6500,
-      });
-    } finally {
-      await safeRemoveTab(tab.id);
-    }
-    state = await get1688CookieStateInPlugin();
-    if (state.token && !forceRefresh) return state;
-  }
-
-  await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed retry 失败: ${e.message}`));
   return get1688CookieStateInPlugin();
 }
 
@@ -1302,12 +1278,17 @@ async function scrape1688CandidateDetailsInPlugin(candidate) {
   if (!candidate.link) return { detailError: "没有候选链接" };
   const tab = await createTabWithRetry({ url: candidate.link, active: false }, "打开 1688 候选详情页");
   try {
-    await waitForTabComplete(tab.id, 70000);
-    await sleep(randomInt(3500, 8000));
+    await waitForTabComplete(tab.id, 45000);
+    await sleep(randomInt(2200, 5200));
     await humanBrowse1688TabInPlugin(tab.id, "1688 候选详情页", {
-      minDurationMs: 6500,
-      maxDurationMs: 15000,
-      dwellChance: 0.38,
+      minDurationMs: 3200,
+      maxDurationMs: 8200,
+      dwellChance: 0.18,
+      minStep: 360,
+      maxStep: 950,
+      minDelay: 420,
+      maxDelay: 1150,
+      mouseMoves: randomInt(1, 3),
     });
     const [execResult] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },

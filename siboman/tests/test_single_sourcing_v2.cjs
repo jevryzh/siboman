@@ -56,6 +56,7 @@ assert(server.includes('AND ($3::uuid IS NULL OR j.store_id = $3::uuid)'), 'work
 assert(server.includes('where += ` AND j.store_id = $${params.length}`'), 'worker job lookup must remain store-scoped');
 assert(background.includes('kinds: ["run"]'), 'extension single-sourcing worker may only claim run jobs');
 assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION'), 'server must define a minimum plugin version for single-sourcing workers');
+assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.57"'), 'server must force the current stable single-sourcing plugin version');
 assert(server.includes('versionTooOld'), 'server must block outdated extension workers from claiming single-sourcing jobs');
 assert(server.includes('blocked: true'), 'outdated extension workers must receive a blocked response instead of a job');
 assert(background.includes('pluginVersion: VERSION'), 'extension worker heartbeat must report its real plugin version');
@@ -129,6 +130,8 @@ assert(!background.includes('AI 严格审核待接入后端评估。') || server
 // 1688 login/captcha must be visible instead of being collapsed into a generic failure.
 assert(background.includes('1688 出现验证码/安全验证，请在当前 Chrome 手动完成验证后重试'), 'plugin must surface 1688 captcha/security verification');
 assert(background.includes('检测到 1688 验证提示'), 'plugin must detect 1688 verification pages');
+assert(!background.includes('1688 token 预热页'), 'plugin must not auto-open 1688 preheat pages while claiming jobs');
+assert(!background.includes('激活 ${label}'), 'plugin must not foreground every 1688 detail tab');
 assert(server.includes('触发验证码或人机验证，需要人工处理后再继续。'), 'server must translate captcha failures for operators');
 assert(sourcing.includes('row.error || row.searchError'), 'result status must display row-level search/captcha errors');
 

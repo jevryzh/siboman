@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = '2.2.9.56';
-    const PLUGIN_ZIP_VERSION = '2.2.9.56';
+    const PLUGIN_MANIFEST_VERSION = '2.2.9.57';
+    const PLUGIN_ZIP_VERSION = '2.2.9.57';
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -269,6 +269,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.57 单品找货对齐生产稳定策略：1688 token 恢复不再自动打开预热页面，候选详情页不再强制切到前台，服务端会拦截旧插件领取任务，降低触发验证码概率；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.56 单品找货增加服务端插件版本闸门：低于 v2.2.9.55 或未上报版本的旧插件只能心跳，不能领取任务，避免旧扩展触发 1688 验证；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.55 单品找货 1688 搜图切回生产同款 MTOP 接口主链路，减少真实搜图页触发验证；遇到 1688 登录/验证码阻塞会自动停止后续采集，批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.54 恢复单品找货独立入口，插件使用 ERP 页面短期授权领取任务，并改为临时 1688 搜图页 + MOQ=1 优先排序；批量上架逻辑未调整。</li>
