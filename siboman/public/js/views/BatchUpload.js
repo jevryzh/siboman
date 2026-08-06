@@ -12,6 +12,7 @@ window.BatchUploadView = {
     const selectedStores = Vue.ref([]);
     const allStores = Vue.ref([]);
     const collectionPrefill = Vue.ref(null);
+    const batchPlaceholders = Vue.ref({});
     const config = Vue.reactive({
       brand: 'no_brand', imageOrder: 'keep', currency: 'CNY',
       defaultStock: 0, watermark: false, aiRewrite: false, vat: '0',
@@ -68,9 +69,10 @@ window.BatchUploadView = {
     // ========== 插件中继协议 (保留) ==========
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const REQUIRED_BACKGROUND_VERSION = "2.2.9.37";
+    const REQUIRED_BACKGROUND_VERSION = "2.2.9.67";
     const extensionConnected = Vue.ref(false);
     const sellerTabReady = Vue.ref(false);
+    const installedBackgroundVersion = Vue.ref('');
 
     // v2.1.4: ERP ↔ content-bridge-iso 完全走 window.postMessage (双向)
     //   理由: 之前 document CustomEvent 跨 world 投递在 Chrome MV3 不可靠 (collect
@@ -101,7 +103,7 @@ window.BatchUploadView = {
       }
     });
 
-    const sendToExtension = (kind, extra = {}) => new Promise((resolve) => {
+    const sendToExtension = (kind, extra = {}, options = {}) => new Promise((resolve) => {
       const reqId = `${kind.split('.')[0]}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
       let resolved = false;
       window.__zhumeng_pending__[reqId] = (data) => {
@@ -125,12 +127,13 @@ window.BatchUploadView = {
         resolve({ ok: false, error: 'postMessage 抛错: ' + e.message });
         return;
       }
+      const timeoutMs = Number(options.timeoutMs || (kind === 'collect.request' ? 120000 : 15000));
       setTimeout(() => {
         if (resolved) return;
         resolved = true;
         delete window.__zhumeng_pending__[reqId];
         resolve(null);
-      }, kind === 'collect.request' ? 120000 : 15000);
+      }, timeoutMs);
     });
 
     const pingExtension = () => sendToExtension('ping.request').then(d => d?.ok ? d : null);
@@ -147,9 +150,14 @@ window.BatchUploadView = {
       }
       return 0;
     };
+    const pluginVersionOk = Vue.computed(() => (
+      extensionConnected.value
+      && compareVersion(installedBackgroundVersion.value, REQUIRED_BACKGROUND_VERSION) >= 0
+    ));
     const ensureFreshPlugin = async () => {
       const ping = await pingExtension();
       const bg = ping?.background_version || '';
+      installedBackgroundVersion.value = bg || ping?.version || installedBackgroundVersion.value || '';
       if (!ping || compareVersion(bg, REQUIRED_BACKGROUND_VERSION) < 0) {
         const got = bg || ping?.version || '未检测到';
         appendLog(`⚠️ 插件版本过旧/未刷新: 当前 ${got}, 需要 background v${REQUIRED_BACKGROUND_VERSION}+。请去店铺管理重新下载插件, 并在 chrome://extensions 点“重新加载”`, 'error');
@@ -193,13 +201,19 @@ window.BatchUploadView = {
       return { ok: false };
     };
 
-    const collectViaExtension = (skus) => sendToExtension('collect.request', {
-      skus,
-      storeIds: selectedStores.value || []
-    }).then(d => {
+    const collectTimeoutMs = (skuCount) => Math.min(15 * 60 * 1000, Math.max(120000, Number(skuCount || 0) * 25000 + 60000));
+    const collectTimeoutText = (skuCount) => `${Math.ceil(collectTimeoutMs(skuCount) / 60000)} 分钟`;
+    const collectViaExtension = (input) => {
+      const payloadSkus = Array.isArray(input) ? input : (Array.isArray(input?.skus) ? input.skus : []);
+      const payloadStoreIds = Array.isArray(input?.storeIds) ? input.storeIds : (selectedStores.value || []);
+      return sendToExtension('collect.request', {
+        skus: payloadSkus,
+        storeIds: payloadStoreIds
+      }, { timeoutMs: collectTimeoutMs(payloadSkus.length) }).then(d => {
       try { console.log('[collectViaExtension resolved]', JSON.stringify(d)); } catch (e) {}
-      return d || { ok: false, error: '采集超时 (120s)' };
+      return d || { ok: false, error: `采集超时 (${collectTimeoutText(payloadSkus.length)})` };
     });
+    };
     const portalImportViaExtension = (items) => sendToExtension('portalImport.request', { items }).then(d => {
       try { console.log('[portalImportViaExtension resolved]', JSON.stringify(d)); } catch (e) {}
       return d || { ok: false, error: 'portal 发布超时' };
@@ -347,7 +361,11 @@ window.BatchUploadView = {
         const ping = await pingExtension();
         if (ping) {
           extensionConnected.value = true;
+          installedBackgroundVersion.value = ping.background_version || ping.version || '';
           appendLog(`✅ 采集插件已连接 (${formatPluginVersion(ping)})`, 'success');
+          if (compareVersion(installedBackgroundVersion.value, REQUIRED_BACKGROUND_VERSION) < 0) {
+            appendLog(`⚠️ 当前插件 ${installedBackgroundVersion.value || '版本未知'} 低于 v${REQUIRED_BACKGROUND_VERSION}, 请先更新插件后再采集。`, 'error');
+          }
           const st = await checkSellerStatus();
           sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
           appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
@@ -365,7 +383,11 @@ window.BatchUploadView = {
       const ping = await pingExtension();
       if (ping) {
         extensionConnected.value = true;
+        installedBackgroundVersion.value = ping.background_version || ping.version || '';
         appendLog(`✅ 采集插件已连接 (${formatPluginVersion(ping)})`, 'success');
+        if (compareVersion(installedBackgroundVersion.value, REQUIRED_BACKGROUND_VERSION) < 0) {
+          appendLog(`⚠️ 当前插件 ${installedBackgroundVersion.value || '版本未知'} 低于 v${REQUIRED_BACKGROUND_VERSION}, 请先更新插件后再采集。`, 'error');
+        }
         const st = await checkSellerStatus();
         sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
         appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
@@ -382,10 +404,15 @@ window.BatchUploadView = {
       //   false. ready handler 是 ground truth, refreshStatus 应该 trust 它.
       const ping = await pingExtension();
       if (ping || extensionConnected.value) {
+        if (ping) installedBackgroundVersion.value = ping.background_version || ping.version || '';
         const st = await checkSellerStatus();
         sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
         const versionTip = ping ? ` (${formatPluginVersion(ping)})` : '';
-        appendLog(sellerTabReady.value ? `刷新成功: 插件+seller 均已连接${versionTip}` : `刷新成功: 插件已连接${versionTip}, seller 待登录`, 'success');
+        if (!pluginVersionOk.value) {
+          appendLog(`刷新成功: 已检测到插件${versionTip}, 但低于 v${REQUIRED_BACKGROUND_VERSION}, 请先更新插件。`, 'error');
+        } else {
+          appendLog(sellerTabReady.value ? `刷新成功: 插件+seller 均已连接${versionTip}` : `刷新成功: 插件已连接${versionTip}, seller 待登录`, 'success');
+        }
       } else {
         appendLog('刷新: 仍未检测到插件, 继续轮询...', 'warn');
         if (!pollTimer) startPolling();
@@ -571,7 +598,7 @@ window.BatchUploadView = {
         //   即使用户状态机有问题也强制走, 让 SW 端兜底 (找不到数据时 okCount=0 failCount=N).
         //   selleready 是历史遗留, 当前 SW 已经用 cookie 检查不依赖 tab.
         parseLoading.value = true;
-        appendLog(`开始采集 ${validRows.length} 个 SKU (通过插件中继)...`, 'info');
+        appendLog(`开始采集 ${validRows.length} 个 SKU (通过插件中继，最长等待 ${collectTimeoutText(validRows.length)})...`, 'info');
         const skus = validRows.map(r => r.sku);
         const t0 = Date.now();
         try {
@@ -678,6 +705,69 @@ window.BatchUploadView = {
           notify.error('查询失败: ' + e.message);
         } finally { parseLoading.value = false; }
       }
+    };
+
+    const ensureRowsCollected = async () => {
+      const validRows = items.value.filter(r => r.valid);
+      const missingRows = validRows.filter(r => !r.distilled);
+      if (!missingRows.length) return true;
+      appendLog(`检测到 ${missingRows.length} 个 SKU 尚未采集，已提交后台先采集，采完自动继续上架。`, 'info');
+      await collectSkus();
+      const stillMissing = items.value.filter(r => r.valid && !r.distilled);
+      if (stillMissing.length) {
+        appendLog(`仍有 ${stillMissing.length} 个 SKU 未采集成功，本次只会上架已采集完成的商品。`, 'warn');
+      }
+      return items.value.some(r => r.valid && r.distilled);
+    };
+
+    const placeholderForRow = (storeId, row) => row?._listingPlaceholders?.[String(storeId)] || '';
+    const updateBatchListingPlaceholder = async (storeId, row, payload = {}) => {
+      const placeholderTaskId = placeholderForRow(storeId, row);
+      if (!placeholderTaskId) return;
+      try {
+        await axios.post('/api/seller/listing-history/batch-progress', {
+          store_id: storeId,
+          placeholder_task_id: placeholderTaskId,
+          sku: row.sku,
+          ...payload,
+        }, { timeout: 15000 });
+      } catch (e) {
+        appendLog(`  ⚠ #${row.index} 上架记录更新失败: ${e.response?.data?.error || e.message}`, 'warn');
+      }
+    };
+    const createBatchListingPlaceholders = async (validRows) => {
+      const batchId = `bu-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const next = {};
+      let created = 0;
+      validRows.forEach((row, idx) => {
+        row._listingRowKey = `row-${idx + 1}`;
+      });
+      for (const storeId of selectedStores.value) {
+        const res = await axios.post('/api/seller/listing-history/batch-start', {
+          store_id: storeId,
+          batch_id: batchId,
+          rows: validRows.map(row => ({
+            row_key: row._listingRowKey,
+            sku: row.sku,
+            offer_id: row.offerId || row.sku,
+            price: row.price,
+            name: row.distilled?.name || '',
+            main_image: row.distilled?.images?.[0] || '',
+          })),
+        }, { timeout: 30000 });
+        for (const item of (res.data?.items || [])) {
+          const rowKey = String(item.row_key || '');
+          if (!next[rowKey]) next[rowKey] = {};
+          next[rowKey][String(storeId)] = item.task_id;
+          created++;
+        }
+      }
+      batchPlaceholders.value = next;
+      for (const row of validRows) {
+        row._listingPlaceholders = next[String(row._listingRowKey || '')] || {};
+      }
+      appendLog(`已创建 ${created} 条上架记录占位，可去上架记录查看“处理中”。`, 'success');
+      return created;
     };
 
     // ========== V3 payload 拼装 (保留) ==========
@@ -814,18 +904,28 @@ window.BatchUploadView = {
     };
 
     // ========== 多店铺扇出发布 (保留) ==========
-    const publishBatch = async () => {
-      const rows = items.value.filter(r=>r.valid && r.distilled);
-      if(!rows.length) return notify.warning('无可上架商品');
-      if(!selectedStores.value.length) return notify.warning('请选择目标店铺');
-      try {
-        await window.ElementPlus.ElMessageBox.confirm(
-          `确认将 ${rows.length} 个商品发布到 ${selectedStores.value.length} 个店铺?`,
-          '批量跟卖', {confirmButtonText:'执行上架', cancelButtonText:'取消', type:'warning'});
-      } catch { return; }
-      publishLoading.value = true;
+    const runPublishBatch = async (confirmedRowsCount, confirmedStoreCount) => {
       logLines.value = [];
       appendLog(`========== 批量跟卖开始 ==========`, 'info');
+      appendLog(`已提交后台流程：SKU ${confirmedRowsCount} 个 | 店铺 ${confirmedStoreCount} 个。页面可继续停留查看实时日志。`, 'info');
+      const canContinue = await ensureRowsCollected();
+      if (!canContinue) {
+        appendLog('没有可上架商品：采集阶段未产出有效商品信息。', 'error');
+        for (const storeId of selectedStores.value) {
+          for (const row of items.value.filter(r => r.valid && !r.distilled)) {
+            await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: row._collectError || '采集阶段未产出有效商品信息' });
+          }
+        }
+        notify.error('采集未产出可上架商品');
+        publishLoading.value = false;
+        return;
+      }
+      for (const storeId of selectedStores.value) {
+        for (const row of items.value.filter(r => r.valid && !r.distilled)) {
+          await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: row._collectError || '采集失败，未进入上架提交' });
+        }
+      }
+      const rows = items.value.filter(r=>r.valid && r.distilled);
       appendLog(`商品: ${rows.length} 个 | 店铺: ${selectedStores.value.length} 个`, 'info');
       if (config.aiRewrite) await rewriteRowsWithAi(rows, selectedStores.value[0] || '');
 
@@ -852,11 +952,19 @@ window.BatchUploadView = {
         }
         const defaultStock = Math.max(0, Math.floor(Number(config.defaultStock || 0)));
         for(const row of rows){
+          await updateBatchListingPlaceholder(storeId, row, {
+            status: 'running',
+            product_name: row.distilled?.name || '',
+            main_image: row.distilled?.images?.[0] || '',
+            price_rub: row.price || null,
+            raw_payload: { stage: 'building_ozon_payload' },
+          });
           // v2.2.4: 拦截 confidence='none' 且 to=0 的行 (URL 面包屑 ID 不是 Seller API 的)
           //   Ozon 必拒 levels_category_not_found, 前端必须拦住不让提交
           const catRes = row._category_resolved || {};
           if (catRes.confidence === 'none' && !catRes.to) {
             appendLog(`  ⚠ #${row.index} SKU ${row.sku}: 类目未解析, 跳过 (去表格"选类目"按钮先选)`, 'warn');
+            await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: '类目未解析，未提交 Ozon' });
             totalSkipped++;
             continue;
           }
@@ -867,6 +975,7 @@ window.BatchUploadView = {
           if (!row.distilled._sourceVariant) {
             const reason = row.distilled._sellerBundleError || '未拿到 Seller bundle 完整源包';
             appendLog(`  ✗ #${row.index} SKU ${row.sku}: ${reason}。为避免生成缺属性商品, 已拦截上架; 请更新/重载插件后重新采集`, 'error');
+            await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: reason });
             totalFail++;
             continue;
           }
@@ -874,7 +983,12 @@ window.BatchUploadView = {
             vat: config.vat, currencyCode: config.currency,
             brand: config.brand, defaultStock,
           });
-          if(!built.ok){ appendLog(`  ✗ #${row.index} ${built.error}`, 'error'); totalFail++; continue; }
+          if(!built.ok){
+            appendLog(`  ✗ #${row.index} ${built.error}`, 'error');
+            await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: built.error });
+            totalFail++;
+            continue;
+          }
           let itemForStore = built.item;
           if (config.watermark && shop.watermark_enabled) {
             try {
@@ -952,7 +1066,10 @@ window.BatchUploadView = {
                 store_id: storeId,
                 item,
                 stocks: storeStocks.filter(s => s.offer_id === item.offer_id),  // 只发当前这个 offer 的 stock
-                meta: row.collectId ? { collectId: row.collectId } : undefined,
+                meta: {
+                  ...(row.collectId ? { collectId: row.collectId } : {}),
+                  listingPlaceholderTaskId: placeholderForRow(storeId, row),
+                },
               }, { timeout: 60000 });
               const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
               const importMode = res.data?.importMode || '';
@@ -970,6 +1087,7 @@ window.BatchUploadView = {
               // 类目等问题让 Ozon 处理, 不再前端拦截
               const errMsg = e.response?.data?.error || e.message;
               appendLog(`  ✗ #${row.index} SKU ${row.sku} → 提交失败: ${errMsg}`, 'error');
+              await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: errMsg });
               totalFail++;
             }
           }
@@ -1017,6 +1135,35 @@ window.BatchUploadView = {
         });
         document.getElementById('zhumeng-stay')?.addEventListener('click', () => cta.remove());
       }
+    };
+    const publishBatch = async () => {
+      const validRows = items.value.filter(r=>r.valid);
+      if(!validRows.length) return notify.warning('无有效 SKU');
+      if(!selectedStores.value.length) return notify.warning('请选择目标店铺');
+      if (publishLoading.value || parseLoading.value) return notify.warning('已有批量任务正在执行，请等待当前流程完成');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `确认提交 ${validRows.length} 个 SKU 到后台流程？系统会先采集，采完后自动继续上架到 ${selectedStores.value.length} 个店铺。`,
+          '批量跟卖', {confirmButtonText:'提交后台执行', cancelButtonText:'取消', type:'warning'});
+      } catch { return; }
+      publishLoading.value = true;
+      try {
+        await createBatchListingPlaceholders(validRows);
+      } catch (e) {
+        const msg = e.response?.data?.error || e.message;
+        appendLog(`创建上架记录失败: ${msg}`, 'error');
+        notify.error('创建上架记录失败：' + msg);
+        publishLoading.value = false;
+        return;
+      }
+      notify.success('已提交后台流程，已先写入上架记录；采集完成后会自动继续上架。');
+      setTimeout(() => {
+        runPublishBatch(validRows.length, selectedStores.value.length).catch((e) => {
+          appendLog(`批量流程异常: ${e.message}`, 'error');
+          notify.error('批量流程异常: ' + e.message);
+          publishLoading.value = false;
+        });
+      }, 0);
     };
 
     // ========== 店铺列表 (保留) ==========
@@ -1144,7 +1291,7 @@ window.BatchUploadView = {
       items, pasteText, parseLoading, publishLoading, logLines,
       selectedStores, allStores, config, FORMAT_LABELS, formatHints,
       collectionPrefill, clearCollectionPrefill,
-      extensionConnected, sellerTabReady, refreshing,
+      extensionConnected, sellerTabReady, installedBackgroundVersion, pluginVersionOk, REQUIRED_BACKGROUND_VERSION, refreshing,
       parsePaste, collectSkus, addWatermarkAll, aiRewriteAll, publishBatch,
       fetchStores, saveConfig, loadConfig, fmtMoney, clearAll, appendLog,
       pingExtension, checkSellerStatus, refreshStatus,
@@ -1168,10 +1315,13 @@ window.BatchUploadView = {
           </div>
         </div>
         <span style="width:1px; height:24px; background:#e2e8f0"></span>
-        <span v-if="extensionConnected && sellerTabReady" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#ecfdf5; color:#059669; border-radius:14px; font-size:12px; font-weight:600">
+        <span v-if="extensionConnected && !pluginVersionOk" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fef2f2; color:#dc2626; border-radius:14px; font-size:12px; font-weight:600">
+          <span style="width:6px; height:6px; border-radius:50%; background:#ef4444"></span>插件需更新 v{{ installedBackgroundVersion || '未知' }} → v{{ REQUIRED_BACKGROUND_VERSION }}
+        </span>
+        <span v-else-if="pluginVersionOk && sellerTabReady" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#ecfdf5; color:#059669; border-radius:14px; font-size:12px; font-weight:600">
           <span style="width:6px; height:6px; border-radius:50%; background:#10b981"></span>插件已连接
         </span>
-        <span v-else-if="extensionConnected && !sellerTabReady" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fffbeb; color:#d97706; border-radius:14px; font-size:12px; font-weight:600">
+        <span v-else-if="pluginVersionOk && !sellerTabReady" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fffbeb; color:#d97706; border-radius:14px; font-size:12px; font-weight:600">
           <span style="width:6px; height:6px; border-radius:50%; background:#f59e0b"></span>插件已装·待登录 seller
         </span>
         <span v-else style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fef2f2; color:#dc2626; border-radius:14px; font-size:12px; font-weight:600">
@@ -1182,8 +1332,8 @@ window.BatchUploadView = {
         <button @click="openHelp" style="padding:6px 12px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:6px; color:#475569; cursor:pointer; font-size:13px">📖 使用说明</button>
         <button @click="openHistory" style="padding:6px 12px; background:#f1f5f9; border:1px solid #cbd5e1; border-radius:6px; color:#475569; cursor:pointer; font-size:13px">📜 历史记录</button>
         <button @click="parsePaste" style="padding:6px 14px; background:#3b82f6; border:none; border-radius:6px; color:#fff; cursor:pointer; font-size:13px; font-weight:600">🔍 解析</button>
-        <button @click="collectSkus" :loading="parseLoading" :disabled="!items.filter(r=>r.valid).length" style="padding:6px 14px; background:#f59e0b; border:none; border-radius:6px; color:#fff; cursor:pointer; font-size:13px; font-weight:600">📡 采集 ({{ items.filter(r=>r.valid).length }})</button>
-        <button @click="publishBatch" :loading="publishLoading" :disabled="!items.filter(r=>r.valid&&r.distilled).length || !!items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence==='none'&&!r._category_resolved.to).length" style="padding:8px 18px; background:linear-gradient(135deg,#10b981,#059669); border:none; border-radius:8px; color:#fff; cursor:pointer; font-size:14px; font-weight:700; box-shadow:0 2px 6px rgba(16,185,129,0.3)">🚀 开始批采 + 上架 ({{ items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence!=='none').length }})</button>
+        <button @click="collectSkus" :loading="parseLoading" :disabled="!pluginVersionOk || !items.filter(r=>r.valid).length" style="padding:6px 14px; background:#f59e0b; border:none; border-radius:6px; color:#fff; cursor:pointer; font-size:13px; font-weight:600">📡 采集 ({{ items.filter(r=>r.valid).length }})</button>
+        <button @click="publishBatch" :loading="publishLoading" :disabled="!pluginVersionOk || publishLoading || parseLoading || !items.filter(r=>r.valid).length || !!items.filter(r=>r.valid&&r.distilled&&r._category_resolved&&r._category_resolved.confidence==='none'&&!r._category_resolved.to).length" style="padding:8px 18px; background:linear-gradient(135deg,#10b981,#059669); border:none; border-radius:8px; color:#fff; cursor:pointer; font-size:14px; font-weight:700; box-shadow:0 2px 6px rgba(16,185,129,0.3)">🚀 提交后台批采 + 上架 ({{ items.filter(r=>r.valid).length }})</button>
       </header>
 
       <main class="bu-body" style="display:grid; grid-template-columns:minmax(0,1fr) 360px; gap:16px; padding:20px; align-items:start; max-width:100%; overflow-x:hidden">

@@ -97,7 +97,7 @@ const dangerousUiConfirmations = [
   [orderView, '不可逆的发货操作', 'bulk ship must be confirmed as irreversible'],
   [listingView, '确认删除选中的 ${selectedIds.value.length} 条记录?', 'listing batch delete must be confirmed'],
   [listingView, '重试失败的上架任务', 'listing retry must be confirmed'],
-  [productView, '批量归档确认', 'bulk archive must be confirmed'],
+  [productView, '批量归档商品确认', 'bulk archive must be confirmed'],
   [productView, '保存并同步价格/图片', 'product edit UI must label Ozon sync clearly'],
 ];
 for (const [source, needle, label] of dangerousUiConfirmations) {

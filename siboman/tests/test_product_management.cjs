@@ -12,6 +12,7 @@ const requiredStatuses = [
   'NOT_MODERATED',
   'FAILED_MODERATION',
   'IN_ACTIVE',
+  'ARCHIVED',
 ];
 
 for (const status of requiredStatuses) {
@@ -31,8 +32,17 @@ assert(server.includes('warehouse_summary'), 'product rows must expose warehouse
 assert(server.includes('return res.status(400).json({ success: false, error: "不支持的商品状态" });'), 'product list must reject unsupported status filters');
 
 assert(productView.includes('@selection-change="onSelectionChange"'));
-assert(productView.includes('selectedRows.value.length > 100'));
+assert(productView.includes('candidates.length > 100'));
 assert(productView.includes("'/api/seller/products/archive'"));
+assert(productView.includes("const candidates = selectedRows.value.filter((row) => row.status !== 'IN_ACTIVE' && row.offer_id)"), 'bulk archive must skip inactive or invalid products');
+assert(productView.includes('storeScopeOptions'), 'product management must expose a selectable store scope');
+assert(productView.includes('multiple') && productView.includes('collapse-tags'), 'product store filter must support multi-select store selection');
+assert(productView.includes('const groups = candidates.reduce((map, row) => {'), 'bulk product archive must group selected products by store');
+assert(productView.includes('store_id: storeId'), 'bulk product archive must send the owning store id for each group');
+assert(productView.includes('label="店铺"'), 'product list must show each product owning store');
+assert(server.includes('SELECT id, store_id, offer_id'), 'product list API must return store_id for ownership-aware actions');
+assert(productView.includes('批量归档商品确认'), 'bulk product archive must use a clear product-specific confirmation');
+assert(productView.includes('Ozon 商品 archive 接口'), 'bulk product archive must explain it calls the Ozon product archive API');
 assert(productView.includes('copyOfferId'));
 assert(productView.includes('exportCsv'));
 assert(productView.includes("'/api/seller/products/export'"), 'CSV export must cover the full filtered result');
@@ -59,6 +69,9 @@ assert(!productView.includes('<el-form-item label="10. 库存">'), 'product edit
 assert(productView.includes(":props=\"{ label: 'label', value: 'category_key'"), 'category cascader must use stable category keys instead of names only');
 assert(productView.includes('description_category_id'), 'product editor must preserve Ozon description category id');
 assert(productView.includes('syncCategoryPathFromForm'), 'product editor must preselect the current category after category tree loading');
+assert(productView.includes('normalizeCategoryFields'), 'product editor must normalize readonly category ids before opening the drawer');
+assert(productView.includes('currentCategoryText'), 'product editor must not show current category as unset when only category id is present');
+assert(productView.includes('categoryPathMissing'), 'product editor must explain when a saved category id is not in the current store tree');
 assert(server.includes('sync_results: syncResults'), 'product update must report each downstream sync result');
 assert(server.includes('价格同步失败：'), 'Ozon price errors must not be swallowed');
 assert(productView.includes('source_url_1688'), 'product editor must maintain the procurement URL');

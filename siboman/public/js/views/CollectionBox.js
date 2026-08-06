@@ -236,44 +236,68 @@ window.CollectionBoxView = {
     };
   },
   template: `
-    <div class="collection-box-v3">
-      <el-card style="margin-bottom:16px">
-        <div style="display:flex; gap:10px; align-items:flex-start">
-          <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon 链接或 SKU，每行一条" />
-          <el-button type="primary" @click="handleImport" style="height:32px">加入采集箱</el-button>
-        </div>
-        <div style="margin-top:8px; color:#909399; font-size:12px">加入后只创建采集箱记录和采集任务；送上架需要在采集完成后手动确认。</div>
-      </el-card>
-
-      <el-card>
-        <template #header>
-          <div style="display:flex; justify-content:space-between; gap:12px; align-items:center">
-            <strong>采集箱</strong>
-            <div style="display:flex; gap:8px">
-              <el-input v-model="search" clearable placeholder="搜索标题 / SKU / 链接" style="width:260px" @input="onSearchInput" @keyup.enter="onSearch" />
-              <el-button @click="onSearch">搜索</el-button>
-              <el-button @click="exportCsv">导出 CSV</el-button>
-              <el-button type="danger" plain :disabled="!selectedRows.length" @click="bulkDelete">批量删除</el-button>
-            </div>
+    <div class="collection-box-v3" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px; box-sizing:border-box">
+      <div style="max-width:1500px; margin:0 auto">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
+          <div>
+            <div style="font-size:28px; line-height:1.2; font-weight:900; color:#111827">采集箱</div>
+            <div style="margin-top:14px; font-size:14px; color:#64748b; font-weight:700">共 {{ pagination.total }} 条采集项 · 当前 {{ statusLabel(activeTab) }}</div>
           </div>
-        </template>
+          <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:flex-end">
+            <el-button size="large" @click="fetchItems">
+              <el-icon><Refresh /></el-icon><span>刷新</span>
+            </el-button>
+            <el-button size="large" @click="exportCsv">
+              <el-icon><Download /></el-icon><span>导出 CSV</span>
+            </el-button>
+            <el-button size="large" type="danger" plain :disabled="!selectedRows.length" @click="bulkDelete">批量删除 ({{ selectedRows.length }})</el-button>
+          </div>
+        </div>
 
-        <el-tabs v-model="activeTab" @tab-change="onTabChange">
-          <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :name="tab.value">
-            <template #label>{{ tab.label }} <span style="color:#909399">({{ statusCounts[tab.value] || 0 }})</span></template>
-          </el-tab-pane>
-        </el-tabs>
+        <div style="background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:14px; margin-bottom:16px">
+          <div style="display:grid; grid-template-columns:minmax(320px,1fr) 132px; gap:12px; align-items:start">
+            <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon 链接或 SKU，每行一条" />
+            <el-button size="large" type="primary" style="height:76px; background:#111827; border-color:#111827" @click="handleImport">加入采集箱</el-button>
+          </div>
+          <div style="margin-top:8px; color:#64748b; font-size:12px; font-weight:700">加入后只创建采集箱记录和采集任务；送上架需要在采集完成后手动确认。</div>
+        </div>
 
-        <el-table :data="items" v-loading="loading" stripe border empty-text="暂无采集项。请粘贴 Ozon 链接或 SKU 后加入采集箱。" @selection-change="onSelectionChange">
-          <el-table-column type="selection" width="44" />
-          <el-table-column label="商品信息" min-width="250">
+        <div style="background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:6px; margin-bottom:14px; display:flex; gap:8px; flex-wrap:wrap">
+          <button
+            v-for="tab in statusTabs"
+            :key="tab.value"
+            type="button"
+            @click="activeTab = tab.value; onTabChange()"
+            :style="{
+              border:'0',
+              borderRadius:'7px',
+              padding:'9px 14px',
+              fontWeight:800,
+              cursor:'pointer',
+              background: activeTab === tab.value ? '#111827' : '#fff',
+              color: activeTab === tab.value ? '#fff' : '#64748b'
+            }">
+            {{ tab.label }} <span style="margin-left:6px; opacity:.78">{{ statusCounts[tab.value] || 0 }}</span>
+          </button>
+        </div>
+
+        <div style="display:grid; grid-template-columns:minmax(320px,1fr) 92px; gap:10px; align-items:center; margin-bottom:14px">
+          <el-input v-model="search" clearable size="large" placeholder="搜索标题 / SKU / 链接" @input="onSearchInput" @keyup.enter="onSearch">
+            <template #prefix><el-icon><Search /></el-icon></template>
+          </el-input>
+          <el-button size="large" type="primary" style="background:#111827; border-color:#111827" @click="onSearch">筛选</el-button>
+        </div>
+
+        <el-table :data="items" v-loading="loading" element-loading-text="正在读取采集箱" size="large" stripe border style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" empty-text="暂无采集项。请粘贴 Ozon 链接或 SKU 后加入采集箱。" @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="52" />
+          <el-table-column label="商品信息" min-width="360">
             <template #default="{ row }">
               <div style="display: flex; gap: 10px; align-items: center">
-                <el-image v-if="row.main_image" :src="row.main_image" style="width:45px; height:45px" fit="cover" preview-teleported :preview-src-list="row.images?.length ? row.images : [row.main_image]" />
-                <div v-else style="width:45px;height:45px;background:#f5f7fa;color:#909399;display:flex;align-items:center;justify-content:center;font-size:11px">无图</div>
+                <el-image v-if="row.main_image" :src="row.main_image" style="width:58px; height:58px; border-radius:8px; background:#f1f5f9" fit="cover" preview-teleported :preview-src-list="row.images?.length ? row.images : [row.main_image]" />
+                <div v-else style="width:58px;height:58px;border-radius:8px;background:#f1f5f9;color:#94a3b8;display:flex;align-items:center;justify-content:center;font-size:11px">无图</div>
                 <div style="flex: 1; min-width: 0">
-                  <div class="text-ellipsis" style="font-size: 13px">{{ row.title || '正在采集...' }}</div>
-                  <div style="font-size:11px; color:#999">SKU: {{ row.ozon_sku || '-' }}</div>
+                  <div class="text-ellipsis" style="font-size:15px; line-height:1.4; font-weight:800; color:#1f2937">{{ row.title || '正在采集...' }}</div>
+                  <div style="font-size:12px; color:#94a3b8; margin-top:7px">SKU: {{ row.ozon_sku || '-' }}</div>
                   <div v-if="row.status === 'failed'" style="font-size:11px; color:#f56c6c; margin-top:3px">{{ rowFailureReason(row) }}</div>
                 </div>
               </div>
@@ -299,7 +323,7 @@ window.CollectionBoxView = {
               </el-tooltip>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="240" fixed="right">
+          <el-table-column label="操作" width="240" fixed="right" align="center">
             <template #default="{ row }">
               <el-button link type="primary" @click="editItem(row)">编辑</el-button>
               <el-button v-if="row.status === 'scraped'" link type="success" @click="sendToListing(row)">送上架</el-button>
@@ -311,7 +335,7 @@ window.CollectionBoxView = {
           </el-table-column>
         </el-table>
 
-        <div style="margin-top: 20px; display: flex; justify-content: flex-end">
+        <div style="position:sticky; bottom:0; left:0; right:0; margin-top:14px; padding:12px 0; background:#f8fafc; z-index:10; display:flex; justify-content:flex-end">
           <el-pagination
             v-model:current-page="pagination.currentPage"
             v-model:page-size="pagination.pageSize"
@@ -322,7 +346,7 @@ window.CollectionBoxView = {
             @size-change="onSizeChange"
           />
         </div>
-      </el-card>
+      </div>
 
       <!-- 补全 Ozon 死穴字段的编辑抽屉 -->
       <el-drawer v-model="drawer.visible" title="编辑采集商品" size="650px">
@@ -336,7 +360,7 @@ window.CollectionBoxView = {
               <el-form-item label="售价 (RUB)" required>
                 <el-input-number v-model="drawer.form.price_rub" style="width:100%" />
                 <el-button type="success" link size="small" @click="drawer.showProfitCalc = true">
-                   <el-icon><Calculator /></el-icon> fx 利润计算器
+                   <el-icon><DataAnalysis /></el-icon> fx 利润计算器
                 </el-button>
               </el-form-item>
             </el-col>

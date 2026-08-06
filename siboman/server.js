@@ -62,6 +62,9 @@ const LOW_PRICE_THRESHOLD_RMB = Number(process.env.LOW_PRICE_THRESHOLD_RMB || 1)
 const OZON_SELLER_BASE_URL = (process.env.OZON_SELLER_BASE_URL || "https://api-seller.ozon.ru").replace(/\/$/, "");
 const OZON_SELLER_CLIENT_ID = process.env.OZON_SELLER_CLIENT_ID || "";
 const OZON_SELLER_API_KEY = process.env.OZON_SELLER_API_KEY || "";
+const OZON_ORDER_CANCEL_MODE = String(process.env.OZON_ORDER_CANCEL_MODE || "disabled").trim().toLowerCase();
+const OZON_ORDER_CANCEL_BASE_URL = (process.env.OZON_ORDER_CANCEL_BASE_URL || "").replace(/\/$/, "");
+const OZON_ORDER_CANCEL_ALLOW_PRODUCTION = /^(1|true|yes)$/i.test(process.env.OZON_ORDER_CANCEL_ALLOW_PRODUCTION || "");
 const MINIMAX_IMAGE_MODEL = process.env.MINIMAX_IMAGE_MODEL || "image-01";
 const MINIMAX_IMAGE_INPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_INPUT_USD_PER_M || 0.30);
 const MINIMAX_IMAGE_OUTPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_OUTPUT_USD_PER_M || 1.20);
@@ -83,7 +86,7 @@ const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || "agnes-image-2.0-flas
 const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD || 0);
 const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
-const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.57";
+const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.67";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -94,6 +97,15 @@ const DEFAULT_MAX_CONSECUTIVE_FAILURES = Number(process.env.DEFAULT_MAX_CONSECUT
 const DISABLE_SERVER_SCRAPER = /^(1|true|yes)$/i.test(process.env.DISABLE_SERVER_SCRAPER || "");
 const SERVER_SINGLE_SOURCING = /^(1|true|yes)$/i.test(process.env.SERVER_SINGLE_SOURCING || "");
 const WORKER_ONLINE_WINDOW_MS = Number(process.env.WORKER_ONLINE_WINDOW_MS || 45000);
+const WORKER_JOB_STALE_MS = Number(process.env.WORKER_JOB_STALE_MS || 10 * 60 * 1000);
+const PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS = Number(process.env.PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS || 0);
+const PLATFORM_SNAPSHOT_STALE_MS = Number(process.env.PLATFORM_SNAPSHOT_STALE_MS || 12 * 60 * 60 * 1000);
+const PLATFORM_SNAPSHOT_DEFAULT_LIMIT = Number(process.env.PLATFORM_SNAPSHOT_DEFAULT_LIMIT || 48);
+const MYERP_API_BASE_URL = (process.env.MYERP_API_BASE_URL || "https://api.jizhangerp.com").replace(/\/$/, "");
+const MYERP_API_TOKEN = String(process.env.MYERP_API_TOKEN || "").trim().replace(/^Bearer\s+/i, "");
+const MYERP_PLATFORM_PERIOD = process.env.MYERP_PLATFORM_PERIOD || "monthly";
+const MYERP_PLATFORM_SYNC_PAGES = Math.min(20, Math.max(1, Number(process.env.MYERP_PLATFORM_SYNC_PAGES || 5)));
+const MYERP_PLATFORM_SYNC_MAX_REQUESTS = Math.min(1000, Math.max(50, Number(process.env.MYERP_PLATFORM_SYNC_MAX_REQUESTS || 400)));
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const INITIAL_USERS = process.env.INITIAL_USERS || "";
 const USER_AGENT =
@@ -121,6 +133,65 @@ function rubToCny(rub) {
 function formatCny(rub) {
   const cny = rubToCny(rub);
   return cny != null ? `¥${cny.toFixed(2)}` : "—";
+}
+
+const OZON_CATEGORY_ZH_RULES = [
+  [/красот|космет|макияж|уход|парфюм|духи|волос|ногт|ресниц|бров|beauty|cosmetic|makeup|skin|hair|nail|perfume/i, "美妆个护"],
+  [/одежд|бель[её]|обув|сумк|аксессуар|рюкзак|кошел|рем[её]н|шапк|перчат|fashion|apparel|clothing|shoe|bag|backpack|accessor/i, "服饰鞋包"],
+  [/дом|мебел|интерьер|декор|посуд|кухн|текстил|ковр|свет|хранен|ванн|home|furniture|kitchen|decor|storage|bath|household/i, "家居家装"],
+  [/спорт|туризм|отдых|рыбал|велосипед|фитнес|тренаж|sport|fitness|outdoor|cycling|fishing|camping/i, "运动户外"],
+  [/дет|малыш|игруш|школ|канцеляр|пелен|коляск|baby|kid|toy|school|stationery/i, "母婴玩具"],
+  [/электрон|компьют|телефон|смартфон|ноутбук|планшет|кабел|заряд|наушник|electronic|computer|phone|mobile|digital|tablet|cable|charger|headphone/i, "手机数码"],
+  [/авто|мото|запчаст|шины|инструмент|ремонт|строител|сад|дач|auto|car|motor|tool|garden|hardware|repair/i, "汽摩五金"],
+  [/продукт|еда|напит|кофе|чай|сладост|бакале|food|drink|coffee|tea|grocery|snack/i, "食品饮料"],
+  [/зоотовар|животн|кошк|собак|питомц|аквариум|pet|cat|dog|aquarium/i, "宠物用品"],
+  [/книг|хобби|творчеств|музык|канцтовар|book|hobby|music|office|creative/i, "图书文娱"],
+  [/аптек|здоров|медицин|витамин|ортопед|health|medical|vitamin|pharmacy/i, "健康保健"],
+];
+
+const OZON_CATEGORY_SEARCH_RULES = [
+  [/住宅|花园|家居|家装|家具|厨房|收纳|house|home|garden/i, ["товары для дома", "для сада", "хранение вещей"]],
+  [/服装|服饰|鞋|包|内衣|clothing|fashion|apparel/i, ["одежда", "женская одежда", "мужская одежда"]],
+  [/美容|卫生|美妆|个护|beauty|cosmetic/i, ["красота и здоровье", "косметика", "уход за кожей"]],
+  [/建筑|装修|五金|工具|repair|hardware|tools/i, ["строительство и ремонт", "инструменты", "товары для ремонта"]],
+  [/食品|饮料|零食|food|drink|grocery/i, ["продукты питания", "напитки", "сладости"]],
+  [/电子|手机|数码|电脑|electronic|phone|computer/i, ["электроника", "смартфон", "аксессуары для телефона"]],
+  [/汽车|摩托|汽摩|auto|car|motor/i, ["автотовары", "аксессуары для автомобиля", "мототовары"]],
+  [/母婴|玩具|儿童|baby|kid|toy/i, ["детские товары", "игрушки", "товары для малышей"]],
+  [/运动|户外|sport|outdoor|fitness/i, ["спорт и отдых", "товары для фитнеса", "туризм"]],
+  [/宠物|pet|cat|dog/i, ["товары для животных", "для кошек", "для собак"]],
+  [/图书|办公|文具|book|office|stationery/i, ["книги", "канцтовары", "товары для офиса"]],
+  [/健康|保健|医药|health|medical/i, ["товары для здоровья", "витамины", "аптека"]],
+];
+
+function hasCyrillic(text = "") {
+  return /[\u0400-\u04FF]/.test(String(text || ""));
+}
+
+function categorySearchTerms(rawName = "", zhName = "", categoryPath = "") {
+  const source = [rawName, zhName, categoryPath].filter(Boolean).join(" / ");
+  const terms = [];
+  for (const [pattern, values] of OZON_CATEGORY_SEARCH_RULES) {
+    if (pattern.test(source)) terms.push(...values);
+  }
+  for (const part of String(source || "").split(/\s*[/›»>]\s*/).map((item) => item.trim()).filter(Boolean)) {
+    if (hasCyrillic(part) || /^[A-Za-z][A-Za-z0-9\s&-]{2,}$/.test(part)) terms.push(part);
+  }
+  if (!terms.length && source.trim()) terms.push(source.trim());
+  return [...new Set(terms)].slice(0, 4);
+}
+
+function categoryNameZh(rawName = "", categoryId = "") {
+  const clean = String(rawName || "").replace(/\s*>\s*/g, " / ").trim();
+  if (!clean) return categoryId ? `未分类 ${categoryId}` : "未分类";
+  const parts = clean.split(/\s*[/›»>]\s*/).filter(Boolean);
+  const matched = parts.map((part) => {
+    const hit = OZON_CATEGORY_ZH_RULES.find(([pattern]) => pattern.test(part));
+    return hit ? hit[1] : "";
+  }).filter(Boolean);
+  if (matched.length) return [...new Set(matched)].slice(0, 2).join(" / ");
+  if (!hasCyrillic(clean) && /[\u4e00-\u9fa5]/.test(clean)) return clean;
+  return categoryId ? `未翻译类目 ${categoryId}` : "未翻译类目";
 }
 
 const app = express();
@@ -1058,11 +1129,65 @@ async function initDatabase() {
         UNIQUE(store_id, posting_number)
       );
 
+      CREATE TABLE IF NOT EXISTS app_order_cancel_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        posting_number TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        dry_run BOOLEAN NOT NULL DEFAULT true,
+        status TEXT NOT NULL DEFAULT 'simulated',
+        ozon_called BOOLEAN NOT NULL DEFAULT false,
+        request_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        response_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        error TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
+      CREATE TABLE IF NOT EXISTS app_order_costs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        posting_number TEXT NOT NULL,
+        offer_id TEXT NOT NULL DEFAULT '',
+        source_url_1688 TEXT NOT NULL DEFAULT '',
+        outbound_cost_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        changed_by UUID REFERENCES app_users(id) ON DELETE SET NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(store_id, posting_number)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_order_cache (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        posting_number TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT '',
+        display_status TEXT NOT NULL DEFAULT '',
+        substatus TEXT NOT NULL DEFAULT '',
+        in_process_at TIMESTAMPTZ,
+        shipment_date TIMESTAMPTZ,
+        delivering_date TIMESTAMPTZ,
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        synced_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(store_id, posting_number)
+      );
+
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'processing';
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_order_costs ADD COLUMN IF NOT EXISTS source_url_1688 TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_order_costs ADD COLUMN IF NOT EXISTS outbound_cost_cny NUMERIC(12,2) NOT NULL DEFAULT 0;
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS ozon_response JSONB NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+      ALTER TABLE app_order_cache ADD COLUMN IF NOT EXISTS display_status TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_order_cancel_events ADD COLUMN IF NOT EXISTS request_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE app_order_cancel_events ADD COLUMN IF NOT EXISTS response_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE app_order_cancel_events ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';
 
       CREATE TABLE IF NOT EXISTS app_top_lists (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1103,9 +1228,103 @@ async function initDatabase() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
+      CREATE TABLE IF NOT EXISTS app_platform_categories (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        source_name TEXT NOT NULL DEFAULT '',
+        source_url TEXT NOT NULL DEFAULT '',
+        period TEXT NOT NULL DEFAULT 'monthly',
+        snapshot_date DATE,
+        category_id TEXT NOT NULL DEFAULT '',
+        category_parent_id TEXT NOT NULL DEFAULT '',
+        category_name TEXT NOT NULL DEFAULT '',
+        category_name_zh TEXT NOT NULL DEFAULT '',
+        category_path TEXT NOT NULL DEFAULT '',
+        level INTEGER NOT NULL DEFAULT 1,
+        sales_units NUMERIC(18,2) NOT NULL DEFAULT 0,
+        sales_amount_rub NUMERIC(18,2) NOT NULL DEFAULT 0,
+        gmv_growth NUMERIC(10,4),
+        avg_price_rub NUMERIC(14,2),
+        price_growth NUMERIC(10,4),
+        sellers NUMERIC(18,2),
+        brands NUMERIC(18,2),
+        brand_rate NUMERIC(10,4),
+        leader_share NUMERIC(10,4),
+        fbs_rate NUMERIC(10,4),
+        buyout_rate NUMERIC(10,4),
+        return_rate NUMERIC(10,4),
+        source_captured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        source_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(source_name, period, snapshot_date, category_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_auto_listing_settings (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        enabled BOOLEAN NOT NULL DEFAULT FALSE,
+        daily_quota INTEGER NOT NULL DEFAULT 30,
+        min_profit_rate NUMERIC(8,4) NOT NULL DEFAULT 0.20,
+        max_ai_cost_cny NUMERIC(12,2) NOT NULL DEFAULT 50,
+        submit_to_ozon BOOLEAN NOT NULL DEFAULT FALSE,
+        rules JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(user_id, store_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_auto_listing_items (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        top_list_id UUID REFERENCES app_top_lists(id) ON DELETE SET NULL,
+        collect_item_id UUID REFERENCES collect_items(id) ON DELETE SET NULL,
+        listing_history_id UUID,
+        source_sku TEXT NOT NULL DEFAULT '',
+        title TEXT NOT NULL DEFAULT '',
+        main_image TEXT NOT NULL DEFAULT '',
+        ozon_url TEXT NOT NULL DEFAULT '',
+        category_name TEXT NOT NULL DEFAULT '',
+        category_name_zh TEXT NOT NULL DEFAULT '',
+        seller_name TEXT NOT NULL DEFAULT '',
+        price_rub NUMERIC(14,2),
+        monthly_sales INTEGER NOT NULL DEFAULT 0,
+        review_count INTEGER NOT NULL DEFAULT 0,
+        seller_count INTEGER,
+        opportunity_score NUMERIC(8,2) NOT NULL DEFAULT 0,
+        stage TEXT NOT NULL DEFAULT 'discovered',
+        status TEXT NOT NULL DEFAULT 'queued',
+        risk_level TEXT NOT NULL DEFAULT 'normal',
+        human_reason TEXT NOT NULL DEFAULT '',
+        note TEXT NOT NULL DEFAULT '',
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(user_id, store_id, source_sku)
+      );
+
+      CREATE TABLE IF NOT EXISTS app_auto_listing_events (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        item_id UUID REFERENCES app_auto_listing_items(id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL DEFAULT 'info',
+        stage TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+
       CREATE INDEX IF NOT EXISTS idx_top_lists_strategy ON app_top_lists(active, strategy_type, monthly_sales DESC);
       CREATE INDEX IF NOT EXISTS idx_top_lists_category ON app_top_lists(category_id, monthly_sales DESC);
       CREATE INDEX IF NOT EXISTS idx_top_lists_china ON app_top_lists(is_china_origin, china_confidence DESC, monthly_sales DESC);
+      CREATE INDEX IF NOT EXISTS idx_platform_categories_period ON app_platform_categories(active, period, snapshot_date DESC, sales_amount_rub DESC);
+      CREATE INDEX IF NOT EXISTS idx_platform_categories_category ON app_platform_categories(category_id, source_captured_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_auto_listing_items_store_stage ON app_auto_listing_items(user_id, store_id, stage, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_auto_listing_items_store_status ON app_auto_listing_items(user_id, store_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_auto_listing_events_item ON app_auto_listing_events(item_id, created_at DESC);
 
       CREATE TABLE IF NOT EXISTS app_stock_drafts (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1190,6 +1409,8 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_collect_items_user_status ON collect_items(user_id, status, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_collect_items_store_offer ON collect_items(store_id, linked_offer_id);
       CREATE INDEX IF NOT EXISTS idx_order_notes_store ON order_notes(store_id, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_order_cache_store_process ON app_order_cache(user_id, store_id, in_process_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_order_cache_store_status ON app_order_cache(user_id, store_id, status);
       CREATE INDEX IF NOT EXISTS idx_stock_drafts_store ON app_stock_drafts(user_id, store_id, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_stock_change_logs_store ON app_stock_change_logs(user_id, store_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_ai_image_records_store ON ai_image_records(store_id, created_at DESC);
@@ -1475,7 +1696,7 @@ app.post("/api/browser/close", async (_req, res) => {
   }
 });
 
-async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, userId = null } = {}) {
+async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, userId = null, baseUrl = OZON_SELLER_BASE_URL } = {}) {
   let clientId = OZON_SELLER_CLIENT_ID;
   let apiKey = OZON_SELLER_API_KEY;
 
@@ -1499,7 +1720,7 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
     error.statusCode = 503;
     throw error;
   }
-  const response = await fetch(`${OZON_SELLER_BASE_URL}${path}`, {
+  const response = await fetch(`${baseUrl}${path}`, {
     method,
     headers: {
       "Client-Id": clientId,
@@ -1744,22 +1965,24 @@ function mapOzonStatus(info) {
 const PRODUCT_STATUS_DISPLAY = {
   ALL: "全部",
   VISIBLE: "销售中",
-  READY_TO_SUPPLY: "待销售",
-  NEED_ATTENTION: "需修改",
+  READY_TO_SUPPLY: "准备销售",
+  NEED_ATTENTION: "待修改",
   NOT_MODERATED: "待审核",
-  FAILED_MODERATION: "审核失败",
-  IN_ACTIVE: "已下架",
+  FAILED_MODERATION: "错误",
+  IN_ACTIVE: "商品已下架",
+  ARCHIVED: "归档",
   UNKNOWN: "未知状态",
 };
 
 const PRODUCT_STATUS_HINT = {
-  ALL: "全部本地商品缓存",
+  ALL: "Ozon 商品列表中的全部商品",
   VISIBLE: "Ozon 前台可见，可正常售卖",
   READY_TO_SUPPLY: "资料已准备，待补库存或供货后销售",
   NEED_ATTENTION: "Ozon 要求补齐资料，请查看体检或审核原因",
   NOT_MODERATED: "已提交 Ozon，正在审核中",
-  FAILED_MODERATION: "审核失败，请先处理 Ozon 返回的问题",
-  IN_ACTIVE: "已下架或归档，可重新上架恢复",
+  FAILED_MODERATION: "Ozon 后台错误状态，请先处理返回的问题",
+  IN_ACTIVE: "商品已下架，可重新上架恢复",
+  ARCHIVED: "Ozon 商品档案/归档商品",
   UNKNOWN: "Ozon 未返回明确业务状态",
 };
 
@@ -2437,19 +2660,38 @@ app.get("/api/inventory", requireAuth, async (req, res, next) => {
 
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
 
-    let where = "WHERE user_id = $1 AND store_id = $2";
+    let livePage = null;
+    if (!search) {
+      try {
+        livePage = await fetchOzonProductListPage(storeId, userId, "ALL", limit, offset);
+      } catch (error) {
+        console.warn(`[inventory] Ozon ALL page fallback to local cache: ${error.message}`);
+      }
+    }
+
+    let where = `WHERE user_id = $1 AND store_id = $2
+      AND LOWER(COALESCE(status, '')) NOT IN ('in_active', 'archived', 'deleted')
+      AND COALESCE((visibility_details->>'archived')::boolean, false) = false`;
     const params = [userId, storeId];
+    if (livePage) {
+      params.push(livePage.offerIds);
+      where += ` AND offer_id = ANY($${params.length}::text[])`;
+    }
     if (search) {
       params.push(`%${search}%`);
       where += ` AND (name ILIKE $${params.length} OR offer_id ILIKE $${params.length})`;
     }
 
-    const countR = await db.query(`SELECT count(*) FROM app_products ${where}`, params);
+    const countR = livePage
+      ? { rows: [{ count: livePage.total }] }
+      : await db.query(`SELECT count(*) FROM app_products ${where}`, params);
     const total = parseInt(countR.rows[0].count);
 
     const result = await db.query(
-      `SELECT * FROM app_products ${where} ORDER BY updated_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, limit, offset]
+      `SELECT * FROM app_products ${where}
+       ORDER BY ${livePage ? `array_position($${params.length}::text[], offer_id), updated_at DESC` : "updated_at DESC"}
+       ${livePage ? "" : `LIMIT $${params.length + 1} OFFSET $${params.length + 2}`}`,
+      livePage ? params : [...params, limit, offset]
     );
 
     res.json({ success: true, items: result.rows.map(enrichProductReadModel), total });
@@ -2988,6 +3230,634 @@ app.post("/api/seller/analytics/bestsellers", requireAuth, async (req, res, next
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+app.post("/api/sourcing/overview", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const rangeDays = Math.min(180, Math.max(7, Number.parseInt(req.body?.range || "30", 10) || 30));
+    const now = new Date();
+    const currentStart = new Date(now.getTime() - rangeDays * 86400e3);
+    const previousStart = new Date(currentStart.getTime() - rangeDays * 86400e3);
+    const rateResult = await db.query(
+      `SELECT rate FROM app_exchange_rates
+        WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
+        ORDER BY effective_at DESC LIMIT 1`,
+    );
+    const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
+    const money = (value) => Math.round(Number(value || 0) * 100) / 100;
+    const salesCny = (row) => Number(row.price_rub || 0) * Number(row.monthly_sales || 0) * effectiveRubCnyRate;
+    const capturedAt = (row) => row.source_captured_at || row.updated_at || row.created_at || null;
+
+    const rowsRes = await db.query(
+      `WITH latest_platform_category AS (
+         SELECT MAX(source_captured_at) AS latest_at
+           FROM app_platform_categories
+          WHERE active = TRUE
+       )
+       SELECT id, sku, title, main_image, price_rub, monthly_sales, review_count, seller_count,
+              category_id, category_name, strategy_type, ozon_url, seller_name, origin_country,
+              source_name, source_url, source_captured_at, created_at, updated_at, 'top_item' AS row_type
+         FROM app_top_lists
+        WHERE active = TRUE
+       UNION ALL
+       SELECT c.id,
+              'category:' || c.category_id AS sku,
+              c.category_name AS title,
+              '' AS main_image,
+              c.avg_price_rub AS price_rub,
+              FLOOR(c.sales_units)::int AS monthly_sales,
+              0 AS review_count,
+              FLOOR(COALESCE(c.sellers, 0))::int AS seller_count,
+              c.category_id,
+              c.category_name,
+              'hot' AS strategy_type,
+              '' AS ozon_url,
+              '' AS seller_name,
+              '' AS origin_country,
+              c.source_name,
+              c.source_url,
+              c.source_captured_at,
+              c.created_at,
+              c.updated_at,
+              'category_snapshot' AS row_type
+         FROM app_platform_categories c
+         JOIN latest_platform_category l ON c.source_captured_at = l.latest_at
+        WHERE c.active = TRUE`,
+    );
+    const rows = rowsRes.rows || [];
+    const latestSource = rows.reduce((latest, row) => {
+      const t = capturedAt(row) ? new Date(capturedAt(row)).getTime() : 0;
+      return t > latest ? t : latest;
+    }, 0);
+
+    const categories = new Map();
+    const products = [];
+    const sellers = new Map();
+    const trendBuckets = new Map();
+    for (let i = rangeDays - 1; i >= 0; i -= 1) {
+      const d = new Date(now.getTime() - i * 86400e3);
+      const key = d.toISOString().slice(0, 10);
+      trendBuckets.set(key, { date: key.slice(5), sales_cny: 0, units: 0, product_count: 0 });
+    }
+    const priceBands = [
+      { label: "0-20", min: 0, max: 20 },
+      { label: "20-50", min: 20, max: 50 },
+      { label: "50-100", min: 50, max: 100 },
+      { label: "100-200", min: 100, max: 200 },
+      { label: "200-500", min: 200, max: 500 },
+      { label: "500+", min: 500, max: Infinity },
+    ].map((band) => ({ ...band, product_count: 0, sales_cny: 0, units: 0 }));
+    const bandFor = (price) => priceBands.find((band) => price >= band.min && price < band.max) || priceBands[priceBands.length - 1];
+
+    for (const row of rows) {
+      const categoryId = String(row.category_id || row.category_name || "uncategorized");
+      const categoryZh = categoryNameZh(row.category_name, row.category_id);
+      const sellerName = String(row.seller_name || "未知卖家");
+      const units = Math.max(0, Number(row.monthly_sales || 0));
+      const amount = salesCny(row);
+      const priceCny = Number(row.price_rub || 0) * effectiveRubCnyRate;
+      const sourceTime = capturedAt(row) ? new Date(capturedAt(row)) : null;
+
+      if (!categories.has(categoryId)) {
+        categories.set(categoryId, {
+          category_id: categoryId,
+          category_name: row.category_name || "",
+          category_name_zh: categoryZh,
+          gmv_cny: 0,
+          previous_gmv_cny: 0,
+          units: 0,
+          product_count: 0,
+          sellers: new Set(),
+          top_products: [],
+        });
+      }
+      const category = categories.get(categoryId);
+      category.gmv_cny += amount;
+      category.units += units;
+      category.product_count += 1;
+      category.sellers.add(sellerName);
+      category.top_products.push({
+        name: row.title || row.sku,
+        image: row.main_image || "",
+        gmv_cny: amount,
+      });
+
+      if (sourceTime && sourceTime >= previousStart && sourceTime < currentStart) {
+        category.previous_gmv_cny += amount;
+      }
+
+      if (!sellers.has(sellerName)) {
+        sellers.set(sellerName, {
+          store_id: sellerName,
+          store_name: sellerName,
+          seller_name: sellerName,
+          gmv_cny: 0,
+          order_count: 0,
+          units: 0,
+          moving_skus: new Set(),
+          product_count: 0,
+          review_count: 0,
+        });
+      }
+      const seller = sellers.get(sellerName);
+      seller.gmv_cny += amount;
+      seller.units += units;
+      seller.order_count += units;
+      seller.product_count += 1;
+      seller.review_count += Number(row.review_count || 0);
+      if (units > 0) seller.moving_skus.add(row.sku);
+
+      const band = bandFor(priceCny);
+      band.product_count += 1;
+      band.sales_cny += amount;
+      band.units += units;
+
+      const trendKey = sourceTime ? sourceTime.toISOString().slice(0, 10) : "";
+      if (trendBuckets.has(trendKey)) {
+        const point = trendBuckets.get(trendKey);
+        point.sales_cny += amount;
+        point.units += units;
+        point.product_count += 1;
+      }
+
+      if (row.row_type !== "category_snapshot") {
+        products.push({
+          key: String(row.sku || row.id),
+          sku: String(row.sku || ""),
+          name: row.title || row.sku || "",
+          image: row.main_image || "",
+          ozon_url: row.ozon_url || (row.sku ? `https://www.ozon.ru/product/${row.sku}/` : ""),
+          store_name: sellerName,
+          seller_name: sellerName,
+          category_id: categoryId,
+          category_name: row.category_name || "",
+          category_name_zh: categoryZh,
+          price_rub: Number(row.price_rub || 0),
+          price_cny: money(priceCny),
+          gmv_cny: money(amount),
+          sales_cny: money(amount),
+          units,
+          order_count: units,
+          review_count: Number(row.review_count || 0),
+          seller_count: Number(row.seller_count || 0),
+          strategy_type: row.strategy_type || "hot",
+          source_name: row.source_name || "",
+          source_captured_at: row.source_captured_at,
+        });
+      }
+    }
+
+    const categoryItems = [...categories.values()]
+      .map((row) => {
+        const growth = row.previous_gmv_cny > 0
+          ? (row.gmv_cny - row.previous_gmv_cny) / row.previous_gmv_cny
+          : null;
+        return {
+          category_id: row.category_id,
+          category_name: row.category_name,
+          category_name_zh: row.category_name_zh,
+          gmv_cny: money(row.gmv_cny),
+          sales_cny: money(row.gmv_cny),
+          previous_gmv_cny: money(row.previous_gmv_cny),
+          growth_rate: growth == null ? null : Math.round(growth * 10000) / 100,
+          units: row.units,
+          order_count: row.units,
+          product_count: row.product_count,
+          store_count: row.sellers.size,
+          seller_count: row.sellers.size,
+          profit_cny: null,
+          profit_rate: null,
+          opportunity_score: Math.max(0, Math.min(100, Math.round((Math.log10(row.gmv_cny + 1) * 18 + Math.log10(row.units + 1) * 16 + row.sellers.size * 2) * 10) / 10)),
+          top_products: row.top_products
+            .sort((a, b) => b.gmv_cny - a.gmv_cny)
+            .slice(0, 3)
+            .map((product) => ({ ...product, gmv_cny: money(product.gmv_cny) })),
+        };
+      })
+      .sort((a, b) => b.gmv_cny - a.gmv_cny);
+    const productItems = products.sort((a, b) => b.gmv_cny - a.gmv_cny).slice(0, 100);
+    const sellerItems = [...sellers.values()]
+      .map((row) => ({
+        ...row,
+        moving_skus: row.moving_skus.size,
+        gmv_cny: money(row.gmv_cny),
+        sales_cny: money(row.gmv_cny),
+        avg_order_cny: row.units > 0 ? money(row.gmv_cny / row.units) : 0,
+      }))
+      .sort((a, b) => b.gmv_cny - a.gmv_cny);
+    const totalSales = products.reduce((sum, row) => sum + Number(row.gmv_cny || 0), 0);
+    const totalUnits = products.reduce((sum, row) => sum + Number(row.units || 0), 0);
+    const movingSkus = new Set(products.filter((row) => Number(row.units || 0) > 0).map((row) => row.sku));
+
+    res.json({
+      success: true,
+      source_scope: "ozon_platform",
+      range_days: rangeDays,
+      stores: [],
+      summary: {
+        gmv_cny: money(totalSales),
+        sales_cny: money(totalSales),
+        order_count: totalUnits,
+        units: totalUnits,
+        moving_skus: movingSkus.size,
+        avg_order_cny: totalUnits > 0 ? money(totalSales / totalUnits) : 0,
+        profit_cny: null,
+        profit_rate: null,
+        active_products: rows.length,
+        stock_warning: 0,
+        seller_count: sellers.size,
+        category_count: categories.size,
+      },
+      categories: categoryItems,
+      products: productItems,
+      store_ranking: sellerItems,
+      trends: [...trendBuckets.values()].map((row) => ({ ...row, gmv_cny: money(row.sales_cny), sales_cny: money(row.sales_cny) })),
+      price_distribution: priceBands.map((band) => ({
+        label: band.label,
+        product_count: band.product_count,
+        sales_cny: money(band.sales_cny),
+        gmv_cny: money(band.sales_cny),
+        units: band.units,
+      })),
+      data_source: {
+        platform: "app_platform_categories",
+        exchange_rate: effectiveRubCnyRate,
+        latest_platform_captured_at: latestSource ? new Date(latestSource).toISOString() : null,
+        note: "Ozon 平台榜单数据源；不使用自有店铺订单缓存。",
+      },
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/overview-legacy-store", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const rawStoreIds = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const requestedStoreIds = rawStoreIds && !["all", "全部店铺"].includes(rawStoreIds)
+      ? rawStoreIds.split(",").map((id) => id.trim()).filter(Boolean)
+      : [];
+    const rangeDays = Math.min(180, Math.max(7, Number.parseInt(req.body?.range || "30", 10) || 30));
+    const now = new Date();
+    const currentStart = new Date(now.getTime() - rangeDays * 86400e3);
+    const previousStart = new Date(currentStart.getTime() - rangeDays * 86400e3);
+
+    const storeParams = [userId];
+    let storeWhere = "user_id = $1 AND active = TRUE";
+    if (requestedStoreIds.length) {
+      storeParams.push(requestedStoreIds);
+      storeWhere += ` AND id = ANY($${storeParams.length}::uuid[])`;
+    }
+    const storesRes = await db.query(
+      `SELECT id, name FROM app_stores WHERE ${storeWhere} ORDER BY updated_at DESC`,
+      storeParams,
+    );
+    const stores = storesRes.rows;
+    if (!stores.length) {
+      return res.json({
+        success: true,
+        range_days: rangeDays,
+        stores: [],
+        summary: {},
+        categories: [],
+        products: [],
+        store_ranking: [],
+        trends: [],
+        price_distribution: [],
+        data_source: { orders: "app_order_cache", products: "app_products", note: "未选择可用店铺" },
+      });
+    }
+    const storeIds = stores.map((store) => store.id);
+    const storeNameById = new Map(stores.map((store) => [String(store.id), store.name]));
+
+    const rateResult = await db.query(
+      `SELECT rate FROM app_exchange_rates
+        WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
+        ORDER BY effective_at DESC LIMIT 1`,
+    );
+    const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
+    const money = (value) => Math.round(Number(value || 0) * 100) / 100;
+    const toCny = (amount, currency = "RUB") => {
+      const n = Number(amount || 0);
+      if (!Number.isFinite(n)) return 0;
+      const code = String(currency || "RUB").toUpperCase();
+      if (code === "RUB") return n * effectiveRubCnyRate;
+      return n;
+    };
+    const normalizeStatus = (status = "") => String(status || "").toLowerCase();
+    const isVisibleProduct = (status = "") => !["in_active", "archived", "deleted"].includes(String(status || "").toLowerCase());
+
+    const productsRes = await db.query(
+      `SELECT p.store_id, s.name AS store_name, p.offer_id, p.sku, p.name, p.image, p.price, p.currency_code,
+              p.stock, p.status, p.category_name, p.description_category_id, p.purchase_price_cny, p.updated_at
+         FROM app_products p
+         JOIN app_stores s ON s.id = p.store_id
+        WHERE p.user_id = $1 AND p.store_id = ANY($2::uuid[])`,
+      [userId, storeIds],
+    );
+    const productMap = new Map();
+    const allProducts = productsRes.rows.map((row) => {
+      const categoryId = row.description_category_id ? String(row.description_category_id) : "";
+      const categoryZh = categoryNameZh(row.category_name, categoryId);
+      const item = {
+        store_id: String(row.store_id),
+        store_name: row.store_name,
+        offer_id: String(row.offer_id || ""),
+        sku: String(row.sku || ""),
+        name: row.name || row.offer_id || "",
+        image: row.image || "",
+        price_cny: money(toCny(row.price, row.currency_code || "RUB")),
+        stock: Number(row.stock || 0),
+        status: row.status || "",
+        category_id: categoryId || "uncategorized",
+        category_name: row.category_name || "",
+        category_name_zh: categoryZh,
+        purchase_price_cny: Number(row.purchase_price_cny || 0),
+        updated_at: row.updated_at,
+      };
+      productMap.set(`${item.store_id}:${item.offer_id}`, item);
+      return item;
+    });
+
+    const cacheRes = await db.query(
+      `SELECT c.store_id, c.status, c.in_process_at, c.payload, c.synced_at
+         FROM app_order_cache c
+        WHERE c.user_id = $1
+          AND c.store_id = ANY($2::uuid[])
+          AND c.in_process_at >= $3`,
+      [userId, storeIds, previousStart.toISOString()],
+    );
+    const latestOrderSync = cacheRes.rows.reduce((latest, row) => {
+      const t = row.synced_at ? new Date(row.synced_at).getTime() : 0;
+      return t > latest ? t : latest;
+    }, 0);
+
+    const categories = new Map();
+    const products = new Map();
+    const storeRanking = new Map(stores.map((store) => [String(store.id), {
+      store_id: String(store.id),
+      store_name: store.name,
+      gmv_cny: 0,
+      profit_cny: 0,
+      order_count: 0,
+      units: 0,
+      moving_skus: new Set(),
+      active_products: 0,
+      stock_warning: 0,
+    }]));
+    const trendBuckets = new Map();
+    for (let i = rangeDays - 1; i >= 0; i -= 1) {
+      const d = new Date(now.getTime() - i * 86400e3);
+      const key = d.toISOString().slice(0, 10);
+      trendBuckets.set(key, { date: key.slice(5), gmv_cny: 0, orders: 0, units: 0 });
+    }
+    const priceBands = [
+      { label: "0-20", min: 0, max: 20 },
+      { label: "20-50", min: 20, max: 50 },
+      { label: "50-100", min: 50, max: 100 },
+      { label: "100-200", min: 100, max: 200 },
+      { label: "200-500", min: 200, max: 500 },
+      { label: "500+", min: 500, max: Infinity },
+    ].map((band) => ({ ...band, product_count: 0, sales_cny: 0, units: 0 }));
+    const bandFor = (price) => priceBands.find((band) => price >= band.min && price < band.max) || priceBands[priceBands.length - 1];
+    for (const product of allProducts) {
+      const storeRow = storeRanking.get(product.store_id);
+      if (storeRow && isVisibleProduct(product.status)) {
+        storeRow.active_products += 1;
+        if (product.stock < 10) storeRow.stock_warning += 1;
+      }
+      bandFor(product.price_cny).product_count += 1;
+    }
+
+    const ensureCategory = (product, fallbackStoreId) => {
+      const key = product?.category_id || "uncategorized";
+      if (!categories.has(key)) {
+        categories.set(key, {
+          category_id: key,
+          category_name: product?.category_name || "",
+          category_name_zh: product?.category_name_zh || categoryNameZh(product?.category_name || "", key === "uncategorized" ? "" : key),
+          gmv_cny: 0,
+          previous_gmv_cny: 0,
+          units: 0,
+          order_count: 0,
+          product_count: 0,
+          profit_cny: 0,
+          stores: new Set(),
+          top_product_keys: new Set(),
+        });
+      }
+      const row = categories.get(key);
+      if (fallbackStoreId) row.stores.add(String(fallbackStoreId));
+      return row;
+    };
+    for (const product of allProducts) {
+      const cat = ensureCategory(product, product.store_id);
+      cat.product_count += 1;
+    }
+
+    const productImage = (payloadProduct = {}, meta = {}) => (
+      meta.image || payloadProduct.image || payloadProduct.primary_image || payloadProduct.picture || ""
+    );
+    const productName = (payloadProduct = {}, meta = {}) => (
+      meta.name || payloadProduct.name || payloadProduct.offer_id || payloadProduct.sku || "未命名商品"
+    );
+    const productPriceCny = (payloadProduct = {}, meta = {}) => {
+      if (Number(payloadProduct.price_cny) > 0) return Number(payloadProduct.price_cny);
+      if (Number(payloadProduct.subtotal_cny) > 0 && Number(payloadProduct.quantity || 1) > 0) {
+        return Number(payloadProduct.subtotal_cny) / Number(payloadProduct.quantity || 1);
+      }
+      const currency = payloadProduct.currency_code || payloadProduct.price?.currency || "RUB";
+      const raw = payloadProduct.price?.amount ?? payloadProduct.price ?? meta.price_cny ?? 0;
+      if (meta.price_cny && !raw) return meta.price_cny;
+      return money(toCny(raw, currency));
+    };
+    const orderTotalCny = (payload = {}, payloadProducts = []) => {
+      if (Number(payload.total_cny) > 0) return Number(payload.total_cny);
+      return payloadProducts.reduce((sum, product) => {
+        const meta = productMap.get(`${payload.store_id || ""}:${product.offer_id || ""}`) || {};
+        return sum + productPriceCny(product, meta) * Math.max(1, Number(product.quantity || 1));
+      }, 0);
+    };
+
+    for (const row of cacheRes.rows) {
+      const orderedAt = row.in_process_at ? new Date(row.in_process_at) : null;
+      if (!orderedAt || Number.isNaN(orderedAt.getTime())) continue;
+      const payload = { ...(row.payload || {}), store_id: String(row.store_id), status: row.status || row.payload?.status || "" };
+      const payloadProducts = Array.isArray(payload.products) ? payload.products : [];
+      const status = normalizeStatus(payload.status);
+      const inCurrent = orderedAt >= currentStart && orderedAt <= now;
+      const inPrevious = orderedAt >= previousStart && orderedAt < currentStart;
+      if (!inCurrent && !inPrevious) continue;
+
+      const gmv = money(orderTotalCny(payload, payloadProducts));
+      const deliveredProfit = status === "delivered" && Number.isFinite(Number(payload.profit_cny)) ? Number(payload.profit_cny) : null;
+      if (inCurrent) {
+        const storeRow = storeRanking.get(String(row.store_id));
+        if (storeRow) {
+          storeRow.gmv_cny += gmv;
+          storeRow.order_count += 1;
+          if (deliveredProfit != null) storeRow.profit_cny += deliveredProfit;
+        }
+        const dayKey = orderedAt.toISOString().slice(0, 10);
+        const bucket = trendBuckets.get(dayKey);
+        if (bucket) {
+          bucket.gmv_cny += gmv;
+          bucket.orders += 1;
+        }
+      }
+
+      for (const product of payloadProducts) {
+        const qty = Math.max(1, Number(product.quantity || 1));
+        const meta = productMap.get(`${String(row.store_id)}:${product.offer_id || ""}`) || {};
+        const lineTotal = money(productPriceCny(product, meta) * qty);
+        const productKey = `${String(row.store_id)}:${product.offer_id || product.sku || product.name || "unknown"}`;
+        const categoryProbe = meta.category_id ? meta : {
+          category_id: "uncategorized",
+          category_name: "",
+          category_name_zh: "未分类",
+        };
+        const cat = ensureCategory(categoryProbe, String(row.store_id));
+        if (inCurrent) {
+          cat.gmv_cny += lineTotal;
+          cat.units += qty;
+          cat.order_count += 1;
+          if (deliveredProfit != null && gmv > 0) cat.profit_cny += deliveredProfit * (lineTotal / gmv);
+          cat.top_product_keys.add(productKey);
+
+          const storeRow = storeRanking.get(String(row.store_id));
+          if (storeRow) {
+            storeRow.units += qty;
+            if (product.offer_id || product.sku) storeRow.moving_skus.add(String(product.offer_id || product.sku));
+          }
+          const dayKey = orderedAt.toISOString().slice(0, 10);
+          const bucket = trendBuckets.get(dayKey);
+          if (bucket) bucket.units += qty;
+          const band = bandFor(meta.price_cny || (lineTotal / qty));
+          band.sales_cny += lineTotal;
+          band.units += qty;
+
+          if (!products.has(productKey)) {
+            products.set(productKey, {
+              key: productKey,
+              store_id: String(row.store_id),
+              store_name: storeNameById.get(String(row.store_id)) || "",
+              offer_id: String(product.offer_id || ""),
+              sku: String(product.sku || meta.sku || ""),
+              name: productName(product, meta),
+              image: productImage(product, meta),
+              category_id: cat.category_id,
+              category_name_zh: cat.category_name_zh,
+              price_cny: meta.price_cny || money(lineTotal / qty),
+              gmv_cny: 0,
+              units: 0,
+              order_count: 0,
+              profit_cny: 0,
+              stock: Number(meta.stock || 0),
+            });
+          }
+          const pr = products.get(productKey);
+          pr.gmv_cny += lineTotal;
+          pr.units += qty;
+          pr.order_count += 1;
+          if (deliveredProfit != null && gmv > 0) pr.profit_cny += deliveredProfit * (lineTotal / gmv);
+        } else if (inPrevious) {
+          cat.previous_gmv_cny += lineTotal;
+        }
+      }
+    }
+
+    const categoryItems = [...categories.values()]
+      .map((row) => {
+        const growth = row.previous_gmv_cny > 0
+          ? (row.gmv_cny - row.previous_gmv_cny) / row.previous_gmv_cny
+          : (row.gmv_cny > 0 ? 1 : 0);
+        const margin = row.gmv_cny > 0 ? row.profit_cny / row.gmv_cny : 0;
+        const topProducts = [...products.values()]
+          .filter((product) => product.category_id === row.category_id)
+          .sort((a, b) => b.gmv_cny - a.gmv_cny)
+          .slice(0, 3);
+        return {
+          category_id: row.category_id,
+          category_name: row.category_name,
+          category_name_zh: row.category_name_zh,
+          gmv_cny: money(row.gmv_cny),
+          previous_gmv_cny: money(row.previous_gmv_cny),
+          growth_rate: Math.round(growth * 10000) / 100,
+          units: row.units,
+          order_count: row.order_count,
+          product_count: row.product_count,
+          store_count: row.stores.size,
+          profit_cny: money(row.profit_cny),
+          profit_rate: row.gmv_cny > 0 ? Math.round(margin * 10000) / 100 : null,
+          opportunity_score: Math.max(0, Math.min(100, Math.round((50 + growth * 30 + margin * 40 + Math.min(row.units, 100) * 0.1) * 10) / 10)),
+          top_products: topProducts.map((product) => ({
+            name: product.name,
+            image: product.image,
+            gmv_cny: money(product.gmv_cny),
+          })),
+        };
+      })
+      .sort((a, b) => b.gmv_cny - a.gmv_cny);
+    const productItems = [...products.values()]
+      .map((row) => ({
+        ...row,
+        gmv_cny: money(row.gmv_cny),
+        profit_cny: money(row.profit_cny),
+        profit_rate: row.gmv_cny > 0 ? Math.round((row.profit_cny / row.gmv_cny) * 10000) / 100 : null,
+      }))
+      .sort((a, b) => b.gmv_cny - a.gmv_cny)
+      .slice(0, 100);
+    const storeItems = [...storeRanking.values()]
+      .map((row) => ({
+        ...row,
+        moving_skus: row.moving_skus.size,
+        gmv_cny: money(row.gmv_cny),
+        profit_cny: money(row.profit_cny),
+        avg_order_cny: row.order_count > 0 ? money(row.gmv_cny / row.order_count) : 0,
+        profit_rate: row.gmv_cny > 0 ? Math.round((row.profit_cny / row.gmv_cny) * 10000) / 100 : null,
+      }))
+      .sort((a, b) => b.gmv_cny - a.gmv_cny);
+    const totalGmv = storeItems.reduce((sum, store) => sum + Number(store.gmv_cny || 0), 0);
+    const totalOrders = storeItems.reduce((sum, store) => sum + Number(store.order_count || 0), 0);
+    const totalUnits = storeItems.reduce((sum, store) => sum + Number(store.units || 0), 0);
+    const totalProfit = storeItems.reduce((sum, store) => sum + Number(store.profit_cny || 0), 0);
+    const movingSkus = new Set(productItems.filter((product) => product.units > 0).map((product) => product.key));
+
+    res.json({
+      success: true,
+      range_days: rangeDays,
+      stores: stores.map((store) => ({ id: store.id, name: store.name })),
+      summary: {
+        gmv_cny: money(totalGmv),
+        order_count: totalOrders,
+        units: totalUnits,
+        moving_skus: movingSkus.size,
+        avg_order_cny: totalOrders > 0 ? money(totalGmv / totalOrders) : 0,
+        profit_cny: money(totalProfit),
+        profit_rate: totalGmv > 0 ? Math.round((totalProfit / totalGmv) * 10000) / 100 : null,
+        active_products: storeItems.reduce((sum, store) => sum + Number(store.active_products || 0), 0),
+        stock_warning: storeItems.reduce((sum, store) => sum + Number(store.stock_warning || 0), 0),
+      },
+      categories: categoryItems,
+      products: productItems,
+      store_ranking: storeItems,
+      trends: [...trendBuckets.values()].map((row) => ({ ...row, gmv_cny: money(row.gmv_cny) })),
+      price_distribution: priceBands.map((band) => ({
+        label: band.label,
+        product_count: band.product_count,
+        sales_cny: money(band.sales_cny),
+        units: band.units,
+      })),
+      data_source: {
+        orders: "app_order_cache",
+        products: "app_products",
+        exchange_rate: effectiveRubCnyRate,
+        latest_order_sync_at: latestOrderSync ? new Date(latestOrderSync).toISOString() : null,
+        note: "自有店铺数据；不含第三方全市场数据。",
+      },
+    });
+  } catch (error) { next(error); }
+});
+
 function classifyChinaMarketItem(item = {}) {
   const country = String(item.origin_country || item.originCountry || '').trim();
   const delivery = String(item.delivery_text || item.deliveryText || '').trim();
@@ -2998,6 +3868,658 @@ function classifyChinaMarketItem(item = {}) {
     return { isChina: false, confidence: 0.65, evidence: `卖家名称特征:${seller}` };
   }
   return { isChina: false, confidence: 0, evidence: '' };
+}
+
+const PLATFORM_SNAPSHOT_SEEDS = [
+  { key: "beauty", label: "美妆个护", query: "косметика уход красота" },
+  { key: "fashion", label: "服饰鞋包", query: "одежда сумка рюкзак обувь" },
+  { key: "home", label: "家居家装", query: "товары для дома кухня хранение" },
+  { key: "digital", label: "手机数码", query: "чехол телефон наушники зарядка" },
+  { key: "sports", label: "运动户外", query: "спорт фитнес туризм" },
+  { key: "baby", label: "母婴玩具", query: "игрушки дети школа" },
+  { key: "auto", label: "汽摩五金", query: "авто инструменты ремонт" },
+  { key: "pets", label: "宠物用品", query: "товары для животных кошек собак" },
+  { key: "food", label: "食品饮料", query: "кофе чай продукты" },
+  { key: "health", label: "健康保健", query: "здоровье витамины аптечка" },
+];
+let platformSnapshotRefreshPromise = null;
+let lastPlatformSnapshotRefreshAt = 0;
+
+function decodeHtmlEntities(value = "") {
+  return String(value || "")
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseJsonLdBlocks(html = "") {
+  const blocks = [];
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = re.exec(String(html || "")))) {
+    const raw = decodeHtmlEntities(match[1]).trim();
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) blocks.push(...parsed);
+      else blocks.push(parsed);
+    } catch {
+      // Ozon occasionally ships malformed JSON-LD; meta tags still give usable basics.
+    }
+  }
+  return blocks;
+}
+
+function extractMetaContent(html = "", key = "") {
+  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const patterns = [
+    new RegExp(`<meta[^>]+property=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
+    new RegExp(`<meta[^>]+name=["']${escaped}["'][^>]+content=["']([^"']*)["'][^>]*>`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+property=["']${escaped}["'][^>]*>`, "i"),
+    new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+name=["']${escaped}["'][^>]*>`, "i"),
+  ];
+  for (const pattern of patterns) {
+    const match = String(html || "").match(pattern);
+    if (match?.[1]) return decodeHtmlEntities(match[1]);
+  }
+  return "";
+}
+
+function parseOzonNumber(value) {
+  const text = String(value ?? "").replace(/\s/g, "").replace(",", ".");
+  const match = text.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return null;
+  const n = Number(match[0]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeOzonSnapshotInput(value = "") {
+  const text = String(value || "").trim();
+  const url = normalizeOzonProductUrl(text) || normalizeOzonPageUrl(text);
+  const sku = extractOzonProductId(url || text) || (text.match(/\b\d{6,}\b/)?.[0] || "");
+  if (!sku) return null;
+  return {
+    sku,
+    url: url || `https://www.ozon.ru/product/${sku}/`,
+  };
+}
+
+async function fetchOzonPublicSnapshot(input) {
+  const normalized = normalizeOzonSnapshotInput(input);
+  if (!normalized) throw new Error("无法识别 Ozon 商品链接或 SKU");
+  const response = await fetch(normalized.url, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(20000),
+    headers: {
+      "user-agent": USER_AGENT,
+      accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "accept-language": "ru-RU,ru;q=0.9,en-US;q=0.7,en;q=0.6,zh-CN;q=0.5",
+    },
+  });
+  if (!response.ok) throw new Error(`Ozon 返回 ${response.status}`);
+  const html = await response.text();
+  const jsonLd = parseJsonLdBlocks(html);
+  const productLd = jsonLd.find((item) => {
+    const type = Array.isArray(item?.["@type"]) ? item["@type"].join(" ") : item?.["@type"];
+    return /Product/i.test(String(type || ""));
+  }) || {};
+  const breadcrumbLd = jsonLd.find((item) => {
+    const type = Array.isArray(item?.["@type"]) ? item["@type"].join(" ") : item?.["@type"];
+    return /BreadcrumbList/i.test(String(type || ""));
+  }) || {};
+  const title = decodeHtmlEntities(
+    productLd.name
+    || extractMetaContent(html, "og:title")
+    || html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+    || "",
+  ).replace(/\s*\|\s*OZON.*$/i, "");
+  const imageValue = productLd.image || extractMetaContent(html, "og:image") || "";
+  const mainImage = Array.isArray(imageValue) ? String(imageValue[0] || "") : String(imageValue || "");
+  const offer = Array.isArray(productLd.offers) ? productLd.offers[0] : productLd.offers || {};
+  const priceRub = parseOzonNumber(offer.price ?? extractMetaContent(html, "product:price:amount"));
+  const breadcrumbItems = Array.isArray(breadcrumbLd.itemListElement) ? breadcrumbLd.itemListElement : [];
+  const categories = breadcrumbItems
+    .map((entry) => decodeHtmlEntities(entry?.name || entry?.item?.name || ""))
+    .filter(Boolean)
+    .filter((name) => !/ozon/i.test(name));
+  const categoryName = categories.slice(-3).join(" / ");
+  const sellerName = decodeHtmlEntities(
+    html.match(/"sellerName"\s*:\s*"([^"]+)"/i)?.[1]
+    || html.match(/"brand"\s*:\s*\{\s*"@type"\s*:\s*"Brand"\s*,\s*"name"\s*:\s*"([^"]+)"/i)?.[1]
+    || productLd.brand?.name
+    || "",
+  );
+  const reviewCount = Math.max(0, Math.floor(Number(productLd.aggregateRating?.reviewCount || productLd.review?.length || 0) || 0));
+  return {
+    sku: normalized.sku,
+    title,
+    main_image: mainImage,
+    price_rub: priceRub,
+    monthly_sales: 0,
+    review_count: reviewCount,
+    seller_count: null,
+    category_id: "",
+    category_name: categoryName,
+    strategy_type: "hot",
+    ozon_url: normalized.url,
+    seller_name: sellerName,
+    origin_country: "",
+    delivery_text: "",
+    source_name: "ozon_public_page",
+    source_url: normalized.url,
+    source_captured_at: new Date().toISOString(),
+    source_payload: {
+      capture_method: "public_product_page",
+      coverage: {
+        title: Boolean(title),
+        price_rub: priceRub != null,
+        main_image: Boolean(mainImage),
+        category_name: Boolean(categoryName),
+        seller_name: Boolean(sellerName),
+        review_count: reviewCount > 0,
+        monthly_sales: false,
+        gmv_growth: false,
+        return_rate: false,
+      },
+      missing_metrics: ["monthly_sales", "gmv_growth", "sales_growth", "return_rate", "brand_share"],
+    },
+  };
+}
+
+function createPlatformSnapshotJob() {
+  return {
+    id: `platform-snapshot-${Date.now().toString(36)}`,
+    logs: [],
+    status: "running",
+    phase: "刷新 Ozon 平台样本",
+    cancelRequested: false,
+  };
+}
+
+function platformSearchUrl(seed = {}) {
+  if (seed.url) return seed.url;
+  const query = encodeURIComponent(seed.query || seed.label || seed.key || "");
+  return `https://www.ozon.ru/search/?text=${query}&sorting=rating`;
+}
+
+function mapOzonScrapeToPlatformSnapshot(ozon = {}, url = "", seed = {}) {
+  const sku = String(ozon.sku || extractOzonProductId(url) || "").replace(/[^\d]/g, "");
+  if (!sku) throw new Error("未识别到 Ozon SKU");
+  const imageUrl = pickOzonImageUrl(ozon);
+  const priceRub = parseOzonNumber(ozon.blackPriceRub || ozon.price || "");
+  const categoryName = String(seed.label || categoryNameZh("", seed.key || "") || "").trim();
+  return {
+    sku,
+    title: String(ozon.title || "").trim(),
+    main_image: imageUrl,
+    price_rub: priceRub,
+    monthly_sales: 0,
+    review_count: 0,
+    seller_count: Number.isFinite(Number(ozon.sellerOfferCount)) ? Math.max(0, Math.floor(Number(ozon.sellerOfferCount))) : null,
+    category_id: String(seed.key || ""),
+    category_name: categoryName,
+    strategy_type: "hot",
+    ozon_url: normalizeOzonProductUrl(url) || url || `https://www.ozon.ru/product/${sku}/`,
+    seller_name: "",
+    origin_country: "",
+    delivery_text: "",
+    source_name: "ozon_public_auto",
+    source_url: platformSearchUrl(seed),
+    source_captured_at: new Date().toISOString(),
+    source_payload: {
+      capture_method: "public_search_auto",
+      seed,
+      coverage: {
+        title: Boolean(ozon.title),
+        price_rub: priceRub != null,
+        main_image: Boolean(imageUrl),
+        category_name: Boolean(categoryName),
+        seller_name: false,
+        review_count: false,
+        monthly_sales: false,
+        gmv_growth: false,
+        return_rate: false,
+      },
+      missing_metrics: ["monthly_sales", "gmv_growth", "sales_growth", "return_rate", "brand_share"],
+      ozon_price_note: ozon.ozonPriceNote || "",
+    },
+  };
+}
+
+async function upsertPlatformSnapshotItem(item = {}) {
+  const classification = classifyChinaMarketItem(item);
+  const result = await db.query(
+    `INSERT INTO app_top_lists (sku,title,main_image,price_rub,monthly_sales,review_count,seller_count,category_id,category_name,strategy_type,ozon_url,seller_name,origin_country,delivery_text,is_china_origin,china_confidence,china_evidence,source_name,source_url,source_captured_at,source_payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb)
+     ON CONFLICT (sku) DO UPDATE SET title=COALESCE(NULLIF(EXCLUDED.title,''),app_top_lists.title),
+       main_image=COALESCE(NULLIF(EXCLUDED.main_image,''),app_top_lists.main_image),
+       price_rub=COALESCE(EXCLUDED.price_rub,app_top_lists.price_rub),
+       monthly_sales=GREATEST(EXCLUDED.monthly_sales, app_top_lists.monthly_sales),
+       review_count=GREATEST(EXCLUDED.review_count,app_top_lists.review_count),
+       seller_count=COALESCE(EXCLUDED.seller_count,app_top_lists.seller_count),
+       category_id=COALESCE(NULLIF(EXCLUDED.category_id,''),app_top_lists.category_id),
+       category_name=COALESCE(NULLIF(EXCLUDED.category_name,''),app_top_lists.category_name),
+       strategy_type=EXCLUDED.strategy_type,
+       ozon_url=EXCLUDED.ozon_url,
+       seller_name=COALESCE(NULLIF(EXCLUDED.seller_name,''),app_top_lists.seller_name),
+       origin_country=COALESCE(NULLIF(EXCLUDED.origin_country,''),app_top_lists.origin_country),
+       delivery_text=COALESCE(NULLIF(EXCLUDED.delivery_text,''),app_top_lists.delivery_text),
+       is_china_origin=EXCLUDED.is_china_origin,
+       china_confidence=EXCLUDED.china_confidence,
+       china_evidence=EXCLUDED.china_evidence,
+       source_name=EXCLUDED.source_name,
+       source_url=EXCLUDED.source_url,
+       source_captured_at=EXCLUDED.source_captured_at,
+       source_payload=EXCLUDED.source_payload,
+       active=TRUE,
+       updated_at=now()
+     RETURNING id, sku, title, price_rub, category_name, source_captured_at`,
+    [String(item.sku || ""), String(item.title || ""), String(item.main_image || ""), item.price_rub == null ? null : Number(item.price_rub),
+     Math.max(0, Math.floor(Number(item.monthly_sales || 0))), Math.max(0, Math.floor(Number(item.review_count || 0))),
+     Number.isFinite(Number(item.seller_count)) ? Math.max(0, Math.floor(Number(item.seller_count))) : null,
+     String(item.category_id || ""), String(item.category_name || item.category || ""), String(item.strategy_type || "hot"),
+     String(item.ozon_url || `https://www.ozon.ru/product/${item.sku}/`), String(item.seller_name || item.seller || ""),
+     String(item.origin_country || ""), String(item.delivery_text || ""), classification.isChina, classification.confidence, classification.evidence,
+     String(item.source_name || ""), String(item.source_url || ""), new Date(item.source_captured_at || Date.now()).toISOString(),
+     JSON.stringify(item.source_payload || item)],
+  );
+  return result.rows[0];
+}
+
+function percentFromMyErp(value) {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return n;
+}
+
+function numberFromMyErp(value) {
+  if (value == null || value === "") return 0;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function myErpGet(pathname, params = {}) {
+  if (!MYERP_API_TOKEN) {
+    const error = new Error("未配置 MYERP_API_TOKEN，无法同步 MY ERP 平台榜单数据");
+    error.code = "MYERP_TOKEN_MISSING";
+    throw error;
+  }
+  const url = new URL(`${MYERP_API_BASE_URL}${pathname}`);
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    url.searchParams.set(key, String(value));
+  }
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${MYERP_API_TOKEN}`,
+      Accept: "application/json",
+      "x-forwarded-host": "my.jizhangerp.com",
+    },
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text }; }
+  if (!res.ok) {
+    const error = new Error(data?.message || data?.error || `MY ERP API ${res.status}`);
+    error.status = res.status;
+    error.payload = data;
+    throw error;
+  }
+  return data;
+}
+
+async function upsertPlatformCategory(row = {}, meta = {}) {
+  const categoryId = String(row.cat3Id || row.cat2Id || row.cat1Id || row.categoryId || row.category_id || row.id || row.name || row.categoryName || "").trim();
+  const categoryName = String(row.cat3Name || row.cat2Name || row.cat1Name || row.categoryName || row.category_name || row.name || row.title || "").trim();
+  if (!categoryId && !categoryName) return null;
+  const categoryParentId = String(
+    row.cat3Id ? (row.cat2Id || row.cat1Id || "")
+      : row.cat2Id ? (row.cat1Id || "")
+        : (row.parentId || row.parent_id || row.categoryParentId || ""),
+  );
+  const categoryPath = [row.cat1Name, row.cat2Name, row.cat3Name].filter(Boolean).join(" / ")
+    || String(row.path || row.categoryPath || categoryName);
+  const salesUnits = numberFromMyErp(row.sales ?? row.salesUnits ?? row.monthlySales ?? row.monthly_sales);
+  const salesAmountRub = numberFromMyErp(row.salesAmount ?? row.sales_amount ?? row.gmv ?? row.gmvRub);
+  const avgPriceRub = row.avgPrice != null
+    ? numberFromMyErp(row.avgPrice)
+    : (salesUnits > 0 && salesAmountRub > 0 ? salesAmountRub / salesUnits : 0);
+  const sourceCapturedAt = row.updatedAt || row.capturedAt || meta.lastUpdate || meta.sourceCapturedAt || new Date().toISOString();
+  const capturedDate = new Date(sourceCapturedAt);
+  const safeCapturedAt = Number.isNaN(capturedDate.getTime()) ? new Date() : capturedDate;
+  const snapshotDate = row.snapshotDate || row.snapshot_date || meta.snapshotDate || safeCapturedAt.toISOString().slice(0, 10);
+  const categoryZh = categoryNameZh(categoryName, categoryId);
+  const result = await db.query(
+    `INSERT INTO app_platform_categories (
+       source_name, source_url, period, snapshot_date, category_id, category_parent_id, category_name, category_name_zh,
+       category_path, level, sales_units, sales_amount_rub, gmv_growth, avg_price_rub, price_growth, sellers, brands,
+       brand_rate, leader_share, fbs_rate, buyout_rate, return_rate, source_captured_at, source_payload
+     ) VALUES (
+       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24::jsonb
+     )
+     ON CONFLICT (source_name, period, snapshot_date, category_id) DO UPDATE SET
+       source_url=EXCLUDED.source_url,
+       category_parent_id=EXCLUDED.category_parent_id,
+       category_name=EXCLUDED.category_name,
+       category_name_zh=EXCLUDED.category_name_zh,
+       category_path=EXCLUDED.category_path,
+       level=EXCLUDED.level,
+       sales_units=EXCLUDED.sales_units,
+       sales_amount_rub=EXCLUDED.sales_amount_rub,
+       gmv_growth=EXCLUDED.gmv_growth,
+       avg_price_rub=EXCLUDED.avg_price_rub,
+       price_growth=EXCLUDED.price_growth,
+       sellers=EXCLUDED.sellers,
+       brands=EXCLUDED.brands,
+       brand_rate=EXCLUDED.brand_rate,
+       leader_share=EXCLUDED.leader_share,
+       fbs_rate=EXCLUDED.fbs_rate,
+       buyout_rate=EXCLUDED.buyout_rate,
+       return_rate=EXCLUDED.return_rate,
+       source_captured_at=EXCLUDED.source_captured_at,
+       source_payload=EXCLUDED.source_payload,
+       active=TRUE,
+       updated_at=now()
+     RETURNING id, category_id`,
+    [
+      String(meta.sourceName || "myerp_category_analysis"),
+      String(meta.sourceUrl || `${MYERP_API_BASE_URL}/ozon/category-analysis/lists`),
+      String(meta.period || MYERP_PLATFORM_PERIOD),
+      snapshotDate,
+      categoryId || categoryName,
+      categoryParentId,
+      categoryName,
+      categoryZh,
+      categoryPath,
+      Math.max(1, Math.floor(Number(row.level || meta.level || 1))),
+      salesUnits,
+      salesAmountRub,
+      percentFromMyErp(row.gmvGrowth ?? row.gmv_growth),
+      avgPriceRub || null,
+      percentFromMyErp(row.priceGrowth ?? row.price_growth),
+      row.sellers == null ? null : numberFromMyErp(row.sellers),
+      row.brands == null ? null : numberFromMyErp(row.brands),
+      percentFromMyErp(row.brandRate ?? row.brand_rate),
+      percentFromMyErp(row.leaderShare ?? row.leader_share),
+      percentFromMyErp(row.fbsRate ?? row.fbs_rate),
+      percentFromMyErp(row.buyout ?? row.buyoutRate ?? row.buyout_rate),
+      percentFromMyErp(row.returnRate ?? row.return_rate),
+      safeCapturedAt.toISOString(),
+      JSON.stringify(row),
+    ],
+  );
+  return result.rows[0];
+}
+
+async function syncMyErpCategoryAnalysis(options = {}) {
+  if (!db) throw new Error("数据库未连接");
+  const period = String(options.period || MYERP_PLATFORM_PERIOD || "monthly");
+  const pageSize = Math.min(100, Math.max(20, Number(options.pageSize || 100)));
+  const fallbackPages = Math.min(200, Math.max(1, Number(options.pages || MYERP_PLATFORM_SYNC_PAGES || 5)));
+  const maxRequests = Math.min(1000, Math.max(10, Number(options.maxRequests || MYERP_PLATFORM_SYNC_MAX_REQUESTS)));
+  let imported = 0;
+  let total = 0;
+  let lastUpdate = null;
+  let requests = 0;
+  const savedKeys = new Set();
+
+  const rowKey = (row = {}) => String(row.cat3Id || row.cat2Id || row.cat1Id || row.categoryId || row.id || "");
+  const fetchCategoryRows = async (filters = {}) => {
+    const rows = [];
+    let endpointTotal = 0;
+    for (let page = 1; page <= fallbackPages; page += 1) {
+      if (requests >= maxRequests) {
+        throw new Error(`MY ERP 类目同步请求超过上限 ${maxRequests}，已停止以避免接口异常循环`);
+      }
+      requests += 1;
+      const data = await myErpGet("/ozon/category-analysis/lists", {
+        period,
+        page,
+        page_size: pageSize,
+        sort_by: "sales",
+        sort_order: "desc",
+        ...filters,
+      });
+      const list = Array.isArray(data?.list) ? data.list : Array.isArray(data?.data?.list) ? data.data.list : [];
+      endpointTotal = Number(data?.total || data?.data?.total || endpointTotal || list.length);
+      lastUpdate = data?.lastUpdate || data?.data?.lastUpdate || data?.snapshotDate || lastUpdate;
+      rows.push(...list);
+      if (!list.length || page * pageSize >= endpointTotal) break;
+    }
+    total += rows.length;
+    return rows;
+  };
+
+  const saveRows = async (rows = []) => {
+    for (const row of rows) {
+      const key = `${row.snapshotDate || ""}:${rowKey(row)}`;
+      if (savedKeys.has(key)) continue;
+      const saved = await upsertPlatformCategory(row, { period, lastUpdate });
+      if (saved) {
+        savedKeys.add(key);
+        imported += 1;
+      }
+    }
+  };
+
+  const level1Rows = await fetchCategoryRows();
+  await saveRows(level1Rows);
+
+  for (const level1 of level1Rows) {
+    const category1 = String(level1.cat1Id || "").trim();
+    if (!category1) continue;
+    const level2Rows = await fetchCategoryRows({ category1 });
+    await saveRows(level2Rows);
+
+    for (const level2 of level2Rows) {
+      const category2 = String(level2.cat2Id || "").trim();
+      if (!category2) continue;
+      const level3Rows = await fetchCategoryRows({ category1, category2 });
+      await saveRows(level3Rows);
+    }
+  }
+  return { imported, total, period, lastUpdate, requests, configured: Boolean(MYERP_API_TOKEN) };
+}
+
+async function refreshOzonPlatformSnapshots(options = {}) {
+  if (!db) throw new Error("数据库未连接");
+  if (platformSnapshotRefreshPromise) return platformSnapshotRefreshPromise;
+  platformSnapshotRefreshPromise = (async () => {
+    const limit = Math.min(200, Math.max(10, Number(options.limit || PLATFORM_SNAPSHOT_DEFAULT_LIMIT)));
+    const perSeed = Math.max(3, Math.ceil(limit / PLATFORM_SNAPSHOT_SEEDS.length));
+    const job = createPlatformSnapshotJob();
+    const context = await getBrowserContext({ headless: true });
+    const seenUrls = new Set();
+    const imported = [];
+    const errors = [];
+    try {
+      for (const seed of PLATFORM_SNAPSHOT_SEEDS) {
+        if (seenUrls.size >= limit) break;
+        const sourceUrl = platformSearchUrl(seed);
+        let urls = [];
+        try {
+          urls = await discoverOzonProductUrls(context, sourceUrl, job, perSeed);
+        } catch (error) {
+          errors.push({ seed: seed.label, stage: "discover", error: error.message });
+          continue;
+        }
+        for (const url of urls) {
+          if (seenUrls.size >= limit) break;
+          const normalizedUrl = normalizeOzonProductUrl(url);
+          if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
+          seenUrls.add(normalizedUrl);
+          try {
+            let item;
+            try {
+              item = await fetchOzonPublicSnapshot(normalizedUrl);
+              item.category_id ||= seed.key;
+              item.category_name ||= seed.label;
+              item.source_name = "ozon_public_auto";
+              item.source_url = sourceUrl;
+              item.source_payload = { ...(item.source_payload || {}), seed, capture_method: "public_search_auto" };
+            } catch {
+              const ozon = await scrapeOzonProduct(context, normalizedUrl, job.id, imported.length + 1);
+              item = mapOzonScrapeToPlatformSnapshot(ozon, normalizedUrl, seed);
+            }
+            const row = await upsertPlatformSnapshotItem(item);
+            imported.push({ ...row, category_name_zh: categoryNameZh(row.category_name, item.category_id || "") });
+            await sleep(randomInt(350, 900));
+          } catch (error) {
+            errors.push({ url: normalizedUrl, stage: "detail", error: error.message });
+          }
+        }
+      }
+      lastPlatformSnapshotRefreshAt = Date.now();
+      return { imported: imported.length, failed: errors.length, items: imported, errors: errors.slice(0, 30), logs: job.logs.slice(-80) };
+    } finally {
+      platformSnapshotRefreshPromise = null;
+    }
+  })();
+  return platformSnapshotRefreshPromise;
+}
+
+async function discoverOzonProductsFromPlatformCategories(options = {}) {
+  if (!db) throw new Error("数据库未连接");
+  const categoryIds = Array.isArray(options.categoryIds)
+    ? options.categoryIds.map(String).map((value) => value.trim()).filter(Boolean)
+    : [];
+  const search = String(options.search || "").trim();
+  const categoryLimit = Math.min(8, Math.max(1, Number(options.categoryLimit || (categoryIds.length ? categoryIds.length : 3))));
+  const perCategory = Math.min(12, Math.max(1, Number(options.perCategory || 6)));
+  const totalLimit = Math.min(80, Math.max(1, Number(options.limit || categoryLimit * perCategory)));
+  const args = [];
+  const where = ["c.active=TRUE"];
+  if (categoryIds.length) {
+    args.push(categoryIds);
+    where.push(`c.id=ANY($${args.length}::uuid[])`);
+  } else if (search) {
+    args.push(search);
+    where.push(`(c.category_id ILIKE '%' || $${args.length} || '%' OR c.category_name ILIKE '%' || $${args.length} || '%' OR c.category_name_zh ILIKE '%' || $${args.length} || '%' OR c.category_path ILIKE '%' || $${args.length} || '%')`);
+  }
+  const categories = await db.query(
+    `WITH latest_platform_category AS (
+       SELECT MAX(source_captured_at) AS latest_at
+         FROM app_platform_categories
+        WHERE active=TRUE
+     )
+     SELECT c.id, c.category_id, c.category_name, c.category_name_zh, c.category_path, c.sales_units, c.sales_amount_rub
+       FROM app_platform_categories c
+       JOIN latest_platform_category l ON c.source_captured_at = l.latest_at
+      WHERE ${where.join(" AND ")}
+      ORDER BY c.sales_units DESC, c.sales_amount_rub DESC, c.updated_at DESC
+      LIMIT $${args.length + 1}`,
+    [...args, categoryLimit],
+  );
+  if (!categories.rowCount) {
+    return { imported: 0, failed: 0, items: [], errors: [], categories: [], note: "没有可用于发现商品的 Ozon 平台类目数据。" };
+  }
+
+  const context = await getBrowserContext({ headless: true });
+  const job = createPlatformSnapshotJob();
+  job.phase = "按类目发现 Ozon 商品";
+  const seenUrls = new Set();
+  const imported = [];
+  const errors = [];
+  const usedCategories = [];
+  try {
+    for (const category of categories.rows) {
+      if (seenUrls.size >= totalLimit) break;
+      const label = category.category_name_zh || categoryNameZh(category.category_name, category.category_id) || category.category_name;
+      const queries = categorySearchTerms(category.category_name, category.category_name_zh, category.category_path);
+      if (!queries.length) continue;
+      usedCategories.push({ id: category.id, category_id: category.category_id, label, queries });
+      for (const query of queries) {
+        if (seenUrls.size >= totalLimit) break;
+        const remaining = Math.max(1, Math.min(perCategory, totalLimit - seenUrls.size));
+        const seed = {
+          key: category.category_id,
+          label,
+          query,
+          source_category_id: category.id,
+          category_path: category.category_path,
+        };
+        let urls = [];
+        try {
+          urls = await discoverOzonProductUrls(context, platformSearchUrl(seed), job, remaining);
+        } catch (error) {
+          errors.push({ category: label, query, stage: "discover", error: error.message });
+          continue;
+        }
+        if (!urls.length) {
+          errors.push({
+            category: label,
+            query,
+            stage: "discover",
+            error: "Ozon 公共搜索没有返回商品链接，常见原因是服务器访问 Ozon 被重定向、风控或地区限制。",
+          });
+        }
+        for (const url of urls) {
+          if (seenUrls.size >= totalLimit) break;
+          const normalizedUrl = normalizeOzonProductUrl(url);
+          if (!normalizedUrl || seenUrls.has(normalizedUrl)) continue;
+          seenUrls.add(normalizedUrl);
+          try {
+            let item;
+            try {
+              item = await fetchOzonPublicSnapshot(normalizedUrl);
+              item.category_id ||= category.category_id;
+              item.category_name ||= label;
+              item.source_name = "ozon_public_category_discovery";
+              item.source_url = platformSearchUrl(seed);
+              item.source_payload = { ...(item.source_payload || {}), seed, capture_method: "public_category_discovery" };
+            } catch {
+              const ozon = await scrapeOzonProduct(context, normalizedUrl, job.id, imported.length + 1);
+              item = mapOzonScrapeToPlatformSnapshot(ozon, normalizedUrl, seed);
+              item.source_name = "ozon_public_category_discovery";
+            }
+            const row = await upsertPlatformSnapshotItem(item);
+            imported.push({ ...row, category_name_zh: categoryNameZh(row.category_name, item.category_id || "") });
+            await sleep(randomInt(260, 720));
+          } catch (error) {
+            errors.push({ url: normalizedUrl, query, stage: "detail", error: error.message });
+          }
+        }
+      }
+    }
+    return {
+      success: imported.length > 0,
+      code: imported.length ? "PRODUCT_DISCOVERY_IMPORTED" : "PRODUCT_LEVEL_SOURCE_UNAVAILABLE",
+      imported: imported.length,
+      failed: errors.length,
+      items: imported,
+      categories: usedCategories,
+      errors: errors.slice(0, 30),
+      logs: job.logs.slice(-80),
+      note: imported.length
+        ? "已按类目发现商品级 Ozon 候选，可勾选后加入自动上架队列。"
+        : "现在没有商品级榜单数据：系统已拿到 Ozon/MY ERP 类目机会，但测试服务器无法从 Ozon 公共搜索稳定抓到商品。需要接入 Ozon Seller 分析页采集端或第三方商品榜单源后，才能自动选品上架。",
+    };
+  } finally {
+    job.status = imported.length ? "done" : "error";
+  }
+}
+
+async function maybeRefreshOzonPlatformSnapshots(reason = "auto") {
+  if (!db || platformSnapshotRefreshPromise) return null;
+  const stats = await db.query(
+    `SELECT COUNT(*)::int AS total, MAX(source_captured_at) AS latest_captured_at
+       FROM app_top_lists WHERE active=TRUE`,
+  ).catch(() => ({ rows: [{}] }));
+  const total = Number(stats.rows[0]?.total || 0);
+  const latest = stats.rows[0]?.latest_captured_at ? new Date(stats.rows[0].latest_captured_at).getTime() : 0;
+  const stale = !latest || Date.now() - latest > PLATFORM_SNAPSHOT_STALE_MS;
+  if (total >= 30 && !stale && reason !== "manual") return null;
+  return refreshOzonPlatformSnapshots({ reason }).catch((error) => {
+    console.warn(`[platform-snapshot] refresh failed: ${error.message}`);
+    return null;
+  });
 }
 
 app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
@@ -3024,7 +4546,609 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
       [...args, limit, offset],
     );
     const freshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_top_lists WHERE active=TRUE`);
-    res.json({ success: true, items: rows.rows, total: count.rows[0]?.total || 0, freshness: freshness.rows[0] || {}, source_policy: 'independent_verified_import' });
+    const items = rows.rows.map((row) => ({
+      ...row,
+      row_type: "product",
+      category_name_zh: categoryNameZh(row.category_name, row.category_id),
+    }));
+    const productTotal = Number(count.rows[0]?.total || 0);
+    if (productTotal > 0) {
+      return res.json({ success: true, items, total: productTotal, freshness: freshness.rows[0] || {}, source_policy: 'independent_verified_import' });
+    }
+
+    const categoryArgs = [];
+    const categoryWhere = ["c.active=TRUE"];
+    if (category) {
+      categoryArgs.push(category);
+      categoryWhere.push(`(c.category_id=$${categoryArgs.length} OR c.category_name ILIKE '%' || $${categoryArgs.length} || '%' OR c.category_name_zh ILIKE '%' || $${categoryArgs.length} || '%')`);
+    }
+    if (search) {
+      categoryArgs.push(search);
+      categoryWhere.push(`(c.category_id ILIKE '%' || $${categoryArgs.length} || '%' OR c.category_name ILIKE '%' || $${categoryArgs.length} || '%' OR c.category_name_zh ILIKE '%' || $${categoryArgs.length} || '%' OR c.category_path ILIKE '%' || $${categoryArgs.length} || '%')`);
+    }
+    const categoryCount = await db.query(
+      `WITH latest_platform_category AS (
+         SELECT MAX(source_captured_at) AS latest_at
+           FROM app_platform_categories
+          WHERE active=TRUE
+       )
+       SELECT COUNT(*)::int AS total
+         FROM app_platform_categories c
+         JOIN latest_platform_category l ON c.source_captured_at = l.latest_at
+        WHERE ${categoryWhere.join(" AND ")}`,
+      categoryArgs,
+    );
+    const categoryRows = await db.query(
+      `WITH latest_platform_category AS (
+         SELECT MAX(source_captured_at) AS latest_at
+           FROM app_platform_categories
+          WHERE active=TRUE
+       )
+       SELECT c.id,
+              'category:' || c.category_id AS sku,
+              c.category_name AS title,
+              '' AS main_image,
+              c.avg_price_rub AS price_rub,
+              FLOOR(c.sales_units)::int AS monthly_sales,
+              0 AS review_count,
+              FLOOR(COALESCE(c.sellers, 0))::int AS seller_count,
+              c.category_id,
+              c.category_name,
+              c.category_name_zh,
+              'hot' AS strategy_type,
+              c.source_url AS ozon_url,
+              '' AS seller_name,
+              '' AS origin_country,
+              c.source_name,
+              c.source_url,
+              c.source_captured_at,
+              c.updated_at,
+              c.sales_amount_rub,
+              c.gmv_growth,
+              c.price_growth,
+              c.return_rate,
+              c.leader_share,
+              c.brands
+         FROM app_platform_categories c
+         JOIN latest_platform_category l ON c.source_captured_at = l.latest_at
+        WHERE ${categoryWhere.join(" AND ")}
+        ORDER BY c.sales_units DESC, c.sales_amount_rub DESC, c.updated_at DESC
+        LIMIT $${categoryArgs.length + 1} OFFSET $${categoryArgs.length + 2}`,
+      [...categoryArgs, limit, offset],
+    );
+    const categoryFreshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_platform_categories WHERE active=TRUE`);
+    const categoryItems = categoryRows.rows.map((row) => ({
+      ...row,
+      row_type: "category",
+      title: row.category_name_zh || categoryNameZh(row.category_name, row.category_id) || row.category_name || row.sku,
+      category_name_zh: row.category_name_zh || categoryNameZh(row.category_name, row.category_id),
+    }));
+    return res.json({
+      success: true,
+      items: categoryItems,
+      total: Number(categoryCount.rows[0]?.total || 0),
+      freshness: categoryFreshness.rows[0] || {},
+      source_policy: 'myerp_ozon_platform_category_fallback',
+      note: "当前没有商品级平台榜单，先展示 MY ERP/Ozon 平台类目机会数据。",
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/discover-products", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const categoryIds = Array.isArray(req.body?.category_ids || req.body?.categoryIds)
+      ? (req.body.category_ids || req.body.categoryIds)
+      : [];
+    const result = await discoverOzonProductsFromPlatformCategories({
+      categoryIds,
+      search: req.body?.search,
+      categoryLimit: req.body?.category_limit || req.body?.categoryLimit,
+      perCategory: req.body?.per_category || req.body?.perCategory,
+      limit: req.body?.limit,
+    });
+    res.status(result.imported ? 200 : 207).json({ success: result.imported > 0, ...result });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/sourcing/platform-snapshot/status", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const stats = await db.query(
+	      `SELECT COUNT(*)::int AS total,
+	              COUNT(*) FILTER (WHERE monthly_sales > 0)::int AS with_sales,
+	              COUNT(*) FILTER (WHERE price_rub IS NOT NULL AND price_rub > 0)::int AS with_price,
+	              COUNT(*) FILTER (WHERE title <> '')::int AS with_title,
+	              COUNT(*) FILTER (WHERE category_name <> '')::int AS with_category,
+	              COUNT(*) FILTER (WHERE source_name = 'ozon_public_page')::int AS public_page_rows,
+	              MAX(source_captured_at) AS latest_captured_at
+	         FROM app_top_lists
+	        WHERE active = TRUE`,
+    );
+    const categoryStats = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE sales_units > 0)::int AS with_sales,
+              COUNT(*) FILTER (WHERE sales_amount_rub > 0)::int AS with_gmv,
+              COUNT(*) FILTER (WHERE category_name_zh <> '')::int AS with_chinese_name,
+              MAX(source_captured_at) AS latest_captured_at
+         FROM app_platform_categories
+        WHERE active = TRUE`,
+    );
+    const bySource = await db.query(
+      `SELECT source_name, COUNT(*)::int AS total, MAX(source_captured_at) AS latest_captured_at
+         FROM app_top_lists
+        WHERE active = TRUE
+        GROUP BY source_name
+        ORDER BY total DESC, source_name ASC
+        LIMIT 12`,
+    );
+    res.json({
+      success: true,
+      stats: {
+        ...(stats.rows[0] || {}),
+        platform_category_total: categoryStats.rows[0]?.total || 0,
+        platform_category_with_sales: categoryStats.rows[0]?.with_sales || 0,
+        platform_category_with_gmv: categoryStats.rows[0]?.with_gmv || 0,
+        platform_category_with_chinese_name: categoryStats.rows[0]?.with_chinese_name || 0,
+        platform_category_latest_captured_at: categoryStats.rows[0]?.latest_captured_at || null,
+        myerp_configured: Boolean(MYERP_API_TOKEN),
+        myerp_api_base_url: MYERP_API_BASE_URL,
+      },
+      sources: bySource.rows || [],
+      refreshing: Boolean(platformSnapshotRefreshPromise),
+      note: MYERP_API_TOKEN
+        ? "平台大盘数据来自已配置的 MY ERP 榜单接口；不使用自己店铺订单。"
+        : "未配置 MYERP_API_TOKEN，测试环境无法读取 MY ERP/Ozon 平台榜单数据。",
+    });
+    const total = Number(stats.rows[0]?.total || 0);
+    const latest = stats.rows[0]?.latest_captured_at ? new Date(stats.rows[0].latest_captured_at).getTime() : 0;
+    if (PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS > 0 && !MYERP_API_TOKEN && !platformSnapshotRefreshPromise && (total < 30 || !latest || Date.now() - latest > PLATFORM_SNAPSHOT_STALE_MS)) {
+      setTimeout(() => maybeRefreshOzonPlatformSnapshots("status-auto"), 100).unref?.();
+    }
+  } catch (error) { next(error); }
+});
+
+app.get("/api/sourcing/platform-data-source/status", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const stats = await db.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE sales_units > 0)::int AS with_sales,
+              COUNT(*) FILTER (WHERE sales_amount_rub > 0)::int AS with_gmv,
+              COUNT(DISTINCT snapshot_date)::int AS snapshot_days,
+              MAX(source_captured_at) AS latest_captured_at
+         FROM app_platform_categories
+        WHERE active = TRUE`,
+    );
+    res.json({
+      success: true,
+      configured: Boolean(MYERP_API_TOKEN),
+      source: "myerp_category_analysis",
+      api_base_url: MYERP_API_BASE_URL,
+      period: MYERP_PLATFORM_PERIOD,
+      stats: stats.rows[0] || {},
+      note: MYERP_API_TOKEN
+        ? "已配置平台榜单数据源，可同步 MY ERP 的 Ozon 类目分析数据。"
+        : "未配置 MYERP_API_TOKEN，不能读取 MY ERP 的 Ozon 平台榜单接口。",
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/platform-data-source/sync", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    if (req.user.role !== "admin") return res.status(403).json({ success: false, error: "仅管理员可同步平台数据源" });
+    if (!MYERP_API_TOKEN) {
+      return res.status(400).json({
+        success: false,
+        code: "MYERP_TOKEN_MISSING",
+        error: "测试环境未配置 MYERP_API_TOKEN，无法读取 MY ERP 的 Ozon 平台榜单数据。",
+      });
+    }
+    const result = await syncMyErpCategoryAnalysis({
+      period: req.body?.period || MYERP_PLATFORM_PERIOD,
+      pages: req.body?.pages || MYERP_PLATFORM_SYNC_PAGES,
+      pageSize: req.body?.page_size || req.body?.pageSize || 100,
+    });
+    res.json({ success: true, ...result });
+  } catch (error) { next(error); }
+});
+
+function autoListingScore(row = {}) {
+  const sales = Math.max(0, Number(row.monthly_sales || row.sales_units || 0));
+  const reviews = Math.max(0, Number(row.review_count || 0));
+  const sellers = Math.max(0, Number(row.seller_count || row.sellers || 0));
+  const price = Math.max(0, Number(row.price_rub || row.avg_price_rub || 0));
+  const demand = Math.min(45, Math.log10(sales + 1) * 18);
+  const proof = Math.min(20, Math.log10(reviews + 1) * 7);
+  const competition = sellers > 0 ? Math.max(0, 22 - Math.log10(sellers + 1) * 9) : 12;
+  const priceFit = price > 0 ? Math.max(0, 13 - Math.abs(price - 1200) / 180) : 4;
+  return Math.max(0, Math.min(100, Math.round((demand + proof + competition + priceFit) * 10) / 10));
+}
+
+async function insertAutoListingEvent({ userId, storeId, itemId, eventType = "info", stage = "", message = "", payload = {} }) {
+  if (!db || !itemId) return;
+  await db.query(
+    `INSERT INTO app_auto_listing_events (user_id, store_id, item_id, event_type, stage, message, payload)
+     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)`,
+    [userId, storeId, itemId, eventType, stage, message, JSON.stringify(payload || {})],
+  );
+}
+
+const AUTO_LISTING_STAGES = [
+  ["discovered", "已发现"],
+  ["collected", "已采集"],
+  ["sourcing", "1688 找货"],
+  ["materials", "资料完成"],
+  ["images", "图片完成"],
+  ["pricing", "核价完成"],
+  ["ready", "待上架"],
+  ["submitted", "已提交 Ozon"],
+  ["ozon_fix", "Ozon 待更正"],
+  ["listed", "已上架"],
+];
+
+app.get("/api/auto-listing/settings", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query.store_id || req.query.storeId || "").split(",")[0].trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id");
+    const result = await db.query(
+      `INSERT INTO app_auto_listing_settings (user_id, store_id)
+       VALUES ($1,$2)
+       ON CONFLICT (user_id, store_id) DO UPDATE SET updated_at = app_auto_listing_settings.updated_at
+       RETURNING *`,
+      [req.user.id, storeId],
+    );
+    res.json({ success: true, settings: result.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.put("/api/auto-listing/settings", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id");
+    const dailyQuota = Math.min(500, Math.max(1, Number(req.body?.daily_quota || req.body?.dailyQuota || 30)));
+    const minProfitRate = Math.max(0, Math.min(5, Number(req.body?.min_profit_rate ?? req.body?.minProfitRate ?? 0.2)));
+    const maxAiCostCny = Math.max(0, Number(req.body?.max_ai_cost_cny ?? req.body?.maxAiCostCny ?? 50));
+    const result = await db.query(
+      `INSERT INTO app_auto_listing_settings (user_id, store_id, enabled, daily_quota, min_profit_rate, max_ai_cost_cny, submit_to_ozon, rules)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+       ON CONFLICT (user_id, store_id) DO UPDATE SET
+         enabled=EXCLUDED.enabled, daily_quota=EXCLUDED.daily_quota, min_profit_rate=EXCLUDED.min_profit_rate,
+         max_ai_cost_cny=EXCLUDED.max_ai_cost_cny, submit_to_ozon=EXCLUDED.submit_to_ozon,
+         rules=EXCLUDED.rules, updated_at=now()
+       RETURNING *`,
+      [
+        req.user.id,
+        storeId,
+        Boolean(req.body?.enabled),
+        Math.round(dailyQuota),
+        minProfitRate,
+        maxAiCostCny,
+        Boolean(req.body?.submit_to_ozon || req.body?.submitToOzon),
+        JSON.stringify(req.body?.rules && typeof req.body.rules === "object" ? req.body.rules : {}),
+      ],
+    );
+    res.json({ success: true, settings: result.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/auto-listing/dashboard", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query.store_id || req.query.storeId || "").split(",")[0].trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id, name");
+    const settingsRes = await db.query(
+      `INSERT INTO app_auto_listing_settings (user_id, store_id)
+       VALUES ($1,$2)
+       ON CONFLICT (user_id, store_id) DO UPDATE SET updated_at = app_auto_listing_settings.updated_at
+       RETURNING *`,
+      [req.user.id, storeId],
+    );
+    const countsRes = await db.query(
+      `SELECT stage, status, COUNT(*)::int AS count
+         FROM app_auto_listing_items
+        WHERE user_id=$1 AND store_id=$2
+        GROUP BY stage, status`,
+      [req.user.id, storeId],
+    );
+    const todayRes = await db.query(
+      `SELECT COUNT(*)::int AS total
+         FROM app_auto_listing_items
+        WHERE user_id=$1 AND store_id=$2 AND created_at >= date_trunc('day', now())`,
+      [req.user.id, storeId],
+    );
+    const processingRes = await db.query(
+      `SELECT id, source_sku, title, main_image, category_name_zh, stage, status, risk_level, human_reason, updated_at
+         FROM app_auto_listing_items
+        WHERE user_id=$1 AND store_id=$2 AND status IN ('queued','running','needs_human')
+        ORDER BY updated_at DESC LIMIT 8`,
+      [req.user.id, storeId],
+    );
+    const eventRes = await db.query(
+      `SELECT e.*, i.source_sku, i.title
+         FROM app_auto_listing_events e
+         JOIN app_auto_listing_items i ON i.id=e.item_id
+        WHERE e.user_id=$1 AND e.store_id=$2
+        ORDER BY e.created_at DESC LIMIT 20`,
+      [req.user.id, storeId],
+    );
+    const stageCounts = Object.fromEntries(AUTO_LISTING_STAGES.map(([key]) => [key, 0]));
+    const statusCounts = { queued: 0, running: 0, paused: 0, needs_human: 0, failed: 0, done: 0 };
+    for (const row of countsRes.rows) {
+      stageCounts[row.stage] = (stageCounts[row.stage] || 0) + Number(row.count || 0);
+      statusCounts[row.status] = (statusCounts[row.status] || 0) + Number(row.count || 0);
+    }
+    const settings = settingsRes.rows[0];
+    const todayTotal = Number(todayRes.rows[0]?.total || 0);
+    res.json({
+      success: true,
+      settings,
+      today: { created: todayTotal, quota: Number(settings.daily_quota || 30), percent: Math.min(100, Math.round(todayTotal * 100 / Math.max(1, Number(settings.daily_quota || 30)))) },
+      cards: {
+        managed: Object.values(stageCounts).reduce((sum, n) => sum + Number(n || 0), 0),
+        processing: statusCounts.queued + statusCounts.running,
+        ozon_ready: stageCounts.listed,
+        needs_human: statusCounts.needs_human + statusCounts.failed,
+        store_quota_left: Math.max(0, Number(settings.daily_quota || 30) - todayTotal),
+        ai_cost_cny: 0,
+      },
+      stages: AUTO_LISTING_STAGES.map(([key, label]) => ({ key, label, count: stageCounts[key] || 0 })),
+      status_counts: statusCounts,
+      processing_items: processingRes.rows,
+      events: eventRes.rows,
+    });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/auto-listing/items", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query.store_id || req.query.storeId || "").split(",")[0].trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id");
+    const stage = String(req.query.stage || "all").trim();
+    const search = String(req.query.search || "").trim();
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 30)));
+    const offset = Math.max(0, Number(req.query.offset || 0));
+    const args = [req.user.id, storeId];
+    const where = ["user_id=$1", "store_id=$2"];
+    if (stage !== "all") { args.push(stage); where.push(`stage=$${args.length}`); }
+    if (search) {
+      args.push(`%${search}%`);
+      where.push(`(source_sku ILIKE $${args.length} OR title ILIKE $${args.length} OR category_name_zh ILIKE $${args.length})`);
+    }
+    const count = await db.query(`SELECT COUNT(*)::int AS total FROM app_auto_listing_items WHERE ${where.join(" AND ")}`, args);
+    const rows = await db.query(
+      `SELECT * FROM app_auto_listing_items WHERE ${where.join(" AND ")}
+       ORDER BY updated_at DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
+      [...args, limit, offset],
+    );
+    res.json({ success: true, items: rows.rows, total: Number(count.rows[0]?.total || 0), stages: AUTO_LISTING_STAGES });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/auto-listing/discover", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id");
+    const sourceIds = Array.isArray(req.body?.source_ids || req.body?.sourceIds) ? (req.body.source_ids || req.body.sourceIds).map(String) : [];
+    const limit = Math.min(100, Math.max(1, Number(req.body?.limit || 20)));
+    const strategy = String(req.body?.strategy || "hot").trim();
+    let rows;
+    if (sourceIds.length) {
+      rows = await db.query(
+        `SELECT * FROM app_top_lists WHERE active=TRUE AND id=ANY($1::uuid[]) ORDER BY monthly_sales DESC LIMIT $2`,
+        [sourceIds, limit],
+      );
+    } else {
+      const args = [];
+      const where = ["active=TRUE"];
+      if (strategy && strategy !== "all") { args.push(strategy); where.push(`strategy_type=$${args.length}`); }
+      rows = await db.query(
+        `SELECT * FROM app_top_lists WHERE ${where.join(" AND ")}
+         ORDER BY monthly_sales DESC, review_count DESC, updated_at DESC LIMIT $${args.length + 1}`,
+        [...args, limit],
+      );
+    }
+    const inserted = [];
+    const skipped = [];
+    for (const row of rows.rows) {
+      const sku = String(row.sku || "").trim();
+      if (!sku) continue;
+      const score = autoListingScore(row);
+      const riskLevel = score >= 70 ? "low" : score >= 45 ? "normal" : "high";
+      const result = await db.query(
+        `INSERT INTO app_auto_listing_items (
+           user_id, store_id, top_list_id, source_sku, title, main_image, ozon_url,
+           category_name, category_name_zh, seller_name, price_rub, monthly_sales, review_count,
+           seller_count, opportunity_score, risk_level, payload
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb)
+         ON CONFLICT (user_id, store_id, source_sku) DO UPDATE SET
+           title=EXCLUDED.title, main_image=EXCLUDED.main_image, price_rub=EXCLUDED.price_rub,
+           monthly_sales=EXCLUDED.monthly_sales, review_count=EXCLUDED.review_count,
+           seller_count=EXCLUDED.seller_count, opportunity_score=EXCLUDED.opportunity_score,
+           risk_level=EXCLUDED.risk_level, updated_at=now()
+         RETURNING id, source_sku, title, stage, status`,
+        [
+          req.user.id,
+          storeId,
+          row.id,
+          sku,
+          row.title || "",
+          row.main_image || "",
+          row.ozon_url || (sku ? `https://www.ozon.ru/product/${sku}/` : ""),
+          row.category_name || "",
+          categoryNameZh(row.category_name || "", row.category_id || ""),
+          row.seller_name || "",
+          Number(row.price_rub || 0) || null,
+          Math.max(0, Number(row.monthly_sales || 0)),
+          Math.max(0, Number(row.review_count || 0)),
+          Number.isFinite(Number(row.seller_count)) ? Math.max(0, Number(row.seller_count)) : null,
+          score,
+          riskLevel,
+          JSON.stringify({ source_name: row.source_name, source_captured_at: row.source_captured_at, strategy_type: row.strategy_type }),
+        ],
+      );
+      inserted.push(result.rows[0]);
+      await insertAutoListingEvent({ userId: req.user.id, storeId, itemId: result.rows[0].id, stage: "discovered", message: "进入自动上架候选队列" });
+    }
+    res.json({ success: true, inserted, skipped, insertedCount: inserted.length, skippedCount: skipped.length });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/auto-listing/items/:id/advance", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const id = String(req.params.id || "").trim();
+    const rowRes = await db.query(`SELECT * FROM app_auto_listing_items WHERE id=$1 AND user_id=$2 FOR UPDATE`, [id, req.user.id]);
+    if (!rowRes.rowCount) return res.status(404).json({ success: false, error: "自动上架商品不存在" });
+    const item = rowRes.rows[0];
+    await assertActiveStoreAccess(item.store_id, req.user.id, "id");
+    const stageKeys = AUTO_LISTING_STAGES.map(([key]) => key);
+    const currentIndex = Math.max(0, stageKeys.indexOf(item.stage));
+    let nextStage = String(req.body?.stage || "").trim();
+    if (!nextStage || !stageKeys.includes(nextStage)) nextStage = stageKeys[Math.min(stageKeys.length - 1, currentIndex + 1)];
+    let collectItemId = item.collect_item_id;
+    let status = nextStage === "ready" || nextStage === "submitted" ? "needs_human" : "running";
+    let message = `推进到${AUTO_LISTING_STAGES.find(([key]) => key === nextStage)?.[1] || nextStage}`;
+    if (item.stage === "discovered" && nextStage !== "discovered" && !collectItemId) {
+      const collect = await db.query(
+        `INSERT INTO collect_items (
+           user_id, store_id, source_type, source_value, ozon_url, ozon_sku,
+           title, main_image, images, price_rub, attributes, status
+         ) VALUES ($1,$2,'auto-listing',$3,$4,$5,$6,$7,$8::jsonb,$9,$10::jsonb,'scraped')
+         ON CONFLICT DO NOTHING
+         RETURNING id`,
+        [
+          req.user.id,
+          item.store_id,
+          item.source_sku || item.ozon_url,
+          item.ozon_url || (item.source_sku ? `https://www.ozon.ru/product/${item.source_sku}/` : ""),
+          item.source_sku,
+          item.title,
+          item.main_image,
+          JSON.stringify(item.main_image ? [item.main_image] : []),
+          Number(item.price_rub || 0) || null,
+          JSON.stringify({ auto_listing_item_id: item.id, category_name_zh: item.category_name_zh }),
+        ],
+      );
+      collectItemId = collect.rows[0]?.id || collectItemId;
+      nextStage = nextStage === "collected" ? nextStage : "collected";
+      status = "queued";
+      message = "已加入采集箱，等待后续找货和资料补全";
+    }
+    const updated = await db.query(
+      `UPDATE app_auto_listing_items
+          SET stage=$1, status=$2, collect_item_id=COALESCE($3, collect_item_id),
+              human_reason=CASE WHEN $2='needs_human' THEN '提交 Ozon 前需要人工确认' ELSE human_reason END,
+              updated_at=now()
+        WHERE id=$4 AND user_id=$5
+        RETURNING *`,
+      [nextStage, status, collectItemId, item.id, req.user.id],
+    );
+    await insertAutoListingEvent({ userId: req.user.id, storeId: item.store_id, itemId: item.id, eventType: status, stage: nextStage, message });
+    res.json({ success: true, item: updated.rows[0] });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/auto-listing/items/bulk-action", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
+    const action = String(req.body?.action || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    if (!ids.length) return res.status(400).json({ success: false, error: "请选择商品" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id");
+    let status = null;
+    let stage = null;
+    let message = "";
+    if (action === "pause") { status = "paused"; message = "已暂停"; }
+    else if (action === "resume") { status = "queued"; message = "已恢复排队"; }
+    else if (action === "needs_human") { status = "needs_human"; message = "已转人工处理"; }
+    else if (action === "ready") { stage = "ready"; status = "needs_human"; message = "已进入待上架，等待人工确认"; }
+    else return res.status(400).json({ success: false, error: "不支持的批量动作" });
+    const sets = ["status=$1", "updated_at=now()"];
+    const params = [status, req.user.id, storeId, ids];
+    if (stage) { sets.push("stage=$5"); params.push(stage); }
+    const result = await db.query(
+      `UPDATE app_auto_listing_items SET ${sets.join(", ")}
+        WHERE user_id=$2 AND store_id=$3 AND id=ANY($4::uuid[])
+        RETURNING id, stage`,
+      params,
+    );
+    for (const item of result.rows) {
+      await insertAutoListingEvent({ userId: req.user.id, storeId, itemId: item.id, eventType: status, stage: item.stage, message });
+    }
+    res.json({ success: true, updated: result.rowCount });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/platform-snapshot/refresh", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const wait = req.body?.wait !== false;
+    const limit = Math.min(200, Math.max(10, Number(req.body?.limit || PLATFORM_SNAPSHOT_DEFAULT_LIMIT)));
+    if (!wait) {
+      maybeRefreshOzonPlatformSnapshots("manual").catch(() => {});
+      return res.json({ success: true, queued: true, refreshing: Boolean(platformSnapshotRefreshPromise), message: "已开始后台刷新 Ozon 平台样本" });
+    }
+    const result = await refreshOzonPlatformSnapshots({ reason: "manual", limit });
+    res.json({ success: true, ...result });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/sourcing/platform-snapshot/collect", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const rawInputs = Array.isArray(req.body?.items)
+      ? req.body.items.map((item) => item?.url || item?.sku || item).filter(Boolean)
+      : String(req.body?.urls || req.body?.text || "")
+        .split(/\n+/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    const normalized = [];
+    const seen = new Set();
+    for (const input of rawInputs) {
+      const item = normalizeOzonSnapshotInput(input);
+      if (!item || seen.has(item.sku)) continue;
+      seen.add(item.sku);
+      normalized.push(item.url);
+      if (normalized.length >= 100) break;
+    }
+    if (!normalized.length) return res.status(400).json({ success: false, error: "请粘贴 Ozon 商品链接或 SKU" });
+    const strategy = ["hot", "new", "potential", "blue_ocean"].includes(String(req.body?.strategy_type || req.body?.strategy || "hot"))
+      ? String(req.body?.strategy_type || req.body?.strategy || "hot")
+      : "hot";
+    const imported = [];
+    const errors = [];
+    for (let index = 0; index < normalized.length; index += 1) {
+      try {
+        const item = await fetchOzonPublicSnapshot(normalized[index]);
+        item.strategy_type = strategy;
+        const row = await upsertPlatformSnapshotItem(item);
+        imported.push({ ...row, category_name_zh: categoryNameZh(row.category_name || "", item.category_id || "") });
+      } catch (error) {
+        const sku = normalizeOzonSnapshotInput(normalized[index])?.sku || "";
+        errors.push({ row: index + 1, sku, url: normalized[index], error: error.message });
+      }
+    }
+    res.status(errors.length && imported.length ? 207 : errors.length ? 400 : 200).json({
+      success: errors.length === 0,
+      imported: imported.length,
+      failed: errors.length,
+      items: imported,
+      errors,
+      note: "已写入 Ozon 平台公开页快照；销量/GMV/增长等榜单指标未从公开商品页伪造。",
+    });
   } catch (error) { next(error); }
 });
 
@@ -3091,7 +5215,11 @@ app.get("/api/sourcing/china-zone", requireAuth, async (req, res, next) => {
         WHERE ${where.join(' AND ')} ORDER BY t.monthly_sales DESC,t.review_count DESC LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
       [...args, limit, offset],
     );
-    res.json({ success: true, items: rows.rows, total: count.rows[0]?.total || 0 });
+    const items = rows.rows.map((row) => ({
+      ...row,
+      category_name_zh: categoryNameZh(row.category_name, row.category_id),
+    }));
+    res.json({ success: true, items, total: count.rows[0]?.total || 0 });
   } catch (error) { next(error); }
 });
 
@@ -3422,6 +5550,15 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         [userId, store.id]
       );
       const pr = prodRes.rows[0] || {};
+      let activeProducts = parseInt(pr.active_products || 0);
+      try {
+        const liveProductCounts = await fetchOzonProductStatusCounts(store.id, userId);
+        if (Number.isFinite(Number(liveProductCounts.VISIBLE))) {
+          activeProducts = Number(liveProductCounts.VISIBLE);
+        }
+      } catch (error) {
+        console.warn(`[dashboard] store=${store.name} active product count fallback to local cache: ${error.message}`);
+      }
       const warningRes = await db.query(
         `SELECT offer_id, name, image, stock
            FROM app_products
@@ -3468,13 +5605,13 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         ? Math.round(((todayOrders.length - yesterdayOrders.length) / yesterdayOrders.length) * 10000) / 100
         : (todayOrders.length > 0 ? 100 : 0);
 
-      console.log(`[dashboard] store=${store.name} today=¥${todayGmv.toFixed(2)}/ yesterday=¥${yesterdayGmv.toFixed(2)} gmv_growth=${gmvGrowth}% | awaiting_treatment=${awaitingTreatment} | return_rate=${returnRate}% | sync=${syncStatus} | active=${pr.active_products} | profit=¥${weeklyProfit.toFixed(2)} [${profitMethod}]`);
+      console.log(`[dashboard] store=${store.name} today=¥${todayGmv.toFixed(2)}/ yesterday=¥${yesterdayGmv.toFixed(2)} gmv_growth=${gmvGrowth}% | awaiting_treatment=${awaitingTreatment} | return_rate=${returnRate}% | sync=${syncStatus} | active=${activeProducts} | profit=¥${weeklyProfit.toFixed(2)} [${profitMethod}]`);
 
       return {
         store_id: store.id,
         store_name: store.name,
         // 7 大核心指标 (对齐 MyERP)
-        active_products: parseInt(pr.active_products || 0),
+        active_products: activeProducts,
         today_orders: todayOrders.length,
         awaiting_treatment: awaitingTreatment,       // 待打包 + 待发货
         today_gmv: Math.round(todayGmv * 100) / 100,
@@ -3609,10 +5746,103 @@ const OZON_VISIBILITY_ENUM = new Set([
   "NOT_MODERATED",    // 待审核
   "MODERATED",        // 已审核
   "IN_ACTIVE",        // 已下架
+  "ARCHIVED",         // 归档
+  "STATE_FAILED",     // 错误
+  "IN_SALE",
+  "TO_SUPPLY",
+  "PARTIAL_APPROVED",
+  "REMOVED_FROM_SALE",
+  "VALIDATION_STATE_FAIL",
+  "VALIDATION_STATE_PENDING",
   "STATE_FAILED_MODERATION",  // 审核失败
   "FAILED_MODERATION",
   "IS_TOO_MANY_IMAGES",
 ]);
+
+const PRODUCT_STATUS_COUNT_FILTERS = {
+  ALL: ["ALL"],
+  VISIBLE: ["IN_SALE"],
+  READY_TO_SUPPLY: ["TO_SUPPLY"],
+  NEED_ATTENTION: ["PARTIAL_APPROVED"],
+  NOT_MODERATED: ["VALIDATION_STATE_PENDING", "NOT_MODERATED"],
+  FAILED_MODERATION: ["STATE_FAILED", "VALIDATION_STATE_FAIL", "FAILED_MODERATION", "STATE_FAILED_MODERATION"],
+  IN_ACTIVE: ["REMOVED_FROM_SALE"],
+  ARCHIVED: ["ARCHIVED"],
+};
+
+function extractOzonProductListTotal(payload) {
+  const candidates = [
+    payload?.result?.total,
+    payload?.total,
+    payload?.result?.count,
+    payload?.count,
+  ];
+  for (const value of candidates) {
+    const n = Number(value);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+async function fetchOzonProductStatusCounts(storeId, userId) {
+  const counts = {};
+  for (const [status, filters] of Object.entries(PRODUCT_STATUS_COUNT_FILTERS)) {
+    let value = null;
+    for (const filter of filters) {
+      try {
+        const payload = await callOzonSellerAPI("/v3/product/list", {
+          filter: { visibility: filter },
+          last_id: "",
+          limit: 1,
+        }, { storeId, userId });
+        const total = extractOzonProductListTotal(payload);
+        if (total !== null) {
+          value = total;
+          if (total > 0 || filter === filters[filters.length - 1]) break;
+        }
+      } catch (error) {
+        // Some Ozon visibility names differ by account/API generation; try the next alias.
+        if (filter === filters[filters.length - 1]) {
+          console.warn(`[products] Ozon ${status} count unavailable via ${filter}: ${error.message}`);
+        }
+      }
+    }
+    if (value !== null) counts[status] = value;
+  }
+  return counts;
+}
+
+async function fetchOzonProductListPage(storeId, userId, status, limit, offset) {
+  const filters = PRODUCT_STATUS_COUNT_FILTERS[status] || [status];
+  const requested = Math.min(1000, Math.max(1, Number(limit || 50) + Number(offset || 0)));
+  for (const visibility of filters) {
+    try {
+      const offerIds = [];
+      let total = 0;
+      let lastId = "";
+      while (offerIds.length < requested) {
+        const payload = await callOzonSellerAPI("/v3/product/list", {
+          filter: { visibility },
+          last_id: lastId,
+          limit: Math.min(100, requested - offerIds.length),
+        }, { storeId, userId });
+        total = extractOzonProductListTotal(payload) ?? total;
+        const items = payload?.result?.items || payload?.items || [];
+        offerIds.push(...items.map((item) => String(item.offer_id || "").trim()).filter(Boolean));
+        lastId = payload?.result?.last_id || payload?.last_id || "";
+        if (!lastId || items.length === 0) break;
+      }
+      return {
+        visibility,
+        total,
+        offerIds: offerIds.slice(Number(offset || 0), Number(offset || 0) + Number(limit || 50)),
+      };
+    } catch (error) {
+      if (visibility === filters[filters.length - 1]) throw error;
+    }
+  }
+  return { visibility: status, total: 0, offerIds: [] };
+}
 
 app.post("/api/seller/products", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
@@ -3629,11 +5859,23 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
       return res.status(400).json({ success: false, error: "不支持的商品状态" });
     }
 
+    let livePage = null;
+    if (!search) {
+      try {
+        livePage = await fetchOzonProductListPage(storeId, userId, visibility, limit, offset);
+      } catch (error) {
+        console.warn(`[products] Ozon ${visibility} page fallback to local cache: ${error.message}`);
+      }
+    }
+
     // 1. 构建过滤条件
     const where = ["user_id = $1 AND store_id = $2"];
     const params = [userId, storeId];
 
-    if (visibility !== "ALL") {
+    if (livePage) {
+      params.push(livePage.offerIds);
+      where.push(`offer_id = ANY($${params.length}::text[])`);
+    } else if (visibility !== "ALL") {
       params.push(visibility);
       where.push(`status = $${params.length}`);
     }
@@ -3645,7 +5887,7 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
 
     // 2. 分页查询记录 (全字段回传给前端抽屉编辑) - v0.3.3 加 stocks_json 分仓原始数据
     const rows = await db.query(
-      `SELECT id, offer_id, name, image, images, price, min_price, old_price, currency_code, vat, stock,
+      `SELECT id, store_id, offer_id, name, image, images, price, min_price, old_price, currency_code, vat, stock,
               brand, country_of_origin, description,
               status, status_name, category_name, description_category_id, type_id, price_index,
               product_id, sku, model_id, barcode,
@@ -3654,16 +5896,18 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
               updated_at, updated_at_ozon
        FROM app_products
        WHERE ${where.join(" AND ")}
-       ORDER BY updated_at DESC
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, limit, offset]
+       ORDER BY ${livePage ? `array_position($${params.length}::text[], offer_id), updated_at DESC` : "updated_at DESC"}
+       ${livePage ? "" : `LIMIT $${params.length + 1} OFFSET $${params.length + 2}`}`,
+      livePage ? params : [...params, limit, offset]
     );
 
     // 3. 查询总数
-    const countRes = await db.query(
-      `SELECT count(*) FROM app_products WHERE ${where.join(" AND ")}`,
-      params
-    );
+    const countRes = livePage
+      ? { rows: [{ count: livePage.total }] }
+      : await db.query(
+        `SELECT count(*) FROM app_products WHERE ${where.join(" AND ")}`,
+        params
+      );
 
     const statusCountRes = await db.query(
       `SELECT status, count(*)::int AS count
@@ -3676,6 +5920,23 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
     for (const row of statusCountRes.rows) {
       status_counts[row.status || "UNKNOWN"] = Number(row.count || 0);
       status_counts.ALL += Number(row.count || 0);
+    }
+
+    let responseTotal = parseInt(countRes.rows[0].count);
+    let countsSource = "local";
+    if (!search) {
+      try {
+        const ozonCounts = await fetchOzonProductStatusCounts(storeId, userId);
+        if (Object.keys(ozonCounts).length) {
+          Object.assign(status_counts, ozonCounts);
+          countsSource = "ozon";
+          if (Number.isFinite(Number(ozonCounts[visibility]))) {
+            responseTotal = Number(ozonCounts[visibility]);
+          }
+        }
+      } catch (error) {
+        console.warn(`[products] Ozon status counts fallback to local cache: ${error.message}`);
+      }
     }
 
     const items = rows.rows.map((row) => {
@@ -3693,13 +5954,14 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
 
     res.json({
       success: true,
-      total: parseInt(countRes.rows[0].count),
+      total: responseTotal,
       items,
       status_counts,
+      status_counts_source: countsSource,
       data: {
         result: {
           items,
-          total: parseInt(countRes.rows[0].count)
+          total: responseTotal
         }
       }
     });
@@ -4350,6 +6612,334 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 50)));
     const offset = Math.max(0, Number(req.body?.offset || 0));
     const status = String(req.body?.status || "").trim().toLowerCase();
+    const hasExplicitRange = Boolean(req.body?.since || req.body?.to);
+    const syncMode = String(req.body?.sync_mode || req.body?.syncMode || "").trim().toLowerCase();
+    const defaultCacheHistoryDays = 84;
+    const financialToCny = (value, currency, settlementRate = null) => {
+      const amount = Number(value || 0);
+      if (!Number.isFinite(amount)) return 0;
+      if (currency === "CNY") return settlementRate ? amount * settlementRate : amount;
+      if (currency === "RUB") return convertRub(amount);
+      return amount;
+    };
+    const logisticsServiceCny = (services, currency, settlementRate = null) => Object.entries(services || {}).reduce((sum, [key, value]) => {
+      const serviceKey = String(key || "").toLowerCase();
+      if (!/fulfillment|pickup|dropoff|deliv|delivery|trans|return|flow|last/.test(serviceKey)) return sum;
+      return sum + Math.abs(financialToCny(value, currency, settlementRate));
+    }, 0);
+    const normalizeOrderAccountingPayload = (payload = {}) => {
+      const fdProducts = payload?.financial_data?.products || [];
+      const products = Array.isArray(payload.products) ? payload.products.map((product) => {
+        const fd = fdProducts.find(x => String(x.product_id) === String(product.sku)) || {};
+        const currency = String(product.currency_code || payload.currency_code || "RUB").toUpperCase();
+        const financialCurrency = String(fd.currency_code || product.financial_currency_code || "RUB").toUpperCase();
+        const priceNative = Number(product.price_native || product.price?.amount || product.price || fd.price || 0);
+        const platformPrice = Number(fd.price || fd.customer_price || 0);
+        const settlementRate = currency === "CNY" && platformPrice > 0 ? priceNative / platformPrice : null;
+        const commissionCny = Math.abs(financialToCny(fd.commission_amount ?? product.commission_amount ?? 0, financialCurrency, null));
+        const lastMileCny = logisticsServiceCny(fd.item_services || fd.services || {}, financialCurrency, null);
+        const payoutCny = financialToCny(fd.payout ?? product.payout_native ?? product.payout_cny ?? 0, financialCurrency, null);
+        return {
+          ...product,
+          financial_currency_code: financialCurrency,
+          commission_cny: Math.round(commissionCny * Number(product.quantity || fd.quantity || 1) * 100) / 100,
+          last_mile_cny: Math.round(lastMileCny * Number(product.quantity || fd.quantity || 1) * 100) / 100,
+          payout_cny: Math.round(payoutCny * Number(product.quantity || fd.quantity || 1) * 100) / 100,
+        };
+      }) : [];
+      const totalCny = Number(payload.total_cny || 0);
+      const commissionCny = products.reduce((sum, product) => sum + Number(product.commission_cny || 0), 0);
+      const payoutCny = products.reduce((sum, product) => sum + Number(product.payout_cny || 0), 0);
+      const rawLastMileCny = products.reduce((sum, product) => sum + Number(product.last_mile_cny || 0), 0);
+      const lastMileCny = rawLastMileCny > 0 ? rawLastMileCny : Math.max(0, totalCny - payoutCny - commissionCny);
+      const outboundCostCny = Number(payload.outbound_cost_cny || 0);
+      const delivered = String(payload.status || "").toLowerCase() === "delivered";
+      return {
+        ...payload,
+        products,
+        commission_cny: Math.round(commissionCny * 100) / 100,
+        last_mile_cny: Math.round(lastMileCny * 100) / 100,
+        ozon_cost_cny: Math.round((commissionCny + lastMileCny) * 100) / 100,
+        profit_cny: delivered ? Math.round((totalCny - commissionCny - lastMileCny - outboundCostCny) * 100) / 100 : null,
+        profit_calculable: delivered,
+        profit_block_reason: delivered ? "" : "仅已送达订单可计算利润",
+      };
+    };
+
+    const enrichPostings = async (postings) => {
+      const allOfferIds = new Set();
+      for (const p of postings) {
+        for (const pd of (p.products || [])) {
+          if (pd?.offer_id) allOfferIds.add(pd.offer_id);
+        }
+      }
+      const imageMap = new Map();
+      if (allOfferIds.size && db) {
+        const joinRows = await db.query(
+          `SELECT offer_id, image, name, purchase_price_cny, source_url_1688 FROM app_products
+           WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
+          [req.user.id, storeId, Array.from(allOfferIds)],
+        );
+        for (const r of joinRows.rows) imageMap.set(r.offer_id, {
+          image: r.image,
+          name: r.name,
+          purchase_price_cny: Number(r.purchase_price_cny || 0),
+          source_url_1688: r.source_url_1688 || "",
+        });
+      }
+      const postingNumbers = postings.map((p) => p.posting_number).filter(Boolean);
+      const orderCostMap = new Map();
+      if (postingNumbers.length && db) {
+        const costRows = await db.query(
+          `SELECT posting_number, offer_id, source_url_1688, outbound_cost_cny
+             FROM app_order_costs
+            WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
+          [req.user.id, storeId, postingNumbers],
+        );
+        for (const r of costRows.rows) {
+          orderCostMap.set(r.posting_number, {
+            offer_id: r.offer_id || "",
+            source_url_1688: r.source_url_1688 || "",
+            outbound_cost_cny: Number(r.outbound_cost_cny || 0),
+          });
+        }
+      }
+
+      const enriched = postings.map((p) => {
+        const fdProducts = p?.financial_data?.products || [];
+        const orderCost = orderCostMap.get(p.posting_number) || {};
+        const serviceAmountCny = (fd, currency, settlementRate) => {
+          const services = fd?.item_services || fd?.services || {};
+          return logisticsServiceCny(services, currency, settlementRate);
+        };
+        const products = (p.products || []).map((pd) => {
+          const fd = fdProducts.find(x => String(x.product_id) === String(pd.sku)) || {};
+          const currency = String(
+            pd.currency_code ||
+            pd.price?.currency ||
+            fd.currency_code ||
+            p.currency_code ||
+            "RUB"
+          ).toUpperCase();
+          const priceNative = Number(pd.price?.amount || pd.price || fd.price || 0);
+          const qty = Number(pd.quantity || fd.quantity || 1);
+          const priceCny = currency === "CNY" ? priceNative
+                         : currency === "RUB" ? convertRub(priceNative)
+                         : priceNative;
+          const priceRub = currency === "RUB" ? priceNative
+                         : currency === "CNY" ? (priceNative / effectiveRubCnyRate)
+                         : 0;
+          const customerRub = Number(fd.customer_price || 0);
+          const commissionNative = Number(fd.commission_amount || 0);
+          const payoutNative = Number(fd.payout || 0);
+          const platformPrice = Number(fd.price || fd.customer_price || 0);
+          const localMeta = imageMap.get(pd.offer_id) || {};
+          const settlementRate = currency === "CNY" && platformPrice > 0 ? priceNative / platformPrice : null;
+          const financialCurrency = String(fd.currency_code || "RUB").toUpperCase();
+          const payoutCny = financialToCny(payoutNative, financialCurrency, null);
+          const commissionCny = Math.abs(financialToCny(commissionNative, financialCurrency, null));
+          const lastMileCny = serviceAmountCny(fd, financialCurrency, null);
+          const purchasePriceCny = Number(localMeta.purchase_price_cny || 0);
+          return {
+            offer_id: pd.offer_id,
+            sku: pd.sku,
+            name: localMeta.name || pd.name,
+            image: localMeta.image || pd.image || "",
+            quantity: qty,
+            currency_code: currency,
+            financial_currency_code: financialCurrency,
+            price_native: priceNative,
+            price_cny: Math.round(priceCny * 100) / 100,
+            price_rub: Math.round(priceRub * 100) / 100,
+            customer_price_rub: customerRub,
+            subtotal_cny: Math.round(priceCny * qty * 100) / 100,
+            subtotal_rub: Math.round(priceRub * qty * 100) / 100,
+            commission_amount: commissionNative,
+            commission_cny: Math.round(commissionCny * qty * 100) / 100,
+            last_mile_cny: Math.round(lastMileCny * qty * 100) / 100,
+            payout_cny: Math.round(payoutCny * qty * 100) / 100,
+            purchase_price_cny: purchasePriceCny,
+            purchase_cost_cny: Math.round(purchasePriceCny * qty * 100) / 100,
+            profit_cny: purchasePriceCny > 0 ? Math.round((payoutCny * qty - purchasePriceCny * qty) * 100) / 100 : null,
+            profit_is_estimated: purchasePriceCny <= 0,
+            source_url_1688: (String(orderCost.offer_id || "") === String(pd.offer_id || "") ? orderCost.source_url_1688 : "") || localMeta.source_url_1688 || "",
+          };
+        });
+        const totalCny = products.reduce((s, x) => s + (x.subtotal_cny || 0), 0);
+        const totalRub = products.reduce((s, x) => s + (x.subtotal_rub || 0), 0);
+        const totalCustomerRub = (fdProducts || []).reduce((s, x) => s + Number(x.customer_price || 0) * Number(x.quantity || 1), 0);
+        const totalCommissionCny = products.reduce((s, x) => s + (x.commission_cny || 0), 0);
+        const totalPayoutCny = products.reduce((s, x) => s + (x.payout_cny || 0), 0);
+        const rawLastMileCny = products.reduce((s, x) => s + (x.last_mile_cny || 0), 0);
+        const delivered = String(p.status || "").toLowerCase() === "delivered";
+        const totalLastMileCny = rawLastMileCny > 0 ? rawLastMileCny : Math.max(0, totalCny - totalPayoutCny - totalCommissionCny);
+        const purchaseCostCny = products.reduce((s, x) => s + (x.purchase_cost_cny || 0), 0);
+        const ozonCostCny = totalCommissionCny + totalLastMileCny;
+        const outboundCostCny = Number(orderCost.outbound_cost_cny || 0);
+        return {
+          ...p,
+          products,
+          total_cny: Math.round(totalCny * 100) / 100,
+          total_rub: Math.round(totalRub * 100) / 100,
+          customer_total_rub: Math.round(totalCustomerRub * 100) / 100,
+          commission_cny: Math.round(totalCommissionCny * 100) / 100,
+          last_mile_cny: Math.round(totalLastMileCny * 100) / 100,
+          payout_cny: Math.round(totalPayoutCny * 100) / 100,
+          ozon_cost_cny: Math.round(ozonCostCny * 100) / 100,
+          purchase_cost_cny: Math.round(purchaseCostCny * 100) / 100,
+          outbound_cost_cny: Math.round(outboundCostCny * 100) / 100,
+          profit_cny: delivered ? Math.round((totalCny - ozonCostCny - outboundCostCny) * 100) / 100 : null,
+          profit_calculable: delivered,
+          profit_block_reason: delivered ? "" : "仅已送达订单可计算利润",
+          product_count: products.reduce((s, x) => s + (x.quantity || 0), 0),
+        };
+      });
+      return { enriched, offerCount: allOfferIds.size, imageCount: imageMap.size };
+    };
+
+    const fetchLiveOrders = async ({ since, to, status: liveStatus, pageLimit = limit, pageOffset = offset }) => {
+      const filter = { since, to };
+      if (liveStatus && liveStatus !== "all") filter.status = liveStatus;
+      const ozonData = await callOzonSellerAPI("/v3/posting/fbs/list", {
+        dir: "DESC",
+        filter,
+        limit: pageLimit,
+        offset: pageOffset,
+        with: { financial_data: true, analytics_data: true },
+      }, { storeId, userId: req.user.id });
+      const postings = ozonData?.result?.postings || [];
+      const hasNext = ozonData?.result?.has_next === true;
+      const totalCount = hasNext ? pageOffset + postings.length + 1 : pageOffset + postings.length;
+      const enrichedResult = await enrichPostings(postings);
+      return { ...enrichedResult, hasNext, totalCount };
+    };
+
+    const upsertOrderCache = async (rows) => {
+      if (!db || !rows.length) return;
+      for (const row of rows) {
+        await db.query(
+          `INSERT INTO app_order_cache (
+             user_id, store_id, posting_number, status, display_status, substatus,
+             in_process_at, shipment_date, delivering_date, payload, synced_at, updated_at
+           )
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),now())
+           ON CONFLICT (store_id, posting_number) DO UPDATE SET
+             status = EXCLUDED.status,
+             display_status = COALESCE(NULLIF(app_order_cache.display_status, ''), EXCLUDED.display_status),
+             substatus = EXCLUDED.substatus,
+             in_process_at = EXCLUDED.in_process_at,
+             shipment_date = EXCLUDED.shipment_date,
+             delivering_date = EXCLUDED.delivering_date,
+             payload = EXCLUDED.payload,
+             synced_at = now(),
+             updated_at = now()`,
+          [
+            req.user.id,
+            storeId,
+            row.posting_number,
+            row.status || "",
+            row.status || "",
+            row.substatus || "",
+            row.in_process_at || row.created_at || null,
+            row.shipment_date || null,
+            row.delivering_date || null,
+            JSON.stringify(row),
+          ],
+        );
+      }
+    };
+
+    const syncCacheRange = async ({ since, to, label = "custom" }) => {
+      let syncOffset = 0;
+      let synced = 0;
+      for (let page = 0; page < 12; page++) {
+        const live = await fetchLiveOrders({
+          since: since.toISOString(),
+          to: to.toISOString(),
+          status: "all",
+          pageLimit: 200,
+          pageOffset: syncOffset,
+        });
+        await upsertOrderCache(live.enriched);
+        synced += live.enriched.length;
+        if (!live.hasNext || live.enriched.length < 200) break;
+        syncOffset += 200;
+      }
+      console.log(`[OrdersCache] store=${storeId} sync_range=${label} synced=${synced}`);
+    };
+
+    const syncCacheWindow = async (days) => {
+      const to = new Date();
+      const since = new Date(to.getTime() - days * 24 * 3600 * 1000);
+      await syncCacheRange({ since, to, label: `${days}d` });
+    };
+
+    const pruneCacheWindow = async (days) => {
+      if (!db) return;
+      const since = new Date(Date.now() - days * 24 * 3600 * 1000);
+      await db.query(
+        `DELETE FROM app_order_cache
+         WHERE user_id = $1 AND store_id = $2 AND in_process_at < $3`,
+        [req.user.id, storeId, since.toISOString()],
+      );
+    };
+
+    if (db && syncMode !== "live") {
+      const cacheCountRes = await db.query(
+        `SELECT count(*)::int AS count
+         FROM app_order_cache
+         WHERE user_id = $1 AND store_id = $2`,
+        [req.user.id, storeId],
+      );
+      const cacheCount = Number(cacheCountRes.rows[0]?.count || 0);
+      if (syncMode === "latest") {
+        const syncSince = req.body?.sync_since ? new Date(req.body.sync_since) : null;
+        const syncTo = req.body?.sync_to ? new Date(req.body.sync_to) : null;
+        if (syncSince && syncTo && Number.isFinite(syncSince.getTime()) && Number.isFinite(syncTo.getTime()) && syncSince <= syncTo) {
+          await syncCacheRange({ since: syncSince, to: syncTo, label: "manual" });
+        } else {
+          await syncCacheWindow(1);
+        }
+      }
+      else if (syncMode === "in_progress") await syncCacheWindow(defaultCacheHistoryDays);
+      else if (!hasExplicitRange && cacheCount < 550) await syncCacheWindow(defaultCacheHistoryDays);
+      await pruneCacheWindow(defaultCacheHistoryDays);
+
+      const where = ["user_id = $1", "store_id = $2"];
+      const params = [req.user.id, storeId];
+      if (req.body?.since) {
+        params.push(req.body.since);
+        where.push(`in_process_at >= $${params.length}`);
+      }
+      if (req.body?.to) {
+        params.push(req.body.to);
+        where.push(`in_process_at <= $${params.length}`);
+      }
+      if (status && status !== "all") {
+        params.push(status === "disputed" ? "dispute" : status);
+        where.push(`COALESCE(NULLIF(display_status, ''), status) = $${params.length}`);
+      }
+      const countRes = await db.query(
+        `SELECT count(*)::int AS count FROM app_order_cache WHERE ${where.join(" AND ")}`,
+        params,
+      );
+      const rowsRes = await db.query(
+        `SELECT payload, COALESCE(NULLIF(display_status, ''), status) AS display_status, status AS source_status
+         FROM app_order_cache
+         WHERE ${where.join(" AND ")}
+         ORDER BY in_process_at DESC NULLS LAST, updated_at DESC
+         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset],
+      );
+      const orders = rowsRes.rows.map((row) => normalizeOrderAccountingPayload({
+        ...(row.payload || {}),
+        source_status: row.source_status,
+        status: row.display_status || row.payload?.status || row.source_status,
+      }));
+      console.log(`[OrdersCache] store=${storeId} mode=${syncMode || "cache"} status=${status || "all"} limit=${limit} offset=${offset} total=${countRes.rows[0]?.count || 0}`);
+      return res.json({ success: true, orders, total: Number(countRes.rows[0]?.count || orders.length), has_next: offset + orders.length < Number(countRes.rows[0]?.count || 0), source: "cache" });
+    }
+
     const filter = {
       since: req.body?.since || new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString(),
       to: req.body?.to || new Date().toISOString(),
@@ -4357,122 +6947,15 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     if (status && status !== "all") filter.status = status;
 
     console.log(`[Orders] store=${storeId} status=${status || "all"} limit=${limit} offset=${offset}`);
-
-    const ozonData = await callOzonSellerAPI("/v3/posting/fbs/list", {
-      dir: "DESC",
-      filter,
-      limit,
-      offset,
-      with: { financial_data: true, analytics_data: true },
-    }, { storeId, userId: req.user.id });
-
-    const postings = ozonData?.result?.postings || [];
-    const hasNext = ozonData?.result?.has_next === true;
-    const totalCount = hasNext ? offset + postings.length + 1 : offset + postings.length;
-
-    // ---- 物理 JOIN 商品表拉图片 ----
-    // 收集所有 offer_id, 一次批量查
-    const allOfferIds = new Set();
-    for (const p of postings) {
-      for (const pd of (p.products || [])) {
-        if (pd?.offer_id) allOfferIds.add(pd.offer_id);
-      }
-    }
-    const imageMap = new Map();
-    if (allOfferIds.size && db) {
-      const joinRows = await db.query(
-        `SELECT offer_id, image, name, purchase_price_cny, source_url_1688 FROM app_products
-         WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
-        [req.user.id, storeId, Array.from(allOfferIds)],
-      );
-      for (const r of joinRows.rows) imageMap.set(r.offer_id, {
-        image: r.image,
-        name: r.name,
-        purchase_price_cny: Number(r.purchase_price_cny || 0),
-        source_url_1688: r.source_url_1688 || "",
-      });
-    }
-
-    // ---- 金额平铺 (v0.3.4 修正: 币种感知, 不再暴力 rubToCny) ----
-    // Ozon 返回结构: post.products[i].price 是"卖家结算币"金额, currency_code 直接给出
-    //   - Polarwind / Three Latte 是 CNY 结算的 -> price=144 就是 144 元
-    //   - RUB 结算的店铺 -> price=1594 是 1594 卢布
-    // financial_data.products[i].customer_price 才是"买家实付卢布" (顾客视角)
-    // 所以 total 计算应基于 post.products[i].price * quantity + currency 感知转换到 CNY
-    const enriched = postings.map((p) => {
-      const fdProducts = p?.financial_data?.products || [];
-      const products = (p.products || []).map((pd) => {
-        const fd = fdProducts.find(x => String(x.product_id) === String(pd.sku)) || {};
-        // v0.3.5 修正: 优先 posting.products[i].currency_code 才是卖家真实结算币 (CNY/USD)
-        // financial_data.products[i].currency_code 是 Ozon 平台核算币 (通常 RUB), 不代表卖家收款币
-        // 例: Polarwind 商品 79 CNY, 但 fd.currency_code=RUB (平台侧核算) - 若按 fd 会误换算
-        const currency = String(
-          pd.currency_code ||          // 商品行结算币 (最权威)
-          fd.currency_code ||          // fd 币种 (Ozon 平台核算币, fallback)
-          p.currency_code ||           // posting 级 (少见)
-          "RUB"
-        ).toUpperCase();
-        const priceNative = Number(pd.price || fd.price || 0);
-        const qty = Number(pd.quantity || fd.quantity || 1);
-        // 币种感知换算到 CNY, CNY 直读, 严禁 rubToCny
-        const priceCny = currency === "CNY" ? priceNative
-                       : currency === "RUB" ? convertRub(priceNative)
-                       : priceNative;
-        const priceRub = currency === "RUB" ? priceNative
-                       : currency === "CNY" ? (priceNative / effectiveRubCnyRate)  // 反算 RUB 供展示参考
-                       : 0;
-        const customerRub = Number(fd.customer_price || 0);  // 买家实付卢布
-        const commissionNative = Number(fd.commission_amount || 0);
-        const payoutNative = Number(fd.payout || 0);
-        const platformPrice = Number(fd.price || fd.customer_price || 0);
-        const localMeta = imageMap.get(pd.offer_id) || {};
-        const settlementRate = currency === "CNY" && platformPrice > 0 ? priceNative / platformPrice : null;
-        const payoutCny = currency === "CNY" ? (settlementRate ? payoutNative * settlementRate : priceNative) : convertRub(payoutNative);
-        const commissionCny = currency === "CNY" ? (settlementRate ? commissionNative * settlementRate : 0) : convertRub(commissionNative);
-        const purchasePriceCny = Number(localMeta.purchase_price_cny || 0);
-        return {
-          offer_id: pd.offer_id,
-          sku: pd.sku,
-          name: localMeta.name || pd.name,
-          image: localMeta.image || "",
-          quantity: qty,
-          currency_code: currency,
-          price_native: priceNative,          // 卖家结算币原价
-          price_cny: Math.round(priceCny * 100) / 100,
-          price_rub: Math.round(priceRub * 100) / 100,
-          customer_price_rub: customerRub,    // 买家实付卢布 (仅供参考)
-          subtotal_cny: Math.round(priceCny * qty * 100) / 100,
-          subtotal_rub: Math.round(priceRub * qty * 100) / 100,
-          commission_amount: commissionNative,
-          commission_cny: Math.round(commissionCny * qty * 100) / 100,
-          payout_cny: Math.round(payoutCny * qty * 100) / 100,
-          purchase_price_cny: purchasePriceCny,
-          purchase_cost_cny: Math.round(purchasePriceCny * qty * 100) / 100,
-          profit_cny: purchasePriceCny > 0 ? Math.round((payoutCny * qty - purchasePriceCny * qty) * 100) / 100 : null,
-          profit_is_estimated: purchasePriceCny <= 0,
-          source_url_1688: localMeta.source_url_1688 || "",
-        };
-      });
-      const totalCny = products.reduce((s, x) => s + (x.subtotal_cny || 0), 0);
-      const totalRub = products.reduce((s, x) => s + (x.subtotal_rub || 0), 0);
-      const totalCustomerRub = (fdProducts || []).reduce((s, x) => s + Number(x.customer_price || 0) * Number(x.quantity || 1), 0);
-      const totalCommissionCny = products.reduce((s, x) => s + (x.commission_cny || 0), 0);
-      const totalPayoutCny = products.reduce((s, x) => s + (x.payout_cny || 0), 0);
-
-      return {
-        ...p,
-        products,
-        total_cny: Math.round(totalCny * 100) / 100,          // ⭐ 卖家结算金额 (人民币)
-        total_rub: Math.round(totalRub * 100) / 100,          // 换算 RUB 供参考
-        customer_total_rub: Math.round(totalCustomerRub * 100) / 100,  // 买家实付 RUB
-        commission_cny: Math.round(totalCommissionCny * 100) / 100,
-        payout_cny: Math.round(totalPayoutCny * 100) / 100,
-        product_count: products.reduce((s, x) => s + (x.quantity || 0), 0),
-      };
+    const live = await fetchLiveOrders({
+      since: filter.since,
+      to: filter.to,
+      status,
+      pageLimit: limit,
+      pageOffset: offset,
     });
-
-    console.log(`[Orders] 拉到 ${enriched.length} 单, has_next=${hasNext}, JOIN 命中图 ${imageMap.size}/${allOfferIds.size}`);
-    res.json({ success: true, orders: enriched, total: totalCount, has_next: hasNext });
+    console.log(`[Orders] 拉到 ${live.enriched.length} 单, has_next=${live.hasNext}, JOIN 命中图 ${live.imageCount}/${live.offerCount}`);
+    res.json({ success: true, orders: live.enriched, total: live.totalCount, has_next: live.hasNext, source: "live" });
   } catch (error) {
     console.error("[Orders] Ozon 拉单失败:", {
       message: error.message,
@@ -4664,6 +7147,98 @@ app.post("/api/seller/orders/ship", requireAuth, async (req, res) => {
         [String(error.payload?.message || error.message || "发货失败").slice(0, 1000), claimedEventId],
       ).catch(() => {});
     }
+    res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
+  }
+});
+
+/**
+ * 订单取消 - 对接 Ozon /v2/posting/fbs/cancel，但默认仅允许沙箱模式执行。
+ */
+app.post("/api/seller/orders/cancel", requireAuth, async (req, res) => {
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    const postingNumber = String(req.body?.posting_number || "").trim();
+    const reason = String(req.body?.reason || "").trim();
+    const cancelReasonId = Number(req.body?.cancel_reason_id || req.body?.cancelReasonId || 0);
+    if (!storeId || !postingNumber) return res.status(400).json({ success: false, error: "缺少 store_id / posting_number" });
+    if (!Number.isInteger(cancelReasonId) || cancelReasonId <= 0) return res.status(400).json({ success: false, error: "缺少有效的 cancel_reason_id" });
+    if (!db) return res.status(503).json({ success: false, error: "数据库不可用，无法安全执行取消" });
+
+    const cached = await db.query(
+      `SELECT status, display_status
+         FROM app_order_cache
+        WHERE user_id=$1 AND store_id=$2 AND posting_number=$3
+        LIMIT 1`,
+      [req.user.id, storeId, postingNumber],
+    );
+    if (!cached.rowCount) {
+      return res.status(404).json({ success: false, error: "本地缓存未找到该订单，请先拉取最新订单" });
+    }
+    const status = String(cached.rows[0]?.display_status || cached.rows[0]?.status || "").toLowerCase();
+    if (status === "cancelled") {
+      return res.status(409).json({ success: false, code: "ORDER_ALREADY_CANCELLED", error: "该订单已是取消状态" });
+    }
+    if (!["awaiting_packaging", "awaiting_deliver"].includes(status)) {
+      return res.status(409).json({ success: false, code: "ORDER_CANCEL_STATUS_BLOCKED", error: `订单当前状态 ${status || "未知"} 不允许取消` });
+    }
+
+    const payload = {
+      posting_number: postingNumber,
+      cancel_reason_id: cancelReasonId,
+      ...(reason ? { cancel_reason_message: reason } : {}),
+    };
+    const cancelBaseUrl = OZON_ORDER_CANCEL_MODE === "sandbox" ? OZON_ORDER_CANCEL_BASE_URL : OZON_SELLER_BASE_URL;
+    const sandboxBaseReady = OZON_ORDER_CANCEL_MODE === "sandbox" &&
+      OZON_ORDER_CANCEL_BASE_URL &&
+      OZON_ORDER_CANCEL_BASE_URL !== OZON_SELLER_BASE_URL;
+    const canCallOzonCancel = sandboxBaseReady ||
+      (OZON_ORDER_CANCEL_MODE === "production" && OZON_ORDER_CANCEL_ALLOW_PRODUCTION);
+    const event = await db.query(
+      `INSERT INTO app_order_cancel_events
+        (user_id, store_id, posting_number, reason, dry_run, status, ozon_called, request_payload)
+       VALUES ($1,$2,$3,$4,$5,$6,false,$7::jsonb)
+       RETURNING id, created_at`,
+      [req.user.id, storeId, postingNumber, reason, !canCallOzonCancel, canCallOzonCancel ? "processing" : "blocked", JSON.stringify(payload)],
+    );
+
+    if (!canCallOzonCancel) {
+      return res.status(409).json({
+        success: false,
+        code: "ORDER_CANCEL_SANDBOX_DISABLED",
+        error: OZON_ORDER_CANCEL_MODE === "sandbox"
+          ? "取消订单真实接口已对接，但未配置独立 Ozon 沙箱地址，已阻止调用真实 Ozon"
+          : "取消订单真实接口已对接，但当前未启用沙箱取消开关，已阻止调用 Ozon",
+        mode: OZON_ORDER_CANCEL_MODE || "disabled",
+        dry_run: true,
+        ozon_called: false,
+        event: event.rows[0],
+      });
+    }
+
+    try {
+      const data = await callOzonSellerAPI("/v2/posting/fbs/cancel", payload, {
+        storeId,
+        userId: req.user.id,
+        baseUrl: cancelBaseUrl,
+      });
+      await db.query(
+        `UPDATE app_order_cancel_events
+            SET status='ozon_succeeded', dry_run=false, ozon_called=true, response_payload=$1::jsonb
+          WHERE id=$2`,
+        [JSON.stringify(data || {}), event.rows[0].id],
+      );
+      return res.json({ success: true, dry_run: false, ozon_called: true, mode: OZON_ORDER_CANCEL_MODE, data, event: event.rows[0] });
+    } catch (error) {
+      await db.query(
+        `UPDATE app_order_cancel_events
+            SET status='failed', dry_run=false, ozon_called=true, error=$1, response_payload=$2::jsonb
+          WHERE id=$3`,
+        [String(error.message || "取消失败").slice(0, 1000), JSON.stringify(error.payload || {}), event.rows[0].id],
+      );
+      throw error;
+    }
+  } catch (error) {
+    console.error("[Orders.cancel]", error.message, error.payload);
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
 });
@@ -4912,12 +7487,20 @@ function listingDisplayStatus(contractStatus) {
 function listingStatusSqlCondition(status, alias, params) {
   const value = String(status || "").trim();
   if (!value || value === "all") return "";
-  if (["processing", "pending", "ozon_processing"].includes(value)) return `${alias}.status IN ('processing','pending','moderating','ozon_processing')`;
+  if (["processing", "pending", "ozon_processing"].includes(value)) return `${alias}.status IN ('queued','claimed','running','processing','pending','moderating','ozon_processing')`;
   if (value === "success") return `${alias}.status IN ('imported','success')`;
   if (value === "partial_success") return `${alias}.partial_success = TRUE`;
   if (value === "cancelled" || value === "canceled") return `${alias}.status IN ('cancelled','canceled')`;
   params.push(value);
   return `${alias}.status = $${params.length}`;
+}
+
+function batchListingPlaceholderTaskId(batchId, storeId, sku, index = 0, rowKey = "") {
+  const batch = String(batchId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || crypto.randomUUID();
+  const store = String(storeId || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 36) || "store";
+  const cleanSku = String(sku || "").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 40) || `row${index}`;
+  const cleanRow = String(rowKey || `row-${index}`).replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 32) || `row${index}`;
+  return `batch-${batch}-${store}-${cleanRow}-${cleanSku}`.slice(0, 180);
 }
 
 app.get("/api/v1/listings/status-contract", requireAuth, async (_req, res) => {
@@ -4985,7 +7568,7 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
         COUNT(*) AS total,
         COUNT(*) FILTER (WHERE lh.status IN ('imported','success')) AS imported,
         COUNT(*) FILTER (WHERE lh.status = 'failed') AS failed,
-        COUNT(*) FILTER (WHERE lh.status IN ('processing','pending','moderating','ozon_processing')) AS processing,
+        COUNT(*) FILTER (WHERE lh.status IN ('queued','claimed','running','processing','pending','moderating','ozon_processing')) AS processing,
         COUNT(*) FILTER (WHERE lh.created_at >= CURRENT_DATE) AS today
       FROM app_listing_history lh
       WHERE ${where}`;
@@ -5026,6 +7609,106 @@ app.get("/api/seller/listing-history", requireAuth, async (req, res, next) => {
   } catch (e) {
     console.error("[listing-history]", e.message);
     res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+app.post("/api/seller/listing-history/batch-start", requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, error: "服务端未配置 DATABASE_URL。" });
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!storeId) return res.status(400).json({ success: false, error: "需要店铺 ID" });
+    if (!rows.length) return res.status(400).json({ success: false, error: "需要上架商品行" });
+    await assertActiveStoreAccess(storeId, req.user.id, "id, name");
+    const batchId = String(req.body?.batch_id || req.body?.batchId || crypto.randomUUID()).trim();
+    const inserted = [];
+    for (let i = 0; i < rows.length; i += 1) {
+      const row = rows[i] || {};
+      const sku = String(row.sku || row.source_sku || row.offer_id || "").trim();
+      if (!sku) continue;
+      const rowKey = String(row.row_key || row.rowKey || `row-${i + 1}`).trim();
+      const taskId = batchListingPlaceholderTaskId(batchId, storeId, sku, i + 1, rowKey);
+      const price = Number(row.price ?? row.price_rub ?? 0);
+      const rawPayload = {
+        kind: "batch-upload-placeholder",
+        batch_id: batchId,
+        source_sku: sku,
+        row_key: rowKey,
+        status_note: "等待采集，采完后自动提交 Ozon",
+        created_from: "batch-start",
+      };
+      const result = await db.query(
+        `INSERT INTO app_listing_history (
+           user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, status, raw_payload, errors_json
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,'queued',$8::jsonb,'[]'::jsonb)
+         ON CONFLICT (task_id) DO UPDATE SET
+           status = CASE WHEN app_listing_history.status IN ('queued','claimed','running') THEN 'queued' ELSE app_listing_history.status END,
+           offer_id = EXCLUDED.offer_id,
+           product_name = COALESCE(NULLIF(EXCLUDED.product_name,''), app_listing_history.product_name),
+           price_rub = COALESCE(EXCLUDED.price_rub, app_listing_history.price_rub),
+           raw_payload = app_listing_history.raw_payload || EXCLUDED.raw_payload,
+           updated_at = now()
+         RETURNING id, task_id, offer_id, status`,
+        [
+          req.user.id,
+          storeId,
+          taskId,
+          String(row.offer_id || row.offerId || sku),
+          String(row.name || row.product_name || `等待采集 SKU ${sku}`),
+          String(row.main_image || row.image || ""),
+          Number.isFinite(price) && price > 0 ? price : null,
+          JSON.stringify(rawPayload),
+        ],
+      );
+      inserted.push({ ...result.rows[0], sku, row_key: rowKey, store_id: storeId });
+    }
+    res.json({ success: true, batch_id: batchId, items: inserted });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+app.post("/api/seller/listing-history/batch-progress", requireAuth, async (req, res) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, error: "服务端未配置 DATABASE_URL。" });
+    const placeholderTaskId = String(req.body?.placeholder_task_id || req.body?.placeholderTaskId || "").trim();
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    if (!placeholderTaskId) return res.status(400).json({ success: false, error: "需要占位任务 ID" });
+    if (storeId) await assertActiveStoreAccess(storeId, req.user.id, "id, name");
+    const status = String(req.body?.status || "running").trim().toLowerCase();
+    const allowedStatus = new Set(["queued", "claimed", "running", "failed"]);
+    const nextStatus = allowedStatus.has(status) ? status : "running";
+    const errorMessage = String(req.body?.error || "").trim();
+    const rawPatch = req.body?.raw_payload && typeof req.body.raw_payload === "object" ? req.body.raw_payload : {};
+    const errorsJson = nextStatus === "failed"
+      ? JSON.stringify([{ code: "batch_upload_failed", message: errorMessage || "批量上架流程中断", message_zh: errorMessage || "批量上架流程中断" }])
+      : null;
+    const result = await db.query(
+      `UPDATE app_listing_history
+          SET status = $1,
+              product_name = COALESCE(NULLIF($2,''), product_name),
+              main_image = COALESCE(NULLIF($3,''), main_image),
+              price_rub = COALESCE($4, price_rub),
+              raw_payload = COALESCE(raw_payload, '{}'::jsonb) || $5::jsonb,
+              errors_json = COALESCE($6::jsonb, errors_json),
+              updated_at = now()
+        WHERE user_id = $7 AND task_id = $8
+        RETURNING id, task_id, status`,
+      [
+        nextStatus,
+        String(req.body?.product_name || req.body?.name || ""),
+        String(req.body?.main_image || req.body?.image || ""),
+        Number.isFinite(Number(req.body?.price_rub ?? req.body?.price)) ? Number(req.body?.price_rub ?? req.body?.price) : null,
+        JSON.stringify({ ...rawPatch, batch_progress_status: nextStatus, batch_progress_at: new Date().toISOString() }),
+        errorsJson,
+        req.user.id,
+        placeholderTaskId,
+      ],
+    );
+    if (!result.rows.length) return res.status(404).json({ success: false, error: "未找到批量上架占位记录" });
+    res.json({ success: true, item: result.rows[0] });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 
@@ -6917,21 +9600,56 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
 
       if (db && req.user?.id && taskId) {
         try {
-          await db.query(
-            `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-             ON CONFLICT (task_id) DO NOTHING`,
-            [
-              req.user.id,
-              storeId || null,
-              String(taskId),
-              String(skuItem.offer_id || ""),
-              String(skuItem.name || ""),
-              String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
-              skuItem.price ? Number(skuItem.price) : null,
-              JSON.stringify({ item, ozon_item: skuItem, source_sku: sourceSku, import_mode: "sku", stocks: rawStocks || [], submitted_at: new Date().toISOString() }),
-            ],
-          );
+          const placeholderTaskId = String(req.body?.meta?.listingPlaceholderTaskId || req.body?.meta?.placeholderTaskId || "").trim();
+          const historyPayload = JSON.stringify({ item, ozon_item: skuItem, source_sku: sourceSku, import_mode: "sku", stocks: rawStocks || [], submitted_at: new Date().toISOString(), placeholder_task_id: placeholderTaskId });
+          let updatedPlaceholder = { rowCount: 0 };
+          if (placeholderTaskId) {
+            updatedPlaceholder = await db.query(
+              `UPDATE app_listing_history
+                  SET task_id = $1,
+                      offer_id = $2,
+                      product_name = $3,
+                      main_image = $4,
+                      price_rub = $5,
+                      status = 'processing',
+                      raw_payload = COALESCE(raw_payload, '{}'::jsonb) || $6::jsonb,
+                      errors_json = '[]'::jsonb,
+                      updated_at = now()
+                WHERE user_id = $7 AND store_id = $8 AND task_id = $9
+                  AND NOT EXISTS (
+                    SELECT 1 FROM app_listing_history existing
+                     WHERE existing.user_id = $7 AND existing.task_id = $1 AND existing.task_id <> $9
+                  )`,
+              [
+                String(taskId),
+                String(skuItem.offer_id || ""),
+                String(skuItem.name || ""),
+                String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
+                skuItem.price ? Number(skuItem.price) : null,
+                historyPayload,
+                req.user.id,
+                storeId || null,
+                placeholderTaskId,
+              ],
+            );
+          }
+          if (!updatedPlaceholder.rowCount) {
+            await db.query(
+              `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+               ON CONFLICT (task_id) DO NOTHING`,
+              [
+                req.user.id,
+                storeId || null,
+                String(taskId),
+                String(skuItem.offer_id || ""),
+                String(skuItem.name || ""),
+                String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
+                skuItem.price ? Number(skuItem.price) : null,
+                historyPayload,
+              ],
+            );
+          }
         } catch (e) { console.error("[listing-history] insert import-by-sku failed:", e.message); }
 
         const collectId = String(req.body?.meta?.collectId || "").trim();
@@ -7146,21 +9864,56 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // 写入上架历史
     if (db && req.user?.id && taskId) {
       try {
-        await db.query(
-          `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
-           ON CONFLICT (task_id) DO NOTHING`,
-          [
-            req.user.id,
-            storeId || null,
-            String(taskId),
-            String(item.offer_id || ""),
-            String(item.name || ""),
-            String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
-            item.price ? Number(item.price) : null,
-            JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, stocks: ozonStocks || rawStocks || [], submitted_at: new Date().toISOString() }),
-          ],
-        );
+        const placeholderTaskId = String(req.body?.meta?.listingPlaceholderTaskId || req.body?.meta?.placeholderTaskId || "").trim();
+        const historyPayload = JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, stocks: ozonStocks || rawStocks || [], submitted_at: new Date().toISOString(), placeholder_task_id: placeholderTaskId });
+        let updatedPlaceholder = { rowCount: 0 };
+        if (placeholderTaskId) {
+          updatedPlaceholder = await db.query(
+            `UPDATE app_listing_history
+                SET task_id = $1,
+                    offer_id = $2,
+                    product_name = $3,
+                    main_image = $4,
+                    price_rub = $5,
+                    status = 'processing',
+                    raw_payload = COALESCE(raw_payload, '{}'::jsonb) || $6::jsonb,
+                    errors_json = '[]'::jsonb,
+                    updated_at = now()
+              WHERE user_id = $7 AND store_id = $8 AND task_id = $9
+                AND NOT EXISTS (
+                  SELECT 1 FROM app_listing_history existing
+                   WHERE existing.user_id = $7 AND existing.task_id = $1 AND existing.task_id <> $9
+                )`,
+            [
+              String(taskId),
+              String(item.offer_id || ""),
+              String(item.name || ""),
+              String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
+              item.price ? Number(item.price) : null,
+              historyPayload,
+              req.user.id,
+              storeId || null,
+              placeholderTaskId,
+            ],
+          );
+        }
+        if (!updatedPlaceholder.rowCount) {
+          await db.query(
+            `INSERT INTO app_listing_history (user_id, store_id, task_id, offer_id, product_name, main_image, price_rub, raw_payload)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+             ON CONFLICT (task_id) DO NOTHING`,
+            [
+              req.user.id,
+              storeId || null,
+              String(taskId),
+              String(item.offer_id || ""),
+              String(item.name || ""),
+              String(item.primary_image || (Array.isArray(item.images) ? item.images[0] : "") || ""),
+              item.price ? Number(item.price) : null,
+              historyPayload,
+            ],
+          );
+        }
       } catch (e) { console.error("[listing-history] insert failed:", e.message); }
 
       const collectId = String(req.body?.meta?.collectId || "").trim();
@@ -7391,6 +10144,155 @@ app.post("/api/seller/orders/:postingNumber/note", requireAuth, async (req, res,
   } catch (error) { next(error); }
 });
 
+app.post("/api/seller/orders/:postingNumber/source", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  const client = await db.connect();
+  try {
+    const postingNumber = String(req.params.postingNumber || "").trim();
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").trim();
+    const offerId = String(req.body?.offer_id || "").trim();
+    const outboundCostCny = Number(req.body?.outbound_cost_cny ?? req.body?.purchase_price_cny);
+    const sourceUrl = String(req.body?.source_url_1688 || "").trim();
+    if (!postingNumber) return res.status(400).json({ success: false, error: "缺少 posting_number" });
+    if (!storeId || !offerId) return res.status(400).json({ success: false, error: "店铺和货号必填" });
+    if (!Number.isFinite(outboundCostCny) || outboundCostCny < 0 || outboundCostCny > 1000000) {
+      return res.status(400).json({ success: false, error: "请输入有效出单总成本" });
+    }
+    if (sourceUrl && !/^https?:\/\//i.test(sourceUrl)) {
+      return res.status(400).json({ success: false, error: "货源链接必须以 http:// 或 https:// 开头" });
+    }
+
+    await client.query("BEGIN");
+    const current = await client.query(
+      `SELECT id, purchase_price_cny, source_url_1688
+         FROM app_products
+        WHERE user_id = $1 AND store_id = $2 AND offer_id = $3
+        FOR UPDATE`,
+      [req.user.id, storeId, offerId],
+    );
+    if (!current.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, error: "商品不存在，请先同步商品列表" });
+    }
+    const productId = current.rows[0].id;
+    const productRes = await client.query(
+      `UPDATE app_products
+          SET source_url_1688 = $1,
+              updated_at = now()
+        WHERE id = $2 AND user_id = $3
+        RETURNING offer_id, name, image, purchase_price_cny, source_url_1688`,
+      [sourceUrl, productId, req.user.id],
+    );
+    await client.query(
+      `UPDATE collect_items
+          SET source_url_1688 = $1,
+              updated_at = now()
+        WHERE linked_offer_id = $2 AND user_id = $3`,
+      [sourceUrl, offerId, req.user.id],
+    );
+    await client.query(
+      `INSERT INTO app_order_costs
+        (user_id, store_id, posting_number, offer_id, source_url_1688, outbound_cost_cny, note, changed_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$1)
+       ON CONFLICT (store_id, posting_number) DO UPDATE SET
+         user_id = EXCLUDED.user_id,
+         offer_id = EXCLUDED.offer_id,
+         source_url_1688 = EXCLUDED.source_url_1688,
+         outbound_cost_cny = EXCLUDED.outbound_cost_cny,
+         note = EXCLUDED.note,
+         changed_by = EXCLUDED.changed_by,
+         updated_at = now()`,
+      [req.user.id, storeId, postingNumber, offerId, sourceUrl, outboundCostCny, `订单 ${postingNumber} 编辑出单总成本`],
+    );
+
+    const cacheRes = await client.query(
+      `SELECT payload FROM app_order_cache
+        WHERE user_id = $1 AND store_id = $2 AND posting_number = $3
+        FOR UPDATE`,
+      [req.user.id, storeId, postingNumber],
+    );
+    let updatedOrder = null;
+    if (cacheRes.rowCount) {
+      const payload = cacheRes.rows[0].payload || {};
+      const products = Array.isArray(payload.products) ? payload.products : [];
+      for (const product of products) {
+        if (String(product.offer_id || "") !== offerId) continue;
+        product.source_url_1688 = sourceUrl;
+      }
+      const rateResult = await client.query(
+        `SELECT rate FROM app_exchange_rates
+          WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
+          ORDER BY effective_at DESC LIMIT 1`,
+      );
+      const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
+      const money = (value) => Math.round(Number(value || 0) * 100) / 100;
+      const financialToCny = (value, currency) => {
+        const amount = Number(value || 0);
+        if (!Number.isFinite(amount)) return 0;
+        const code = String(currency || "").trim().toUpperCase();
+        if (code === "RUB") return amount * effectiveRubCnyRate;
+        return amount;
+      };
+      const logisticsServiceCny = (services, currency) => Object.entries(services || {}).reduce((sum, [key, value]) => {
+        const serviceKey = String(key || "").toLowerCase();
+        if (!/fulfillment|pickup|dropoff|deliv|delivery|trans|return|flow|last/.test(serviceKey)) return sum;
+        return sum + Math.abs(financialToCny(value, currency));
+      }, 0);
+      const fdProducts = Array.isArray(payload?.financial_data?.products) ? payload.financial_data.products : [];
+      for (const product of products) {
+        const fd = fdProducts.find((item) => String(item.product_id) === String(product.sku)) || {};
+        const qty = Number(product.quantity || fd.quantity || 1);
+        const financialCurrency = String(fd.currency_code || product.financial_currency_code || "RUB").toUpperCase();
+        const commissionCny = Math.abs(financialToCny(fd.commission_amount ?? product.commission_amount ?? product.commission_cny ?? 0, financialCurrency));
+        const lastMileCny = logisticsServiceCny(fd.item_services || fd.services || {}, financialCurrency);
+        const payoutCny = Math.abs(financialToCny(fd.payout ?? product.payout_native ?? product.payout_cny ?? 0, financialCurrency));
+        product.financial_currency_code = financialCurrency;
+        product.commission_cny = money(commissionCny * qty);
+        product.last_mile_cny = money(lastMileCny * qty);
+        product.payout_cny = money(payoutCny * qty);
+      }
+      const totalCny = Number(payload.total_cny || 0);
+      const commissionCny = products.reduce((sum, product) => sum + Math.abs(Number(product.commission_cny || 0)), 0);
+      const payoutCny = products.reduce((sum, product) => sum + Math.abs(Number(product.payout_cny || 0)), 0);
+      const rawLastMileCny = products.reduce((sum, product) => sum + Math.abs(Number(product.last_mile_cny || 0)), 0);
+      const lastMileCny = rawLastMileCny > 0 ? rawLastMileCny : Math.max(0, totalCny - payoutCny - commissionCny);
+      const ozonCostCny = commissionCny + lastMileCny;
+      const delivered = String(payload.status || "").toLowerCase() === "delivered";
+      payload.commission_cny = money(commissionCny);
+      payload.last_mile_cny = money(lastMileCny);
+      payload.ozon_cost_cny = money(ozonCostCny);
+      payload.outbound_cost_cny = money(outboundCostCny);
+      payload.profit_cny = delivered ? money(totalCny - ozonCostCny - outboundCostCny) : null;
+      payload.profit_calculable = delivered;
+      payload.profit_block_reason = delivered ? "" : "仅已送达订单可计算利润";
+      await client.query(
+        `UPDATE app_order_cache
+            SET payload = $1::jsonb,
+                updated_at = now()
+          WHERE user_id = $2 AND store_id = $3 AND posting_number = $4`,
+        [JSON.stringify(payload), req.user.id, storeId, postingNumber],
+      );
+      updatedOrder = payload;
+    }
+
+    await client.query("COMMIT");
+    const product = productRes.rows[0];
+    res.json({
+      success: true,
+      product: {
+        ...product,
+        purchase_price_cny: Number(product.purchase_price_cny || 0),
+        outbound_cost_cny: Math.round(outboundCostCny * 100) / 100,
+        source_url_1688: product.source_url_1688 || "",
+      },
+      order: updatedOrder,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    next(error);
+  } finally { client.release(); }
+});
+
 app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -7571,8 +10473,6 @@ app.post("/api/jobs", async (req, res, next) => {
       downloadUrl: null,
       cancelRequested: false,
     };
-    jobs.set(id, job);
-
     const delayMinMs = clampInt(req.body.delayMinMs ?? req.body.delayMs, 1000, 120000, DEFAULT_DELAY_MIN_MS);
     const delayMaxMs = Math.max(
       delayMinMs,
@@ -7595,6 +10495,11 @@ app.post("/api/jobs", async (req, res, next) => {
     };
 
     if (queueSingleSourcing) {
+      const activeJob = await findActiveDbJobForUser(req.user, { kind: "run", storeId });
+      if (activeJob) {
+        res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, job: activeJob });
+        return;
+      }
       const queued = await createQueuedDbJob(req.user, job, {
         urls,
         urlRows,
@@ -7602,9 +10507,11 @@ app.post("/api/jobs", async (req, res, next) => {
         options,
         raw: { urlsText: req.body.urlsText || "" },
       });
-      res.json({ success: true, jobId: queued.id, queued: true });
+      res.json({ success: true, jobId: queued.id, queued: true, job: queued });
       return;
     }
+
+    jobs.set(id, job);
 
     runJob(job, options).catch(async (error) => {
       if (job.status === "canceled") {
@@ -7705,103 +10612,24 @@ app.post("/api/batch-ozon/jobs", async (req, res, next) => {
 
 app.get("/api/jobs/:id", async (req, res, next) => {
   try {
+    if (db) {
+      const job = await getDbJobForUser(req.params.id, req.user);
+      if (job) {
+        res.json({ success: true, job });
+        return;
+      }
+    }
     const runtimeJob = jobs.get(req.params.id);
     if (runtimeJob) {
       res.json({ success: true, job: serializeJob(runtimeJob) });
       return;
     }
-    if (db) {
-      const job = await getDbJobForUser(req.params.id, req.user);
-      if (!job) {
-        res.status(404).json({ success: false, error: "任务不存在。" });
-        return;
-      }
-      res.json({ success: true, job });
+    const storedJob = await loadStoredJob(req.params.id);
+    if (!storedJob) {
+      res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
-    const job = jobs.get(req.params.id);
-    if (!job) {
-      const storedJob = await loadStoredJob(req.params.id);
-      if (!storedJob) {
-        res.status(404).json({ success: false, error: "任务不存在。" });
-        return;
-      }
-      res.json({ success: true, job: storedJob });
-      return;
-    }
-    res.json({ success: true, job: serializeJob(job) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/jobs/:id/review", async (req, res, next) => {
-  try {
-    const job = db
-      ? await getDbJobForUser(req.params.id, req.user)
-      : (jobs.get(req.params.id) || await loadStoredJob(req.params.id));
-    if (!job || job.kind !== "run") {
-      res.status(404).json({ success: false, error: "单品找货任务不存在。" });
-      return;
-    }
-    res.json({ success: true, review: buildSingleSourcingReviewPayload(job) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/jobs/:id/review/confirm", async (req, res, next) => {
-  try {
-    if (!db) {
-      res.status(409).json({ success: false, error: "当前环境不支持保存确认结果。" });
-      return;
-    }
-    const job = await getDbJobForUser(req.params.id, req.user);
-    if (!job || job.kind !== "run") {
-      res.status(404).json({ success: false, error: "单品找货任务不存在。" });
-      return;
-    }
-    const rows = Array.isArray(req.body?.rows) ? req.body.rows.slice(0, 1000) : [];
-    const confirmations = rows
-      .map((row) => ({
-        sourceRow: clampInt(row.sourceRow, 1, 999999, 0),
-        ozonSku: String(row.ozonSku || "").replace(/[^\d]/g, "").slice(0, 32),
-        ozonUrl: normalizeOzonProductUrl(row.ozonUrl || ""),
-        ozonTitle: String(row.ozonTitle || "").slice(0, 500),
-        selectedRank: clampInt(row.selectedRank, 0, 999999, 0),
-        candidateTitle: String(row.candidateTitle || "").slice(0, 500),
-        candidateUrl: String(row.candidateUrl || "").slice(0, 2000),
-        candidateImage: String(row.candidateImage || "").slice(0, 2000),
-        purchasePriceRmb: Number.isFinite(Number(row.purchasePriceRmb)) ? Number(Number(row.purchasePriceRmb).toFixed(2)) : null,
-        listingPriceRub: Number.isFinite(Number(row.listingPriceRub)) ? Number(Number(row.listingPriceRub).toFixed(2)) : null,
-        candidatePriceDetails: String(row.candidatePriceDetails || "").slice(0, 1000),
-        estimatedPurchasePriceRmb: Number.isFinite(Number(row.estimatedPurchasePriceRmb)) ? Number(Number(row.estimatedPurchasePriceRmb).toFixed(2)) : null,
-        purchaseMultiplier: String(row.purchaseMultiplier || "").slice(0, 100),
-        candidateMoq: String(row.candidateMoq || "").slice(0, 200),
-        candidateFreight: String(row.candidateFreight || "").slice(0, 200),
-        candidateWeight: String(row.candidateWeight || "").slice(0, 200),
-        candidateDimensions: String(row.candidateDimensions || "").slice(0, 500),
-        candidatePackQuantity: String(row.candidatePackQuantity || "").slice(0, 200),
-        risk: String(row.risk || "").slice(0, 500),
-        aiDecision: String(row.aiDecision || "").slice(0, 100),
-        aiReason: String(row.aiReason || "").slice(0, 1000),
-        note: String(row.note || "").slice(0, 500),
-        confirmed: row.confirmed !== false,
-        confirmedAt: new Date().toISOString(),
-      }))
-      .filter((row) => row.confirmed && row.ozonSku && Number.isFinite(Number(row.listingPriceRub)) && Number(row.listingPriceRub) > 0);
-    const payload = job.payload && typeof job.payload === "object" ? job.payload : {};
-    payload.review_confirmations = confirmations;
-    payload.review_confirmed_at = new Date().toISOString();
-    await db.query(
-      `UPDATE app_jobs SET payload = $1::jsonb, updated_at = now() WHERE id = $2`,
-      [JSON.stringify(payload), req.params.id],
-    );
-    res.json({
-      success: true,
-      confirmed: confirmations,
-      batchText: buildBatchUploadTextFromConfirmations(confirmations),
-    });
+    res.json({ success: true, job: storedJob });
   } catch (error) {
     next(error);
   }
@@ -7826,12 +10654,13 @@ app.post("/api/jobs/:id/cancel", async (req, res, next) => {
         res.json({ success: true });
         return;
       }
-      await updateDbJob(req.params.id, {
+      const updated = await updateDbJob(req.params.id, {
         status: "canceled",
         phase: "已停止",
         logs: [...(job.logs || []), makeLogEntry("已请求停止，任务已取消。", "warn")],
       });
-      res.json({ success: true });
+      await clearWorkerCurrentJobRefs(req.params.id);
+      res.json({ success: true, job: updated });
       return;
     }
     const job = jobs.get(req.params.id);
@@ -7919,6 +10748,7 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       });
       return;
     }
+    await rescueStaleDbJobsForUser(req.user, { kinds });
     const job = await claimNextDbJob(req.user, workerName, { kinds });
     if (job) {
       await upsertWorkerHeartbeat(req.user, workerName, {
@@ -7947,10 +10777,33 @@ app.get("/api/worker/status", async (req, res, next) => {
     if (requestedStoreId) {
       await assertActiveStoreAccess(requestedStoreId, req.user.id, "id");
     }
+    await rescueStaleDbJobsForUser(req.user, { kinds: ["run"] });
     const workersResult = await db.query(
-      `SELECT worker_name, store_id, version, platform, hostname, profile_dir, current_job_id, current_phase, last_seen_at
-       FROM app_worker_heartbeats
-       WHERE user_id = $1
+      `SELECT h.worker_name, h.store_id, h.version, h.platform, h.hostname, h.profile_dir,
+              CASE WHEN j.status IN ('queued','claimed','running','exporting') THEN h.current_job_id ELSE NULL END AS current_job_id,
+              CASE WHEN h.current_job_id IS NOT NULL AND COALESCE(j.status, '') NOT IN ('queued','claimed','running','exporting')
+                   THEN COALESCE(NULLIF(j.phase, ''), '任务已结束')
+                   ELSE h.current_phase
+              END AS current_phase,
+              j.id AS job_id,
+              j.kind AS job_kind,
+              j.status AS job_status,
+              j.phase AS job_phase,
+              j.total AS job_total,
+              j.processed AS job_processed,
+              j.source_total AS job_source_total,
+              j.source_start_row AS job_source_start_row,
+              j.payload AS job_payload,
+              j.logs AS job_logs,
+              j.results AS job_results,
+              j.error AS job_error,
+              j.download_url AS job_download_url,
+              j.created_at AS job_created_at,
+              j.updated_at AS job_updated_at,
+              h.last_seen_at
+       FROM app_worker_heartbeats h
+       LEFT JOIN app_jobs j ON j.id = h.current_job_id AND j.user_id = h.user_id
+       WHERE h.user_id = $1
        ORDER BY last_seen_at DESC
        LIMIT 10`,
       [req.user?.id || ""],
@@ -7976,6 +10829,27 @@ app.get("/api/worker/status", async (req, res, next) => {
       const versionTooOld = compareNumericVersion(version, MIN_SINGLE_SOURCING_PLUGIN_VERSION) < 0;
       const blockedByPhase = /预览版|暂不领取|不领取任务|未开启领取任务|低于单品找货最低版本|版本\s*未知/i.test(currentPhase);
       const canClaimJobs = storeMatch && !versionTooOld && !blockedByPhase;
+      const currentJob = row.current_job_id && row.job_id ? serializeJob({
+        id: row.job_id,
+        status: row.job_status,
+        storeId: row.store_id || "",
+        createdAt: row.job_created_at,
+        updatedAt: row.job_updated_at,
+        phase: row.job_phase || "",
+        kind: row.job_kind,
+        total: row.job_total || 0,
+        sourceTotal: row.job_source_total || 0,
+        sourceStartRow: row.job_source_start_row || 1,
+        processed: row.job_processed || 0,
+        consecutiveFailures: 0,
+        logs: Array.isArray(row.job_logs) ? row.job_logs : [],
+        verification: null,
+        results: Array.isArray(row.job_results) ? row.job_results : [],
+        error: row.job_error || "",
+        downloadUrl: row.job_download_url || "",
+        cancelRequested: undefined,
+        payload: row.job_payload || {},
+      }) : null;
       return {
         workerName: row.worker_name,
         storeId,
@@ -7985,6 +10859,7 @@ app.get("/api/worker/status", async (req, res, next) => {
         hostname: row.hostname || "",
         profileDir: row.profile_dir || "",
         currentJobId: row.current_job_id || "",
+        currentJob,
         currentPhase,
         canClaimJobs,
         versionTooOld,
@@ -8046,6 +10921,7 @@ app.post("/api/worker/heartbeat", async (req, res, next) => {
       currentPhase: req.body?.currentPhase || "本机采集端在线",
       currentJobId: req.body?.currentJobId,
     });
+    await rescueStaleDbJobsForUser(req.user, { kinds: ["run"] });
     const queueResult = await db.query(
       `SELECT
          count(*) FILTER (WHERE status = 'queued')::int AS queued,
@@ -8069,6 +10945,11 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
     const existing = await getDbJobForUser(req.params.id, req.user);
     if (!existing) {
       res.status(404).json({ success: false, error: "任务不存在。" });
+      return;
+    }
+    if (existing.status === "canceled") {
+      await clearWorkerCurrentJobRefs(req.params.id);
+      res.json({ success: true, job: existing, canceled: true });
       return;
     }
     await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
@@ -8104,6 +10985,28 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};
     const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon" ? "batch-ozon" : "run";
+    if (existing.status === "canceled") {
+      await clearWorkerCurrentJobRefs(req.params.id);
+      const stoppedJob = {
+        ...job,
+        id: req.params.id,
+        kind,
+        status: "canceled",
+        phase: "已停止",
+        logs: Array.isArray(job.logs) ? job.logs : existing.logs,
+        results: Array.isArray(job.results) ? job.results : existing.results,
+        processed: job.processed ?? existing.processed,
+        total: job.total ?? existing.total,
+      };
+      const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, stoppedJob, req.body?.excelBase64 || "").catch(() => existing.downloadUrl || "");
+      const updates = normalizeWorkerJobUpdate({ ...stoppedJob, downloadUrl }, existing);
+      updates.status = "canceled";
+      updates.phase = "已停止";
+      if (downloadUrl) updates.downloadUrl = downloadUrl;
+      const updated = await updateDbJob(req.params.id, updates);
+      res.json({ success: true, job: updated, downloadUrl, canceled: true });
+      return;
+    }
     await upsertWorkerHeartbeat(req.user, req.body?.workerName || req.headers["x-worker-name"] || "", {
       version: req.body?.version,
       pluginVersion: req.body?.pluginVersion,
@@ -8114,14 +11017,17 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       currentPhase: job.phase || existing.phase || "任务完成",
     });
     if (kind === "run") {
-      await updateDbJob(req.params.id, {
+      const initialUpdates = {
         status: "running",
         phase: "服务器 AI 审核/生成 Excel",
         processed: job.processed ?? existing.processed,
         total: job.total ?? existing.total,
         logs: Array.isArray(job.logs) ? job.logs : existing.logs,
-        results: Array.isArray(job.results) ? job.results : existing.results,
-      });
+      };
+      if (Array.isArray(job.results) && job.results.length !== (existing.results || []).length) {
+        initialUpdates.results = job.results;
+      }
+      await updateDbJob(req.params.id, initialUpdates);
       await finalizeWorkerRunJob(existing, job);
     }
     const downloadUrl = await saveWorkerArtifacts(req.params.id, kind, job, req.body?.excelBase64 || "");
@@ -8346,7 +11252,6 @@ async function finalizeWorkerRunJob(existing, job) {
           processed: job.processed,
           total: job.total,
           logs: job.logs,
-          results: job.results,
         });
         result.aiReview = await reviewCandidatesWithMiniMax(result.ozon, result.candidates);
         applyAiReview(result);
@@ -8358,7 +11263,6 @@ async function finalizeWorkerRunJob(existing, job) {
           processed: job.processed,
           total: job.total,
           logs: job.logs,
-          results: job.results,
         });
       } else if (!result.selectedCandidate && !hasStrictNoneAiDecision(result)) {
         const fallback = findBestFallbackCandidate(result.candidates);
@@ -8370,11 +11274,152 @@ async function finalizeWorkerRunJob(existing, job) {
   }
 }
 
+function hasUsableLocalImage(image) {
+  return Boolean(image?.filePath && existsSync(image.filePath));
+}
+
+function normalizeImageUrlValue(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.startsWith("//")) return `https:${text}`;
+  return text;
+}
+
+function pickFirstImageUrl(values) {
+  const queue = Array.isArray(values) ? [...values] : [values];
+  const seen = new Set();
+  const preferredKeys = [
+    "mainImageUrl",
+    "mainImage",
+    "primaryImage",
+    "primary_image",
+    "image",
+    "imageUrl",
+    "image_url",
+    "images",
+    "imageUrls",
+    "image_urls",
+    "url",
+    "publicUrl",
+    "picUrl",
+    "imgUrl",
+    "offerPicUrl",
+    "odPicUrl",
+    "thumbnail",
+    "thumb",
+    "cover",
+    "coverImage",
+    "src",
+    "currentSrc",
+  ];
+  while (queue.length) {
+    const value = queue.shift();
+    if (value == null) continue;
+    if (typeof value === "string") {
+      const normalized = normalizeImageUrlValue(value);
+      if (/^(https?:)?\/\//i.test(normalized) || normalized.startsWith("/artifacts/")) return normalized;
+      continue;
+    }
+    if (Array.isArray(value)) {
+      queue.unshift(...value);
+      continue;
+    }
+    if (typeof value !== "object" || seen.has(value)) continue;
+    seen.add(value);
+    for (const key of preferredKeys) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) queue.push(value[key]);
+    }
+  }
+  return "";
+}
+
+function pickOzonImageUrl(ozon = {}) {
+  return pickFirstImageUrl([
+    ozon?.mainImageUrl,
+    ozon?.mainImage,
+    ozon?.image,
+    ozon?.imageUrl,
+    ozon?.primaryImage,
+    ozon?.primary_image,
+    ozon?.cover,
+    ozon?.thumbnail,
+    ozon?.images,
+    ozon?.imageUrls,
+    ozon?.raw?.mainImageUrl,
+    ozon?.raw?.mainImage,
+    ozon?.raw?.image,
+    ozon?.raw?.imageUrl,
+    ozon?.raw?.primaryImage,
+    ozon?.raw?.primary_image,
+    ozon?.raw?.images,
+    ozon?.raw?.imageUrls,
+  ]);
+}
+
+function pickCandidateImageUrl(candidate = {}) {
+  return pickFirstImageUrl([
+    candidate?.image,
+    candidate?.imageUrl,
+    candidate?.picUrl,
+    candidate?.imgUrl,
+    candidate?.mainImageUrl,
+    candidate?.mainImage,
+    candidate?.offerPicUrl,
+    candidate?.odPicUrl,
+    candidate?.thumbnail,
+    candidate?.thumb,
+    candidate?.cover,
+    candidate?.localImage,
+    candidate?.raw?.image,
+    candidate?.raw?.imageUrl,
+    candidate?.raw?.picUrl,
+    candidate?.raw?.imgUrl,
+    candidate?.raw?.mainImage,
+    candidate?.raw?.mainImageUrl,
+    candidate?.raw?.offerPicUrl,
+    candidate?.raw?.odPicUrl,
+  ]);
+}
+
+function localArtifactPathFromPublicUrl(jobId, publicUrl) {
+  if (!jobId || !isSafeJobId(jobId)) return "";
+  const text = String(publicUrl || "").trim();
+  if (!text) return "";
+  let pathname = text;
+  try {
+    if (/^https?:\/\//i.test(text)) pathname = new URL(text).pathname;
+  } catch {
+    pathname = text;
+  }
+  const prefix = `/artifacts/jobs/${jobId}/images/`;
+  if (!pathname.startsWith(prefix)) return "";
+  const filename = path.basename(pathname.slice(prefix.length));
+  if (!filename) return "";
+  const filePath = path.join(JOBS_DIR, jobId, "images", filename);
+  return existsSync(filePath) ? filePath : "";
+}
+
+function existingLocalImageFromArtifactUrl(jobId, image, imageUrl) {
+  if (hasUsableLocalImage(image)) return image;
+  const localPath = localArtifactPathFromPublicUrl(jobId, image?.publicUrl || image?.url || imageUrl);
+  if (!localPath) return null;
+  return {
+    ...(image && typeof image === "object" ? image : {}),
+    url: image?.url || imageUrl || "",
+    filePath: localPath,
+    publicUrl: image?.publicUrl || imageUrl || `/artifacts/jobs/${jobId}/images/${path.basename(localPath)}`,
+  };
+}
+
 async function hydrateWorkerRunResultImages(jobId, result) {
   if (!jobId || !isSafeJobId(jobId) || !result) return;
   const sourceRow = result.sourceRow || extractOzonProductId(result.url || result.ozon?.sourceUrl || "") || "0";
-  const ozonUrl = result.ozon?.mainImageUrl || result.ozon?.mainImage?.url || "";
-  if (ozonUrl && !result.ozon?.mainImage?.filePath) {
+  result.ozon = result.ozon && typeof result.ozon === "object" ? result.ozon : {};
+  const ozonUrl = pickOzonImageUrl(result.ozon);
+  const existingOzonImage = existingLocalImageFromArtifactUrl(jobId, result.ozon.mainImage, ozonUrl);
+  if (existingOzonImage) {
+    result.ozon.mainImage = existingOzonImage;
+  } else if (ozonUrl && /^https?:\/\//i.test(ozonUrl)) {
     try {
       result.ozon.mainImage = await downloadArtifactImageByUrl({
         jobId,
@@ -8388,8 +11433,13 @@ async function hydrateWorkerRunResultImages(jobId, result) {
   }
   if (!Array.isArray(result.candidates)) return;
   for (const candidate of result.candidates) {
-    const imageUrl = candidate?.image || candidate?.imageUrl || candidate?.localImage?.url || "";
-    if (!imageUrl || candidate?.localImage?.filePath) continue;
+    const imageUrl = pickCandidateImageUrl(candidate);
+    const existingCandidateImage = existingLocalImageFromArtifactUrl(jobId, candidate?.localImage, imageUrl);
+    if (existingCandidateImage) {
+      candidate.localImage = existingCandidateImage;
+      continue;
+    }
+    if (!imageUrl || !/^https?:\/\//i.test(imageUrl)) continue;
     try {
       candidate.localImage = await downloadArtifactImageByUrl({
         jobId,
@@ -12018,6 +15068,14 @@ async function writeJobArtifacts(job) {
     await fs.writeFile(path.join(dir, resumeFilename), `${job.resumeUrls.join("\n")}\n`, "utf8");
     job.resumeFile = `/artifacts/jobs/${job.id}/${resumeFilename}`;
   }
+  if (Array.isArray(job.results)) {
+    for (const result of job.results) {
+      if (!result || result.error) continue;
+      await hydrateWorkerRunResultImages(job.id, result).catch((error) => {
+        console.warn(`[single-sourcing-artifacts] image hydration failed job=${job.id}: ${error.message}`);
+      });
+    }
+  }
   const jsonPath = path.join(dir, "results.json");
   await fs.writeFile(jsonPath, JSON.stringify(serializeJob(job), null, 2), "utf8");
 
@@ -12058,7 +15116,7 @@ async function writeJobArtifacts(job) {
       "Ozon件数": ozon.packQuantity || "",
       "Ozon件数依据": ozon.packQuantityEvidence || "",
       "Ozon图片": "",
-      "Ozon主图链接": ozon.mainImageUrl || "",
+      "Ozon主图链接": pickOzonImageUrl(ozon),
       "本地主图文件": ozon.mainImage?.filePath || "",
       "Ozon描述": ozon.description || "",
       "Ozon错误": result.error || "",
@@ -12118,7 +15176,7 @@ async function writeJobArtifacts(job) {
         "1688重量来源": candidate.weightSource || "",
         "1688图片": "",
         "1688链接": candidate.link,
-        "1688图片链接": candidate.image,
+        "1688图片链接": pickCandidateImageUrl(candidate),
         "疑似引流款": candidate.trafficBaitRisk ? "是" : "",
         "引流款原因": candidate.trafficBaitReason || "",
         "疑似优惠价": candidate.promotionRisk ? "是" : "",
@@ -12165,7 +15223,7 @@ async function writeJobArtifacts(job) {
           "1688重量来源": diagnosticCandidate.weightSource || "",
           "1688图片": "",
           "1688链接": diagnosticCandidate.link,
-          "1688图片链接": diagnosticCandidate.image,
+          "1688图片链接": pickCandidateImageUrl(diagnosticCandidate),
           "疑似引流款": diagnosticCandidate.trafficBaitRisk ? "是" : "",
           "引流款原因": diagnosticCandidate.trafficBaitReason || "",
           "疑似优惠价": diagnosticCandidate.promotionRisk ? "是" : "",
@@ -12223,7 +15281,7 @@ async function writeBatchOzonArtifacts(job) {
       "Ozon件数": ozon.packQuantity || "",
       "Ozon件数依据": ozon.packQuantityEvidence || "",
       "Ozon图片": "",
-      "Ozon主图链接": ozon.mainImageUrl || "",
+      "Ozon主图链接": pickOzonImageUrl(ozon),
       "本地主图文件": ozon.mainImage?.filePath || "",
       "Ozon属性": attrs,
       "Ozon描述": ozon.description || "",
@@ -12561,6 +15619,27 @@ async function createQueuedDbJob(user, job, payload) {
   return dbRowToJob(result.rows[0]);
 }
 
+async function findActiveDbJobForUser(user, options = {}) {
+  if (!db || !user?.id) return null;
+  const kind = String(options.kind || "").trim();
+  const storeId = String(options.storeId || options.store_id || "").trim();
+  const result = await db.query(
+    `SELECT j.*, u.username, u.display_name
+     FROM app_jobs j
+     LEFT JOIN app_users u ON u.id = j.user_id
+     WHERE j.user_id = $1
+       AND j.status IN ('queued','claimed','running','exporting')
+       AND ($2 = '' OR j.kind = $2)
+       AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
+     ORDER BY
+       CASE j.status WHEN 'running' THEN 1 WHEN 'claimed' THEN 2 WHEN 'exporting' THEN 3 WHEN 'queued' THEN 4 ELSE 9 END,
+       j.updated_at DESC
+     LIMIT 1`,
+    [user.id, kind, storeId || null],
+  );
+  return result.rowCount ? dbRowToJob(result.rows[0]) : null;
+}
+
 async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
   if (!db || !user?.id) return;
   const workerLabel = String(workerName || "").trim().slice(0, 80) || "本机采集端";
@@ -12587,6 +15666,63 @@ async function upsertWorkerHeartbeat(user, workerName = "", meta = {}) {
        last_seen_at = now()`,
     [user.id, storeId, workerLabel, version, platform, hostname, profileDir, currentJobId, currentPhase],
   );
+}
+
+async function rescueStaleDbJobsForUser(user, options = {}) {
+  if (!db || !user?.id) return 0;
+  const client = await db.connect();
+  const kinds = Array.isArray(options.kinds)
+    ? options.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
+    : [];
+  const tokenStoreId = isScopedWorkerUser(user) ? String(user.tokenStoreId || "").trim() : "";
+  const staleSeconds = Math.max(60, Math.round(WORKER_JOB_STALE_MS / 1000));
+  const onlineSeconds = Math.max(30, Math.round(WORKER_ONLINE_WINDOW_MS / 1000));
+  try {
+    await client.query("BEGIN");
+    const stale = await client.query(
+      `SELECT j.*
+       FROM app_jobs j
+       WHERE j.user_id = $1
+         AND j.status IN ('claimed','running')
+         AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
+         AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
+         AND j.updated_at < now() - ($4::int * interval '1 second')
+         AND NOT EXISTS (
+           SELECT 1
+           FROM app_worker_heartbeats h
+           WHERE h.user_id = j.user_id
+             AND h.current_job_id = j.id
+             AND h.last_seen_at > now() - ($5::int * interval '1 second')
+         )
+       ORDER BY j.updated_at ASC
+       LIMIT 5
+       FOR UPDATE SKIP LOCKED`,
+      [user.id, kinds, tokenStoreId || null, staleSeconds, onlineSeconds],
+    );
+    for (const row of stale.rows) {
+      const logs = Array.isArray(row.logs) ? row.logs.slice(-299) : [];
+      const processed = Number(row.processed || 0);
+      const total = Number(row.total || 0);
+      const nextText = total > 0 ? `第 ${Math.min(processed + 1, total)}/${total} 条` : "断点";
+      logs.push(makeLogEntry(`超过 ${Math.round(staleSeconds / 60)} 分钟未收到采集端进度，已重新放回队列，将从${nextText}继续。`, "warn"));
+      await client.query(
+        `UPDATE app_jobs
+         SET status = 'queued',
+             phase = $2,
+             logs = $3::jsonb,
+             updated_at = now()
+         WHERE id = $1`,
+        [row.id, `采集端断开，等待重新领取（从${nextText}继续）`, JSON.stringify(logs)],
+      );
+    }
+    await client.query("COMMIT");
+    return stale.rowCount || 0;
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function claimNextDbJob(user, workerName = "", options = {}) {
@@ -12648,131 +15784,16 @@ function normalizeWorkerJobUpdate(input = {}, existing = {}) {
   if (input.phase !== undefined) updates.phase = String(input.phase || "").slice(0, 500);
   if (input.processed !== undefined) updates.processed = clampInt(input.processed, 0, 999999, existing.processed || 0);
   if (input.total !== undefined) updates.total = clampInt(input.total, 0, 999999, existing.total || 0);
-  if (Array.isArray(input.logs)) updates.logs = input.logs.slice(-300).map(normalizeLogEntryForDb);
+  if (Array.isArray(input.logs)) {
+    updates.logs = input.logs
+      .filter((entry) => !/^实时进度：/.test(String(entry?.message || entry || "").trim()))
+      .slice(-300)
+      .map(normalizeLogEntryForDb);
+  }
   if (Array.isArray(input.results)) updates.results = input.results.map(stripBuffers);
   if (input.error !== undefined) updates.error = String(input.error || "").slice(0, 2000);
   if (input.downloadUrl !== undefined) updates.downloadUrl = String(input.downloadUrl || "");
   return updates;
-}
-
-function buildBatchUploadTextFromConfirmations(rows = []) {
-  return rows
-    .filter((row) => row?.ozonSku && Number(row.listingPriceRub) > 0)
-    .map((row) => `${row.ozonSku}\t${Number(row.listingPriceRub).toFixed(2)}`)
-    .join("\n");
-}
-
-function pickSingleSourcingFinalCandidate(result = {}) {
-  const selectedRank = Number(result.aiReview?.selected_rank || result.selectedCandidate?.rank || 0);
-  const byRank = selectedRank
-    ? (result.candidates || []).find((candidate) => Number(candidate.rank) === selectedRank)
-    : null;
-  return result.selectedCandidate || byRank || findBestFallbackCandidate(result.candidates || []) || (result.candidates || [])[0] || null;
-}
-
-function compactRiskText(candidate = {}) {
-  const parts = [];
-  if (candidate.trafficBaitRisk) parts.push(candidate.trafficBaitReason || "疑似引流款");
-  if (candidate.promotionRisk) parts.push(candidate.promotionReason || candidate.promotionText || "疑似优惠价");
-  if (candidate.avoidForSourcing && !parts.length) parts.push(getCandidateAvoidReason(candidate) || "候选存在风险");
-  return parts.join("；");
-}
-
-function buildSingleSourcingReviewPayload(job = {}) {
-  const confirmations = Array.isArray(job.payload?.review_confirmations) ? job.payload.review_confirmations : [];
-  const confirmationMap = new Map(confirmations.map((row) => [Number(row.sourceRow), row]));
-  const rows = [];
-  const candidateRows = [];
-  for (const result of job.results || []) {
-    const ozon = result.ozon || {};
-    const finalCandidate = pickSingleSourcingFinalCandidate(result);
-    const confirmed = confirmationMap.get(Number(result.sourceRow || 0));
-    const ozonSku = String(ozon.sku || ozon.productId || extractOzonProductId(result.url || ozon.sourceUrl || "") || "").replace(/[^\d]/g, "");
-    const ozonPrice = getOzonBestBlackPriceText(ozon) || getOzonDisplayPriceText(ozon);
-    const ozonBlackPrice = getOzonBestBlackPriceText(ozon);
-    const listingPriceRub = confirmed?.listingPriceRub
-      ?? parseRmbNumber(ozonPrice)
-      ?? parseRmbNumber(ozon.currentGreenPriceCny)
-      ?? "";
-    const purchasePrice = finalCandidate
-      ? normalize1688PriceOnly(finalCandidate.priceDetails || finalCandidate.price)
-      : "";
-    const unitPriceNumber = Number(purchasePrice);
-    const estimatedPurchasePrice = Number.isFinite(unitPriceNumber) && unitPriceNumber > 0 && finalCandidate?.purchaseMultiplier
-      ? Number((unitPriceNumber * Number(finalCandidate.purchaseMultiplier)).toFixed(2))
-      : finalCandidate?.estimatedPurchasePriceRmb;
-    const finalDecision = finalCandidate?.finalMatchType || result.aiReview?.decision || "";
-    rows.push({
-      sourceRow: result.sourceRow || rows.length + 1,
-      confirmed: Boolean(confirmed),
-      ozonSku,
-      ozonUrl: result.url || ozon.sourceUrl || "",
-      ozonTitle: ozon.title || "",
-      ozonImage: ozon.mainImage?.publicUrl || ozon.mainImageUrl || "",
-      ozonPrice,
-      ozonBlackPrice,
-      ozonWeight: formatNumberForSheet(ozon.weightGrams || normalizeWeightGrams(ozon.weightText)),
-      aiEstimatedWeight: formatNumberForSheet(result.aiReview?.estimated_weight_grams),
-      ozonPackQuantity: ozon.packQuantity || result.aiReview?.ozon_pack_quantity || "",
-      selectedRank: confirmed?.selectedRank || finalCandidate?.rank || result.aiReview?.selected_rank || "",
-      candidateTitle: confirmed?.candidateTitle || finalCandidate?.title || "",
-      candidateUrl: confirmed?.candidateUrl || finalCandidate?.link || "",
-      candidateImage: confirmed?.candidateImage || finalCandidate?.localImage?.publicUrl || finalCandidate?.image || finalCandidate?.imageUrl || "",
-      purchasePriceRmb: confirmed?.purchasePriceRmb ?? purchasePrice,
-      listingPriceRub,
-      candidatePriceDetails: confirmed?.candidatePriceDetails || finalCandidate?.priceDetails || "",
-      estimatedPurchasePriceRmb: confirmed?.estimatedPurchasePriceRmb ?? estimatedPurchasePrice ?? "",
-      purchaseMultiplier: confirmed?.purchaseMultiplier || finalCandidate?.purchaseMultiplier || "",
-      candidateMoq: confirmed?.candidateMoq || finalCandidate?.minOrderQuantity || finalCandidate?.moq || "",
-      candidateFreight: confirmed?.candidateFreight || finalCandidate?.shippingFee || "",
-      candidateWeight: confirmed?.candidateWeight || formatNumberForSheet(finalCandidate?.weightGrams || normalizeWeightGrams(finalCandidate?.weightText)),
-      candidateDimensions: confirmed?.candidateDimensions || finalCandidate?.dimensionsText || "",
-      candidatePackQuantity: confirmed?.candidatePackQuantity || finalCandidate?.candidatePackQuantity || finalCandidate?.packQuantity || "",
-      risk: confirmed?.risk || compactRiskText(finalCandidate || {}),
-      aiDecision: confirmed?.aiDecision || finalDecision,
-      aiReason: confirmed?.aiReason || result.aiReview?.reason || finalCandidate?.finalReason || finalCandidate?.aiReason || "",
-      note: confirmed?.note || "",
-      error: result.error || result.searchError || "",
-    });
-    for (const candidate of result.candidates || []) {
-      candidateRows.push({
-        sourceRow: result.sourceRow || rows.length,
-        rank: candidate.rank || "",
-        title: candidate.title || "",
-        url: candidate.link || "",
-        image: candidate.localImage?.publicUrl || candidate.image || candidate.imageUrl || "",
-        price: normalize1688PriceOnly(candidate.priceDetails || candidate.price),
-        priceDetails: candidate.priceDetails || "",
-        estimatedPurchasePriceRmb: candidate.estimatedPurchasePriceRmb || "",
-        purchaseMultiplier: candidate.purchaseMultiplier || "",
-        moq: candidate.minOrderQuantity || candidate.moq || "",
-        freight: candidate.shippingFee || "",
-        weight: formatNumberForSheet(candidate.weightGrams || normalizeWeightGrams(candidate.weightText)),
-        dimensions: candidate.dimensionsText || "",
-        packQuantity: candidate.candidatePackQuantity || candidate.packQuantity || "",
-        risk: compactRiskText(candidate),
-        aiDecision: candidate.finalMatchType || candidate.aiVerdict || "",
-        aiReason: candidate.finalReason || candidate.aiReason || "",
-        selected: Number(candidate.rank) === Number(finalCandidate?.rank || result.aiReview?.selected_rank || 0),
-      });
-    }
-  }
-  return {
-    job: {
-      id: job.id,
-      status: job.status,
-      phase: job.phase,
-      total: job.total,
-      processed: job.processed,
-      updatedAt: job.updatedAt,
-      downloadUrl: job.downloadUrl,
-      confirmedAt: job.payload?.review_confirmed_at || "",
-    },
-    rows,
-    candidateRows,
-    confirmedRows: rows.filter((row) => row.confirmed),
-    batchText: buildBatchUploadTextFromConfirmations(confirmations),
-  };
 }
 
 function normalizeLogEntryForDb(entry) {
@@ -12866,6 +15887,20 @@ async function updateDbJob(id, updates = {}) {
     values,
   );
   return dbRowToJob(result.rows[0]);
+}
+
+async function clearWorkerCurrentJobRefs(jobId, phase = "任务已停止，等待插件刷新") {
+  if (!db || !isSafeJobId(jobId)) return 0;
+  const result = await db.query(
+    `UPDATE app_worker_heartbeats
+        SET current_job_id = NULL,
+            current_phase = $2,
+            last_seen_at = now()
+      WHERE current_job_id = $1
+      RETURNING worker_name`,
+    [jobId, String(phase || "").slice(0, 200)],
+  );
+  return result.rowCount || 0;
 }
 
 async function loadDbJobHistory(user) {
@@ -13083,8 +16118,29 @@ async function sendJobDownload(id, res) {
   const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
   const downloadPrefix = kind === "batch-ozon" ? "ozon-batch" : "ozon-1688";
   const filePath = path.join(JOBS_DIR, id, excelName);
+  if (existsSync(filePath) && kind !== "batch-ozon") {
+    const shouldRepairImages = await singleSourcingExcelNeedsImageRepair(id, filePath, jsonPath).catch((error) => {
+      console.warn(`[history-download] image repair precheck failed job=${id}: ${error.message}`);
+      return false;
+    });
+    if (shouldRepairImages) {
+      const repaired = await rebuildJobArtifactsFromLocalJson(id).catch((error) => {
+        console.warn(`[history-download] local image repair failed job=${id}: ${error.message}`);
+        return false;
+      });
+      if (!repaired) {
+        await rebuildJobArtifactsFromDb(id).catch((error) => {
+          console.warn(`[history-download] db image repair failed job=${id}: ${error.message}`);
+          return false;
+        });
+      }
+    }
+  }
   if (!existsSync(filePath)) {
-    const rebuilt = await rebuildJobArtifactsFromDb(id).catch((error) => {
+    const rebuilt = await rebuildJobArtifactsFromLocalJson(id).catch((error) => {
+      console.warn(`[history-download] local rebuild failed job=${id}: ${error.message}`);
+      return false;
+    }) || await rebuildJobArtifactsFromDb(id).catch((error) => {
       console.warn(`[history-download] rebuild failed job=${id}: ${error.message}`);
       return false;
     });
@@ -13096,6 +16152,70 @@ async function sendJobDownload(id, res) {
   await markJobDownloaded(id).catch(() => {});
   const shortId = id.length > 18 ? id.slice(0, 18) : id;
   res.download(filePath, `${downloadPrefix}-${shortId}.xlsx`);
+}
+
+function singleSourcingWorkbookHasEmbeddedMedia(filePath) {
+  if (!filePath || !existsSync(filePath)) return false;
+  try {
+    return readFileSync(filePath).includes(Buffer.from("xl/media/"));
+  } catch {
+    return false;
+  }
+}
+
+function jobResultsHaveRecoverableImageSources(job) {
+  if (!job || !Array.isArray(job.results)) return false;
+  return job.results.some((result) => {
+    if (!result || result.error) return false;
+    if (pickOzonImageUrl(result.ozon || {})) return true;
+    if (hasUsableLocalImage(result.ozon?.mainImage)) return true;
+    return (result.candidates || []).some((candidate) => pickCandidateImageUrl(candidate) || hasUsableLocalImage(candidate?.localImage));
+  });
+}
+
+async function readJobArtifactJson(id) {
+  if (!isSafeJobId(id)) return null;
+  const jsonPath = path.join(JOBS_DIR, id, "results.json");
+  if (!existsSync(jsonPath)) return null;
+  try {
+    return JSON.parse(await fs.readFile(jsonPath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function singleSourcingExcelNeedsImageRepair(id, excelPath, jsonPath = "") {
+  if (!isSafeJobId(id) || !existsSync(excelPath)) return false;
+  if (singleSourcingWorkbookHasEmbeddedMedia(excelPath)) return false;
+  let job = null;
+  if (jsonPath && existsSync(jsonPath)) {
+    try {
+      job = JSON.parse(await fs.readFile(jsonPath, "utf8"));
+    } catch {
+      job = null;
+    }
+  }
+  job ||= await readJobArtifactJson(id);
+  return jobResultsHaveRecoverableImageSources(job);
+}
+
+async function rebuildJobArtifactsFromLocalJson(id) {
+  const job = await readJobArtifactJson(id);
+  if (!job || !Array.isArray(job.results) || !job.results.length) return false;
+  await writeJobArtifacts({
+    ...job,
+    id,
+    kind: job.kind || "run",
+    status: job.status || "done",
+    phase: job.phase || "已完成",
+    total: job.total || job.results.length,
+    processed: job.processed || job.results.length,
+    logs: Array.isArray(job.logs) ? job.logs : [],
+    results: job.results,
+    downloadUrl: job.downloadUrl || `/api/history/${id}/download`,
+    cancelRequested: false,
+  });
+  return true;
 }
 
 async function rebuildJobArtifactsFromDb(id) {
@@ -13917,6 +17037,21 @@ try {
   console.warn(`[uploads] 目录不可写，图片上传/水印会失败: ${e.message}`);
 }
 await initDatabase();
+if (db && MYERP_API_TOKEN) {
+  setTimeout(() => {
+    syncMyErpCategoryAnalysis({ period: MYERP_PLATFORM_PERIOD, pages: MYERP_PLATFORM_SYNC_PAGES })
+      .then((result) => {
+        console.log(`[myerp-platform-sync] startup imported=${result.imported} total=${result.total} period=${result.period}`);
+      })
+      .catch((error) => {
+        console.warn(`[myerp-platform-sync] startup failed: ${error.message}`);
+      });
+  }, 4000).unref?.();
+}
+if (db && PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS > 0) {
+  setTimeout(() => maybeRefreshOzonPlatformSnapshots("startup"), 8000).unref?.();
+  setInterval(() => maybeRefreshOzonPlatformSnapshots("interval"), PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS).unref?.();
+}
 
 // SPA catch-all
 app.get("*", (req, res, next) => {

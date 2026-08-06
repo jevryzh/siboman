@@ -6,6 +6,11 @@ window.SingleSourcingReviewView = {
     const currentJobId = Vue.ref('');
     const jobHistory = Vue.ref([]);
     const activeTab = Vue.ref('sheet');
+    const reviewFilter = Vue.reactive({
+      matchType: 'all',
+      minProfitRate: null,
+      confirmed: 'all',
+    });
     const PREFILL_KEY = 'single_sourcing_batch_prefill';
     const RUB_CNY_RATE = 0.0862;
 
@@ -65,12 +70,14 @@ window.SingleSourcingReviewView = {
 
     const logisticsFor = (row) => {
       const blackPrice = numberOf(row.ozonBlackPrice || row.ozonPrice);
+      const manualWeightG = numberOf(row.manualWeightG);
       const realWeightG = numberOf(row.ozonWeight);
       const aiWeightG = numberOf(row.aiEstimatedWeight);
       const weightG = realWeightG ?? aiWeightG;
-      const weightKg = weightG !== null ? weightG / 1000 : null;
-      const purchase = numberOf(row.estimatedPurchasePriceRmb) ?? numberOf(row.purchasePriceRmb);
-      const freight = numberOf(row.candidateFreight);
+      const effectiveWeightG = manualWeightG ?? weightG;
+      const weightKg = effectiveWeightG !== null ? effectiveWeightG / 1000 : null;
+      const purchase = numberOf(row.manualPurchasePriceRmb) ?? numberOf(row.estimatedPurchasePriceRmb) ?? numberOf(row.purchasePriceRmb);
+      const freight = numberOf(row.manualFreightRmb) ?? numberOf(row.candidateFreight);
       const alibabaCost = purchase !== null ? Number((purchase + (freight ?? 0)).toFixed(2)) : null;
       if (blackPrice === null || weightKg === null) {
         return {
@@ -131,7 +138,26 @@ window.SingleSourcingReviewView = {
     };
 
     const activeRows = Vue.computed(() => review.value.rows || []);
+    const rowProfitRate = (row) => numberOf(logisticsFor(row).profitRate);
+    const rowMatchType = (row) => {
+      const decision = String(row.aiDecision || '').toLowerCase();
+      if (decision === 'exact' || decision === 'match') return 'exact';
+      if (decision === 'none' || decision === 'no_match' || decision === 'not_match') return 'none';
+      return 'approximate';
+    };
+    const filteredRows = Vue.computed(() => activeRows.value.filter((row) => {
+      if (reviewFilter.matchType !== 'all' && rowMatchType(row) !== reviewFilter.matchType) return false;
+      if (reviewFilter.confirmed === 'confirmed' && !row.confirmed) return false;
+      if (reviewFilter.confirmed === 'unconfirmed' && row.confirmed) return false;
+      const minProfit = numberOf(reviewFilter.minProfitRate);
+      if (minProfit !== null) {
+        const profitRate = rowProfitRate(row);
+        if (profitRate === null || profitRate * 100 < minProfit) return false;
+      }
+      return true;
+    }));
     const confirmedCount = Vue.computed(() => activeRows.value.filter((row) => row.confirmed).length);
+    const filteredCount = Vue.computed(() => filteredRows.value.length);
     const batchText = Vue.computed(() => activeRows.value
       .filter((row) => row.confirmed && row.ozonSku && Number(row.listingPriceRub) > 0)
       .map((row) => `${row.ozonSku}\t${Number(row.listingPriceRub).toFixed(2)}`)
@@ -159,13 +185,16 @@ window.SingleSourcingReviewView = {
       { label: '1688价格', prop: 'purchasePriceRmb', width: 110 },
       { label: '1688价格明细', prop: 'candidatePriceDetails', width: 220 },
       { label: '按Ozon件数估算采购价RMB', prop: 'estimatedPurchasePriceRmb', width: 190 },
+      { label: '人工采购价RMB', prop: 'manualPurchasePriceRmb', width: 150 },
       { label: '采购倍数', prop: 'purchaseMultiplier', width: 100 },
       { label: 'Ozon件数', prop: 'ozonPackQuantity', width: 100 },
       { label: '1688销售件数', prop: 'candidatePackQuantity', width: 120 },
       { label: '最少起批', prop: 'candidateMoq', width: 110 },
       { label: '1688运费', prop: 'candidateFreight', width: 110 },
+      { label: '人工运费', prop: 'manualFreightRmb', width: 130 },
       { label: '1688尺寸', prop: 'candidateDimensions', width: 140 },
       { label: '1688重量（克）', prop: 'candidateWeight', width: 130 },
+      { label: '人工重量（克）', prop: 'manualWeightG', width: 140 },
       { label: '阿里巴巴采购价(预)', prop: 'alibabaCost', width: 150 },
       { label: '头程物流费', prop: 'logisticsFee', width: 120 },
       { label: '佣金', prop: 'commission', width: 100 },
@@ -217,7 +246,23 @@ window.SingleSourcingReviewView = {
       await loadReview(currentJobId.value);
     };
     const toggleAllConfirmed = (value) => {
-      for (const row of activeRows.value) row.confirmed = Boolean(value);
+      for (const row of filteredRows.value) row.confirmed = Boolean(value);
+    };
+    const showExact = () => {
+      reviewFilter.matchType = 'exact';
+      reviewFilter.confirmed = 'all';
+      activeTab.value = 'sheet';
+    };
+    const showApproxProfit = () => {
+      reviewFilter.matchType = 'approximate';
+      if (numberOf(reviewFilter.minProfitRate) === null) reviewFilter.minProfitRate = 10;
+      reviewFilter.confirmed = 'all';
+      activeTab.value = 'sheet';
+    };
+    const resetFilter = () => {
+      reviewFilter.matchType = 'all';
+      reviewFilter.minProfitRate = null;
+      reviewFilter.confirmed = 'all';
     };
     const isSelectedCandidate = (candidate) => {
       const row = activeRows.value.find(item => Number(item.sourceRow) === Number(candidate.sourceRow));
@@ -290,9 +335,10 @@ window.SingleSourcingReviewView = {
 
     return {
       loading, saving, review, currentJobId, jobHistory, activeTab, activeRows, candidateRows,
-      confirmedCount, batchText, displayColumns, formatTime, imageUrl, decisionText, decisionType,
+      filteredRows, filteredCount, confirmedCount, batchText, displayColumns, reviewFilter,
+      formatTime, imageUrl, decisionText, decisionType,
       cellValue, logisticsFor, loadReview, refresh, toggleAllConfirmed, isSelectedCandidate,
-      useCandidate, saveConfirmations, copyBatchText, sendToBatchUpload,
+      showExact, showApproxProfit, resetFilter, useCandidate, saveConfirmations, copyBatchText, sendToBatchUpload,
     };
   },
   template: `
@@ -320,6 +366,7 @@ window.SingleSourcingReviewView = {
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px">
           <el-tag type="info">任务 {{ review.job?.status || '-' }}</el-tag>
           <el-tag>{{ review.job?.processed || 0 }}/{{ review.job?.total || 0 }}</el-tag>
+          <el-tag type="primary">当前筛选 {{ filteredCount }}</el-tag>
           <el-tag type="success">已选用 {{ confirmedCount }}</el-tag>
           <span style="color:#909399; font-size:13px; line-height:24px">更新时间：{{ formatTime(review.job?.updatedAt) }}</span>
         </div>
@@ -340,7 +387,27 @@ window.SingleSourcingReviewView = {
           </div>
         </div>
 
-        <el-table v-show="activeTab === 'sheet'" :data="activeRows" border stripe height="620" style="width:100%" row-key="sourceRow">
+        <div v-show="activeTab === 'sheet'" style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:12px; padding:12px; background:#f7f9fc; border:1px solid #ebeef5; border-radius:6px">
+          <el-button size="small" type="success" @click="showExact">只看完全一致</el-button>
+          <el-button size="small" type="warning" @click="showApproxProfit">近似且利润达标</el-button>
+          <el-button size="small" @click="resetFilter">显示全部</el-button>
+          <el-select v-model="reviewFilter.matchType" size="small" style="width:132px">
+            <el-option label="全部匹配" value="all" />
+            <el-option label="完全一致" value="exact" />
+            <el-option label="近似匹配" value="approximate" />
+            <el-option label="无匹配" value="none" />
+          </el-select>
+          <el-input-number v-model="reviewFilter.minProfitRate" size="small" :min="-100" :max="300" :precision="1" placeholder="最低利润率" style="width:150px" />
+          <span style="font-size:12px; color:#606266">利润率 ≥ %</span>
+          <el-select v-model="reviewFilter.confirmed" size="small" style="width:120px">
+            <el-option label="全部状态" value="all" />
+            <el-option label="已勾选" value="confirmed" />
+            <el-option label="未勾选" value="unconfirmed" />
+          </el-select>
+          <span style="font-size:12px; color:#909399">改人工采购价、重量或运费后，利润会即时重算。</span>
+        </div>
+
+        <el-table v-show="activeTab === 'sheet'" :data="filteredRows" border stripe height="620" style="width:100%" row-key="sourceRow">
           <el-table-column
             v-for="col in displayColumns"
             :key="col.prop"
@@ -370,6 +437,15 @@ window.SingleSourcingReviewView = {
               </template>
               <template v-else-if="col.prop === 'listingPriceRub'">
                 <el-input-number v-model="row.listingPriceRub" :min="0" :precision="2" style="width:126px" />
+              </template>
+              <template v-else-if="col.prop === 'manualPurchasePriceRmb'">
+                <el-input-number v-model="row.manualPurchasePriceRmb" :min="0" :precision="2" placeholder="按实填" style="width:126px" />
+              </template>
+              <template v-else-if="col.prop === 'manualFreightRmb'">
+                <el-input-number v-model="row.manualFreightRmb" :min="0" :precision="2" placeholder="按实填" style="width:112px" />
+              </template>
+              <template v-else-if="col.prop === 'manualWeightG'">
+                <el-input-number v-model="row.manualWeightG" :min="0" :precision="0" placeholder="按实填" style="width:118px" />
               </template>
               <template v-else-if="col.prop === 'note'">
                 <el-input v-model="row.note" placeholder="人工备注" />

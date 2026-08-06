@@ -77,7 +77,7 @@
           "value: 'VISIBLE'",
           "value: 'READY_TO_SUPPLY'",
           "value: 'FAILED_MODERATION'",
-          "selectedRows.value.length > 100",
+          "candidates.length > 100",
           "'/api/seller/products/export'",
           "source_url_1688",
           "保存并同步价格/图片"
@@ -330,12 +330,12 @@
       "riskLevel": "external_write_impact",
       "readonlyAcceptance": [
         "List orders by current store, status tab, date range, and pagination.",
-        "Show order details, procurement links, local notes, labels, deadlines, shipping status, cost fields, and export.",
+        "Show order details, procurement links, local notes, deadlines, shipping status, cost fields, and export.",
         "Cancelled or dispute orders must visibly block dangerous actions."
       ],
       "authorizationAcceptance": [
-        "Notes, label generation, order export, and shipping actions are authenticated and store-scoped.",
-        "Batch labels and batch ship cap selected rows and report partial failures."
+        "Notes, order export, and shipping actions are authenticated and store-scoped.",
+        "Batch ship caps selected rows and reports partial failures."
       ],
       "externalWriteAcceptance": [
         "Ship/package calls are irreversible Ozon operations, are not part of local smoke, and require confirmation.",
@@ -345,13 +345,16 @@
       "localSmoke": {
         "viewContains": [
           "batchShip",
-          "printLabels",
           "exportOrders",
           "saveNote",
           "source_url_1688",
           "row.status !== 'cancelled'",
           "if (!['awaiting_packaging', 'awaiting_deliver'].includes(row.status))",
           "statusText(row.status)"
+        ],
+        "viewMustNotContain": [
+          "printLabels",
+          "面单"
         ],
         "serverContains": [
           "CREATE TABLE IF NOT EXISTS app_order_ship_events",
@@ -488,34 +491,34 @@
     },
     {
       "id": "market-discovery",
-      "menuLabel": "市场榜单",
+      "menuLabel": "选品中心",
       "route": "#/market-discovery",
       "viewFile": "public/js/views/MarketDiscovery.js",
       "riskLevel": "requires_authorization",
       "readonlyAcceptance": [
-        "Bestseller and China-zone lists show source name, capture time, category, confidence, and unavailable-source fallback.",
-        "Ranking data source is independent from frozen single-sourcing.",
-        "Add-to-collection is explicit and does not silently start a listing publish."
+        "Auto-listing overview shows daily quota progress, pipeline stage counts, processing items, and recent events.",
+        "Market opportunities use independent Ozon platform data, show source name, capture time, Chinese category, and can be explicitly added to the auto-listing queue.",
+        "Pipeline items expose current stage, status, risk level, human-handling reason, and next action without silently publishing to Ozon."
       ],
       "authorizationAcceptance": [
-        "Import or add-to-collection is authenticated and current-store scoped.",
+        "Discovering opportunities and queue operations are authenticated and current-store scoped.",
         "Admin-only imports are blocked for non-admin users."
       ],
       "externalWriteAcceptance": [
-        "Any future live crawler or paid ranking import requires separate authorization; local smoke only checks structure."
+        "Real Ozon submission is guarded by a disabled-by-default submit_to_ozon switch; local smoke only checks structure."
       ],
       "localSmoke": {
         "viewContains": [
-          "独立公共数据源",
-          "addToCollection",
+          "自动上架",
+          "商品流水线",
+          "规则中心",
           "split(',').map(value => value.trim()).find(Boolean)"
         ],
-        "viewMustNotContain": [
-          "single-sourcing",
-          "1688",
-          "找货"
-        ],
+        "viewMustNotContain": [],
         "serverContains": [
+          "CREATE TABLE IF NOT EXISTS app_auto_listing_items",
+          "/api/auto-listing/dashboard",
+          "/api/auto-listing/discover",
           "CREATE TABLE IF NOT EXISTS app_top_lists",
           "CREATE TABLE IF NOT EXISTS app_china_sellers",
           "/api/sourcing/bestsellers",

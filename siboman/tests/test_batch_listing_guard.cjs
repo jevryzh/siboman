@@ -49,6 +49,19 @@ for (const needle of [
   '复制源卡片',
   "importMode === 'sku'",
   'collectViaExtension',
+  'collectTimeoutMs',
+  'ensureRowsCollected',
+  'createBatchListingPlaceholders',
+  'updateBatchListingPlaceholder',
+  '_listingPlaceholders',
+  '_listingRowKey',
+  'row_key: row._listingRowKey',
+  '/api/seller/listing-history/batch-start',
+  '/api/seller/listing-history/batch-progress',
+  'listingPlaceholderTaskId',
+  'runPublishBatch',
+  '已提交后台流程',
+  '提交后台批采 + 上架',
   'portalImportViaExtension',
   'buildV3Item',
   'richContent: d.richContent ||',
@@ -65,7 +78,7 @@ for (const needle of [
   'collection_box_listing_prefill',
   'consumeCollectionPrefill',
   'collectionPrefill.value?.item?.id',
-  'meta: row.collectId ? { collectId: row.collectId } : undefined',
+  'listingPlaceholderTaskId: placeholderForRow(storeId, row)',
   '不会自动提交 Ozon',
 ]) {
   assert(batch.includes(needle), `BatchUpload protection missing: ${needle}`);
@@ -91,6 +104,11 @@ for (const needle of [
   'enrichListingErrors',
   '/api/seller/listing-history/export',
   '/api/seller/listing-history/:id/retry',
+  '/api/seller/listing-history/batch-start',
+  '/api/seller/listing-history/batch-progress',
+  'batch-upload-placeholder',
+  'row_key',
+  "('queued','claimed','running','processing','pending','moderating','ozon_processing')",
 ]) {
   assert(server.includes(needle), `server protection missing: ${needle}`);
 }
@@ -107,6 +125,7 @@ for (const needle of [
   'message_zh',
   '每 30s 自动刷新',
   '同步状态',
+  "startsWith('batch-')",
 ]) {
   assert(listing.includes(needle), `ListingHistory protection missing: ${needle}`);
 }

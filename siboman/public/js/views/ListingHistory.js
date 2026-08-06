@@ -136,6 +136,7 @@ window.ListingHistoryView = {
 
     const syncTask = async (row) => {
       if (String(row.task_id || '').startsWith('portal-')) return window.ElementPlus.ElMessage.warning('该记录由门户上架，后台会自动按货号同步');
+      if (String(row.task_id || '').startsWith('batch-')) return window.ElementPlus.ElMessage.warning('该记录还在批量采集/提交中，拿到 Ozon 任务后会自动更新');
       syncingTaskId.value = row.task_id;
       try {
         const res = await axios.post('/api/seller/import/sync-task', { task_id: row.task_id, store_id: row.store_id || getStoreId() });

@@ -149,8 +149,12 @@ const initApp = () => {
 
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
+        if (path === '#/selection') return 'sourcing';
+        if (path === '#/history') return 'listing-history';
+        if (path === '#/ai-image') return 'ai-generator';
+        if (path === '#/screen') return 'data-screen';
+        if (path === '#/ranking') return 'market-discovery';
         if (path.includes('dashboard')) return 'dashboard';
-        if (path.includes('single-sourcing-review')) return 'single-sourcing-review';
         if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
@@ -189,9 +193,6 @@ const initApp = () => {
             <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')">
               <el-icon><Search /></el-icon><span>单品找货</span>
             </el-menu-item>
-            <el-menu-item index="#/single-sourcing-review" @click="goTo('#/single-sourcing-review')">
-              <el-icon><Tickets /></el-icon><span>找货核对</span>
-            </el-menu-item>
             <el-menu-item index="#/products" @click="goTo('#/products')">
               <el-icon><Goods /></el-icon><span>商品管理</span>
             </el-menu-item>
@@ -225,13 +226,13 @@ const initApp = () => {
           </el-menu>
         </el-aside>
         <el-container>
-          <el-header style="background:#fff; border-bottom:1px solid #eee; display:flex; align-items:center; justify-content:space-between">
+          <el-header class="erp-app-header">
             <el-breadcrumb separator="/">
               <el-breadcrumb-item>逐梦 ERP</el-breadcrumb-item>
               <el-breadcrumb-item>{{ routeName }}</el-breadcrumb-item>
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
-              <shop-switcher @change="handleStoreChange" />
+              <shop-switcher v-if="routeName !== 'orders'" @change="handleStoreChange" />
               <el-tooltip :content="buildInfo.buildTime ? ('构建时间：' + buildInfo.buildTime) : '版本信息读取中'" placement="bottom">
                 <el-tag size="small" :type="envLabel === '生产环境' ? 'success' : envLabel === '测试环境' ? 'warning' : 'info'">
                   {{ envLabel }}<span v-if="buildInfo.version"> · {{ buildInfo.version }}</span>
@@ -243,21 +244,20 @@ const initApp = () => {
               <el-button type="danger" link @click="handleLogout">退出</el-button>
             </div>
           </el-header>
-          <el-main>
-            <div v-if="routeName === 'dashboard'"><dashboard-view /></div>
-            <div v-else-if="routeName === 'sourcing'"><sourcing-module-view /></div>
-            <div v-else-if="routeName === 'single-sourcing'"><sourcing-module-view /></div>
-            <div v-else-if="routeName === 'single-sourcing-review'"><single-sourcing-review-view /></div>
+          <el-main class="erp-main">
+            <div v-if="routeName === 'dashboard'" class="erp-route-page"><dashboard-view /></div>
+            <div v-else-if="routeName === 'sourcing'" class="erp-route-page"><market-discovery-view /></div>
+            <div v-else-if="routeName === 'single-sourcing'" class="erp-route-page"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
             <div v-else-if="routeName === 'orders'"><order-list-view /></div>
-            <div v-else-if="routeName === 'upload'"><batch-upload-view /></div>
-            <div v-else-if="routeName === 'listing-history'"><listing-history-view /></div>
-            <div v-else-if="routeName === 'ai-generator'"><ai-image-generator-view /></div>
-            <div v-else-if="routeName === 'analytics'"><analytics-center-view /></div>
+            <div v-else-if="routeName === 'upload'" class="erp-route-page"><batch-upload-view /></div>
+            <div v-else-if="routeName === 'listing-history'" class="erp-route-page"><listing-history-view /></div>
+            <div v-else-if="routeName === 'ai-generator'" class="erp-route-page"><ai-image-generator-view /></div>
+            <div v-else-if="routeName === 'analytics'" class="erp-route-page"><analytics-center-view /></div>
             <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
-            <div v-else-if="routeName === 'market-discovery'"><market-discovery-view /></div>
+            <div v-else-if="routeName === 'market-discovery'" class="erp-route-page"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
           </el-main>
         </el-container>
@@ -283,7 +283,6 @@ const initApp = () => {
   register('collection-edit-drawer', window.CollectionEditDrawer);
   register('dashboard-view', window.DashboardView);
   register('sourcing-module-view', window.SourcingModuleView);
-  register('single-sourcing-review-view', window.SingleSourcingReviewView);
   register('product-list-view', window.ProductListView);
   register('inventory-management-view', window.InventoryManagementView);
   register('order-list-view', window.OrderListView);

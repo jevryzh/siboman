@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.57";
+const VERSION = "2.2.9.67";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -25,6 +25,73 @@ let workerAuthToken = "";
 let imageSearchQueue = Promise.resolve();
 let last1688SearchAt = 0;
 let last1688FailureAt = 0;
+const active1688TabIds = new Set();
+// v2.2.9.63+: 自适应风控窗口，记录最近 60s 内的失败/验证码事件数
+let riskWindow = [];
+const RISK_WINDOW_MS = 60_000;
+const CRITICAL_RISK_HOLD_MS = 5 * 60_000;
+let criticalRiskHoldUntil = 0;
+function pushRiskEvent(isCritical) {
+  const now = Date.now();
+  riskWindow.push({ at: now, critical: !!isCritical });
+  riskWindow = riskWindow.filter((entry) => now - entry.at <= RISK_WINDOW_MS);
+  if (isCritical) {
+    criticalRiskHoldUntil = Math.max(criticalRiskHoldUntil, now + CRITICAL_RISK_HOLD_MS);
+    console.warn(`[SW ${VERSION}] 1688 触发风控关键字，进入 5 分钟任务暂停`);
+  }
+}
+function adaptiveCooldownMs() {
+  const now = Date.now();
+  if (now < criticalRiskHoldUntil) return Math.max(45_000, criticalRiskHoldUntil - now + randomInt(0, 30_000));
+  const active = riskWindow.filter((entry) => now - entry.at <= RISK_WINDOW_MS);
+  const f60 = active.length;
+  const fCritical = active.filter((entry) => entry.critical).length;
+  if (fCritical > 0) return randomInt(120_000, 180_000);
+  if (f60 >= 3) return randomInt(60_000, 90_000);
+  if (f60 === 2) return randomInt(30_000, 50_000);
+  if (f60 === 1) return randomInt(20_000, 35_000);
+  return randomInt(12_000, 22_000);  // v2.2.9.62 仅 7-14s 太频繁，调慢
+}
+function clear1688Success() {
+  if (riskWindow.length) {
+    console.log(`[SW ${VERSION}] 1688 成功清零风险窗口，前 ${riskWindow.length} 个事件已通过`);
+  }
+  riskWindow = [];
+  criticalRiskHoldUntil = 0;
+  last1688FailureAt = 0;
+}
+
+function markSourcingCanceled(job, message = "收到停止请求，正在中断当前采集步骤。") {
+  if (!job || job.cancelRequested) return;
+  job.cancelRequested = true;
+  if (job.abortController && !job.abortController.signal?.aborted) {
+    try { job.abortController.abort(); } catch (_) {}
+  }
+  if (Array.isArray(job.logs)) job.logs.push(makeLog(message, "warn"));
+  closeActive1688TabsInPlugin().catch((error) => console.warn(`[SW ${VERSION}] 关闭 1688 临时页失败: ${error.message || error}`));
+}
+
+function assertSourcingNotCanceled(job) {
+  if (job?.cancelRequested || job?.abortController?.signal?.aborted) {
+    throw new Error("任务已停止");
+  }
+}
+
+function touchLiveHeartbeat(job) {
+  if (!job) return false;
+  const now = Date.now();
+  if (job.lastLiveLogAt && now - job.lastLiveLogAt < 4500) return false;
+  job.lastLiveLogAt = now;
+  return true;
+}
+
+async function closeActive1688TabsInPlugin() {
+  const ids = Array.from(active1688TabIds);
+  active1688TabIds.clear();
+  for (const tabId of ids) {
+    await safeRemoveTab(tabId).catch(() => {});
+  }
+}
 
 function isTransientTabEditError(error) {
   const message = String(error?.message || error || "");
@@ -459,6 +526,22 @@ async function reportSourcingProgress(job, extra = {}) {
   }
 }
 
+function startSourcingCancelMonitor(job) {
+  const timer = setInterval(async () => {
+    if (!job || ["done", "error", "canceled"].includes(job.status)) {
+      clearInterval(timer);
+      return;
+    }
+    if (!touchLiveHeartbeat(job)) return;
+    const data = await reportSourcingProgress(job, { phase: job.phase || "采集中" });
+    if (data?.job?.status === "canceled") {
+      markSourcingCanceled(job, "收到停止请求，正在中断当前 1688/Ozon 采集步骤。");
+      clearInterval(timer);
+    }
+  }, 5000);
+  return () => clearInterval(timer);
+}
+
 async function completeSourcingJob(job) {
   await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/complete`, {
     method: "POST",
@@ -530,6 +613,7 @@ async function runQueuedSourcingJob(remoteJob) {
     results: Array.isArray(remoteJob.results) ? remoteJob.results : [],
     error: "",
     cancelRequested: false,
+    abortController: typeof AbortController === "function" ? new AbortController() : null,
   };
   job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取单品找货任务。`));
   await reportSourcingProgress(job);
@@ -539,59 +623,67 @@ async function runQueuedSourcingJob(remoteJob) {
   const delayMinMs = Math.max(1000, Number(options.delayMinMs || 8000));
   const delayMaxMs = Math.max(delayMinMs, Number(options.delayMaxMs || 20000));
   let fatalStop = false;
+  const stopCancelMonitor = startSourcingCancelMonitor(job);
 
-  for (let index = job.processed; index < rows.length; index += 1) {
-    if (job.cancelRequested) break;
-    const row = rows[index] || {};
-    const url = row.url || row;
-    const sourceRow = Number(row.sourceRow || index + 1);
-    const sku = extractOzonSkuFromUrl(url);
-    const result = { url, sourceRow, ozon: null, candidates: [], selectedCandidate: null, aiReview: null };
-    try {
-      if (!sku) throw new Error("没有识别到 Ozon SKU");
-      job.phase = `采集 Ozon 第 ${sourceRow} 行`;
-      job.logs.push(makeLog(`开始采集 Ozon SKU ${sku}`));
-      await reportSourcingProgress(job);
-      const ozonRaw = await collectSku(sku, []);
-      result.ozon = normalizeOzonForSourcing(ozonRaw, url, sourceRow);
-
-      if (enable1688 && result.ozon.mainImageUrl) {
-        job.phase = `1688 搜图 第 ${sourceRow} 行`;
-        job.logs.push(makeLog(`用主图搜索 1688 候选，最多 ${maxCandidates} 个。`));
+  try {
+    for (let index = job.processed; index < rows.length; index += 1) {
+      if (job.cancelRequested) break;
+      const row = rows[index] || {};
+      const url = row.url || row;
+      const sourceRow = Number(row.sourceRow || index + 1);
+      const sku = extractOzonSkuFromUrl(url);
+      const result = { url, sourceRow, ozon: null, candidates: [], selectedCandidate: null, aiReview: null };
+      try {
+        if (!sku) throw new Error("没有识别到 Ozon SKU");
+        job.phase = `采集 Ozon 第 ${sourceRow} 行`;
+        job.logs.push(makeLog(`开始采集 Ozon SKU ${sku}`));
         await reportSourcingProgress(job);
-        const searchResult = await search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates);
-        if (searchResult.success) {
-          result.candidates = searchResult.candidates;
-          result.selectedCandidate = result.candidates[0] || null;
-          result.aiReview = {
-            decision: result.selectedCandidate ? "needs_review" : "no_match",
-            reason: "插件端已完成 1688 搜图和详情采集，AI 严格审核待接入后端评估。",
-          };
-          job.logs.push(makeLog(`1688 找到 ${result.candidates.length} 个候选。`));
-        } else {
-          result.searchError = searchResult.error;
-          job.logs.push(makeLog(`1688 搜图失败：${searchResult.error}`, "warn"));
-          if (isCritical1688BlockerInPlugin(searchResult.error)) {
-            fatalStop = true;
-            job.error = searchResult.error;
-            job.phase = "已自动停止：1688 需要人工登录/验证";
-            job.logs.push(makeLog("检测到 1688 登录/验证码/安全验证阻塞，已停止后续采集，避免继续触发风控。", "error"));
+        const ozonRaw = await collectSku(sku, []);
+        if (job.cancelRequested) break;
+        result.ozon = normalizeOzonForSourcing(ozonRaw, url, sourceRow);
+
+        if (enable1688 && result.ozon.mainImageUrl) {
+          job.phase = `1688 搜图 第 ${sourceRow} 行`;
+          job.logs.push(makeLog(`用主图搜索 1688 候选，最多 ${maxCandidates} 个。`));
+          await reportSourcingProgress(job);
+          const searchResult = await search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates, job);
+          if (job.cancelRequested) break;
+          if (searchResult.success) {
+            result.candidates = searchResult.candidates;
+            result.selectedCandidate = result.candidates[0] || null;
+            result.aiReview = {
+              decision: result.selectedCandidate ? "needs_review" : "no_match",
+              reason: "插件端已完成 1688 搜图和详情采集，AI 严格审核待接入后端评估。",
+            };
+            job.logs.push(makeLog(`1688 找到 ${result.candidates.length} 个候选。`));
+          } else {
+            result.searchError = searchResult.error;
+            job.logs.push(makeLog(`1688 搜图失败：${searchResult.error}`, "warn"));
+            if (isCritical1688BlockerInPlugin(searchResult.error)) {
+              fatalStop = true;
+              job.error = searchResult.error;
+              job.phase = "已自动停止：1688 需要人工登录/验证";
+              job.logs.push(makeLog("检测到 1688 登录/验证码/安全验证阻塞，已停止后续采集，避免继续触发风控。", "error"));
+            }
           }
+        } else if (enable1688) {
+          result.searchError = "Ozon 主图为空，无法 1688 搜图";
+          job.logs.push(makeLog(result.searchError, "warn"));
         }
-      } else if (enable1688) {
-        result.searchError = "Ozon 主图为空，无法 1688 搜图";
-        job.logs.push(makeLog(result.searchError, "warn"));
+      } catch (e) {
+        result.error = e.message || String(e);
+        job.logs.push(makeLog(`第 ${sourceRow} 行失败：${result.error}`, "error"));
       }
-    } catch (e) {
-      result.error = e.message || String(e);
-      job.logs.push(makeLog(`第 ${sourceRow} 行失败：${result.error}`, "error"));
+      if (job.cancelRequested) break;
+      job.results.push(result);
+      job.processed = index + 1;
+      if (!fatalStop) job.phase = `已完成 ${job.processed}/${job.total}`;
+      await reportSourcingProgress(job);
+      if (fatalStop || job.cancelRequested) break;
+      if (index < rows.length - 1) await sleep(randomInt(delayMinMs, delayMaxMs));
     }
-    job.results.push(result);
-    job.processed = index + 1;
-    if (!fatalStop) job.phase = `已完成 ${job.processed}/${job.total}`;
-    await reportSourcingProgress(job);
-    if (fatalStop) break;
-    if (index < rows.length - 1) await sleep(randomInt(delayMinMs, delayMaxMs));
+  } finally {
+    stopCancelMonitor();
   }
 
   job.status = fatalStop ? "error" : (job.cancelRequested ? "canceled" : (job.results.some(r => !r.error) ? "done" : "error"));
@@ -632,9 +724,9 @@ async function run1688ImageSearchQueued(fn) {
   imageSearchQueue = new Promise((resolve) => { release = resolve; });
   await previous;
   try {
-    const normalCooldown = randomInt(7000, 14000);
-    const failureCooldown = Date.now() - last1688FailureAt < 60000 ? randomInt(12000, 22000) : 0;
-    const waitMs = Math.max(0, last1688SearchAt + Math.max(normalCooldown, failureCooldown) - Date.now());
+    const cooldown = adaptiveCooldownMs();
+    const baseGap = last1688SearchAt ? 0 : randomInt(2_000, 5_000);
+    const waitMs = Math.max(baseGap, last1688SearchAt + cooldown - Date.now());
     if (waitMs > 0) await sleep(waitMs);
     return await fn();
   } finally {
@@ -660,34 +752,40 @@ function isCritical1688BlockerInPlugin(message) {
 
 async function recover1688SessionInPlugin(reason, attempt) {
   last1688FailureAt = Date.now();
-  console.warn(`[SW ${VERSION}] 1688 会话恢复 attempt=${attempt}: ${compact1688ErrorInPlugin(reason)}`);
+  const reasonText = compact1688ErrorInPlugin(reason);
+  pushRiskEvent(isCritical1688BlockerInPlugin(reasonText));
+  console.warn(`[SW ${VERSION}] 1688 会话恢复 attempt=${attempt}: ${reasonText}`);
   await sleep(randomInt(3500, 8000) * Math.min(attempt, 3));
+  if (Date.now() < criticalRiskHoldUntil) return;  // 风控暂停期不主动 seed，避免再触发
   await seed1688MtopTokenInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 token seed 恢复失败: ${e.message}`));
   await get1688CookieStateInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 cookie 读取失败: ${e.message}`));
 }
 
-async function search1688ByImageInPlugin(imageUrl, maxCandidates) {
-  return run1688ImageSearchQueued(() => search1688ByImageInPluginInternal(imageUrl, maxCandidates));
+async function search1688ByImageInPlugin(imageUrl, maxCandidates, job = null) {
+  return run1688ImageSearchQueued(() => search1688ByImageInPluginInternal(imageUrl, maxCandidates, job));
 }
 
-async function search1688ByImageInPluginInternal(imageUrl, maxCandidates) {
+async function search1688ByImageInPluginInternal(imageUrl, maxCandidates, job = null) {
   try {
+    assertSourcingNotCanceled(job);
     let state = await ensure1688CookieStateInPlugin(false);
+    assertSourcingNotCanceled(job);
     if (!state.token) {
       return { success: false, error: "没有拿到 1688 搜图 token。请先在当前 Chrome 登录 1688，再回到 ERP 重新执行任务。" };
     }
-    const base64Image = await fetchImageAsBase64(imageUrl);
+    const base64Image = await fetchImageAsBase64(imageUrl, job);
     let lastError = null;
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
-        const candidates = await collect1688CandidatesInPlugin(base64Image, state, maxCandidates);
+        assertSourcingNotCanceled(job);
+        const candidates = await collect1688CandidatesInPlugin(base64Image, state, maxCandidates, job);
         const ranked = rank1688CandidatesForOzonInPlugin(candidates).slice(0, maxCandidates);
-        return ranked.length
-          ? { success: true, candidates: ranked }
-          : { success: false, error: "1688 接口搜图未返回候选" };
+        if (ranked.length) { clear1688Success(); return { success: true, candidates: ranked }; }
+        return { success: false, error: "1688 接口搜图未返回候选" };
       } catch (error) {
         lastError = error;
         const message = error?.message || String(error);
+        if (/任务已停止/.test(message)) throw error;
         if (attempt >= 2 || !is1688RefreshableError(message) || isCritical1688BlockerInPlugin(message)) break;
         await recover1688SessionInPlugin(message, attempt);
         state = await ensure1688CookieStateInPlugin(false);
@@ -702,11 +800,13 @@ async function search1688ByImageInPluginInternal(imageUrl, maxCandidates) {
 async function create1688SearchTabInPlugin(searchUrl) {
   // 单品找货只使用插件自建临时 tab，避免改写用户手动登录/验证中的 1688 页面。
   const tab = await createTabWithRetry({ url: searchUrl, active: false }, "打开 1688 以图搜货页");
+  if (tab?.id) active1688TabIds.add(tab.id);
   return { id: tab.id, ephemeral: true };
 }
 
 async function close1688SearchTabInPlugin(tab) {
   if (!tab?.id || !tab.ephemeral) return;
+  active1688TabIds.delete(tab.id);
   await safeRemoveTab(tab.id);
 }
 
@@ -1006,18 +1106,24 @@ function is1688RefreshableError(message) {
   return /FAIL_SYS_ILLEGAL_ACCESS|非法请求|FAIL_SYS_TOKEN|FAIL_SYS_TOKEN_EXPIRED|FAIL_SYS_TOKEN_EXOIRED|_m_h5_tk|token|令牌|store image error|没有 imageId|未返回 imageId|imageId|cookie|login|401|403|TOKEN/i.test(String(message || ""));
 }
 
-async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates) {
-  const imageId = await uploadImageTo1688InPlugin(base64Image, cookieState);
+async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates, job = null) {
+  assertSourcingNotCanceled(job);
+  const imageId = await uploadImageTo1688InPlugin(base64Image, cookieState, job);
+  assertSourcingNotCanceled(job);
   await sleep(randomInt(1200, 2800));
-  const candidates = (await searchOffersByImageIdInPlugin(imageId, cookieState)).slice(0, maxCandidates);
-  return enrich1688CandidatesInPlugin(candidates);
+  assertSourcingNotCanceled(job);
+  const candidates = (await searchOffersByImageIdInPlugin(imageId, cookieState, job)).slice(0, maxCandidates);
+  assertSourcingNotCanceled(job);
+  return enrich1688CandidatesInPlugin(candidates, job);
 }
 
-async function enrich1688CandidatesInPlugin(candidates) {
+async function enrich1688CandidatesInPlugin(candidates, job = null) {
   const enriched = [];
   for (const [index, candidate] of candidates.entries()) {
+    assertSourcingNotCanceled(job);
     if (index > 0) await sleep(randomInt(2500, 6500));
-    const details = await scrape1688CandidateDetailsInPlugin(candidate);
+    assertSourcingNotCanceled(job);
+    const details = await scrape1688CandidateDetailsInPlugin(candidate, job);
     enriched.push(addTrafficBaitAssessmentInPlugin(merge1688CandidateDetailsInPlugin(candidate, details)));
   }
   return enriched;
@@ -1064,10 +1170,12 @@ function normalize1688OfferItemInPlugin(item, index) {
   };
 }
 
-async function fetchImageAsBase64(url) {
-  const resp = await fetch(url, { credentials: "omit", headers: { Referer: "https://www.ozon.ru/" } });
+async function fetchImageAsBase64(url, job = null) {
+  assertSourcingNotCanceled(job);
+  const resp = await fetch(url, { credentials: "omit", headers: { Referer: "https://www.ozon.ru/" }, signal: job?.abortController?.signal });
   if (!resp.ok) throw new Error(`主图下载失败 ${resp.status}`);
   const blob = await resp.blob();
+  assertSourcingNotCanceled(job);
   const compressed = await compressImageBlobFor1688InPlugin(blob).catch((error) => {
     console.warn(`[SW ${VERSION}] 1688 搜图主图压缩失败，使用原图: ${error.message || error}`);
     return null;
@@ -1146,7 +1254,7 @@ async function seed1688MtopTokenInPlugin() {
   await sleep(600);
 }
 
-async function uploadImageTo1688InPlugin(base64Image, cookieState) {
+async function uploadImageTo1688InPlugin(base64Image, cookieState, job = null) {
   const imageBase64 = String(base64Image || "").replace(/^data:image\/[^;]+;base64,/i, "");
   const uploadParams = {
     appId: 32517,
@@ -1166,6 +1274,7 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState) {
   let lastError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
+      assertSourcingNotCanceled(job);
       const dataStr = JSON.stringify(uploadParams);
       const timestamp = String(Date.now());
       const url = buildMtopUrlInPlugin({
@@ -1179,8 +1288,10 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState) {
         method: "POST",
         headers: build1688HeadersInPlugin(state.cookieHeader, { "Content-Type": "application/x-www-form-urlencoded" }),
         credentials: "include",
+        signal: job?.abortController?.signal,
         body: `data=${encodeURIComponent(dataStr)}`,
       });
+      assertSourcingNotCanceled(job);
       const json = parseMtopTextInPlugin(await resp.text());
       assertMtopSuccessInPlugin(json, "上传图片失败");
       const imageId = json.data?.data?.imageId || json.data?.imageId || json.data?.result?.[0]?.imageId;
@@ -1189,6 +1300,7 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState) {
     } catch (error) {
       lastError = error;
       const message = String(error?.message || error || "");
+      if (/任务已停止|AbortError|aborted/i.test(message)) throw new Error("任务已停止");
       if (attempt >= 3 || !is1688RefreshableError(message)) throw error;
       console.warn(`[SW ${VERSION}] 1688 图片上传失败，第 ${attempt}/3 次重试: ${message}`);
       await sleep(1000 * attempt);
@@ -1198,7 +1310,7 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState) {
   throw lastError;
 }
 
-async function searchOffersByImageIdInPlugin(imageId, cookieState) {
+async function searchOffersByImageIdInPlugin(imageId, cookieState, job = null) {
   const searchParams = {
     appId: 32517,
     params: JSON.stringify({
@@ -1224,11 +1336,14 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState) {
     jsonpIncPrefix: "reqTppId_32517_getOfferList",
     data: dataStr,
   });
+  assertSourcingNotCanceled(job);
   const resp = await fetch(url, {
     method: "GET",
     headers: build1688HeadersInPlugin(cookieState.cookieHeader),
     credentials: "include",
+    signal: job?.abortController?.signal,
   });
+  assertSourcingNotCanceled(job);
   const json = parseMtopTextInPlugin(await resp.text());
   assertMtopSuccessInPlugin(json, "搜索 1688 失败");
   const offers = json.data?.data?.OFFER?.items || [];
@@ -1274,12 +1389,17 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState) {
   });
 }
 
-async function scrape1688CandidateDetailsInPlugin(candidate) {
+async function scrape1688CandidateDetailsInPlugin(candidate, job = null) {
+  assertSourcingNotCanceled(job);
   if (!candidate.link) return { detailError: "没有候选链接" };
   const tab = await createTabWithRetry({ url: candidate.link, active: false }, "打开 1688 候选详情页");
+  if (tab?.id) active1688TabIds.add(tab.id);
   try {
+    assertSourcingNotCanceled(job);
     await waitForTabComplete(tab.id, 45000);
+    assertSourcingNotCanceled(job);
     await sleep(randomInt(2200, 5200));
+    assertSourcingNotCanceled(job);
     await humanBrowse1688TabInPlugin(tab.id, "1688 候选详情页", {
       minDurationMs: 3200,
       maxDurationMs: 8200,
@@ -1290,6 +1410,7 @@ async function scrape1688CandidateDetailsInPlugin(candidate) {
       maxDelay: 1150,
       mouseMoves: randomInt(1, 3),
     });
+    assertSourcingNotCanceled(job);
     const [execResult] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extract1688DetailData,
@@ -1299,6 +1420,7 @@ async function scrape1688CandidateDetailsInPlugin(candidate) {
   } catch (e) {
     return { detailError: e.message || String(e) };
   } finally {
+    active1688TabIds.delete(tab.id);
     await safeRemoveTab(tab.id);
   }
 }

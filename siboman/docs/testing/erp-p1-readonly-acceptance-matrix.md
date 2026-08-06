@@ -23,7 +23,7 @@
 | 批量上架 | `#/upload` | external_write_impact | 发布前插件版本、单店约束、Seller category/type_id、多图、rich content、仓库/库存/价格完整；提交慢显示处理中，不能当完成 |
 | 上架记录 | `#/listing-history` | requires_authorization | task_id、canonical status、原始错误、中文错误、部分成功说明、同步/重试/删除/CSV、筛选分页与店铺隔离 |
 | 库存管理 | `#/inventory` | external_write_impact | 草稿持久化、低库存阈值、分仓、Excel 导入、冲突确认、负数阻断、批量提交结果、库存变更日志、店铺仓库隔离 |
-| 订单管理 | `#/orders` | external_write_impact | 状态 Tab、日期筛选、详情、1688 货源、备注、面单、批量发货确认、取消单禁操作、Ozon 成功但本地库存失败可见 |
+| 订单管理 | `#/orders` | external_write_impact | 状态 Tab、日期筛选、详情、1688 货源、备注、导出、批量发货确认、取消单禁操作、Ozon 成功但本地库存失败可见；不做面单入口 |
 | AI 套图 | `#/ai-generator` | external_write_impact | 默认 Agnes，按 TokenDun、万相、MiniMax 回退；provider 状态、失败原因、历史可见；本地 smoke 不触发计费生成 |
 | 经营分析 | `#/analytics` | read_only | dashboard/category/bestseller/profit/cost/exchange-rate 数据源可见；成本缺失不猜利润；失败有降级提示 |
 | 数据大屏 | `#/data-screen` | read_only | 实时指标、订单流、库存告警、状态分布、全屏、零数据、断网降级，不写订单/库存/商品 |

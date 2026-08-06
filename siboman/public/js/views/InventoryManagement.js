@@ -5,6 +5,7 @@ window.InventoryManagementView = {
     const syncLoading = Vue.ref(false);
     const search = Vue.ref('');
     const drafts = Vue.ref([]);
+    const selectedInventory = Vue.ref([]);
     const draftLoading = Vue.ref(false);
     const importInput = Vue.ref(null);
     const importLoading = Vue.ref(false);
@@ -22,6 +23,15 @@ window.InventoryManagementView = {
       warehouses: [],     // 仓库列表
       stocks: [],         // [{warehouse_id, warehouse_name, stock}]
       submitting: false,
+    });
+    const bulkStockDialog = Vue.reactive({
+      visible: false,
+      submitting: false,
+      warehouseMode: 'default',
+      warehouse_id: '',
+      target_stock: 0,
+      submitNow: false,
+      preview: [],
     });
 
     // v0.3.2: 动态读取当前店铺 ID
@@ -205,6 +215,84 @@ window.InventoryManagementView = {
         stockDialog.submitting = false;
       }
     };
+    const selectedStockRows = () => selectedInventory.value || [];
+    const firstStock = (row) => parseStocks(row).find((stock) => Number(stock.warehouse_id) > 0) || null;
+    const selectedWarehouseOptions = Vue.computed(() => {
+      const map = new Map();
+      for (const row of selectedStockRows()) {
+        for (const stock of parseStocks(row)) {
+          const wid = Number(stock.warehouse_id || 0);
+          if (!wid || map.has(wid)) continue;
+          map.set(wid, {
+            warehouse_id: wid,
+            label: `${stock.warehouse_name || stock.name || warehouseLabel(stock.source)} / ${wid}`,
+          });
+        }
+      }
+      return Array.from(map.values());
+    });
+    const buildBulkStockRows = () => {
+      const targetStock = Math.floor(Number(bulkStockDialog.target_stock));
+      if (!Number.isFinite(targetStock) || targetStock < 0) return [];
+      return selectedStockRows().map((row) => {
+        const stock = bulkStockDialog.warehouseMode === 'specific'
+          ? parseStocks(row).find((item) => Number(item.warehouse_id) === Number(bulkStockDialog.warehouse_id))
+          : firstStock(row);
+        if (!stock) return null;
+        return {
+          offer_id: row.offer_id,
+          product_id: row.product_id,
+          warehouse_id: Number(stock.warehouse_id),
+          current_stock: Number(stock.present ?? row.stock ?? 0),
+          target_stock: targetStock,
+          name: row.name,
+        };
+      }).filter(Boolean);
+    };
+    const refreshBulkStockPreview = () => {
+      bulkStockDialog.preview = buildBulkStockRows();
+    };
+    const openBulkStockEditor = () => {
+      if (!selectedInventory.value.length) return notify.warning('请先勾选要批量修改库存的商品');
+      bulkStockDialog.warehouseMode = 'default';
+      bulkStockDialog.warehouse_id = selectedWarehouseOptions.value[0]?.warehouse_id || '';
+      bulkStockDialog.target_stock = 0;
+      bulkStockDialog.submitNow = false;
+      refreshBulkStockPreview();
+      bulkStockDialog.visible = true;
+    };
+    const saveBulkStockDrafts = async () => {
+      const rows = buildBulkStockRows();
+      if (!rows.length) return notify.warning('所选商品没有可用仓库，或目标库存无效');
+      const skipped = selectedInventory.value.length - rows.length;
+      bulkStockDialog.submitting = true;
+      try {
+        const res = await axios.post('/api/seller/stocks/save-draft', { store_id: getStoreId(), stocks: rows });
+        const savedIds = (res.data.items || []).map((item) => item.id).filter(Boolean);
+        if (bulkStockDialog.submitNow) {
+          const submitRes = await submitWithConflictCheck('/api/seller/products/stocks/bulk', {
+            store_id: getStoreId(),
+            ids: savedIds,
+          }, { validateStatus: (status) => status === 200 || status === 207 });
+          lastSubmitResult.value = {
+            submitted: submitRes.data.submitted || 0,
+            succeeded: submitRes.data.succeeded || 0,
+            failed: submitRes.data.failed || 0,
+            errors: Array.isArray(submitRes.data.errors) ? submitRes.data.errors : [],
+          };
+          notify.success(`已提交 ${submitRes.data.succeeded || 0} 条库存变更${skipped ? `，跳过 ${skipped} 个无仓库商品` : ''}`);
+        } else {
+          notify.success(`已保存 ${res.data.saved || 0} 条库存草稿${skipped ? `，跳过 ${skipped} 个无仓库商品` : ''}`);
+        }
+        bulkStockDialog.visible = false;
+        selectedInventory.value = [];
+        await refreshAll();
+      } catch (e) {
+        if (e.code !== 'STOCK_CONFLICT_CANCELLED') notify.error('批量修改库存失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        bulkStockDialog.submitting = false;
+      }
+    };
 
     const saveStockDrafts = async () => {
       const selected = stockDialog.stocks.filter((stock) => stock.selected);
@@ -320,6 +408,7 @@ window.InventoryManagementView = {
       const sheet = window.XLSX.utils.json_to_sheet(rows); const book = window.XLSX.utils.book_new(); window.XLSX.utils.book_append_sheet(book, sheet, '预补货单'); window.XLSX.writeFile(book, `预补货单-${new Date().toISOString().slice(0, 10)}.xlsx`);
     };
 
+    const onSelectionChange = (rows) => { selectedInventory.value = rows || []; };
     const onPageChange = () => fetchInventory();
     const onSizeChange = () => { pagination.currentPage = 1; fetchInventory(); };
     const onSearch = () => { pagination.currentPage = 1; fetchInventory(); };
@@ -348,6 +437,9 @@ window.InventoryManagementView = {
       return map[String(source || '').toLowerCase()] || String(source || '未知仓');
     };
     const warehouseTagType = (source) => ({ fbs: 'primary', fbo: 'success', crossborder: 'warning', rfbs: 'info' }[String(source || '').toLowerCase()] || 'info');
+    const handleInventoryAction = ({ action, row }) => {
+      if (action === 'stock') openStockEditor(row);
+    };
 
     Vue.onMounted(refreshAll);
     const onShopChanged = () => { pagination.currentPage = 1; inventory.value = []; drafts.value = []; pagination.total = 0; refreshAll(); };
@@ -358,45 +450,41 @@ window.InventoryManagementView = {
     });
 
     return {
-      inventory, loading, syncLoading, search, pagination, stockDialog,
+      inventory, loading, syncLoading, search, pagination, stockDialog, bulkStockDialog, selectedInventory, selectedWarehouseOptions,
       drafts, draftLoading, importInput, importLoading, logDialog, threshold, inventoryStats, lastImportResult, lastSubmitResult,
-      fetchInventory, handleSyncAll, openStockEditor, submitStockChanges,
+      fetchInventory, handleSyncAll, openStockEditor, submitStockChanges, openBulkStockEditor, refreshBulkStockPreview, saveBulkStockDrafts,
       fetchDrafts, refreshAll, onThresholdChange, saveStockDrafts, submitAllDrafts, clearDrafts, importStocks, downloadTemplate, exportReplenishment, openChangeLogs,
-      onPageChange, onSizeChange, onSearch, onSearchInput,
+      onSelectionChange, onPageChange, onSizeChange, onSearch, onSearchInput, handleInventoryAction,
       parseStocks, totalStock, totalReserved, warehouseCount, warehouseLabel, warehouseTagType,
     };
   },
   template: `
-    <div class="inventory-container">
-      <el-card>
-        <template #header>
-          <div style="display:flex; justify-content:space-between; align-items:center">
-            <div style="display:flex; align-items:center; gap:12px">
-              <span style="font-weight:bold">库存管理 (v0.3.4)</span>
-              <el-tag size="small" type="info">共 {{ pagination.total }} 个 SKU</el-tag>
-              <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">同步 Ozon 全量</el-button>
-              <el-button type="primary" size="small" :disabled="!drafts.length" :loading="draftLoading" @click="submitAllDrafts">提交草稿 ({{ drafts.length }})</el-button>
-              <el-button size="small" :disabled="!drafts.length" @click="clearDrafts">清空草稿</el-button>
-              <el-button size="small" :loading="importLoading" @click="importInput?.click()">导入库存</el-button>
-              <el-button size="small" @click="downloadTemplate">下载模板</el-button>
-              <el-button size="small" @click="exportReplenishment">导出预补货单</el-button>
-              <el-button size="small" @click="openChangeLogs">变更记录</el-button>
-              <input ref="importInput" type="file" accept=".csv,.xlsx,.xls" style="display:none" @change="importStocks" />
-            </div>
-            <div style="display:flex; gap:8px">
-              <span style="font-size:12px; color:#606266; align-self:center">低库存阈值</span>
-              <el-input-number :model-value="threshold" :min="1" :max="9999" size="small" style="width:100px" @change="onThresholdChange" />
-              <el-input v-model="search" placeholder="货号 / 商品名" size="small" style="width:240px" @input="onSearchInput" @keyup.enter="onSearch" clearable />
-              <el-button type="primary" size="small" @click="onSearch">查询</el-button>
+    <div class="inventory-container" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px; box-sizing:border-box">
+      <div style="max-width:1500px; margin:0 auto">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
+          <div>
+            <div style="font-size:28px; line-height:1.2; font-weight:900; color:#111827">库存</div>
+            <div style="margin-top:14px; font-size:14px; color:#64748b; font-weight:700">
+              共 {{ pagination.total }} 个当前 Ozon SKU · {{ drafts.length }} 条草稿
             </div>
           </div>
-        </template>
+          <div style="display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap">
+            <el-button size="large" @click="refreshAll">
+              <el-icon><Refresh /></el-icon><span>刷新</span>
+            </el-button>
+            <el-button size="large" type="primary" style="background:#111827; border-color:#111827" :loading="syncLoading" @click="handleSyncAll">
+              <el-icon><RefreshRight /></el-icon><span>同步 Ozon 全量</span>
+            </el-button>
+            <el-button size="large" type="primary" plain :disabled="!drafts.length" :loading="draftLoading" @click="submitAllDrafts">提交草稿 ({{ drafts.length }})</el-button>
+            <el-button size="large" @click="openChangeLogs">变更记录</el-button>
+          </div>
+        </div>
 
-        <div style="display:grid; grid-template-columns:repeat(4,minmax(140px,1fr)); border:1px solid #ebeef5; margin-bottom:16px">
-          <div style="padding:14px 18px; border-right:1px solid #ebeef5"><div style="font-size:12px;color:#909399">商品总数</div><strong style="font-size:24px">{{ inventoryStats.total }}</strong></div>
-          <div style="padding:14px 18px; border-right:1px solid #ebeef5"><div style="font-size:12px;color:#909399">当前页缺货</div><strong style="font-size:24px;color:#f56c6c">{{ inventoryStats.outOfStock }}</strong></div>
-          <div style="padding:14px 18px; border-right:1px solid #ebeef5"><div style="font-size:12px;color:#909399">当前页低库存</div><strong style="font-size:24px;color:#e6a23c">{{ inventoryStats.lowStock }}</strong></div>
-          <div style="padding:14px 18px"><div style="font-size:12px;color:#909399">暂存待提交</div><strong style="font-size:24px;color:#409eff">{{ inventoryStats.drafts }}</strong></div>
+        <div style="display:grid; grid-template-columns:repeat(4,minmax(160px,1fr)); border:1px solid #dfe7f1; border-radius:8px; overflow:hidden; background:#fff; margin-bottom:22px">
+          <div style="padding:24px 26px; border-right:1px solid #dfe7f1"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:12px">当前 Ozon 商品</div><strong style="font-size:32px;line-height:1;color:#111827;font-weight:900">{{ inventoryStats.total }}</strong></div>
+          <div style="padding:24px 26px; border-right:1px solid #dfe7f1"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:12px">当前页缺货</div><strong style="font-size:32px;line-height:1;color:#dc2626;font-weight:900">{{ inventoryStats.outOfStock }}</strong></div>
+          <div style="padding:24px 26px; border-right:1px solid #dfe7f1"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:12px">当前页低库存</div><strong style="font-size:32px;line-height:1;color:#d97706;font-weight:900">{{ inventoryStats.lowStock }}</strong></div>
+          <div style="padding:24px 26px"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:12px">暂存待提交</div><strong style="font-size:32px;line-height:1;color:#2563eb;font-weight:900">{{ inventoryStats.drafts }}</strong></div>
         </div>
 
         <el-alert
@@ -432,20 +520,49 @@ window.InventoryManagementView = {
           <div v-if="lastSubmitResult.errors.length > 8" style="font-size:12px; color:#909399; margin-top:4px">仅展示前 8 条，完整记录可打开“变更记录”。</div>
         </div>
 
-        <el-table :data="inventory" v-loading="loading" stripe border size="small" empty-text="暂无库存数据。请先选择店铺并点击同步 Ozon 全量；如已同步，可调整搜索条件。">
+        <div style="display:grid; grid-template-columns:minmax(280px,1fr) 88px 88px 120px 120px; gap:10px; align-items:center; margin-bottom:12px">
+          <el-input v-model="search" placeholder="搜索货号 / 商品名" size="large" @input="onSearchInput" @keyup.enter="onSearch" clearable>
+            <template #prefix><el-icon><Search /></el-icon></template>
+          </el-input>
+          <el-button size="large" type="primary" style="background:#111827; border-color:#111827" @click="onSearch">筛选</el-button>
+          <el-button size="large" @click="search=''; pagination.currentPage=1; fetchInventory()">重置</el-button>
+          <el-button size="large" type="warning" plain :loading="importLoading" @click="importInput?.click()">
+            <el-icon><UploadFilled /></el-icon><span>导入</span>
+          </el-button>
+          <el-button size="large" @click="downloadTemplate">
+            <el-icon><Download /></el-icon><span>模板</span>
+          </el-button>
+          <input ref="importInput" type="file" accept=".csv,.xlsx,.xls" style="display:none" @change="importStocks" />
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:18px">
+          <div style="display:flex; gap:10px; flex-wrap:wrap">
+            <el-button size="large" type="primary" plain :disabled="!selectedInventory.length" @click="openBulkStockEditor">批量改库存 ({{ selectedInventory.length }})</el-button>
+            <el-button size="large" @click="exportReplenishment">导出预补货单</el-button>
+            <el-button size="large" :disabled="!drafts.length" @click="clearDrafts">清空草稿</el-button>
+          </div>
+        </div>
+
+        <div v-if="selectedInventory.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:14px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
+          <span style="font-size:13px; color:#1e3a8a; font-weight:800">已选择 {{ selectedInventory.length }} 个商品</span>
+          <el-button type="primary" size="large" @click="openBulkStockEditor">批量设置库存</el-button>
+        </div>
+
+        <el-table :data="inventory" v-loading="loading" element-loading-text="正在读取库存" stripe border size="large" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" empty-text="暂无库存数据。请先选择店铺并点击同步 Ozon 全量；如已同步，可调整搜索条件。" @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="52" />
           <!-- v0.3.4: 图片放大 60x60 + 点击预览大图 -->
-          <el-table-column label="图片" width="80">
+          <el-table-column label="图片" width="92">
             <template #default="{ row }">
               <el-image
                 :src="row.image"
-                style="width:60px; height:60px; border-radius:6px; cursor:zoom-in; border:1px solid #ebeef5"
+                style="width:58px; height:58px; border-radius:8px; cursor:zoom-in; background:#f1f5f9"
                 fit="cover"
                 preview-teleported
                 :preview-src-list="Array.isArray(row.images) && row.images.length ? row.images : (row.image ? [row.image] : [])"
                 :initial-index="0"
                 hide-on-click-modal>
                 <template #error>
-                  <div style="width:60px; height:60px; background:#f5f7fa; display:flex; align-items:center; justify-content:center">
+                  <div style="width:58px; height:58px; background:#f1f5f9; display:flex; align-items:center; justify-content:center; border-radius:8px">
                     <el-icon color="#c0c4cc" size="24"><Picture /></el-icon>
                   </div>
                 </template>
@@ -453,10 +570,10 @@ window.InventoryManagementView = {
             </template>
           </el-table-column>
 
-          <el-table-column label="商品信息" min-width="240">
+          <el-table-column label="商品信息" min-width="380">
             <template #default="{ row }">
-              <div style="font-size:13px; font-weight:500">{{ row.name }}</div>
-              <div style="font-size:11px; color:#999; margin-top:2px">
+              <div style="font-size:15px; line-height:1.4; font-weight:800; color:#1f2937">{{ row.name }}</div>
+              <div style="font-size:12px; color:#94a3b8; margin-top:7px">
                 货号: <code>{{ row.offer_id }}</code>
                 <span v-if="row.sku"> · SKU {{ row.sku }}</span>
               </div>
@@ -465,15 +582,15 @@ window.InventoryManagementView = {
 
           <el-table-column label="品牌" prop="brand" width="120" show-overflow-tooltip />
 
-          <el-table-column label="当前库存 (分仓)" width="220">
+          <el-table-column label="当前库存" width="190">
             <template #default="{ row }">
               <el-popover placement="top" :width="320" trigger="hover">
                 <template #reference>
                   <div style="display:flex; align-items:center; gap:8px; cursor:pointer">
-                    <el-tag size="small" :type="totalStock(row) < threshold ? 'danger' : 'success'" style="font-weight:bold; font-size:13px">
+                    <el-tag size="large" :type="totalStock(row) < threshold ? 'danger' : 'success'" style="font-weight:900; font-size:15px">
                       {{ totalStock(row) }}
                     </el-tag>
-                    <span style="font-size:11px; color:#999">{{ warehouseCount(row) }} 仓</span>
+                    <span style="font-size:12px; color:#64748b; font-weight:700">{{ warehouseCount(row) }} 仓 · 预留 {{ totalReserved(row) }}</span>
                     <el-icon size="12" color="#999"><InfoFilled /></el-icon>
                   </div>
                 </template>
@@ -512,21 +629,32 @@ window.InventoryManagementView = {
               <el-tag size="small" v-else type="success">充足</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="重量(g)" prop="weight" width="80" />
+          <el-table-column label="重量(g)" prop="weight" width="90" />
           <el-table-column label="最后同步" width="150">
             <template #default="{ row }">
               <span style="font-size:11px; color:#666">{{ (row.updated_at || '').slice(0,19).replace('T',' ') }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="130" fixed="right">
+          <el-table-column label="操作" width="76" fixed="right" align="center">
             <template #default="{ row }">
-              <el-button type="primary" size="small" @click="openStockEditor(row)">分仓修改</el-button>
+              <el-dropdown trigger="click" placement="bottom-end" @command="handleInventoryAction">
+                <el-button link type="primary" style="font-size:18px; padding:0 8px">
+                  <el-icon><MoreFilled /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item :command="{ action: 'stock', row }">
+                      <el-icon><EditPen /></el-icon><span>分仓修改</span>
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </template>
           </el-table-column>
         </el-table>
 
         <!-- v0.3.4 sticky 分页 -->
-        <div style="position:sticky; bottom:0; left:0; right:0; margin:20px -20px -20px; padding:12px 20px; background:#fff; border-top:1px solid #ebeef5; z-index:10; display:flex; justify-content:flex-end; box-shadow:0 -2px 6px rgba(0,0,0,0.04)">
+        <div style="position:sticky; bottom:0; left:0; right:0; margin-top:14px; padding:12px 0; background:#f8fafc; z-index:10; display:flex; justify-content:flex-end">
           <el-pagination
             v-model:current-page="pagination.currentPage"
             v-model:page-size="pagination.pageSize"
@@ -537,7 +665,7 @@ window.InventoryManagementView = {
             @current-change="onPageChange"
           />
         </div>
-      </el-card>
+      </div>
 
       <el-dialog v-model="logDialog.visible" title="库存变更记录" width="900px" destroy-on-close>
         <el-table :data="logDialog.items" v-loading="logDialog.loading" border stripe size="small" max-height="560">
@@ -557,6 +685,48 @@ window.InventoryManagementView = {
           </el-table-column>
           <el-table-column prop="error" label="说明" min-width="220" show-overflow-tooltip />
         </el-table>
+      </el-dialog>
+
+      <el-dialog v-model="bulkStockDialog.visible" title="批量设置库存" width="620px" destroy-on-close>
+        <div style="display:grid; gap:14px">
+          <el-alert type="info" :closable="false" show-icon title="批量设置会先生成库存草稿；勾选立即提交时，会继续走 Ozon 实时库存冲突检查。" />
+          <el-form label-position="top">
+            <el-form-item label="作用仓库">
+              <el-radio-group v-model="bulkStockDialog.warehouseMode" @change="refreshBulkStockPreview">
+                <el-radio-button label="default">每个商品默认仓</el-radio-button>
+                <el-radio-button label="specific">指定同一仓库</el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+            <el-form-item v-if="bulkStockDialog.warehouseMode === 'specific'" label="仓库">
+              <el-select v-model="bulkStockDialog.warehouse_id" filterable placeholder="选择仓库" style="width:100%" @change="refreshBulkStockPreview">
+                <el-option v-for="item in selectedWarehouseOptions" :key="item.warehouse_id" :label="item.label" :value="item.warehouse_id" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="目标库存">
+              <el-input-number v-model="bulkStockDialog.target_stock" :min="0" :precision="0" :step="1" controls-position="right" style="width:180px" @change="refreshBulkStockPreview" />
+            </el-form-item>
+            <el-form-item>
+              <el-checkbox v-model="bulkStockDialog.submitNow">保存草稿后立即提交至 Ozon</el-checkbox>
+            </el-form-item>
+          </el-form>
+          <div style="display:flex; justify-content:space-between; color:#64748b; font-size:12px">
+            <span>将生成 {{ bulkStockDialog.preview.length }} 条库存草稿</span>
+            <span v-if="selectedInventory.length - bulkStockDialog.preview.length > 0">跳过 {{ selectedInventory.length - bulkStockDialog.preview.length }} 个无可用仓库商品</span>
+          </div>
+          <el-table :data="bulkStockDialog.preview.slice(0, 8)" size="small" border max-height="260">
+            <el-table-column prop="offer_id" label="货号" min-width="150" show-overflow-tooltip />
+            <el-table-column prop="warehouse_id" label="仓库 ID" width="110" />
+            <el-table-column prop="current_stock" label="当前" width="80" align="right" />
+            <el-table-column prop="target_stock" label="目标" width="80" align="right" />
+          </el-table>
+          <div v-if="bulkStockDialog.preview.length > 8" style="font-size:12px; color:#94a3b8">仅预览前 8 条，其余会一起处理。</div>
+        </div>
+        <template #footer>
+          <el-button @click="bulkStockDialog.visible=false">取消</el-button>
+          <el-button type="primary" :loading="bulkStockDialog.submitting" @click="saveBulkStockDrafts">
+            {{ bulkStockDialog.submitNow ? '保存并提交' : '保存草稿' }}
+          </el-button>
+        </template>
       </el-dialog>
 
       <!-- v0.3.4 分仓库存修改对话框 -->

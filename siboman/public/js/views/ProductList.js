@@ -11,12 +11,55 @@ window.ProductListView = {
     const statusCounts = Vue.reactive({ ALL: 0 });
     const selectedRows = Vue.ref([]);
     const bulkLoading = Vue.ref(false);
+    const bulkStockDialog = Vue.reactive({
+      visible: false,
+      submitting: false,
+      loadingDetails: false,
+      warehouseMode: 'default',
+      warehouse_id: '',
+      warehouseByStore: {},
+      target_stock: 0,
+      submitNow: false,
+      preview: [],
+      skipped: 0,
+    });
+    const shops = Vue.ref([]);
+    const ALL_STORES = '__all__';
+    const CURRENT_STORE = '__current__';
+    const storeScope = Vue.ref([CURRENT_STORE]);
+    let previousStoreScope = [CURRENT_STORE];
 
     // v0.3.2: 不用 Vue.computed 缓存 localStorage (localStorage 非响应式).
     // 动态读取; 请求拦截器会自动往请求里注入 store_id.
     const getStoreId = () => String(
       window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''),
     ).split(',').map((value) => value.trim()).find(Boolean) || '';
+    const shopById = (storeId) => shops.value.find((shop) => String(shop.id) === String(storeId)) || null;
+    const storeNameById = (storeId) => shopById(storeId)?.name || (storeId ? '未命名店铺' : '当前店铺');
+    const activeStoreIds = () => shops.value.map((shop) => String(shop.id || '').trim()).filter(Boolean);
+    const storeScopeValues = () => (Array.isArray(storeScope.value) ? storeScope.value : [storeScope.value])
+      .map((value) => String(value || '').trim())
+      .filter(Boolean);
+    const isAllStoresScope = () => storeScopeValues().includes(ALL_STORES);
+    const selectedStoreIds = () => {
+      const values = storeScopeValues();
+      if (values.includes(ALL_STORES)) return activeStoreIds();
+      const ids = values.map((value) => value === CURRENT_STORE ? getStoreId() : value).filter(Boolean);
+      return [...new Set(ids)];
+    };
+    const effectiveStoreIdForProduct = (row) => String(row?.store_id || row?.storeId || drawer.form?.store_id || getStoreId() || '').trim();
+    const currentStoreName = Vue.computed(() => {
+      if (isAllStoresScope()) return `全部店铺 (${activeStoreIds().length})`;
+      const ids = selectedStoreIds();
+      if (!ids.length) return '未选择店铺';
+      if (ids.length === 1) return storeNameById(ids[0]);
+      return `已选 ${ids.length} 个店铺`;
+    });
+    const storeScopeOptions = Vue.computed(() => [
+      { label: `全部店铺 (${activeStoreIds().length})`, value: ALL_STORES },
+      { label: `当前店铺 · ${storeNameById(getStoreId())}`, value: CURRENT_STORE },
+      ...shops.value.map((shop) => ({ label: shop.name || '未命名店铺', value: String(shop.id) })),
+    ]);
 
     const notify = {
       success: (msg) => (window.ElementPlus?.ElMessage || console).success?.(msg),
@@ -27,31 +70,42 @@ window.ProductListView = {
     const statusTabs = [
       { label: '全部', value: 'ALL' },
       { label: '销售中', value: 'VISIBLE' },
-      { label: '待销售', value: 'READY_TO_SUPPLY' },
-      { label: '需修改', value: 'NEED_ATTENTION' },
+      { label: '准备销售', value: 'READY_TO_SUPPLY' },
+      { label: '错误', value: 'FAILED_MODERATION' },
+      { label: '待修改', value: 'NEED_ATTENTION' },
       { label: '待审核', value: 'NOT_MODERATED' },
-      { label: '审核失败', value: 'FAILED_MODERATION' },
-      { label: '已下架', value: 'IN_ACTIVE' },
+      { label: '商品已下架', value: 'IN_ACTIVE' },
+      { label: '归档', value: 'ARCHIVED' },
     ];
     const statusCn = (status) => ({
       ALL: '全部',
       VISIBLE: '销售中',
-      READY_TO_SUPPLY: '待补库存',
-      NEED_ATTENTION: '需修改',
+      READY_TO_SUPPLY: '准备销售',
+      NEED_ATTENTION: '待修改',
       NOT_MODERATED: '待审核',
-      FAILED_MODERATION: '审核失败',
-      IN_ACTIVE: '已下架',
+      FAILED_MODERATION: '错误',
+      IN_ACTIVE: '商品已下架',
+      ARCHIVED: '归档',
     }[status] || '未知状态');
     const statusHint = (status) => ({
-      ALL: '全部本地商品缓存',
+      ALL: 'Ozon 商品列表中的全部商品',
       VISIBLE: 'Ozon 前台可见, 可正常售卖',
       READY_TO_SUPPLY: '资料已准备, 待补库存或供货后销售',
       NEED_ATTENTION: 'Ozon 要求补齐资料, 请先查看体检问题',
       NOT_MODERATED: '已提交 Ozon, 正在审核中',
-      FAILED_MODERATION: '审核失败, 先查看失败/体检原因再保存同步',
-      IN_ACTIVE: '已下架或归档, 可用重新上架恢复',
+      FAILED_MODERATION: 'Ozon 后台错误/审核失败状态, 先查看失败/体检原因再保存同步',
+      IN_ACTIVE: '商品已下架, 可用重新上架恢复',
+      ARCHIVED: 'Ozon 商品档案/归档商品',
     }[status] || '未知状态');
     const productStatusLabel = (row) => statusCn(row?.status) || row?.status_name || row?.status || '未知状态';
+    const statusCount = (value) => Number(statusCounts[value] || 0);
+    const statusTabItems = Vue.computed(() => statusTabs.map((tab) => ({ ...tab, count: statusCount(tab.value) })));
+    const selectStatusTab = (value) => {
+      activeTab.value = value;
+      pagination.currentPage = 1;
+      selectedRows.value = [];
+      fetchProducts();
+    };
     const issueSummary = (row) => {
       const issues = Array.isArray(row.compliance_issues) ? row.compliance_issues.filter(Boolean) : [];
       if (issues.length) return issues.join('；');
@@ -59,22 +113,287 @@ window.ProductListView = {
     };
     const syncFieldsNote = '保存会先更新本地商品资料，并尝试同步价格和图片到 Ozon；库存和仓库不在这里编辑，请到库存管理处理。';
 
+    const submitWithConflictCheck = async (url, payload, config = {}) => {
+      try {
+        return await axios.post(url, payload, config);
+      } catch (error) {
+        const data = error.response?.data || {};
+        if (error.response?.status !== 409 || data.code !== 'STOCK_CONFLICT') throw error;
+        const conflicts = Array.isArray(data.conflicts) ? data.conflicts : [];
+        const details = conflicts.slice(0, 8).map((item) =>
+          `${item.offer_id} / 仓${item.warehouse_id}: 原 ${item.expected_stock}，现 ${item.live_stock}，目标 ${item.target_stock}`
+        ).join('\n');
+        try {
+          await window.ElementPlus.ElMessageBox.confirm(
+            `${conflicts.length} 条库存已被其他操作修改：\n${details}${conflicts.length > 8 ? '\n…' : ''}\n\n是否以当前目标库存覆盖？`,
+            '发现 Ozon 实时库存冲突',
+            { type: 'warning', confirmButtonText: '确认覆盖', cancelButtonText: '取消', dangerouslyUseHTMLString: false },
+          );
+        } catch {
+          const cancelled = new Error('已取消覆盖实时库存');
+          cancelled.code = 'STOCK_CONFLICT_CANCELLED';
+          throw cancelled;
+        }
+        return axios.post(url, { ...payload, force: true }, config);
+      }
+    };
+
+    const parseStocks = (row) => {
+      const raw = row?.stocks_json;
+      if (!raw) return [];
+      if (Array.isArray(raw)) return raw;
+      try { return JSON.parse(raw); } catch { return []; }
+    };
+    const stockDisplay = (row) => {
+      const stocks = parseStocks(row);
+      if (!stocks.length) return Number(row?.stock || 0);
+      return stocks.reduce((sum, item) => sum + Number(item.present || 0), 0);
+    };
+    const warehouseLabel = (source) => {
+      const map = { fbs: 'FBS 卖家仓', fbo: 'FBO 官方仓', crossborder: '跨境仓', rfbs: 'RFBS 自发货' };
+      return map[String(source || '').toLowerCase()] || String(source || '未知仓');
+    };
+    const bulkStockDetailCache = new Map();
+    const rowStocks = (row) => {
+      const detailed = Array.isArray(row?._bulk_stocks) ? row._bulk_stocks : [];
+      return detailed.length ? detailed : parseStocks(row);
+    };
+    const firstStock = (row) => rowStocks(row).find((stock) => Number(stock.warehouse_id) > 0) || null;
+    const selectedWarehouseOptions = Vue.computed(() => {
+      const map = new Map();
+      for (const row of selectedRows.value || []) {
+        const storeId = effectiveStoreIdForProduct(row);
+        for (const stock of rowStocks(row)) {
+          const wid = Number(stock.warehouse_id || 0);
+          if (!wid) continue;
+          const key = `${storeId}|${wid}`;
+          if (map.has(key)) continue;
+          map.set(key, {
+            value: key,
+            store_id: storeId,
+            warehouse_id: wid,
+            label: `${storeNameById(storeId)} · ${stock.warehouse_name || stock.name || warehouseLabel(stock.source)} / ${wid}${stock.city ? ` · ${stock.city}` : ''}`,
+          });
+        }
+      }
+      return Array.from(map.values());
+    });
+    const selectedStoreWarehouseGroups = Vue.computed(() => {
+      const groups = new Map();
+      for (const option of selectedWarehouseOptions.value) {
+        const storeId = String(option.store_id || '').trim();
+        if (!storeId) continue;
+        if (!groups.has(storeId)) {
+          groups.set(storeId, {
+            store_id: storeId,
+            store_name: storeNameById(storeId),
+            options: [],
+          });
+        }
+        groups.get(storeId).options.push({
+          warehouse_id: option.warehouse_id,
+          label: option.label.replace(`${storeNameById(storeId)} · `, ''),
+        });
+      }
+      return Array.from(groups.values());
+    });
+
+    const initializeWarehouseByStore = () => {
+      const next = {};
+      for (const group of selectedStoreWarehouseGroups.value) {
+        const current = bulkStockDialog.warehouseByStore[group.store_id];
+        const valid = group.options.some((item) => Number(item.warehouse_id) === Number(current));
+        next[group.store_id] = valid ? Number(current) : Number(group.options[0]?.warehouse_id || 0);
+      }
+      bulkStockDialog.warehouseByStore = next;
+    };
+
+    const buildBulkStockRows = () => {
+      const targetStock = Math.floor(Number(bulkStockDialog.target_stock));
+      if (!Number.isFinite(targetStock) || targetStock < 0) return [];
+      return (selectedRows.value || []).map((row) => {
+        const storeId = effectiveStoreIdForProduct(row);
+        const stock = bulkStockDialog.warehouseMode === 'specific'
+          ? rowStocks(row).find((item) => Number(item.warehouse_id) === Number(bulkStockDialog.warehouseByStore[storeId]))
+          : firstStock(row);
+        if (!storeId || !stock || !row.offer_id) return null;
+        return {
+          store_id: storeId,
+          store_name: row.store_name || storeNameById(storeId),
+          offer_id: row.offer_id,
+          product_id: row.product_id,
+          warehouse_id: Number(stock.warehouse_id),
+          current_stock: Number(stock.present ?? row.stock ?? 0),
+          target_stock: targetStock,
+          name: row.name,
+        };
+      }).filter(Boolean);
+    };
+
+    const refreshBulkStockPreview = () => {
+      bulkStockDialog.preview = buildBulkStockRows();
+      bulkStockDialog.skipped = Math.max(0, selectedRows.value.length - bulkStockDialog.preview.length);
+    };
+
+    const loadBulkStockDetails = async () => {
+      const rows = selectedRows.value || [];
+      if (!rows.length) return;
+      bulkStockDialog.loadingDetails = true;
+      try {
+        const tasks = rows.map(async (row) => {
+          const storeId = effectiveStoreIdForProduct(row);
+          const offerId = String(row.offer_id || '').trim();
+          if (!storeId || !offerId) return;
+          const key = `${storeId}|${offerId}`;
+          if (bulkStockDetailCache.has(key)) {
+            row._bulk_stocks = bulkStockDetailCache.get(key);
+            return;
+          }
+          const res = await axios.get('/api/seller/products/stocks/detail', {
+            params: { store_id: storeId, offer_id: offerId },
+          });
+          const stocks = (res.data?.warehouses || [])
+            .filter((stock) => Number(stock.warehouse_id) > 0)
+            .map((stock) => ({
+              warehouse_id: Number(stock.warehouse_id),
+              warehouse_name: stock.warehouse_name || stock.name || `WH-${stock.warehouse_id}`,
+              name: stock.name || stock.warehouse_name || `WH-${stock.warehouse_id}`,
+              source: stock.source || 'fbs',
+              city: stock.city || '',
+              present: Number(stock.present || 0),
+              reserved: Number(stock.reserved || 0),
+              has_stock: stock.has_stock !== false,
+            }));
+          bulkStockDetailCache.set(key, stocks);
+          row._bulk_stocks = stocks;
+        });
+        const results = await Promise.allSettled(tasks);
+        const failed = results.filter((result) => result.status === 'rejected').length;
+        selectedRows.value = selectedRows.value.slice();
+        if (failed) notify.warning(`有 ${failed} 个商品仓库明细读取失败，已用本地缓存兜底`);
+      } finally {
+        bulkStockDialog.loadingDetails = false;
+      }
+    };
+
+    const openBulkStockEditor = async () => {
+      if (!selectedRows.value.length) return notify.warning('请先勾选要批量修改库存的商品');
+      bulkStockDialog.warehouseMode = 'default';
+      bulkStockDialog.warehouseByStore = {};
+      bulkStockDialog.target_stock = 0;
+      bulkStockDialog.submitNow = false;
+      bulkStockDialog.visible = true;
+      await loadBulkStockDetails();
+      initializeWarehouseByStore();
+      bulkStockDialog.warehouse_id = selectedWarehouseOptions.value[0]?.value || '';
+      refreshBulkStockPreview();
+    };
+
+    const saveBulkStockDrafts = async () => {
+      const rows = buildBulkStockRows();
+      if (!rows.length) return notify.warning('所选商品没有可用仓库，或目标库存无效');
+      bulkStockDialog.submitting = true;
+      try {
+        const groups = rows.reduce((map, row) => {
+          if (!map.has(row.store_id)) map.set(row.store_id, []);
+          map.get(row.store_id).push(row);
+          return map;
+        }, new Map());
+        let saved = 0;
+        let submitted = 0;
+        let succeeded = 0;
+        let failed = 0;
+        const errors = [];
+        for (const [storeId, stocks] of groups.entries()) {
+          try {
+            const saveRes = await axios.post('/api/seller/stocks/save-draft', { store_id: storeId, stocks });
+            saved += Number(saveRes.data.saved || 0);
+            const savedIds = (saveRes.data.items || []).map((item) => item.id).filter(Boolean);
+            if (bulkStockDialog.submitNow && savedIds.length) {
+              const submitRes = await submitWithConflictCheck('/api/seller/products/stocks/bulk', {
+                store_id: storeId,
+                ids: savedIds,
+              }, { validateStatus: (status) => status === 200 || status === 207 });
+              submitted += Number(submitRes.data.submitted || 0);
+              succeeded += Number(submitRes.data.succeeded || 0);
+              failed += Number(submitRes.data.failed || 0);
+              if (Array.isArray(submitRes.data.errors)) errors.push(...submitRes.data.errors.map((err) => ({ ...err, store_name: storeNameById(storeId) })));
+            }
+          } catch (e) {
+            if (e.code === 'STOCK_CONFLICT_CANCELLED') throw e;
+            errors.push({ store_name: storeNameById(storeId), error: e.response?.data?.error || e.message });
+          }
+        }
+        const skippedText = bulkStockDialog.skipped ? `，跳过 ${bulkStockDialog.skipped} 个无仓库商品` : '';
+        if (bulkStockDialog.submitNow) {
+          const message = `提交 ${submitted} 条：成功 ${succeeded}，失败 ${failed}${skippedText}`;
+          if (failed || errors.length) notify.warning(message);
+          else notify.success(message);
+        } else {
+          const message = `已保存 ${saved} 条库存草稿${skippedText}`;
+          if (errors.length) notify.warning(`${message}，部分店铺失败`);
+          else notify.success(message);
+        }
+        if (errors.length) console.warn('[ProductBulkStock]', errors);
+        bulkStockDialog.visible = false;
+        selectedRows.value = [];
+        await fetchProducts();
+      } catch (e) {
+        if (e.code !== 'STOCK_CONFLICT_CANCELLED') notify.error('批量修改库存失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        bulkStockDialog.submitting = false;
+      }
+    };
+
+    const fetchShops = async () => {
+      try {
+        const res = await axios.get('/api/seller/shops');
+        shops.value = (res.data?.shops || []).filter((shop) => shop.active !== false);
+        if (!storeScopeValues().length) storeScope.value = [CURRENT_STORE];
+      } catch (e) {
+        notify.warning('店铺列表读取失败: ' + (e.response?.data?.error || e.message));
+      }
+    };
+
     const fetchProducts = async () => {
-      const sid = getStoreId();
-      if (!sid) return;
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return;
       loading.value = true;
       try {
-        // store_id 由请求拦截器自动注入; 这里保留显式传参增强可读性
-        const res = await axios.post('/api/seller/products', {
+        const aggregateStoreMode = isAllStoresScope() || storeIds.length > 1;
+        const limit = aggregateStoreMode ? Math.min(200, Math.max(pagination.pageSize, 50)) : pagination.pageSize;
+        const offset = aggregateStoreMode ? 0 : (pagination.currentPage - 1) * pagination.pageSize;
+        const results = await Promise.allSettled(storeIds.map((sid) => axios.post('/api/seller/products', {
           visibility: activeTab.value,
           store_id: sid,
           search: search.value,
-          limit: pagination.pageSize,
-          offset: (pagination.currentPage - 1) * pagination.pageSize,
-        });
-        products.value = res.data.items || [];
-        pagination.total = Number(res.data.total || 0);
-        Object.assign(statusCounts, { ALL: 0 }, res.data.status_counts || {});
+          limit,
+          offset,
+        }).then((res) => ({ sid, data: res.data }))));
+        const rows = [];
+        let total = 0;
+        const mergedCounts = { ALL: 0 };
+        const failures = [];
+        for (const result of results) {
+          if (result.status !== 'fulfilled') {
+            failures.push(result.reason?.response?.data?.error || result.reason?.message || '未知错误');
+            continue;
+          }
+          const { sid, data } = result.value;
+          const storeName = storeNameById(sid);
+          rows.push(...(data.items || []).map((row) => ({ ...row, store_id: sid, store_name: storeName })));
+          total += Number(data.total || 0);
+          for (const [key, value] of Object.entries(data.status_counts || {})) {
+            mergedCounts[key] = Number(mergedCounts[key] || 0) + Number(value || 0);
+          }
+        }
+        rows.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
+        products.value = aggregateStoreMode
+          ? rows.slice((pagination.currentPage - 1) * pagination.pageSize, pagination.currentPage * pagination.pageSize)
+          : rows;
+        pagination.total = total;
+        Object.assign(statusCounts, { ALL: 0 }, mergedCounts);
+        if (failures.length) notify.warning(`部分店铺读取失败：${failures.slice(0, 2).join('；')}`);
       } catch (e) {
         notify.error('获取列表失败: ' + (e.response?.data?.error || e.message));
       } finally {
@@ -98,9 +417,23 @@ window.ProductListView = {
       }
     };
 
+    const normalizeCategoryFields = (form) => {
+      const readonly = form.category_readonly || {};
+      const categoryId = Number(form.description_category_id || readonly.description_category_id || 0);
+      const typeId = Number(form.type_id || readonly.type_id || 0);
+      if (categoryId > 0) form.description_category_id = categoryId;
+      if (typeId > 0) form.type_id = typeId;
+      if (!form.category_name) {
+        form.category_name = readonly.category_name || form.category_display || (categoryId > 0 ? `Ozon 类目 ${categoryId}` : '');
+      }
+      form.category_path = form.category_path || form.category_name || '';
+      return form;
+    };
+
     const editProduct = (row) => {
       drawer.itemId = row.offer_id;
       drawer.form = JSON.parse(JSON.stringify(row));
+      normalizeCategoryFields(drawer.form);
       for (const key of ['price', 'old_price', 'min_price', 'purchase_price_cny', 'weight', 'width', 'depth', 'height']) {
         const value = drawer.form[key];
         drawer.form[key] = value === null || value === undefined || value === '' ? null : Number(value);
@@ -119,22 +452,25 @@ window.ProductListView = {
     const categoryTreeLoaded = Vue.ref(false);
     const categoryLoading = Vue.ref(false);
     const categoryNodeByKey = new Map();
-    const makeCategoryKey = (node, indexPath) => {
+    const makeCategoryKey = (node, indexPath, inheritedCategoryId = 0) => {
       const categoryId = Number(node.description_category_id || 0);
       const typeId = Number(node.type_id || 0);
-      if (categoryId > 0) return `cat:${categoryId}`;
       if (typeId > 0) return `type:${typeId}`;
+      if (categoryId > 0 || inheritedCategoryId > 0) return `cat:${categoryId || inheritedCategoryId}`;
       return `name:${indexPath.join('.')}:${node.category_name || node.type_name || 'unknown'}`;
     };
     const syncCategoryPathFromForm = () => {
       if (!categoryTreeLoaded.value) return;
-      const categoryId = Number(drawer.form.description_category_id || 0);
-      const currentName = String(drawer.form.category_name || '').trim();
+      normalizeCategoryFields(drawer.form);
+      const categoryId = Number(drawer.form.description_category_id || drawer.form.category_readonly?.description_category_id || 0);
+      const typeId = Number(drawer.form.type_id || drawer.form.category_readonly?.type_id || 0);
+      const currentName = String(drawer.form.category_name || drawer.form.category_readonly?.category_name || '').trim();
       let foundPath = [];
       const walk = (nodes, path = []) => {
         for (const node of nodes || []) {
           const nextPath = [...path, node.category_key];
-          if ((categoryId > 0 && Number(node.description_category_id || 0) === categoryId)
+          if ((typeId > 0 && Number(node.type_id || 0) === typeId)
+            || (!typeId && categoryId > 0 && Number(node.description_category_id || 0) === categoryId)
             || (!categoryId && currentName && node.category_name === currentName)) {
             foundPath = nextPath;
             return true;
@@ -145,6 +481,7 @@ window.ProductListView = {
       };
       walk(categoryTree.value);
       drawer.categoryPath = foundPath;
+      if (foundPath.length) onCategoryChange(foundPath);
     };
     const ensureCategoryTree = async (visible) => {
       if (categoryTreeLoaded.value || !visible) return;
@@ -153,17 +490,24 @@ window.ProductListView = {
         const r = await axios.post('/api/seller/categories/tree', { store_id: getStoreId() });
         const raw = r.data?.data?.result || [];
         categoryNodeByKey.clear();
-        const clean = (nodes, indexPath = []) => (nodes || []).map((n, index) => {
+        const clean = (nodes, indexPath = [], inherited = {}) => (nodes || []).map((n, index) => {
           const nextIndexPath = [...indexPath, index];
           const label = n.category_name || n.type_name || '未命名类目';
-          const categoryKey = makeCategoryKey(n, nextIndexPath);
+          const ownCategoryId = Number(n.description_category_id || 0) || 0;
+          const ownTypeId = Number(n.type_id || 0) || 0;
+          const inheritedCategoryId = ownCategoryId || Number(inherited.description_category_id || 0) || null;
+          const inheritedCategoryName = n.category_name || inherited.category_name || '';
+          const categoryKey = makeCategoryKey(n, nextIndexPath, inheritedCategoryId);
           const node = {
             label,
             category_key: categoryKey,
-            category_name: n.category_name || label,
-            description_category_id: Number(n.description_category_id || 0) || null,
-            type_id: Number(n.type_id || 0) || null,
-            children: n.children && n.children.length ? clean(n.children, nextIndexPath) : undefined,
+            category_name: n.category_name || inheritedCategoryName || label,
+            description_category_id: inheritedCategoryId,
+            type_id: ownTypeId || null,
+            children: n.children && n.children.length ? clean(n.children, nextIndexPath, {
+              description_category_id: inheritedCategoryId,
+              category_name: inheritedCategoryName || label,
+            }) : undefined,
           };
           categoryNodeByKey.set(categoryKey, node);
           return node;
@@ -187,6 +531,20 @@ window.ProductListView = {
         if (selected?.type_id) drawer.form.type_id = selected.type_id;
       }
     };
+    const currentCategoryText = Vue.computed(() => {
+      const categoryId = Number(drawer.form.description_category_id || drawer.form.category_readonly?.description_category_id || 0);
+      return drawer.form.category_path
+        || drawer.form.category_name
+        || drawer.form.category_readonly?.category_name
+        || drawer.form.category_display
+        || (categoryId > 0 ? `Ozon 类目 ${categoryId}` : '未设置');
+    });
+    const categoryPathMissing = Vue.computed(() => (
+      drawer.visible
+      && Number(drawer.form.description_category_id || drawer.form.category_readonly?.description_category_id || 0) > 0
+      && categoryTreeLoaded.value
+      && !drawer.categoryPath.length
+    ));
 
     // v0.3.4 图片工具
     const allPreviewList = () => {
@@ -284,7 +642,7 @@ window.ProductListView = {
       } catch { return; }
       try {
         await axios.post('/api/seller/products/archive', {
-          store_id: getStoreId(),
+          store_id: effectiveStoreIdForProduct(row),
           offer_id: [row.offer_id],
         });
         notify.success('归档成功, 本地状态已同步');
@@ -303,7 +661,7 @@ window.ProductListView = {
       } catch { return; }
       try {
         await axios.post('/api/seller/products/unarchive', {
-          store_id: getStoreId(),
+          store_id: effectiveStoreIdForProduct(row),
           offer_id: [row.offer_id],
         });
         notify.success('已上架, 本地状态已同步');
@@ -318,7 +676,7 @@ window.ProductListView = {
       try {
         const response = await axios.patch(`/api/seller/products/${encodeURIComponent(drawer.itemId)}/full-update`, {
           ...drawer.form,
-          store_id: getStoreId(),
+          store_id: effectiveStoreIdForProduct(drawer.form),
         });
         if (response.data?.success) notify.success('商品资料已保存，价格和图片已提交 Ozon');
         else notify.warning((response.data?.errors || []).join('；') || '本地资料已保存，部分 Ozon 同步失败');
@@ -349,27 +707,52 @@ window.ProductListView = {
         notify.warning('复制失败，请手动复制');
       }
     };
+    const handleProductAction = ({ action, row }) => {
+      if (action === 'edit') return editProduct(row);
+      if (action === 'archive') return archiveProduct(row);
+      if (action === 'unarchive') return unarchiveProduct(row);
+    };
 
     const onSelectionChange = (rows) => { selectedRows.value = rows || []; };
     const bulkArchive = async () => {
+      const candidates = selectedRows.value.filter((row) => row.status !== 'IN_ACTIVE' && row.offer_id);
       if (!selectedRows.value.length) return notify.warning('请先选择商品');
-      if (selectedRows.value.length > 100) return notify.warning('单次最多处理 100 个商品');
+      if (!candidates.length) return notify.warning('所选商品都已下架或已归档');
+      if (candidates.length > 100) return notify.warning('单次最多处理 100 个商品');
       try {
         await window.ElementPlus.ElMessageBox.confirm(
-          `确定归档选中的 ${selectedRows.value.length} 个商品？`,
-          '批量归档确认',
+          `确定归档选中的 ${candidates.length} 个商品？归档会调用 Ozon 商品 archive 接口，前台不可见，可再上架恢复。`,
+          '批量归档商品确认',
           { confirmButtonText: '确定归档', cancelButtonText: '取消', type: 'warning' },
         );
       } catch { return; }
       bulkLoading.value = true;
       try {
-        await axios.post('/api/seller/products/archive', {
-          store_id: getStoreId(),
-          offer_id: selectedRows.value.map((row) => row.offer_id),
-        });
-        notify.success(`已归档 ${selectedRows.value.length} 个商品`);
+        const groups = candidates.reduce((map, row) => {
+          const storeId = effectiveStoreIdForProduct(row);
+          if (!storeId) return map;
+          if (!map.has(storeId)) map.set(storeId, []);
+          map.get(storeId).push(row.offer_id);
+          return map;
+        }, new Map());
+        let archived = 0;
+        const errors = [];
+        for (const [storeId, offerIds] of groups.entries()) {
+          try {
+            await axios.post('/api/seller/products/archive', {
+              store_id: storeId,
+              offer_id: offerIds,
+            });
+            archived += offerIds.length;
+          } catch (e) {
+            errors.push(`${storeNameById(storeId)}: ${e.response?.data?.error || e.message}`);
+          }
+        }
+        if (errors.length) notify.warning(`已归档 ${archived} 个商品，失败 ${errors.length} 个店铺`);
+        else notify.success(`已归档 ${archived} 个商品`);
         selectedRows.value = [];
         await fetchProducts();
+        if (errors.length) console.warn('[ProductBulkArchive]', errors);
       } catch (e) {
         notify.error('批量归档失败: ' + (e.response?.data?.error || e.message));
       } finally { bulkLoading.value = false; }
@@ -379,7 +762,7 @@ window.ProductListView = {
       if (!pagination.total) return notify.warning('当前筛选条件没有可导出的商品');
       try {
         const response = await axios.post('/api/seller/products/export', {
-          store_id: getStoreId(), visibility: activeTab.value, search: search.value,
+          store_id: selectedStoreIds()[0] || getStoreId(), visibility: activeTab.value, search: search.value,
         }, { responseType: 'blob', timeout: 120000 });
         const url = URL.createObjectURL(response.data);
         const a = document.createElement('a');
@@ -397,6 +780,26 @@ window.ProductListView = {
       pagination.currentPage = 1;
       products.value = [];
       pagination.total = 0;
+      selectedRows.value = [];
+      fetchProducts();
+    };
+    const onStoreScopeChange = (value = storeScope.value) => {
+      const incoming = (Array.isArray(value) ? value : [value]).map((item) => String(item || '').trim()).filter(Boolean);
+      const hadAll = previousStoreScope.includes(ALL_STORES);
+      const hasAll = incoming.includes(ALL_STORES);
+      let normalized = incoming;
+      if (hasAll && (!hadAll || incoming.length === 1)) {
+        normalized = [ALL_STORES];
+      } else if (hasAll) {
+        normalized = incoming.filter((item) => item !== ALL_STORES);
+      }
+      if (!normalized.length) normalized = [CURRENT_STORE];
+      storeScope.value = [...new Set(normalized)];
+      previousStoreScope = storeScope.value.slice();
+      pagination.currentPage = 1;
+      selectedRows.value = [];
+      products.value = [];
+      pagination.total = 0;
       fetchProducts();
     };
     window.addEventListener('shop-changed', onShopChanged);
@@ -405,19 +808,22 @@ window.ProductListView = {
       window.removeEventListener('shop-changed', onShopChanged);
     });
 
-    Vue.onMounted(fetchProducts);
+    Vue.onMounted(() => fetchShops().finally(() => fetchProducts()));
 
     return {
       products, loading, syncLoading, saveLoading,
-      activeTab, statusTabs, statusCounts, search, drawer, pagination,
-      selectedRows, bulkLoading,
+      activeTab, statusTabs, statusCounts, statusTabItems, search, drawer, pagination,
+      selectedRows, bulkLoading, bulkStockDialog, selectedWarehouseOptions, selectedStoreWarehouseGroups, storeScope, storeScopeOptions, currentStoreName,
       fetchProducts, handleSyncAll, editProduct, saveProduct,
       archiveProduct, unarchiveProduct,
       onPageChange, onSizeChange, onTabChange, onSearch, onSearchInput,
-      copyOfferId, onSelectionChange, bulkArchive, exportCsv,
+      copyOfferId, onSelectionChange, bulkArchive, openBulkStockEditor, refreshBulkStockPreview, saveBulkStockDrafts,
+      exportCsv, onStoreScopeChange, selectStatusTab, handleProductAction,
       statusCn, statusHint, productStatusLabel, issueSummary, syncFieldsNote,
+      parseStocks, stockDisplay, warehouseLabel,
       // v0.3.5
       categoryTree, categoryLoading, ensureCategoryTree, onCategoryChange,
+      currentCategoryText, categoryPathMissing,
       allPreviewList, uploadImage, removeGalleryImage,
       productPreviewList,
       aiRefineImage, aiFillProduct, aiPricing,
@@ -425,66 +831,116 @@ window.ProductListView = {
     };
   },
   template: `
-    <div class="product-list-v3">
-      <el-card>
-        <template #header>
-          <div style="display:flex; justify-content:space-between; align-items:center">
-            <div style="display:flex; align-items:center; gap:12px">
-              <span style="font-weight:bold; font-size:15px">商品管理</span>
-              <el-tag size="small" type="info">共 {{ pagination.total }} 个 SKU</el-tag>
-              <el-button type="success" size="small" @click="() => (window.location.hash = '#/collection')">
-                从采集箱新增
-              </el-button>
-              <el-button type="warning" size="small" :loading="syncLoading" @click="handleSyncAll">同步 Ozon 商品</el-button>
-              <el-button size="small" :disabled="!selectedRows.length" :loading="bulkLoading" @click="bulkArchive">批量归档</el-button>
-              <el-button size="small" @click="exportCsv">导出筛选结果</el-button>
-            </div>
-            <div style="display:flex; gap:8px">
-              <el-input v-model="search" placeholder="搜 SKU / 货号 / 标题" size="small" style="width:240px" @input="onSearchInput" @keyup.enter="onSearch" clearable />
-              <el-button type="primary" size="small" @click="onSearch">查询</el-button>
-              <el-button size="small" @click="fetchProducts">刷新</el-button>
-            </div>
+    <div class="product-list-v3" style="padding:28px 34px; background:#f8fafc; min-height:calc(100vh - 64px)">
+      <div style="max-width:1600px; margin:0 auto">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
+          <div>
+            <div style="font-size:28px; line-height:1; font-weight:800; color:#111827; letter-spacing:0">商品</div>
+            <div style="margin-top:14px; font-size:14px; color:#64748b">{{ currentStoreName }} · 共 {{ pagination.total }} 个 SKU</div>
           </div>
-        </template>
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end">
+            <el-button size="large" @click="fetchProducts">
+              <el-icon><Refresh /></el-icon><span>刷新</span>
+            </el-button>
+            <el-button size="large" type="primary" style="background:#111827; border-color:#111827" :loading="syncLoading" @click="handleSyncAll">
+              <el-icon><RefreshRight /></el-icon><span>同步 Ozon 商品</span>
+            </el-button>
+            <el-button size="large" type="success" @click="() => (window.location.hash = '#/collection')">从采集箱新增</el-button>
+            <el-button size="large" type="warning" plain @click="exportCsv">
+              <el-icon><Download /></el-icon><span>导出筛选结果</span>
+            </el-button>
+          </div>
+        </div>
 
-        <el-tabs v-model="activeTab" @tab-change="onTabChange">
-          <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :name="tab.value">
-            <template #label>
-              <el-tooltip :content="statusHint(tab.value)" placement="top">
-                <span>{{ tab.label }} <span style="color:#909399">({{ statusCounts[tab.value] || 0 }})</span></span>
-              </el-tooltip>
+        <div style="display:flex; align-items:center; gap:10px; border:1px solid #dfe7f1; border-radius:8px; background:#fff; padding:5px; width:max-content; max-width:100%; margin-bottom:14px; overflow-x:auto">
+          <button
+            v-for="tab in statusTabItems"
+            :key="tab.value"
+            @click="selectStatusTab(tab.value)"
+            :style="{
+              border:'none',
+              borderRadius:'6px',
+              padding:'8px 14px',
+              cursor:'pointer',
+              fontWeight:800,
+              whiteSpace:'nowrap',
+              background: activeTab === tab.value ? '#111827' : 'transparent',
+              color: activeTab === tab.value ? '#fff' : '#64748b'
+            }">
+            {{ tab.label }}
+            <span :style="{ marginLeft:'6px', padding:'1px 8px', borderRadius:'999px', background: activeTab === tab.value ? 'rgba(255,255,255,.18)' : '#eef2f7', color: activeTab === tab.value ? '#fff' : '#64748b' }">{{ tab.count }}</span>
+          </button>
+        </div>
+
+        <div style="display:grid; grid-template-columns:260px minmax(260px,1fr) 70px 70px; gap:10px; align-items:center; margin-bottom:14px">
+          <el-select
+            v-model="storeScope"
+            size="large"
+            multiple
+            collapse-tags
+            collapse-tags-tooltip
+            :max-collapse-tags="1"
+            filterable
+            placeholder="选择店铺"
+            style="width:100%"
+            @change="onStoreScopeChange">
+            <template #prefix><el-icon><Shop /></el-icon></template>
+            <el-option v-for="option in storeScopeOptions" :key="'product-filter-' + option.value" :label="option.label" :value="option.value" />
+          </el-select>
+          <el-input v-model="search" size="large" placeholder="搜索 SKU / 货号 / 标题..." clearable style="width:100%" @input="onSearchInput" @keyup.enter="onSearch">
+            <template #prefix><el-icon><Search /></el-icon></template>
+          </el-input>
+          <el-button size="large" style="width:100%" @click="onSearch">筛选</el-button>
+          <el-button size="large" style="width:100%" @click="() => { search=''; activeTab='ALL'; pagination.currentPage=1; fetchProducts(); }">重置</el-button>
+        </div>
+
+        <div v-if="selectedRows.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
+          <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedRows.length }} 个商品</span>
+          <div style="display:flex; gap:8px">
+            <el-button type="primary" size="small" plain :loading="bulkStockDialog.loadingDetails" @click="openBulkStockEditor">批量改库存</el-button>
+            <el-button type="danger" size="small" :loading="bulkLoading" @click="bulkArchive">批量归档</el-button>
+            <el-button size="small" @click="exportCsv">导出当前筛选</el-button>
+          </div>
+        </div>
+
+        <el-table :data="products" v-loading="loading" element-loading-text="正在读取商品..." border size="large" empty-text="暂无商品。请先选择店铺，或点击同步 Ozon 商品刷新本地缓存。" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="52" />
+          <el-table-column label="店铺" width="135">
+            <template #default="{ row }">
+              <div style="display:inline-flex; align-items:center; gap:8px; max-width:112px; background:#f1f5f9; border-radius:7px; padding:8px 10px; color:#475569; font-weight:800">
+                <span style="width:5px; height:5px; border-radius:50%; background:#6366f1; flex-shrink:0"></span>
+                <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.store_name || currentStoreName }}</span>
+              </div>
             </template>
-          </el-tab-pane>
-        </el-tabs>
-
-        <el-table :data="products" v-loading="loading" stripe border size="small" empty-text="暂无商品。请先选择店铺, 或点击同步 Ozon 商品刷新本地缓存。" @selection-change="onSelectionChange">
-          <el-table-column type="selection" width="44" />
-          <el-table-column label="图片" width="86">
+          </el-table-column>
+          <el-table-column label="图片" width="96">
             <template #default="{ row }">
               <el-tooltip content="点击图片可放大查看图册" placement="top">
                 <el-image
                   :src="row.image"
-                  style="width:56px; height:56px; border-radius:6px; border:1px solid #ebeef5; cursor:zoom-in"
+                  style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; cursor:zoom-in"
                   fit="cover"
                   preview-teleported
                   :preview-src-list="productPreviewList(row)"
                   :initial-index="0">
                   <template #error>
-                    <div style="width:56px; height:56px; background:#f5f7fa; display:flex; align-items:center; justify-content:center; color:#c0c4cc">
-                      <el-icon><Picture /></el-icon>
+                    <div style="width:58px; height:58px; background:#f1f5f9; display:flex; align-items:center; justify-content:center">
+                      <el-icon color="#cbd5e1"><Picture /></el-icon>
                     </div>
                   </template>
                 </el-image>
               </el-tooltip>
             </template>
           </el-table-column>
-          <el-table-column label="商品基本信息" min-width="240">
+          <el-table-column label="商品" min-width="390">
             <template #default="{ row }">
-              <div style="font-size:13px; font-weight:500; line-height:1.4">{{ row.name || '(无标题)' }}</div>
-              <div style="font-size:11px; color:#999; margin-top:4px">
-                货号 <code>{{ row.offer_id }}</code>
-                <el-button link size="small" title="复制货号" @click.stop="copyOfferId(row.offer_id)"><el-icon><CopyDocument /></el-icon></el-button>
-                <span v-if="row.sku"> · SKU <code>{{ row.sku }}</code></span>
+              <div style="min-width:0">
+                <div style="font-size:15px; color:#1f2937; font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.name || '(无标题)' }}</div>
+                <div style="margin-top:6px; display:flex; align-items:center; gap:6px; font-size:12px; color:#94a3b8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">
+                  <span>SKU {{ row.sku || '-' }}</span>
+                  <span>货号 {{ row.offer_id || '-' }}</span>
+                  <el-button link type="primary" size="small" title="复制货号" @click.stop="copyOfferId(row.offer_id)"><el-icon><CopyDocument /></el-icon></el-button>
+                </div>
               </div>
             </template>
           </el-table-column>
@@ -519,7 +975,12 @@ window.ProductListView = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="库存" prop="stock" width="80" sortable />
+          <el-table-column label="库存" prop="stock" width="120" sortable>
+            <template #default="{ row }">
+              <div style="font-weight:900; color:#111827">{{ stockDisplay(row) }}</div>
+              <div v-if="parseStocks(row).length" style="font-size:11px; color:#94a3b8">{{ parseStocks(row).length }} 仓</div>
+            </template>
+          </el-table-column>
           <el-table-column label="品牌" prop="brand" width="120" show-overflow-tooltip />
           <el-table-column label="1688 货源" width="120">
             <template #default="{ row }">
@@ -540,28 +1001,42 @@ window.ProductListView = {
               <span style="font-size:11px; color:#666">{{ (row.updated_at || '').slice(0,19).replace('T',' ') }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="180" fixed="right">
+          <el-table-column label="操作" width="72" fixed="right" align="center">
             <template #default="{ row }">
-              <el-button type="primary" size="small" @click="editProduct(row)">编辑</el-button>
-              <el-button v-if="row.status !== 'IN_ACTIVE'" type="danger" size="small" link @click="archiveProduct(row)">归档</el-button>
-              <el-button v-else type="success" size="small" link @click="unarchiveProduct(row)">上架</el-button>
+              <el-dropdown trigger="click" placement="bottom-end" @command="handleProductAction">
+                <el-button link style="width:28px; height:28px; padding:0; color:#64748b">
+                  <el-icon size="18"><MoreFilled /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item :command="{ action: 'edit', row }">
+                      <el-icon><EditPen /></el-icon><span>编辑商品</span>
+                    </el-dropdown-item>
+                    <el-dropdown-item v-if="row.status !== 'IN_ACTIVE'" :command="{ action: 'archive', row }" divided>
+                      <el-icon><CircleClose /></el-icon><span style="color:#ef4444">归档商品</span>
+                    </el-dropdown-item>
+                    <el-dropdown-item v-else :command="{ action: 'unarchive', row }" divided>
+                      <el-icon><CircleCheck /></el-icon><span style="color:#059669">重新上架</span>
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </template>
           </el-table-column>
         </el-table>
 
-        <!-- v0.3.4: 分页物理 sticky 到底部, 不再随内容滚动 -->
-        <div style="position:sticky; bottom:0; left:0; right:0; margin:20px -20px -20px; padding:12px 20px; background:#fff; border-top:1px solid #ebeef5; z-index:10; display:flex; justify-content:flex-end; box-shadow:0 -2px 6px rgba(0,0,0,0.04)">
+        <div style="position:sticky; bottom:0; left:0; right:0; margin-top:0; padding:12px 0; background:#f8fafc; z-index:10; display:flex; justify-content:flex-end">
           <el-pagination
             v-model:current-page="pagination.currentPage"
             v-model:page-size="pagination.pageSize"
             :total="pagination.total"
-            :page-sizes="[20, 50, 100, 200]"
-            layout="total, sizes, prev, pager, next, jumper"
+            :page-sizes="[20, 50, 100]"
+            layout="total, sizes, prev, pager, next"
             @size-change="onSizeChange"
             @current-change="onPageChange"
           />
         </div>
-      </el-card>
+      </div>
 
       <!-- 生产力级编辑抽屉 (v0.3.3 加主图预览 + 归档) -->
       <el-drawer v-model="drawer.visible" title="商品资料编辑" size="760px" destroy-on-close>
@@ -678,7 +1153,7 @@ window.ProductListView = {
                 <el-cascader
                   v-model="drawer.categoryPath"
                   :options="categoryTree"
-                  :props="{ label: 'label', value: 'category_key', children: 'children', checkStrictly: false, emitPath: true }"
+                  :props="{ label: 'label', value: 'category_key', children: 'children', checkStrictly: true, emitPath: true }"
                   filterable
                   clearable
                   :loading="categoryLoading"
@@ -687,8 +1162,12 @@ window.ProductListView = {
                   @change="onCategoryChange"
                   @visible-change="ensureCategoryTree" />
                 <div style="margin-top:6px; font-size:12px; color:#909399">
-                  当前：{{ drawer.form.category_name || '未设置' }}
+                  当前：{{ currentCategoryText }}
                   <span v-if="drawer.form.description_category_id"> · 类目 ID {{ drawer.form.description_category_id }}</span>
+                  <span v-if="drawer.form.type_id"> · Type ID {{ drawer.form.type_id }}</span>
+                </div>
+                <div v-if="categoryPathMissing" style="margin-top:4px; font-size:12px; color:#e6a23c">
+                  已有类目 ID，但未在当前店铺类目树中匹配到三级路径；请搜索并重新选择一次 Ozon 类目。
                 </div>
               </el-form-item>
             </el-col>
@@ -802,6 +1281,70 @@ window.ProductListView = {
           <el-button type="primary" :loading="saveLoading" @click="saveProduct">保存并同步价格/图片</el-button>
         </template>
       </el-drawer>
+
+      <el-dialog v-model="bulkStockDialog.visible" title="批量设置库存" width="680px" destroy-on-close>
+        <div style="display:flex; flex-direction:column; gap:14px">
+          <el-alert
+            type="info"
+            :closable="false"
+            show-icon
+            :title="bulkStockDialog.loadingDetails ? '正在读取所选商品的分仓库存明细...' : '批量设置会按所选商品归属店铺分别生成库存草稿；勾选立即提交时，会继续走 Ozon 实时库存冲突检查。'" />
+          <el-form label-position="top" size="large">
+            <el-form-item label="设置范围">
+              <el-radio-group v-model="bulkStockDialog.warehouseMode" @change="refreshBulkStockPreview">
+                <el-radio-button label="default">每个商品默认仓库</el-radio-button>
+                <el-radio-button label="specific">指定仓库</el-radio-button>
+              </el-radio-group>
+            </el-form-item>
+            <el-form-item v-if="bulkStockDialog.warehouseMode === 'specific'" label="仓库">
+              <div v-if="bulkStockDialog.loadingDetails" style="color:#64748b; font-size:13px; font-weight:700">正在读取仓库...</div>
+              <el-empty v-else-if="!selectedStoreWarehouseGroups.length" description="未读取到可指定仓库" :image-size="64" />
+              <div v-else style="display:flex; flex-direction:column; gap:10px; width:100%">
+                <div
+                  v-for="group in selectedStoreWarehouseGroups"
+                  :key="'bulk-stock-store-' + group.store_id"
+                  style="display:grid; grid-template-columns:150px minmax(0,1fr); gap:10px; align-items:center; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc">
+                  <div style="min-width:0; color:#334155; font-weight:900; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">
+                    {{ group.store_name }}
+                  </div>
+                  <el-select
+                    v-model="bulkStockDialog.warehouseByStore[group.store_id]"
+                    filterable
+                    placeholder="选择该店铺仓库"
+                    style="width:100%"
+                    @change="refreshBulkStockPreview">
+                    <el-option v-for="item in group.options" :key="group.store_id + '-' + item.warehouse_id" :label="item.label" :value="item.warehouse_id" />
+                  </el-select>
+                </div>
+              </div>
+            </el-form-item>
+            <el-form-item label="目标库存">
+              <el-input-number v-model="bulkStockDialog.target_stock" :min="0" :precision="0" :step="1" controls-position="right" style="width:180px" @change="refreshBulkStockPreview" />
+            </el-form-item>
+            <el-form-item>
+              <el-checkbox v-model="bulkStockDialog.submitNow">保存草稿后立即提交至 Ozon</el-checkbox>
+            </el-form-item>
+          </el-form>
+          <div style="display:flex; justify-content:space-between; align-items:center; color:#64748b; font-size:13px; font-weight:700">
+            <span>{{ bulkStockDialog.loadingDetails ? '正在读取仓库...' : '将生成 ' + bulkStockDialog.preview.length + ' 条库存草稿' }}</span>
+            <span v-if="bulkStockDialog.skipped">跳过 {{ bulkStockDialog.skipped }} 个无可用仓库商品</span>
+          </div>
+          <el-table :data="bulkStockDialog.preview.slice(0, 8)" size="small" border max-height="260">
+            <el-table-column prop="store_name" label="店铺" width="120" show-overflow-tooltip />
+            <el-table-column prop="offer_id" label="货号" min-width="150" show-overflow-tooltip />
+            <el-table-column prop="warehouse_id" label="仓库 ID" width="110" />
+            <el-table-column prop="current_stock" label="当前库存" width="100" />
+            <el-table-column prop="target_stock" label="目标库存" width="100" />
+          </el-table>
+          <div v-if="bulkStockDialog.preview.length > 8" style="font-size:12px; color:#94a3b8">仅预览前 8 条，其余会一起处理。</div>
+        </div>
+        <template #footer>
+          <el-button @click="bulkStockDialog.visible=false">取消</el-button>
+          <el-button type="primary" :loading="bulkStockDialog.submitting" @click="saveBulkStockDrafts">
+            {{ bulkStockDialog.submitNow ? '保存并提交' : '保存草稿' }}
+          </el-button>
+        </template>
+      </el-dialog>
     </div>
   `
 };

@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = '2.2.9.57';
-    const PLUGIN_ZIP_VERSION = '2.2.9.57';
+    const PLUGIN_MANIFEST_VERSION = '2.2.9.67';
+    const PLUGIN_ZIP_VERSION = '2.2.9.67';
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -181,21 +181,33 @@ window.StoreManagementView = {
     return {
       shops, loading, dialogVisible, submitLoading, form,
       PLUGIN_MANIFEST_VERSION, PLUGIN_ZIP_VERSION, pluginDetected, pluginChecking, installedPluginVersion, pluginStatusText, needsPluginRefresh,
-      handleAdd, submitForm, handleDelete, saveShopSettings, maskClientId, displayClientId, downloadExtension, refreshPluginStatus,
+      fetchShops, handleAdd, submitForm, handleDelete, saveShopSettings, maskClientId, displayClientId, downloadExtension, refreshPluginStatus,
     };
   },
   template: `
-    <div class="store-management-container">
-      <el-card>
-        <template #header>
-          <div style="display: flex; justify-content: space-between; align-items: center">
-            <span>店铺授权管理</span>
-            <el-button type="primary" @click="handleAdd">+ 新增授权</el-button>
+    <div class="store-management-container" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px; box-sizing:border-box">
+      <div style="max-width:1500px; margin:0 auto">
+        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
+          <div>
+            <div style="font-size:28px; line-height:1.2; font-weight:900; color:#111827">店铺授权</div>
+            <div style="margin-top:14px; font-size:14px; color:#64748b; font-weight:700">共 {{ shops.length }} 个店铺 · Ozon API 授权与插件状态</div>
           </div>
-        </template>
+          <div style="display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap">
+            <el-button size="large" @click="fetchShops">
+              <el-icon><Refresh /></el-icon><span>刷新</span>
+            </el-button>
+            <el-button size="large" type="primary" style="background:#111827; border-color:#111827" @click="handleAdd">
+              <el-icon><Plus /></el-icon><span>新增授权</span>
+            </el-button>
+          </div>
+        </div>
 
-        <el-table :data="shops" v-loading="loading" stripe empty-text="暂无店铺授权。新增授权后才能同步商品、库存、订单和采集任务。">
-          <el-table-column label="店铺名称" prop="name" />
+        <el-table :data="shops" v-loading="loading" element-loading-text="正在读取店铺" stripe border size="large" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04); margin-bottom:20px" empty-text="暂无店铺授权。新增授权后才能同步商品、库存、订单和采集任务。">
+          <el-table-column label="店铺名称" prop="name" min-width="180">
+            <template #default="{ row }">
+              <div style="font-size:15px; font-weight:800; color:#1f2937">{{ row.name }}</div>
+            </template>
+          </el-table-column>
           <el-table-column label="Client ID">
             <template #default="{ row }">
               <code>{{ displayClientId(row) }}</code>
@@ -224,16 +236,15 @@ window.StoreManagementView = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="150" fixed="right">
+          <el-table-column label="操作" width="120" fixed="right" align="center">
             <template #default="{ row }">
               <el-button link type="danger" @click="handleDelete(row)">移除</el-button>
             </template>
           </el-table-column>
         </el-table>
-      </el-card>
 
       <!-- 插件下载引导 -->
-      <el-card style="margin-top: 20px; background-color: #fdf6ec; border-color: #faecd8;">
+      <el-card style="background-color:#fff; border:1px solid #dfe7f1; border-radius:8px; box-shadow:none; overflow:hidden">
         <template #header>
           <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
             <div style="font-weight: bold; color: #e6a23c">逐梦 Ozon 采集器</div>
@@ -269,6 +280,12 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.63 单品找货降低 1688 风控触发：自适应风控窗口（60s 内失败 / 验证码事件动态拉长下次间隔），normal cooldown 12-22s、连续失败 30-50s/60-90s、触发风控关键字 2-5min 暂停；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.67 单品找货日志优化：实时状态保持刷新，但日志只记录关键节点，不再重复刷屏。</li>
+            <li>✅ v2.2.9.61 单品找货 1688 搜图主链路切回真实 1688 页面会话，避免 direct MTOP 在当前会话中连续超时；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.60 单品找货修复旧任务锁定导致实时日志不跟随新任务，并给 1688 搜图主图压缩加 8 秒保护；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.59 单品找货补齐 1688 图片上传/搜图接口真实网络超时，并恢复实时日志自动同步；批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.58 单品找货增加 1688 以图搜货单行超时保护：单个商品搜图卡住会记录失败并继续下一行；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.57 单品找货对齐生产稳定策略：1688 token 恢复不再自动打开预热页面，候选详情页不再强制切到前台，服务端会拦截旧插件领取任务，降低触发验证码概率；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.56 单品找货增加服务端插件版本闸门：低于 v2.2.9.55 或未上报版本的旧插件只能心跳，不能领取任务，避免旧扩展触发 1688 验证；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.55 单品找货 1688 搜图切回生产同款 MTOP 接口主链路，减少真实搜图页触发验证；遇到 1688 登录/验证码阻塞会自动停止后续采集，批量上架逻辑未调整。</li>
@@ -343,6 +360,7 @@ window.StoreManagementView = {
           </p>
         </div>
       </el-card>
+      </div>
 
       <el-dialog v-model="dialogVisible" title="新增 Ozon 店铺授权" width="500px">
         <el-form :model="form" label-position="top">
