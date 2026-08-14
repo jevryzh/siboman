@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.67";
+const VERSION = "2.2.9.75";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -26,6 +26,8 @@ let imageSearchQueue = Promise.resolve();
 let last1688SearchAt = 0;
 let last1688FailureAt = 0;
 const active1688TabIds = new Set();
+const ACTIVE_SOURCING_JOB_KEY = "activeSourcingJob";
+const ACTIVE_SOURCING_JOB_TTL_MS = 6 * 60 * 1000;
 // v2.2.9.63+: 自适应风控窗口，记录最近 60s 内的失败/验证码事件数
 let riskWindow = [];
 const RISK_WINDOW_MS = 60_000;
@@ -67,6 +69,9 @@ function markSourcingCanceled(job, message = "收到停止请求，正在中断�
   if (job.abortController && !job.abortController.signal?.aborted) {
     try { job.abortController.abort(); } catch (_) {}
   }
+  if (job.stepAbortController && !job.stepAbortController.signal?.aborted) {
+    try { job.stepAbortController.abort(); } catch (_) {}
+  }
   if (Array.isArray(job.logs)) job.logs.push(makeLog(message, "warn"));
   closeActive1688TabsInPlugin().catch((error) => console.warn(`[SW ${VERSION}] 关闭 1688 临时页失败: ${error.message || error}`));
 }
@@ -75,6 +80,61 @@ function assertSourcingNotCanceled(job) {
   if (job?.cancelRequested || job?.abortController?.signal?.aborted) {
     throw new Error("任务已停止");
   }
+  if (job?.stepAbortController?.signal?.aborted) {
+    throw new Error("当前步骤超时，已中断");
+  }
+}
+
+function getSourcingAbortSignal(job) {
+  return job?.stepAbortController?.signal || job?.abortController?.signal;
+}
+
+async function withSourcingStepTimeout(job, label, timeoutMs, fn) {
+  if (!job || typeof AbortController !== "function") return fn();
+  const previousController = job.stepAbortController || null;
+  const stepController = new AbortController();
+  job.stepAbortController = stepController;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { stepController.abort(); } catch (_) {}
+    closeActive1688TabsInPlugin().catch(() => {});
+  }, timeoutMs);
+  try {
+    return await fn();
+  } catch (error) {
+    const message = String(error?.message || error || "");
+    if (timedOut || /AbortError|aborted|当前步骤超时/i.test(message)) {
+      throw new Error(`${label} 超过 ${Math.round(timeoutMs / 1000)} 秒未返回，已中断当前步骤`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    if (job.stepAbortController === stepController) job.stepAbortController = previousController;
+  }
+}
+
+function isOzonVerificationBlocker(data) {
+  const text = [
+    data?.name,
+    data?.title,
+    data?.description,
+    data?.raw_url,
+    data?._debug?.url,
+  ].map(value => String(value || "")).join(" ");
+  return /请拖动滑块|滑块|验证码|安全验证|人机验证|captcha|verify|robot|are you human|подтвердите|капча/i.test(text);
+}
+
+function isCriticalOzonBlockerInPlugin(message) {
+  return /Ozon.*(?:验证|验证码|滑块|风控|屏蔽)|请拖动滑块|captcha|verify|are you human|подтвердите|капча/i.test(String(message || ""));
+}
+
+function isSourcingStepTimeoutInPlugin(message) {
+  return /超过 \d+ 秒未返回|当前步骤超时|timeout|timed out|AbortError|aborted/i.test(String(message || ""));
+}
+
+function isCriticalSourcingBlockerInPlugin(message) {
+  return isCritical1688BlockerInPlugin(message) || isCriticalOzonBlockerInPlugin(message) || isSourcingStepTimeoutInPlugin(message);
 }
 
 function touchLiveHeartbeat(job) {
@@ -83,6 +143,33 @@ function touchLiveHeartbeat(job) {
   if (job.lastLiveLogAt && now - job.lastLiveLogAt < 4500) return false;
   job.lastLiveLogAt = now;
   return true;
+}
+
+async function setActiveSourcingJob(job, phase = "") {
+  if (!job?.id) return;
+  await chrome.storage.local.set({
+    [ACTIVE_SOURCING_JOB_KEY]: {
+      id: job.id,
+      phase: phase || job.phase || "",
+      touchedAt: Date.now(),
+    },
+  }).catch(() => {});
+}
+
+async function getActiveSourcingJob() {
+  const stored = await chrome.storage.local.get([ACTIVE_SOURCING_JOB_KEY]).catch(() => ({}));
+  const active = stored?.[ACTIVE_SOURCING_JOB_KEY];
+  if (!active?.id || Date.now() - Number(active.touchedAt || 0) > ACTIVE_SOURCING_JOB_TTL_MS) {
+    await chrome.storage.local.remove([ACTIVE_SOURCING_JOB_KEY]).catch(() => {});
+    return null;
+  }
+  return active;
+}
+
+async function clearActiveSourcingJob(id = "") {
+  const active = await getActiveSourcingJob();
+  if (!active || (id && active.id !== id)) return;
+  await chrome.storage.local.remove([ACTIVE_SOURCING_JOB_KEY]).catch(() => {});
 }
 
 async function closeActive1688TabsInPlugin() {
@@ -128,7 +215,7 @@ async function removeTabWithRetry(tabId, label = "关闭标签页") {
 }
 
 // ========== 采集核心: 打开 Ozon 商品前端页 + executeScript 提取 ==========
-async function collectSku(sku, storeIds = []) {
+async function collectSku(sku, storeIds = [], job = null) {
   const url = OZON_PRODUCT_URL(sku);
   console.log(`[SW ${VERSION}] 采集 SKU ${sku}: 准备打开 ${url}, stores=${storeIds.length}`);
   
@@ -154,6 +241,7 @@ async function collectSku(sku, storeIds = []) {
   let lastRaw = null;
   const maxRetries = 15;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    assertSourcingNotCanceled(job);
     try {
       const [execResult] = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
@@ -164,6 +252,10 @@ async function collectSku(sku, storeIds = []) {
       if (result) lastRaw = JSON.stringify(result).slice(0, 300);
     } catch (e) {
       console.warn(`[SW ${VERSION}]   attempt ${attempt} executeScript 抛错: ${e.message}`);
+    }
+    if (isOzonVerificationBlocker(result)) {
+      await safeRemoveTab(tab.id);
+      throw new Error("Ozon 商品页出现滑块/验证码，请在当前 Chrome 完成人工验证后，从当前行重新执行。");
     }
     // v2.2.9.8: extract 函数本身 try/catch 抛错时会在 result._error 字段, 这里打印到 SW console (user 能看)
     if (result && result._error) {
@@ -179,7 +271,7 @@ async function collectSku(sku, storeIds = []) {
       const tabInfo = await chrome.tabs.get(tab.id).catch(() => null);
       console.log(`[SW ${VERSION}]   attempt ${attempt} result=${result ? `object(name=${result.name?.slice(0,30)||'(empty)'})` : 'null'} tab.status=${tabInfo?.status} url=${tabInfo?.url?.slice(0,60)}`);
     }
-    if (attempt < maxRetries) await new Promise(r => setTimeout(r, 2000));
+    if (attempt < maxRetries) await sleep(2000);
   }
   if (!result && lastRaw) console.warn(`[SW ${VERSION}]   polling 15 次都失败, 最后 raw: ${lastRaw}`);
 
@@ -190,6 +282,10 @@ async function collectSku(sku, storeIds = []) {
   if (!result.name) {
     await safeRemoveTab(tab.id);
     throw new Error(`未提取到商品名. raw=${JSON.stringify(result).slice(0, 300)}`);
+  }
+  if (isOzonVerificationBlocker(result)) {
+    await safeRemoveTab(tab.id);
+    throw new Error("Ozon 商品页出现滑块/验证码，请在当前 Chrome 完成人工验证后，从当前行重新执行。");
   }
 
   // v2.2.9.15: 优先复用 Seller 后台“复制商品”链路拿完整跟卖源包。
@@ -364,6 +460,18 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function sleepWithSourcingLease(job, ms, phase = "") {
+  const deadline = Date.now() + Math.max(0, Number(ms) || 0);
+  while (Date.now() < deadline) {
+    assertSourcingNotCanceled(job);
+    if (phase) job.phase = phase;
+    touchLiveHeartbeat(job);
+    await reportSourcingProgress(job, { phase: job.phase || phase || "等待下一条" });
+    await sleep(Math.min(4000, Math.max(0, deadline - Date.now())));
+  }
+  assertSourcingNotCanceled(job);
+}
+
 function randomInt(min, max) {
   return Math.floor(min + Math.random() * (max - min + 1));
 }
@@ -504,6 +612,7 @@ function workerMeta(currentPhase = "") {
 
 async function reportSourcingProgress(job, extra = {}) {
   try {
+    await setActiveSourcingJob(job, extra.phase || job.phase || "");
     const data = await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/progress`, {
       method: "POST",
       body: {
@@ -543,24 +652,28 @@ function startSourcingCancelMonitor(job) {
 }
 
 async function completeSourcingJob(job) {
-  await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/complete`, {
-    method: "POST",
-    body: {
-      job: {
-        id: job.id,
-        kind: "run",
-        status: job.status,
-        phase: job.phase,
-        total: job.total,
-        processed: job.processed,
-        logs: job.logs,
-        results: job.results,
-        error: job.error || "",
+  try {
+    await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/complete`, {
+      method: "POST",
+      body: {
+        job: {
+          id: job.id,
+          kind: "run",
+          status: job.status,
+          phase: job.phase,
+          total: job.total,
+          processed: job.processed,
+          logs: job.logs,
+          results: job.results,
+          error: job.error || "",
+        },
+        excelBase64: "",
+        ...workerMeta(job.phase),
       },
-      excelBase64: "",
-      ...workerMeta(job.phase),
-    },
-  });
+    });
+  } finally {
+    await clearActiveSourcingJob(job.id);
+  }
 }
 
 function extractOzonSkuFromUrl(url) {
@@ -569,8 +682,16 @@ function extractOzonSkuFromUrl(url) {
   return match ? match[1] : "";
 }
 
+function isLikelyOzonMarketingImageInPlugin(url) {
+  const text = String(url || "").toLowerCase();
+  return /\/marketing-api\/banners?\//i.test(text)
+    || /\/banners?\//i.test(text)
+    || /\/brand(?:-|_)?logo/i.test(text)
+    || /\/seller(?:-|_)?logo/i.test(text);
+}
+
 function normalizeOzonForSourcing(data, url, sourceRow) {
-  const images = Array.isArray(data.images) ? data.images.filter(Boolean) : [];
+  const images = Array.isArray(data.images) ? data.images.filter((image) => image && !isLikelyOzonMarketingImageInPlugin(image)) : [];
   const mainImageUrl = images[0] || "";
   const weightGrams = Number(data.weight || data.weightGrams || 0) || "";
   const priceText = data.price || data.currentBlackPriceCny || data.currentBlackPrice || "";
@@ -600,23 +721,36 @@ function normalizeOzonForSourcing(data, url, sourceRow) {
 async function runQueuedSourcingJob(remoteJob) {
   const payload = remoteJob.payload || {};
   const options = payload.options || {};
-  const rows = Array.isArray(payload.urlRows) && payload.urlRows.length
+  const rawRows = Array.isArray(payload.urlRows) && payload.urlRows.length
     ? payload.urlRows
     : (Array.isArray(payload.urls) ? payload.urls.map((url, index) => ({ url, sourceRow: index + 1 })) : []);
+  const declaredTotal = Math.max(0, Number(remoteJob.total || payload.sourceTotal || rawRows.length || 0));
+  const rows = declaredTotal > 0 ? rawRows.slice(0, declaredTotal) : rawRows;
+  const initialProcessed = Math.min(Math.max(0, Number(remoteJob.processed || 0)), rows.length);
   const job = {
     id: remoteJob.id,
     status: "running",
     phase: "插件已领取，准备单品找货",
     total: rows.length,
-    processed: Number(remoteJob.processed || 0),
+    processed: initialProcessed,
     logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
-    results: Array.isArray(remoteJob.results) ? remoteJob.results : [],
+    results: Array.isArray(remoteJob.results) ? remoteJob.results.slice(0, rows.length) : [],
     error: "",
     cancelRequested: false,
     abortController: typeof AbortController === "function" ? new AbortController() : null,
   };
   job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取单品找货任务。`));
+  await setActiveSourcingJob(job);
   await reportSourcingProgress(job);
+
+  if (job.total > 0 && job.processed >= job.total) {
+    job.status = "done";
+    job.processed = job.total;
+    job.phase = "已完成，正在生成 Excel";
+    job.logs.push(makeLog(`任务进度已到 ${job.processed}/${job.total}，不再继续采集额外行。`));
+    await completeSourcingJob(job);
+    return;
+  }
 
   const maxCandidates = Math.max(1, Math.min(20, Number(options.maxCandidates || 5)));
   const enable1688 = options.enable1688 !== false;
@@ -638,7 +772,7 @@ async function runQueuedSourcingJob(remoteJob) {
         job.phase = `采集 Ozon 第 ${sourceRow} 行`;
         job.logs.push(makeLog(`开始采集 Ozon SKU ${sku}`));
         await reportSourcingProgress(job);
-        const ozonRaw = await collectSku(sku, []);
+        const ozonRaw = await withSourcingStepTimeout(job, `Ozon 第 ${sourceRow} 行采集`, 90_000, () => collectSku(sku, [], job));
         if (job.cancelRequested) break;
         result.ozon = normalizeOzonForSourcing(ozonRaw, url, sourceRow);
 
@@ -646,7 +780,7 @@ async function runQueuedSourcingJob(remoteJob) {
           job.phase = `1688 搜图 第 ${sourceRow} 行`;
           job.logs.push(makeLog(`用主图搜索 1688 候选，最多 ${maxCandidates} 个。`));
           await reportSourcingProgress(job);
-          const searchResult = await search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates, job);
+          const searchResult = await withSourcingStepTimeout(job, `1688 第 ${sourceRow} 行搜图`, 240_000, () => search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates, job));
           if (job.cancelRequested) break;
           if (searchResult.success) {
             result.candidates = searchResult.candidates;
@@ -659,11 +793,15 @@ async function runQueuedSourcingJob(remoteJob) {
           } else {
             result.searchError = searchResult.error;
             job.logs.push(makeLog(`1688 搜图失败：${searchResult.error}`, "warn"));
-            if (isCritical1688BlockerInPlugin(searchResult.error)) {
+            if (isCriticalSourcingBlockerInPlugin(searchResult.error)) {
               fatalStop = true;
               job.error = searchResult.error;
-              job.phase = "已自动停止：1688 需要人工登录/验证";
-              job.logs.push(makeLog("检测到 1688 登录/验证码/安全验证阻塞，已停止后续采集，避免继续触发风控。", "error"));
+              job.phase = isSourcingStepTimeoutInPlugin(searchResult.error)
+                ? "已自动停止：当前步骤超时"
+                : "已自动停止：1688 需要人工登录/验证";
+              job.logs.push(makeLog(isSourcingStepTimeoutInPlugin(searchResult.error)
+                ? "检测到当前商品采集步骤超时，已停止后续采集。请检查 1688/Ozon 页面是否被验证页阻塞，再从当前行继续。"
+                : "检测到 1688 登录/验证码/安全验证阻塞，已停止后续采集，避免继续触发风控。", "error"));
             }
           }
         } else if (enable1688) {
@@ -673,14 +811,26 @@ async function runQueuedSourcingJob(remoteJob) {
       } catch (e) {
         result.error = e.message || String(e);
         job.logs.push(makeLog(`第 ${sourceRow} 行失败：${result.error}`, "error"));
+        if (isCriticalSourcingBlockerInPlugin(result.error)) {
+          fatalStop = true;
+          job.error = result.error;
+          job.phase = isCriticalOzonBlockerInPlugin(result.error)
+            ? "已自动停止：Ozon 需要人工验证"
+            : "已自动停止：当前步骤超时";
+          job.logs.push(makeLog(isCriticalOzonBlockerInPlugin(result.error)
+            ? "检测到 Ozon 商品页滑块/验证码，已停止后续采集。请在当前 Chrome 完成验证后，从这一行继续。"
+            : "检测到当前商品采集步骤超时，已停止后续采集。请检查 Ozon/1688 页面后从这一行继续。", "error"));
+        }
       }
       if (job.cancelRequested) break;
       job.results.push(result);
-      job.processed = index + 1;
+      job.processed = Math.min(index + 1, job.total);
       if (!fatalStop) job.phase = `已完成 ${job.processed}/${job.total}`;
       await reportSourcingProgress(job);
       if (fatalStop || job.cancelRequested) break;
-      if (index < rows.length - 1) await sleep(randomInt(delayMinMs, delayMaxMs));
+      if (index < rows.length - 1) {
+        await sleepWithSourcingLease(job, randomInt(delayMinMs, delayMaxMs), `等待下一条 ${Math.min(index + 2, rows.length)}/${job.total}`);
+      }
     }
   } finally {
     stopCancelMonitor();
@@ -688,7 +838,7 @@ async function runQueuedSourcingJob(remoteJob) {
 
   job.status = fatalStop ? "error" : (job.cancelRequested ? "canceled" : (job.results.some(r => !r.error) ? "done" : "error"));
   job.phase = fatalStop ? job.phase : (job.status === "done" ? "已完成，正在生成 Excel" : (job.status === "canceled" ? "已停止" : "全部失败"));
-  job.error = fatalStop ? (job.error || "1688 需要人工登录/验证") : (job.status === "error" ? "单品找货全部失败" : "");
+  job.error = fatalStop ? (job.error || "采集被验证/超时阻断") : (job.status === "error" ? "单品找货全部失败" : "");
   job.logs.push(makeLog(job.status === "done" ? "单品找货完成。" : job.phase, job.status === "error" ? "error" : "info"));
   await completeSourcingJob(job);
 }
@@ -697,9 +847,13 @@ async function pollSourcingQueueOnce() {
   if (sourcingBusy) return;
   sourcingBusy = true;
   try {
+    const activeJob = await getActiveSourcingJob();
+    const currentPhase = activeJob?.id
+      ? (activeJob.phase || "单品找货任务仍在执行，保持任务租约")
+      : "逐梦插件在线，可领取单品找货任务";
     const data = await erpApi("/api/worker/jobs/next", {
       method: "POST",
-      body: { ...workerMeta("逐梦插件在线，可领取单品找货任务"), kinds: ["run"] },
+      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run"] },
     });
     if (data.job) {
       console.log(`[SW ${VERSION}] 领取单品找货任务: ${data.job.id}`);
@@ -714,7 +868,7 @@ async function pollSourcingQueueOnce() {
 }
 
 function startSourcingQueueLoop() {
-  chrome.alarms.create("zhumeng-single-sourcing", { periodInMinutes: 1 });
+  chrome.alarms.create("zhumeng-single-sourcing", { periodInMinutes: 0.5 });
   setTimeout(() => pollSourcingQueueOnce(), 1500);
 }
 
@@ -1172,7 +1326,7 @@ function normalize1688OfferItemInPlugin(item, index) {
 
 async function fetchImageAsBase64(url, job = null) {
   assertSourcingNotCanceled(job);
-  const resp = await fetch(url, { credentials: "omit", headers: { Referer: "https://www.ozon.ru/" }, signal: job?.abortController?.signal });
+  const resp = await fetch(url, { credentials: "omit", headers: { Referer: "https://www.ozon.ru/" }, signal: getSourcingAbortSignal(job) });
   if (!resp.ok) throw new Error(`主图下载失败 ${resp.status}`);
   const blob = await resp.blob();
   assertSourcingNotCanceled(job);
@@ -1288,7 +1442,7 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState, job = null) {
         method: "POST",
         headers: build1688HeadersInPlugin(state.cookieHeader, { "Content-Type": "application/x-www-form-urlencoded" }),
         credentials: "include",
-        signal: job?.abortController?.signal,
+        signal: getSourcingAbortSignal(job),
         body: `data=${encodeURIComponent(dataStr)}`,
       });
       assertSourcingNotCanceled(job);
@@ -1300,7 +1454,7 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState, job = null) {
     } catch (error) {
       lastError = error;
       const message = String(error?.message || error || "");
-      if (/任务已停止|AbortError|aborted/i.test(message)) throw new Error("任务已停止");
+      if (/任务已停止|当前步骤超时|AbortError|aborted/i.test(message)) throw error;
       if (attempt >= 3 || !is1688RefreshableError(message)) throw error;
       console.warn(`[SW ${VERSION}] 1688 图片上传失败，第 ${attempt}/3 次重试: ${message}`);
       await sleep(1000 * attempt);
@@ -1341,7 +1495,7 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState, job = null) {
     method: "GET",
     headers: build1688HeadersInPlugin(cookieState.cookieHeader),
     credentials: "include",
-    signal: job?.abortController?.signal,
+    signal: getSourcingAbortSignal(job),
   });
   assertSourcingNotCanceled(job);
   const json = parseMtopTextInPlugin(await resp.text());
@@ -2434,6 +2588,270 @@ function buildPortalItemFromImportItem(importItem) {
   // 同时带 4194/4195 会被 Ozon 判定“图片字段重复”。
   normalizePortalAttributes(item, { removeIds: [4194, 4195] });
   return item;
+}
+
+async function discoverOzonProductsFromSearch(searchQuery, strategyType, maxProducts, categoryLabel, progressTabId) {
+  if (!searchQuery && !categoryLabel) throw new Error("需要搜索关键词或类目名");
+  const query = searchQuery || categoryLabel;
+  const searchUrl = `https://www.ozon.ru/search/?text=${encodeURIComponent(query)}&sorting=rating`;
+  console.log(`[SW ${VERSION}] discoverOzonProducts: 打开搜索页 ${searchUrl}, max=${maxProducts}`);
+  const tab = await createTabWithRetry({ url: searchUrl, active: false }, "打开 Ozon 搜索页");
+  let collected = [];
+  try {
+    await waitForTabComplete(tab.id, 30000);
+    await sleep(randomInt(2000, 4000));
+    let stagnant = 0;
+    let prevCount = 0;
+    for (let round = 0; round < 15 && collected.length < maxProducts && stagnant < 4; round++) {
+      const [extracted] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: extractOzonSearchResults,
+        args: [maxProducts],
+      }).catch(() => [null]);
+      if (extracted && extracted.length) {
+        for (const item of extracted) {
+          if (!collected.find((c) => c.sku === item.sku)) collected.push(item);
+          if (collected.length >= maxProducts) break;
+        }
+      }
+      if (collected.length > prevCount) {
+        console.log(`[SW ${VERSION}] discoverOzonProducts: 第 ${round + 1} 轮, 累计 ${collected.length}/${maxProducts}`);
+        stagnant = 0;
+        prevCount = collected.length;
+      } else {
+        stagnant++;
+      }
+      if (collected.length < maxProducts) {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (d) => window.scrollBy(0, d),
+          args: [Math.floor(window.innerHeight * 1.5) || 800],
+        }).catch(() => {});
+        await sleep(randomInt(1500, 3000));
+      }
+    }
+  } finally {
+    await safeRemoveTab(tab.id).catch(() => {});
+  }
+  if (!collected.length) {
+    console.log(`[SW ${VERSION}] discoverOzonProducts: 新 tab 提取为空，尝试从用户已打开的 Ozon 标签页提取`);
+    const ozonTabs = await chrome.tabs.query({ url: "https://www.ozon.ru/*" }).catch(() => []);
+    for (const ot of ozonTabs) {
+      if (collected.length >= maxProducts) break;
+      const [extracted] = await chrome.scripting.executeScript({
+        target: { tabId: ot.id },
+        func: extractOzonSearchResults,
+        args: [maxProducts - collected.length],
+      }).catch(() => [null]);
+      if (extracted && extracted.length) {
+        for (const item of extracted) {
+          if (!collected.find((c) => c.sku === item.sku)) collected.push(item);
+          if (collected.length >= maxProducts) break;
+        }
+        console.log(`[SW ${VERSION}] discoverOzonProducts: 从已打开标签页 ${ot.url?.slice(0, 60)} 提取到 ${extracted.length} 个商品`);
+      }
+    }
+  }
+  if (!collected.length) {
+    return { imported: 0, failed: 0, items: [], error: "Ozon 搜索页没有返回商品卡片（可能是反爬或地区限制）" };
+  }
+  const response = await erpApi("/api/sourcing/platform-snapshot/batch-upsert", {
+    method: "POST",
+    body: {
+      items: collected,
+      strategy_type: strategyType,
+      source_name: "extension_search",
+      source_url: searchUrl,
+    },
+  });
+  console.log(`[SW ${VERSION}] discoverOzonProducts: 已上传 ${collected.length} 个商品到 ERP, imported=${response.imported}`);
+  return {
+    imported: response.imported || 0,
+    failed: response.failed || 0,
+    items: response.items || [],
+    errors: response.errors || [],
+    total_found: collected.length,
+  };
+}
+
+function extractOzonSearchResults(maxCount) {
+  try {
+    const results = [];
+    const toAbs = (val) => {
+      try { return new URL(String(val || ""), location.href).href; } catch { return ""; }
+    };
+    const clean = (val) => String(val || "").replace(/\s+/g, " ").trim();
+    const seenSkus = new Set();
+
+    // 策略1: data-widget 容器内的 data-index 卡片
+    const widgetCards = document.querySelectorAll(
+      '[data-widget="searchResultsV2"] [data-index], [data-widget="searchResultsV2"] [class*="item"], [data-widget="skuGrid"] [data-index], [data-widget="skuGrid"] [class*="item"], [data-widget="searchResults"] [data-index], .widget-search-results-container [data-index]'
+    );
+    // 策略2: 直接找所有商品链接，向上找父容器
+    const productLinks = document.querySelectorAll('a[href*="/product/"]');
+    const linkCards = [];
+    for (const link of productLinks) {
+      let parent = link;
+      for (let i = 0; i < 6; i++) {
+        parent = parent.parentElement;
+        if (!parent) break;
+        if (parent.querySelector('img') && parent.querySelector('img') !== link.querySelector('img')) break;
+      }
+      if (parent) linkCards.push(parent);
+    }
+    const allCards = widgetCards.length ? [...widgetCards] : linkCards;
+
+    for (const card of allCards) {
+      if (results.length >= maxCount) break;
+      let sku = "";
+      let title = "";
+      let mainImage = "";
+      let priceRub = null;
+      let ozonUrl = "";
+      let sellerName = "";
+      let categoryName = "";
+      const link = card.matches?.('a[href*="/product/"]') ? card : card.querySelector?.('a[href*="/product/"]');
+      if (link) {
+        ozonUrl = toAbs(link.getAttribute("href"));
+        const m = ozonUrl.match(/\/product\/(?:[^/?]*?-)?(\d{5,})/);
+        if (m) sku = m[1];
+      }
+      if (!sku) {
+        const idx = card.getAttribute?.("data-index") || card.getAttribute?.("data-sku") || "";
+        sku = String(idx).match(/\d{5,}/)?.[0] || "";
+      }
+      if (!sku) continue;
+      if (seenSkus.has(sku)) continue;
+      seenSkus.add(sku);
+
+      title = clean(
+        card.querySelector?.("img")?.getAttribute("alt") ||
+        link?.getAttribute("title") ||
+        link?.textContent ||
+        card.querySelector?.("[title]")?.getAttribute("title") ||
+        card.querySelector?.('[class*="title"], [class*="name"]')?.textContent ||
+        ""
+      );
+      const img = card.querySelector?.("img[src]");
+      if (img) mainImage = toAbs(img.getAttribute("src") || img.getAttribute("data-src") || "");
+      if (!mainImage) {
+        const bgImg = card.querySelector?.('[style*="background-image"]');
+        if (bgImg) {
+          const m = bgImg.getAttribute("style")?.match(/url\(["']?([^"')]+)/);
+          if (m) mainImage = toAbs(m[1]);
+        }
+      }
+      const priceEl = card.querySelector?.('[class*="price"], [data-widget="price"], [class*="Price"]');
+      if (priceEl) {
+        const priceText = clean(priceEl.textContent);
+        const m = priceText.match(/[\d\s\u00a0,]+/);
+        if (m) priceRub = Number(m[0].replace(/[\s\u00a0,]/g, ""));
+      }
+      const breadcrumb = card.querySelector?.("[class*='category'], [class*='breadcrumb']");
+      if (breadcrumb) categoryName = clean(breadcrumb.textContent);
+      const sellerEl = card.querySelector?.("[class*='seller'], [class*='brand']");
+      if (sellerEl) sellerName = clean(sellerEl.textContent);
+      if (title || mainImage || priceRub) {
+        results.push({
+          sku, title: title || sku, main_image: mainImage, price_rub: priceRub,
+          ozon_url: ozonUrl || `https://www.ozon.ru/product/${sku}/`,
+          seller_name: sellerName, category_name: categoryName,
+          monthly_sales: 0, review_count: 0, seller_count: null,
+        });
+      }
+    }
+    return results;
+  } catch (e) {
+    return [];
+  }
+}
+
+async function discoverOzonCategoryProducts(categoryUrl, categoryName, strategyType, maxProducts) {
+  if (!categoryUrl) throw new Error("需要品类页 URL");
+  let url = categoryUrl;
+  if (!/^https?:\/\//.test(url)) url = `https://www.ozon.ru${url.startsWith("/") ? "" : "/"}${url}`;
+  if (!/\/category\//.test(url) && !/sorting=/.test(url)) url = url.replace(/\/?$/, "/?sorting=rating");
+  console.log(`[SW ${VERSION}] discoverCategoryProducts: 打开品类页 ${url}, max=${maxProducts}`);
+  const tab = await createTabWithRetry({ url, active: false }, "打开 Ozon 品类页");
+  let collected = [];
+  try {
+    await waitForTabComplete(tab.id, 30000);
+    await sleep(randomInt(2000, 4000));
+    let stagnant = 0;
+    let prevCount = 0;
+    for (let round = 0; round < 15 && collected.length < maxProducts && stagnant < 4; round++) {
+      const [extracted] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: extractOzonSearchResults,
+        args: [maxProducts],
+      }).catch(() => [null]);
+      if (extracted && extracted.length) {
+        for (const item of extracted) {
+          if (!collected.find((c) => c.sku === item.sku)) collected.push(item);
+          if (collected.length >= maxProducts) break;
+        }
+      }
+      if (collected.length > prevCount) {
+        console.log(`[SW ${VERSION}] discoverCategoryProducts: 第 ${round + 1} 轮, 累计 ${collected.length}/${maxProducts}`);
+        stagnant = 0;
+        prevCount = collected.length;
+      } else {
+        stagnant++;
+      }
+      if (collected.length < maxProducts) {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: (d) => window.scrollBy(0, d),
+          args: [Math.floor(window.innerHeight * 1.5) || 800],
+        }).catch(() => {});
+        await sleep(randomInt(1500, 3000));
+      }
+    }
+  } finally {
+    await safeRemoveTab(tab.id).catch(() => {});
+  }
+  if (!collected.length) {
+    console.log(`[SW ${VERSION}] discoverCategoryProducts: 新 tab 提取为空，尝试从用户已打开的 Ozon 标签页提取`);
+    const ozonTabs = await chrome.tabs.query({ url: "https://www.ozon.ru/*" }).catch(() => []);
+    for (const ot of ozonTabs) {
+      if (collected.length >= maxProducts) break;
+      const [extracted] = await chrome.scripting.executeScript({
+        target: { tabId: ot.id },
+        func: extractOzonSearchResults,
+        args: [maxProducts - collected.length],
+      }).catch(() => [null]);
+      if (extracted && extracted.length) {
+        for (const item of extracted) {
+          if (!collected.find((c) => c.sku === item.sku)) collected.push(item);
+          if (collected.length >= maxProducts) break;
+        }
+        console.log(`[SW ${VERSION}] discoverCategoryProducts: 从已打开标签页 ${ot.url?.slice(0, 60)} 提取到 ${extracted.length} 个商品`);
+      }
+    }
+  }
+  if (!collected.length) {
+    return { imported: 0, failed: 0, items: [], error: "Ozon 品类页没有返回商品卡片（可能是反爬或页面结构变化），请手动在 Ozon 上浏览品类页后重试" };
+  }
+  for (const item of collected) {
+    if (categoryName && !item.category_name) item.category_name = categoryName;
+  }
+  const response = await erpApi("/api/sourcing/platform-snapshot/batch-upsert", {
+    method: "POST",
+    body: {
+      items: collected,
+      strategy_type: strategyType,
+      source_name: "extension_category_page",
+      source_url: url,
+    },
+  });
+  console.log(`[SW ${VERSION}] discoverCategoryProducts: 已上传 ${collected.length} 个商品到 ERP, imported=${response.imported}`);
+  return {
+    imported: response.imported || 0,
+    failed: response.failed || 0,
+    items: response.items || [],
+    errors: response.errors || [],
+    total_found: collected.length,
+  };
 }
 
 async function portalImportItems(importItems, preferTabId) {
@@ -3844,6 +4262,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const result = await portalImportItems(msg.items || [], sender?.tab?.id || null);
         sendResponse({ ok: true, result });
       } catch (e) {
+        sendResponse({ ok: false, error: e.message || String(e), version: VERSION });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "discoverOzonProducts") {
+    const searchQuery = String(msg.query || msg.search || "").trim();
+    const strategyType = String(msg.strategy_type || "hot").trim();
+    const maxProducts = Math.min(100, Math.max(5, Number(msg.limit || 30)));
+    const categoryLabel = String(msg.category_label || "").trim();
+    (async () => {
+      try {
+        const result = await discoverOzonProductsFromSearch(searchQuery, strategyType, maxProducts, categoryLabel, msg.progress_callback_tab_id);
+        sendResponse({ ok: true, ...result });
+      } catch (e) {
+        console.error(`[SW ${VERSION}] discoverOzonProducts error:`, e.message);
+        sendResponse({ ok: false, error: e.message || String(e), version: VERSION });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "discoverCategoryPage") {
+    const categoryUrl = String(msg.category_url || msg.url || "").trim();
+    const categoryName = String(msg.category_name || "").trim();
+    const strategyType = String(msg.strategy_type || "hot").trim();
+    const maxProducts = Math.min(100, Math.max(5, Number(msg.limit || 30)));
+    (async () => {
+      try {
+        const result = await discoverOzonCategoryProducts(categoryUrl, categoryName, strategyType, maxProducts);
+        sendResponse({ ok: true, ...result });
+      } catch (e) {
+        console.error(`[SW ${VERSION}] discoverCategoryPage error:`, e.message);
         sendResponse({ ok: false, error: e.message || String(e), version: VERSION });
       }
     })();

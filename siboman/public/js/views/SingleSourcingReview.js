@@ -163,6 +163,7 @@ window.SingleSourcingReviewView = {
       .map((row) => `${row.ozonSku}\t${Number(row.listingPriceRub).toFixed(2)}`)
       .join('\n'));
     const candidateRows = Vue.computed(() => review.value.candidateRows || []);
+    const latestLogisticsExcelUrl = Vue.computed(() => currentJobId.value ? `/api/history/${encodeURIComponent(currentJobId.value)}/download` : '');
 
     const displayColumns = [
       { label: '已选用', prop: 'confirmed', width: 88, fixed: 'left' },
@@ -327,6 +328,9 @@ window.SingleSourcingReviewView = {
       }));
       window.location.hash = '#/upload';
     };
+    const backToSingleSourcing = () => {
+      window.location.hash = '#/single-sourcing';
+    };
 
     Vue.onMounted(async () => {
       currentJobId.value = getHashJobId();
@@ -336,9 +340,9 @@ window.SingleSourcingReviewView = {
     return {
       loading, saving, review, currentJobId, jobHistory, activeTab, activeRows, candidateRows,
       filteredRows, filteredCount, confirmedCount, batchText, displayColumns, reviewFilter,
-      formatTime, imageUrl, decisionText, decisionType,
+      latestLogisticsExcelUrl, formatTime, imageUrl, decisionText, decisionType,
       cellValue, logisticsFor, loadReview, refresh, toggleAllConfirmed, isSelectedCandidate,
-      showExact, showApproxProfit, resetFilter, useCandidate, saveConfirmations, copyBatchText, sendToBatchUpload,
+      showExact, showApproxProfit, resetFilter, useCandidate, saveConfirmations, copyBatchText, sendToBatchUpload, backToSingleSourcing,
     };
   },
   template: `
@@ -361,6 +365,14 @@ window.SingleSourcingReviewView = {
               />
             </el-select>
             <el-button @click="refresh">刷新</el-button>
+            <el-button
+              v-if="latestLogisticsExcelUrl"
+              tag="a"
+              :href="latestLogisticsExcelUrl"
+              target="_blank"
+              rel="noreferrer"
+            >下载最新物流表 Excel</el-button>
+            <el-button @click="backToSingleSourcing">返回单品找货</el-button>
           </div>
         </div>
         <div style="display:flex; gap:10px; flex-wrap:wrap; margin-top:14px">

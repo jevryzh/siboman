@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = '2.2.9.67';
-    const PLUGIN_ZIP_VERSION = '2.2.9.67';
+    const PLUGIN_MANIFEST_VERSION = '2.2.9.75';
+    const PLUGIN_ZIP_VERSION = '2.2.9.75';
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -280,6 +280,8 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.75 单品找货增强任务续租：行间等待持续回传心跳，服务端可快速救回失联/空闲未收尾任务，避免卡在 N/40 后不继续。</li>
+            <li>✅ v2.2.9.72 单品找货识别 Ozon 滑块/验证码页，并给 Ozon/1688 单行采集增加硬超时；停止任务会中断当前步骤，避免卡在 39/40 条仍被心跳保活。</li>
             <li>✅ v2.2.9.63 单品找货降低 1688 风控触发：自适应风控窗口（60s 内失败 / 验证码事件动态拉长下次间隔），normal cooldown 12-22s、连续失败 30-50s/60-90s、触发风控关键字 2-5min 暂停；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.67 单品找货日志优化：实时状态保持刷新，但日志只记录关键节点，不再重复刷屏。</li>
             <li>✅ v2.2.9.61 单品找货 1688 搜图主链路切回真实 1688 页面会话，避免 direct MTOP 在当前会话中连续超时；批量上架逻辑未调整。</li>

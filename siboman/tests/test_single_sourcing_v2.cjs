@@ -23,13 +23,18 @@ assert.strictEqual(singleModule.route, '#/single-sourcing', 'single sourcing mus
 assert.strictEqual(singleModule.viewFile, 'public/js/views/SourcingModule.js', 'single sourcing matrix must point at SourcingModule');
 assert.strictEqual(singleModule.riskLevel, 'requires_authorization', 'single sourcing needs authorization but is not an external-write module');
 
-// Restore target: the stable pre-review single-sourcing flow must be independent and must not load the later review page.
+// Stable single-sourcing flow stays independent, with the review page reachable from history.
 assert(main.includes('index="#/single-sourcing"'), 'main sidebar must expose an independent single-sourcing entry');
 assert(main.includes("goTo('#/single-sourcing')"), 'main sidebar must navigate directly to #/single-sourcing');
 assert(main.includes("routeName === 'single-sourcing'"), 'main shell must render single sourcing route');
-assert(!main.includes('single-sourcing-review'), 'pre-review restore must not expose the unstable review route');
-assert(!indexHtml.includes('/js/views/SingleSourcingReview.js'), 'pre-review restore must not load the review component script');
-assert(indexHtml.includes('/js/views/SourcingModule.js?v=22985'), 'index must bust browser cache for the restored single sourcing module');
+assert(main.includes("routeName === 'single-sourcing-review'"), 'main shell must render single-sourcing review route');
+assert(indexHtml.includes('/js/views/SingleSourcingReview.js'), 'index must load the review component script');
+assert(sourcing.includes('openHistoryReview'), 'history rows must expose the result-review action');
+assert(sourcing.includes('结果核对'), 'history rows must show the result-review button');
+assert(server.includes('app.get("/api/jobs/:id/review"'), 'server must expose the review read API');
+assert(server.includes('app.post("/api/jobs/:id/review/confirm"'), 'server must expose the review confirmation API');
+assert(server.includes('await writeJobArtifacts(job);'), 'review confirmation must rebuild the latest logistics workbook');
+assert(indexHtml.includes('/js/views/SourcingModule.js?v=23017'), 'index must bust browser cache for the single sourcing module');
 assert(/\/js\/views\/StoreManagement\.js\?v=\d+/.test(indexHtml), 'index must bust browser cache for plugin download status');
 assert(!main.includes("routeName === 'single-sourcing-frozen'"), 'old frozen placeholder route must stay removed');
 assert(main.indexOf("goTo('#/single-sourcing')") > main.indexOf("goTo('#/collection')"), 'single sourcing must sit beside collection workflow, not under selection center');
@@ -63,18 +68,21 @@ assert(server.includes('id, user_id, store_id, kind, status'), 'app_jobs insert 
 assert(server.includes('AND ($3::uuid IS NULL OR j.store_id = $3::uuid)'), 'worker claim must filter queued jobs by scoped store id');
 assert(server.includes('storeMatch'), 'worker status must expose whether the plugin is authorized for the selected store');
 assert(background.includes('kinds: ["run"]'), 'extension single-sourcing worker may only claim run jobs');
-assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.67"'), 'server must force the restored stable plugin version');
+assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.75"'), 'server must force the current stable plugin version');
 assert(server.includes('const WORKER_JOB_STALE_MS'), 'server must configure stale worker job rescue timeout');
 assert(server.includes('async function rescueStaleDbJobsForUser'), 'server must rescue stale claimed/running worker jobs');
 assert(server.includes("AND j.status IN ('claimed','running')"), 'stale rescue must target claimed/running jobs');
 assert(server.includes("SET status = 'queued'"), 'stale rescue must requeue interrupted jobs for resume');
 assert(server.includes('AND h.current_job_id = j.id'), 'stale rescue must not steal jobs from online active workers');
+assert(server.includes('COALESCE(j.processed, 0) < COALESCE(j.total, 0)'), 'stale rescue must not requeue jobs that already reached total progress');
 assert(server.includes('await rescueStaleDbJobsForUser(req.user, { kinds });'), 'worker polling must rescue stale jobs before claiming');
+assert(server.includes('["done", "error", "canceled"].includes(existing.status)'), 'worker progress must not overwrite terminal jobs');
+assert(server.includes('totalLimit > 0 ? totalLimit : 999999'), 'worker progress must clamp processed to total when total is known');
 assert(server.includes('initialUpdates.results = job.results'), 'worker completion should persist incoming results only when progress has not already stored them');
 assert(!server.includes('phase: `服务器 AI 审核第 ${rowLabel} 行`,\n          processed: job.processed,\n          total: job.total,\n          logs: job.logs,\n          results: job.results'), 'AI review progress must not rewrite the full results JSON before each model call');
-assert.strictEqual(manifest.version, '2.2.9.67', 'manifest version must match restored plugin version');
-assert(background.includes('const VERSION = "2.2.9.67"'), 'background version must match restored plugin version');
-assert(bridge.includes('const VERSION = "2.2.9.67"'), 'bridge version must match restored plugin version');
+assert.strictEqual(manifest.version, '2.2.9.75', 'manifest version must match current plugin version');
+assert(background.includes('const VERSION = "2.2.9.75"'), 'background version must match current plugin version');
+assert(bridge.includes('const VERSION = "2.2.9.75"'), 'bridge version must match current plugin version');
 assert(background.includes('startSourcingCancelMonitor'), 'worker must poll cancellation while long collection/search steps are running');
 assert(server.includes('if (existing.status === "canceled")'), 'server must not let worker progress/complete overwrite canceled jobs');
 assert(server.includes('clearWorkerCurrentJobRefs'), 'server must clear worker current-job pointers when a job is canceled');
@@ -97,7 +105,12 @@ assert(server.indexOf('const job = await getDbJobForUser(req.params.id, req.user
 assert(server.includes('!/^实时进度：/.test'), 'server must reject duplicate heartbeat logs from older plugins before DB storage');
 assert(background.includes('active1688TabIds'), 'extension must track temporary 1688 tabs so cancel can close them');
 assert(background.includes('abortController'), 'extension must abort in-flight 1688/Ozon network requests on cancel');
+assert(background.includes('withSourcingStepTimeout'), 'extension must apply per-step hard timeouts for Ozon and 1688 collection');
+assert(background.includes('isOzonVerificationBlocker'), 'extension must detect Ozon captcha/slider pages before accepting scraped data');
 assert(background.includes('touchLiveHeartbeat'), 'extension must send heartbeat progress while long 1688 steps are running');
+assert(background.includes('rawRows.slice(0, declaredTotal)'), 'extension must not process more rows than the server-declared total');
+assert(background.includes('job.processed >= job.total'), 'extension must complete instead of continuing when resumed progress already reached total');
+assert(background.includes('Math.min(index + 1, job.total)'), 'extension must clamp processed progress to total');
 assert(!background.includes('job.logs.push(makeLog(`实时进度：'), 'extension heartbeat must not spam duplicate progress entries into logs');
 assert(sourcing.includes('filter((entry) => !/^实时进度：/'), 'single sourcing log panel must hide legacy duplicate heartbeat logs');
 assert(background.includes('pluginVersion: VERSION'), 'extension worker heartbeat must report its real plugin version');
@@ -173,6 +186,6 @@ assert(server.includes('imageColumns') && server.includes('"_1688ImagePath"'), '
 assert(server.includes('hydrateWorkerRunResultImages') && server.includes('pickOzonImageUrl') && server.includes('pickCandidateImageUrl'), 'single sourcing must hydrate Ozon/1688 image URLs before Excel export');
 assert(server.includes('ozon?.images') && server.includes('candidate?.picUrl') && server.includes('candidate?.localImage'), 'image hydration must support plugin/worker image payload fallbacks');
 assert(server.includes('singleSourcingExcelNeedsImageRepair') && server.includes('rebuildJobArtifactsFromLocalJson'), 'history download must repair old image-less single-sourcing workbooks');
-assert(String(packageJson.version).includes('restore-pre-review-sourcing'), 'package version must describe the restored pre-review sourcing build');
+assert(String(packageJson.version).includes('review-prefix'), 'package version must describe the review and SKU prefix build');
 
-console.log('Single sourcing restored stable pre-review guard passed.');
+console.log('Single sourcing review entry guard passed.');

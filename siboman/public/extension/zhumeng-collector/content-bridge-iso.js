@@ -15,7 +15,7 @@
   "use strict";
   const PROTO = "__zhumeng_proto";
   const PROTO_VAL = "zhumeng-v1";
-  const VERSION = "2.2.9.67";
+  const VERSION = "2.2.9.75";
 
   console.log(`[逐梦采集器 v${VERSION}][ISO] 启动, 监听 window message`);
 
@@ -109,6 +109,38 @@
         replyToMain(reqId, "portalImport.response", resp);
       } catch (e) {
         replyToMain(reqId, "portalImport.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    if (kind === "discoverProducts.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: "discoverOzonProducts",
+          query: data.query || data.search || "",
+          strategy_type: data.strategy_type || "hot",
+          limit: data.limit || 30,
+          category_label: data.category_label || "",
+        });
+        replyToMain(reqId, "discoverProducts.response", resp);
+      } catch (e) {
+        replyToMain(reqId, "discoverProducts.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    if (kind === "discoverCategory.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: "discoverCategoryPage",
+          category_url: data.category_url || data.url || "",
+          category_name: data.category_name || "",
+          strategy_type: data.strategy_type || "hot",
+          limit: data.limit || 30,
+        });
+        replyToMain(reqId, "discoverCategory.response", resp);
+      } catch (e) {
+        replyToMain(reqId, "discoverCategory.response", { ok: false, error: e.message });
       }
       return;
     }

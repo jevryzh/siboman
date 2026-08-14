@@ -6,13 +6,32 @@ window.MarketDiscoveryView = {
     const queueLoading = Vue.ref(false);
     const selectedMarketRows = Vue.ref([]);
     const selectedQueueRows = Vue.ref([]);
+    const rulesOnly = Vue.ref(false);
+    const detailDrawer = Vue.reactive({ visible: false, loading: false, item: null, events: [], note: '' });
     const marketRows = Vue.ref([]);
     const queueRows = Vue.ref([]);
     const dashboard = Vue.ref(null);
+    const collectorStatus = Vue.ref(null);
+    const collectorResult = Vue.ref(null);
+    const collectorLoading = Vue.ref(false);
+    const workerStatus = Vue.ref({ workers: [], queue: { queued: 0, active: 0 } });
+    const sourcingJobState = Vue.ref(null);
+    const marketView = Vue.ref('product');
     const marketSource = Vue.ref({ policy: '', note: '', freshness: {} });
     const discoveryState = Vue.ref(null);
-    const settings = Vue.reactive({ enabled: false, daily_quota: 30, min_profit_rate: 0.2, max_ai_cost_cny: 50, submit_to_ozon: false });
-    const filters = Vue.reactive({ strategy: 'hot', search: '', stage: 'all' });
+    const defaultGeoRules = () => ({
+      geo_enabled: true,
+      min_blue_ocean_score: 62,
+      min_sales_30d: 100,
+      max_seller_count: 25,
+      max_risk_score: 55,
+      min_profit_score: 45,
+      require_source_fresh_days: 14,
+      prefer_content_gap: true,
+      block_high_certification_risk: true,
+    });
+    const settings = Vue.reactive({ enabled: false, daily_quota: 30, min_profit_rate: 0.2, max_ai_cost_cny: 50, submit_to_ozon: false, rules: defaultGeoRules() });
+    const filters = Vue.reactive({ strategy: 'blue_ocean', search: '', stage: 'all' });
     const marketPage = Vue.reactive({ page: 1, size: 30, total: 0 });
     const queuePage = Vue.reactive({ page: 1, size: 30, total: 0 });
 
@@ -21,6 +40,45 @@ window.MarketDiscoveryView = {
     const errorText = error => error?.response?.data?.error || error?.message || '请求失败';
     const moneyRub = value => Number(value || 0) > 0 ? `₽${Number(value).toFixed(0)}` : '-';
     const formatTime = value => value ? new Date(value).toLocaleString('zh-CN', { hour12: false }) : '-';
+    const normalizeRules = raw => ({ ...defaultGeoRules(), ...(raw && typeof raw === 'object' ? raw : {}) });
+    const hydrateSettings = raw => {
+      Object.assign(settings, raw || {});
+      settings.rules = normalizeRules(settings.rules);
+    };
+    const payloadOf = row => {
+      const raw = row?.source_payload || row?.payload?.source_payload || row?.payload || {};
+      if (raw && typeof raw === 'object') return raw;
+      try { return JSON.parse(raw); } catch { return {}; }
+    };
+    const isGeoRow = row => {
+      const source = `${row?.source_name || row?.payload?.source_name || ''} ${row?.strategy_type || ''}`.toLowerCase();
+      const payload = payloadOf(row);
+      return source.includes('geo') || source.includes('blue_ocean') || source.includes('blue-ocean') || payload.blue_ocean_score != null || payload.demand_score != null;
+    };
+    const scoreText = value => value == null || value === '' ? '-' : Number(value).toFixed(1);
+    const scoreColor = value => Number(value || 0) >= 75 ? '#16a34a' : Number(value || 0) >= 62 ? '#2563eb' : Number(value || 0) >= 48 ? '#d97706' : '#64748b';
+    const geoScore = row => {
+      const payload = payloadOf(row);
+      return Number(payload.blue_ocean_score ?? row?.opportunity_score ?? 0);
+    };
+    const geoLevel = row => payloadOf(row).opportunity_level || (geoScore(row) >= 75 ? 'A' : geoScore(row) >= 62 ? 'B' : geoScore(row) >= 48 ? 'C' : 'D');
+    const signalText = (row, key) => {
+      const payload = payloadOf(row);
+      const value = payload[key];
+      return value == null || value === '' ? '-' : Number(value).toFixed(0);
+    };
+    const rowReasons = row => payloadOf(row).reasons || (isGeoRow(row) ? 'GEO 采集信号已接入，建议按蓝海分和风险规则复核。' : 'Ozon 榜单候选，建议先看销量、评论和卖家数。');
+    const sourceBadgeType = row => isGeoRow(row) ? 'success' : row?.row_type === 'category' ? 'warning' : 'info';
+    const rowTitle = row => row?.title || row?.product_name || payloadOf(row).product_name || payloadOf(row).keyword || row?.sku || '-';
+    const rowSku = row => row?.sku || row?.source_sku || payloadOf(row).sku || payloadOf(row).product_key || '';
+    const rowBrand = row => row?.brand || payloadOf(row).brand || '';
+    const rowImage = row => row?.main_image || row?.image_url || payloadOf(row).image_url || payloadOf(row).main_image || '';
+    const rowUrl = row => row?.ozon_url || row?.source_url || payloadOf(row).source_url || (rowSku(row) ? `https://www.ozon.ru/product/${rowSku(row)}/` : '');
+    const rowCategory = row => row?.category_name_zh || row?.category_name || row?.category || payloadOf(row).category3 || payloadOf(row).category || '未分类';
+    const rowPrice = row => row?.price_rub ?? row?.avg_price ?? payloadOf(row).avg_price ?? payloadOf(row).price_rub;
+    const rowSales = row => row?.monthly_sales ?? row?.sales_30d ?? payloadOf(row).sales_30d ?? payloadOf(row).monthly_sales;
+    const rowRevenue = row => row?.revenue_30d ?? row?.revenue_rub ?? row?.sales_amount_rub ?? payloadOf(row).revenue_30d ?? payloadOf(row).revenue_rub;
+    const rowGrowth = row => row?.gmv_growth ?? row?.growth_30d ?? payloadOf(row).growth_30d;
     const stageLabels = {
       discovered: '已发现',
       collected: '已采集',
@@ -40,7 +98,7 @@ window.MarketDiscoveryView = {
       if (!storeId()) return;
       const response = await axios.get('/api/auto-listing/dashboard', { params: { store_id: storeId() } });
       dashboard.value = response.data;
-      Object.assign(settings, response.data.settings || {});
+      hydrateSettings(response.data.settings || {});
     }
 
     async function loadMarket() {
@@ -48,6 +106,7 @@ window.MarketDiscoveryView = {
       try {
         const response = await axios.get('/api/sourcing/bestsellers', {
           params: {
+            view: marketView.value,
             strategy: filters.strategy,
             search: filters.search,
             limit: marketPage.size,
@@ -87,18 +146,49 @@ window.MarketDiscoveryView = {
       finally { queueLoading.value = false; }
     }
 
+    async function loadCollectorStatus() {
+      try {
+        const response = await axios.get('/api/sourcing/opportunity-collector/status');
+        collectorStatus.value = response.data || null;
+      } catch (error) {
+        collectorStatus.value = null;
+      }
+    }
+
     async function refreshAll() {
       if (!storeId()) return ElementPlus.ElMessage.warning('请先选择店铺');
       loading.value = true;
       try {
-        await Promise.all([loadDashboard(), loadMarket(), loadQueue()]);
+        await Promise.all([loadDashboard(), loadMarket(), loadQueue(), loadCollectorStatus()]);
       } finally { loading.value = false; }
+    }
+
+    async function runOpportunityCollector() {
+      collectorLoading.value = true;
+      try {
+        const response = await axios.post('/api/sourcing/opportunity-collector/run', {
+          wait: true,
+          limit: 30,
+        });
+        collectorResult.value = response.data || null;
+        const imported = Number(response.data?.imported || 0);
+        if (imported > 0) {
+          ElementPlus.ElMessage.success(`已采集 ${imported} 个 Ozon 商品候选`);
+          marketView.value = 'product';
+          marketPage.page = 1;
+        } else {
+          ElementPlus.ElMessage.warning(response.data?.note || '没有采集到商品候选，请查看页面提示');
+        }
+        await loadCollectorStatus();
+        await loadMarket();
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+      finally { collectorLoading.value = false; }
     }
 
     async function discoverSelected(limit = 20) {
       if (!storeId()) return ElementPlus.ElMessage.warning('请先选择店铺');
       const sourceRows = selectedMarketRows.value.filter(row => row.row_type !== 'category');
-      if (!sourceRows.length) return ElementPlus.ElMessage.warning('当前是类目级平台数据，不能直接加入自动上架队列；需要先接商品级榜单。');
+      if (!sourceRows.length) return ElementPlus.ElMessage.warning('请先勾选 GEO 商品级机会。');
       const sourceIds = sourceRows.map(row => row.id);
       try {
         const response = await axios.post('/api/auto-listing/discover', {
@@ -107,7 +197,7 @@ window.MarketDiscoveryView = {
           strategy: filters.strategy,
           limit: sourceIds.length ? sourceIds.length : limit,
         });
-        ElementPlus.ElMessage.success(`已加入自动队列 ${response.data.insertedCount || 0} 个商品`);
+        ElementPlus.ElMessage.success(`已加入找货候选 ${response.data.insertedCount || 0} 个商品`);
         activeTab.value = 'pipeline';
         await Promise.all([loadDashboard(), loadQueue()]);
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
@@ -119,8 +209,10 @@ window.MarketDiscoveryView = {
       const categories = categoryRows.length ? categoryRows : fallbackRows;
       if (!categories.length) {
         await loadMarket();
-        return ElementPlus.ElMessage.info('当前已经是商品级榜单，可以直接勾选商品加入自动队列。');
+        return ElementPlus.ElMessage.info('当前已经是商品级榜单，可以直接勾选商品加入找货候选。');
       }
+      const searchQuery = categories.map(c => c.category_name_zh || c.title || c.category_name).filter(Boolean).join(' ');
+      if (await tryExtensionDiscovery(searchQuery, categories)) return;
       marketLoading.value = true;
       try {
         const response = await axios.post('/api/sourcing/discover-products', {
@@ -133,14 +225,161 @@ window.MarketDiscoveryView = {
         discoveryState.value = response.data || null;
         const imported = Number(response.data.imported || 0);
         if (imported > 0) {
-          ElementPlus.ElMessage.success(`已发现 ${imported} 个商品候选，下面可以勾选加入自动队列`);
+          ElementPlus.ElMessage.success(`已发现 ${imported} 个商品候选，下面可以勾选加入找货候选`);
+          marketView.value = 'product';
         } else {
-          ElementPlus.ElMessage.warning(response.data.note || '暂时没有发现商品候选');
+          ElementPlus.ElMessage.warning(response.data.note || '暂时没有发现商品候选，请安装并连接采集插件后重试');
         }
         marketPage.page = 1;
         await loadMarket();
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
       finally { marketLoading.value = false; }
+    }
+
+    async function tryExtensionDiscovery(searchQuery, categories) {
+      const PROTO = "__zhumeng_proto";
+      const PROTO_VAL = "zhumeng-v1";
+      const hasPlugin = await checkExtensionConnected(PROTO, PROTO_VAL);
+      if (!hasPlugin) {
+        ElementPlus.ElMessage.warning('未检测到采集插件，尝试用服务器发现…（插件发现更快更稳定）');
+        return false;
+      }
+      marketLoading.value = true;
+      try {
+        let totalImported = 0;
+        const hasCategoryUrls = categories.some(c => c.ozon_url || c.category_url);
+        if (hasCategoryUrls) {
+          for (const cat of categories.slice(0, 3)) {
+            const catUrl = cat.ozon_url || cat.category_url || `https://www.ozon.ru/category/${cat.category_id}/`;
+            const result = await sendExtensionMessage('discoverCategory.request', {
+              category_url: catUrl,
+              category_name: cat.category_name_zh || cat.title || cat.category_name || '',
+              strategy_type: filters.strategy || 'hot',
+              limit: Math.min(40, 20 + categories.length * 6),
+            }, 120000);
+            if (!result || !result.ok) {
+              discoveryState.value = { success: false, note: result?.error || '插件执行失败', code: 'EXTENSION_FAILED', plugin: true };
+              continue;
+            }
+            totalImported += Number(result.imported || 0);
+          }
+        } else {
+          const queries = categories.length
+            ? categories.map(c => c.category_name_zh || c.title || c.category_name).filter(Boolean)
+            : [searchQuery].filter(Boolean);
+          if (!queries.length) return false;
+          for (const query of queries.slice(0, 3)) {
+            const result = await sendExtensionMessage('discoverProducts.request', {
+              query,
+              strategy_type: filters.strategy || 'hot',
+              limit: Math.min(40, 20 + categories.length * 6),
+              category_label: query,
+            }, 120000);
+            if (!result || !result.ok) {
+              discoveryState.value = { success: false, note: result?.error || '插件执行失败', code: 'EXTENSION_FAILED', plugin: true };
+              continue;
+            }
+            totalImported += Number(result.imported || 0);
+          }
+        }
+        if (totalImported > 0) {
+          discoveryState.value = { success: true, imported: totalImported };
+          ElementPlus.ElMessage.success(`采集插件已发现 ${totalImported} 个商品候选`);
+        } else {
+          discoveryState.value = { success: false, note: '采集插件未在 Ozon 找到商品', code: 'EXTENSION_NO_RESULTS' };
+          ElementPlus.ElMessage.warning('采集插件未在 Ozon 找到商品');
+        }
+        if (totalImported > 0) marketView.value = 'product';
+        marketPage.page = 1;
+        await loadMarket();
+      } catch (error) {
+        ElementPlus.ElMessage.error('插件发现失败: ' + errorText(error));
+      } finally { marketLoading.value = false; }
+      return true;
+    }
+
+    async function checkExtensionConnected(PROTO, PROTO_VAL) {
+      if (!window.__zhumeng_pending__) window.__zhumeng_pending__ = {};
+      if (!window.__zhumeng_reply_registered__) {
+        window.__zhumeng_reply_registered__ = true;
+        window.addEventListener('message', (event) => {
+          const d = event.data;
+          if (!d || typeof d !== 'object' || d[PROTO] !== PROTO_VAL) return;
+          if (typeof d.kind === 'string' && d.kind.endsWith('.request')) return;
+          const resolver = window.__zhumeng_pending__[d.reqId];
+          if (resolver) {
+            delete window.__zhumeng_pending__[d.reqId];
+            resolver(d);
+          }
+        });
+      }
+      const reply = await sendExtensionMessage('ping.request', {}, 5000);
+      return Boolean(reply && reply.ok);
+    }
+
+    function ensureExtensionBridge() {
+      const PROTO = "__zhumeng_proto";
+      const PROTO_VAL = "zhumeng-v1";
+      if (!window.__zhumeng_pending__) window.__zhumeng_pending__ = {};
+      if (window.__zhumeng_reply_registered__) return;
+      window.__zhumeng_reply_registered__ = true;
+      window.addEventListener('message', (event) => {
+        const d = event.data;
+        if (!d || typeof d !== 'object' || d[PROTO] !== PROTO_VAL) return;
+        if (typeof d.kind === 'string' && d.kind.endsWith('.request')) return;
+        const resolver = window.__zhumeng_pending__[d.reqId];
+        if (resolver) {
+          delete window.__zhumeng_pending__[d.reqId];
+          resolver(d);
+        }
+      });
+    }
+
+    function sendExtensionMessage(kind, extra = {}, timeoutMs = 8000) {
+      ensureExtensionBridge();
+      return new Promise((resolve) => {
+        const reqId = `${kind.split('.')[0]}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+        window.__zhumeng_pending__[reqId] = (data) => {
+          resolve(data);
+        };
+        try {
+          window.postMessage(JSON.parse(JSON.stringify({ __zhumeng_proto: "zhumeng-v1", reqId, kind, ...extra })), '*');
+        } catch {
+          resolve({ ok: false, error: '序列化失败' });
+          return;
+        }
+        setTimeout(() => {
+          if (window.__zhumeng_pending__[reqId]) {
+            delete window.__zhumeng_pending__[reqId];
+            resolve(null);
+          }
+        }, timeoutMs);
+      });
+    }
+
+    async function authorizePluginWorker() {
+      try {
+        const response = await axios.get('/api/worker/plugin-token', { params: { store_id: storeId() } });
+        if (!response.data?.token) return false;
+        const reply = await sendExtensionMessage('workerAuth.request', { token: response.data.token }, 10000);
+        return Boolean(reply?.ok);
+      } catch {
+        return false;
+      }
+    }
+
+    async function loadWorkerStatus() {
+      try {
+        const response = await axios.get('/api/worker/status', { params: { store_id: storeId() } });
+        workerStatus.value = {
+          workers: response.data.workers || [],
+          queue: response.data.queue || { queued: 0, active: 0 },
+        };
+        return workerStatus.value;
+      } catch (error) {
+        workerStatus.value = { workers: [], queue: { queued: 0, active: 0 }, error: errorText(error) };
+        return workerStatus.value;
+      }
     }
 
     async function advanceRow(row) {
@@ -151,24 +390,111 @@ window.MarketDiscoveryView = {
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
     }
 
+    async function advanceTo(row, stage) {
+      try {
+        await axios.post(`/api/auto-listing/items/${row.id}/advance`, { store_id: storeId(), stage });
+        ElementPlus.ElMessage.success('已推进阶段');
+        await Promise.all([loadDashboard(), loadQueue()]);
+        if (detailDrawer.visible && detailDrawer.item?.id === row.id) await openQueueDetail(row);
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+    }
+
+    async function startSourcingJob(rows = selectedQueueRows.value) {
+      const targets = (Array.isArray(rows) ? rows : [rows]).filter(Boolean);
+      if (!targets.length) return ElementPlus.ElMessage.warning('请先选择找货候选');
+      try {
+        await ElementPlus.ElMessageBox.confirm(`将为 ${targets.length} 个候选创建真实单品找货任务，由本机采集端执行 Ozon 采集、1688 以图搜货和 AI 审核。继续吗？`, '启动真实找货', { type: 'warning' });
+      } catch { return; }
+      try {
+        await authorizePluginWorker().catch(() => false);
+        await loadWorkerStatus().catch(() => null);
+        const response = await axios.post('/api/auto-listing/items/start-sourcing', {
+          store_id: storeId(),
+          ids: targets.map(row => row.id),
+          maxCandidates: 5,
+        });
+        sourcingJobState.value = {
+          jobId: response.data.jobId,
+          existing: Boolean(response.data.existing),
+          queued: response.data.queued !== false,
+          count: response.data.count || targets.length,
+          phase: response.data.job?.phase || '等待本机采集端领取',
+        };
+        localStorage.setItem('singleSourcingJobId', response.data.jobId);
+        await loadWorkerStatus().catch(() => null);
+        if (canClaimSourcingWorker.value) {
+          ElementPlus.ElMessage.success(response.data.existing ? `已切换到排队中的找货任务 ${response.data.jobId}` : `已创建真实找货任务 ${response.data.jobId}`);
+        } else {
+          ElementPlus.ElMessage.warning('真实找货任务已排队，但当前没有可领取的采集插件');
+        }
+        await Promise.all([loadDashboard(), loadQueue()]);
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+    }
+
+    function openSourcingReview(row) {
+      const jobId = row?.payload?.sourcing_job_id || payloadOf(row).sourcing_job_id;
+      if (!jobId) return ElementPlus.ElMessage.warning('还没有真实找货任务，请先启动找货');
+      window.location.hash = `#/single-sourcing-review?id=${encodeURIComponent(jobId)}`;
+    }
+
     async function bulkAction(action) {
       if (!selectedQueueRows.value.length) return ElementPlus.ElMessage.warning('请先选择商品');
+      if (action === 'delete') {
+        try {
+          await ElementPlus.ElMessageBox.confirm(`确认移除 ${selectedQueueRows.value.length} 个找货候选？`, '移除候选', { type: 'warning' });
+        } catch { return; }
+      }
       try {
         await axios.post('/api/auto-listing/items/bulk-action', {
           store_id: storeId(),
           ids: selectedQueueRows.value.map(row => row.id),
           action,
         });
-        ElementPlus.ElMessage.success('已更新队列');
+        ElementPlus.ElMessage.success(action === 'delete' ? '已移除候选' : '已更新队列');
         await Promise.all([loadDashboard(), loadQueue()]);
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+    }
+
+    async function removeQueueRow(row) {
+      try {
+        await ElementPlus.ElMessageBox.confirm(`确认移除 ${rowTitle(row)}？`, '移除候选', { type: 'warning' });
+        await axios.delete(`/api/auto-listing/items/${row.id}`);
+        ElementPlus.ElMessage.success('已移除候选');
+        if (detailDrawer.item?.id === row.id) detailDrawer.visible = false;
+        await Promise.all([loadDashboard(), loadQueue()]);
+      } catch (error) {
+        if (error !== 'cancel') ElementPlus.ElMessage.error(errorText(error));
+      }
+    }
+
+    async function openQueueDetail(row) {
+      detailDrawer.visible = true;
+      detailDrawer.loading = true;
+      try {
+        const response = await axios.get(`/api/auto-listing/items/${row.id}/events`);
+        detailDrawer.item = response.data.item || row;
+        detailDrawer.events = response.data.events || [];
+        detailDrawer.note = detailDrawer.item.note || '';
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+      finally { detailDrawer.loading = false; }
+    }
+
+    async function saveQueueNote() {
+      if (!detailDrawer.item?.id) return;
+      try {
+        const response = await axios.patch(`/api/auto-listing/items/${detailDrawer.item.id}`, { note: detailDrawer.note });
+        detailDrawer.item = response.data.item || detailDrawer.item;
+        ElementPlus.ElMessage.success('备注已保存');
+        await loadQueue();
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
     }
 
     async function saveSettings() {
       if (!storeId()) return ElementPlus.ElMessage.warning('请先选择店铺');
       try {
+        settings.rules = normalizeRules(settings.rules);
         const response = await axios.put('/api/auto-listing/settings', { ...settings, store_id: storeId() });
-        Object.assign(settings, response.data.settings || {});
+        hydrateSettings(response.data.settings || {});
         ElementPlus.ElMessage.success('规则已保存');
         await loadDashboard();
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
@@ -178,10 +504,10 @@ window.MarketDiscoveryView = {
     function resetQueue() { queuePage.page = 1; loadQueue(); }
     function marketRowSelectable() { return true; }
     const selectedProductCount = Vue.computed(() => selectedMarketRows.value.filter(row => row.row_type !== 'category').length);
-    const selectedCategoryCount = Vue.computed(() => selectedMarketRows.value.filter(row => row.row_type === 'category').length);
-    const hasCategoryMarket = Vue.computed(() => marketRows.value.some(row => row.row_type === 'category'));
-    const discoverCategoryLabel = Vue.computed(() => selectedCategoryCount.value ? `从 ${selectedCategoryCount.value} 个类目发现商品` : '从当前类目发现商品');
-    const primaryDiscoverLabel = Vue.computed(() => hasCategoryMarket.value ? '从类目发现商品' : '发现商品');
+    const selectedCategoryCount = Vue.computed(() => 0);
+    const hasCategoryMarket = Vue.computed(() => false);
+    const discoverCategoryLabel = Vue.computed(() => '导入 GEO 商品机会');
+    const primaryDiscoverLabel = Vue.computed(() => '导入 GEO 商品机会');
     const discoveryErrorText = Vue.computed(() => {
       const state = discoveryState.value || {};
       const errors = Array.isArray(state.errors) ? state.errors.slice(0, 3) : [];
@@ -192,8 +518,20 @@ window.MarketDiscoveryView = {
       if (categoryNames.length) parts.push(`已尝试类目：${categoryNames.join('、')}`);
       if (errors.length) parts.push(`失败明细：${errors.map(item => [item.category, item.query, item.error].filter(Boolean).join(' / ')).join('；')}`);
       if (!parts.length && state.code === 'PRODUCT_LEVEL_SOURCE_UNAVAILABLE') {
-        parts.push('当前只有类目级机会数据，还没有商品级 SKU 榜单。');
+        parts.push('当前还没有 GEO 商品级 SKU 数据。');
       }
+      return parts.join('。');
+    });
+    const collectorResultText = Vue.computed(() => {
+      const result = collectorResult.value || {};
+      const parts = [];
+      if (Array.isArray(result.errors) && result.errors.length) {
+        parts.push(`失败明细：${result.errors.slice(0, 3).map(item => [item.seed, item.url, item.stage, item.error].filter(Boolean).join(' / ')).join('；')}`);
+      }
+      if (Array.isArray(result.logs) && result.logs.length) {
+        parts.push(`最近日志：${result.logs.slice(-3).map(line => String(line).replace(/^\[[^\]]+\]\s*/, '')).join('；')}`);
+      }
+      if (!parts.length && result.imported === 0) parts.push('Ozon 公共搜索没有返回可写入的商品链接。');
       return parts.join('。');
     });
     const percentText = value => value == null || value === '' ? '-' : `${Number(value).toFixed(2)}%`;
@@ -204,142 +542,354 @@ window.MarketDiscoveryView = {
       if (Math.abs(n) >= 10000) return `₽${(n / 10000).toFixed(2)}万`;
       return `₽${n.toFixed(0)}`;
     };
+    const geoMarketSummary = Vue.computed(() => {
+      const rows = marketRows.value || [];
+      const geoRows = rows.filter(isGeoRow);
+      const scored = geoRows.map(geoScore).filter(value => Number.isFinite(value) && value > 0);
+      const avgScore = scored.length ? scored.reduce((sum, value) => sum + value, 0) / scored.length : 0;
+      const passRows = geoRows.filter(row => {
+        const payload = payloadOf(row);
+        const score = geoScore(row);
+        const sales = Number(payload.sales_30d ?? row.monthly_sales ?? 0);
+        const sellers = Number(row.seller_count ?? payload.seller_count ?? 0);
+        const risk = Number(payload.risk_score ?? 0);
+        return score >= Number(settings.rules.min_blue_ocean_score || 0)
+          && sales >= Number(settings.rules.min_sales_30d || 0)
+          && (!sellers || sellers <= Number(settings.rules.max_seller_count || 9999))
+          && (!risk || risk <= Number(settings.rules.max_risk_score || 100));
+      });
+      return {
+        geoRows: geoRows.length,
+        avgScore,
+        passRows: passRows.length,
+        sourceCount: new Set(rows.map(row => row.source_name).filter(Boolean)).size,
+      };
+    });
+    const geoRuleChips = Vue.computed(() => [
+      `蓝海分 ≥ ${settings.rules.min_blue_ocean_score}`,
+      `30天销量 ≥ ${settings.rules.min_sales_30d}`,
+      `卖家数 ≤ ${settings.rules.max_seller_count}`,
+      `风险分 ≤ ${settings.rules.max_risk_score}`,
+    ]);
+    const passesGeoRules = row => {
+      const payload = payloadOf(row);
+      const score = geoScore(row);
+      const sales = Number(payload.sales_30d ?? row.monthly_sales ?? 0);
+      const sellers = Number(row.seller_count ?? payload.seller_count ?? 0);
+      const risk = Number(payload.risk_score ?? 0);
+      const profit = Number(payload.profit_score ?? 0);
+      return score >= Number(settings.rules.min_blue_ocean_score || 0)
+        && sales >= Number(settings.rules.min_sales_30d || 0)
+        && (!sellers || sellers <= Number(settings.rules.max_seller_count || 9999))
+        && (!risk || risk <= Number(settings.rules.max_risk_score || 100))
+        && (!profit || profit >= Number(settings.rules.min_profit_score || 0));
+    };
+    const displayedMarketRows = Vue.computed(() => rulesOnly.value ? marketRows.value.filter(passesGeoRules) : marketRows.value);
+    const rulePassedMarketRows = Vue.computed(() => marketRows.value.filter(row => row.row_type !== 'category' && passesGeoRules(row)));
+    const onlineSourcingWorkers = Vue.computed(() => (workerStatus.value.workers || []).filter(worker => worker.online));
+    const canClaimSourcingWorker = Vue.computed(() => onlineSourcingWorkers.value.some(worker => worker.canClaimJobs && worker.storeMatch !== false && !worker.versionTooOld));
+    const sourcingWorkerHint = Vue.computed(() => {
+      const state = sourcingJobState.value;
+      const queue = workerStatus.value.queue || {};
+      if (workerStatus.value.error) return `任务 ${state?.jobId || ''} 状态读取失败：${workerStatus.value.error}`;
+      if (canClaimSourcingWorker.value) return `采集插件已在线，可领取任务。当前排队 ${queue.queued || 0} 个，执行中 ${queue.active || 0} 个。`;
+      const oldWorker = onlineSourcingWorkers.value.find(worker => worker.versionTooOld);
+      if (oldWorker) return `任务 ${state?.jobId || ''} 已排队，但插件版本 ${oldWorker.version || '未知'} 低于最低版本 ${oldWorker.minVersion || ''}，需要到店铺管理下载新版插件。`;
+      if (onlineSourcingWorkers.value.length) return `任务 ${state?.jobId || ''} 已排队，但在线插件还没有当前店铺授权，已尝试自动授权；请刷新插件或进入单品找货页确认授权。`;
+      return `任务 ${state?.jobId || ''} 已排队，但没有检测到在线采集插件，所以暂时不会打开 Ozon/1688 页面执行找货。`;
+    });
+    async function discoverRulePassed() {
+      const rows = rulePassedMarketRows.value;
+      if (!rows.length) return ElementPlus.ElMessage.warning('当前页没有符合规则的 GEO 商品');
+      selectedMarketRows.value = rows;
+      await discoverSelected();
+    }
 
-    Vue.onMounted(refreshAll);
+    Vue.onMounted(() => {
+      refreshAll();
+      loadWorkerStatus();
+    });
     Vue.watch(() => window.currentStoreId, refreshAll);
 
     return {
-      activeTab, loading, marketLoading, queueLoading, selectedMarketRows, selectedQueueRows,
-      marketRows, queueRows, dashboard, settings, filters, marketPage, queuePage, marketSource,
-      discoveryState, moneyRub, moneyRubLarge, formatTime, percentText, stageLabels, statusLabels, riskTypes, selectedProductCount, selectedCategoryCount, hasCategoryMarket, discoverCategoryLabel, primaryDiscoverLabel, discoveryErrorText,
-      refreshAll, loadMarket, loadQueue, discoverSelected, discoverProductsFromCategories, advanceRow, bulkAction, saveSettings,
-      resetMarket, resetQueue, marketRowSelectable,
+      activeTab, loading, marketLoading, queueLoading, selectedMarketRows, selectedQueueRows, rulesOnly, detailDrawer,
+      marketRows, queueRows, dashboard, collectorStatus, collectorResult, collectorLoading, workerStatus, sourcingJobState, settings, filters, marketPage, queuePage, marketSource,
+      discoveryState, marketView, moneyRub, moneyRubLarge, formatTime, percentText, stageLabels, statusLabels, riskTypes, selectedProductCount, selectedCategoryCount, hasCategoryMarket, discoverCategoryLabel, primaryDiscoverLabel, discoveryErrorText, collectorResultText,
+      payloadOf, isGeoRow, scoreText, scoreColor, geoScore, geoLevel, signalText, rowReasons, sourceBadgeType,
+      rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, geoMarketSummary, geoRuleChips, displayedMarketRows, rulePassedMarketRows, passesGeoRules,
+      onlineSourcingWorkers, canClaimSourcingWorker, sourcingWorkerHint,
+      refreshAll, loadMarket, loadQueue, loadCollectorStatus, loadWorkerStatus, runOpportunityCollector, discoverSelected, discoverRulePassed, discoverProductsFromCategories, advanceRow, advanceTo, startSourcingJob, openSourcingReview, bulkAction, removeQueueRow, openQueueDetail, saveQueueNote, saveSettings,
+      resetMarket, resetQueue, marketRowSelectable, switchToCategoryView: () => { marketView.value = 'product'; marketPage.page = 1; loadMarket(); },
     };
   },
   template: `
-    <div class="market-discovery-auto" v-loading="loading" style="max-width:1600px;margin:0 auto">
-      <div style="display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px">
+    <div class="market-discovery-auto" v-loading="loading">
+      <div class="market-head">
         <div>
-          <h1 style="margin:0;font-size:30px;line-height:1.2;color:#0f172a">选品中心</h1>
-          <div style="margin-top:8px;color:#64748b;font-size:14px">Ozon 平台机会发现、1688 找货、资料补全、图片补全和待上架队列</div>
+          <h1 class="market-title">选品中心</h1>
+          <div class="market-subtitle">结合 GEO 商品级 Ozon 数据，按蓝海评分、需求、竞争、利润和风险筛选，再加入 1688 找货候选。</div>
         </div>
-        <div style="display:flex;gap:10px">
-          <el-button @click="discoverProductsFromCategories" :loading="marketLoading">{{primaryDiscoverLabel}}</el-button>
-          <el-button type="primary" @click="bulkAction('ready')" :disabled="!selectedQueueRows.length">推进一次</el-button>
+        <div class="market-head-actions">
+          <el-button @click="runOpportunityCollector" :loading="collectorLoading">采集 Ozon 机会池</el-button>
+          <el-button type="primary" @click="startSourcingJob()" :disabled="!selectedQueueRows.length">启动真实找货</el-button>
           <el-button :type="settings.enabled ? 'warning' : 'success'" @click="settings.enabled=!settings.enabled;saveSettings()">{{settings.enabled ? '暂停自动运营' : '启动自动运营'}}</el-button>
         </div>
       </div>
 
-      <div style="display:grid;grid-template-columns:minmax(420px,1fr) 1fr;gap:14px;margin-bottom:16px">
-        <div style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px 24px">
-          <div style="display:flex;align-items:center;gap:8px;color:#16a34a;font-weight:700;font-size:13px"><span style="width:8px;height:8px;border-radius:50%;background:#22c55e"></span>{{settings.enabled ? '自动运营中' : '自动运营已暂停'}}</div>
-          <div style="margin-top:14px;font-size:20px;font-weight:800;color:#0f172a">今天的自动上架进度</div>
-          <div style="display:flex;align-items:center;gap:14px;margin-top:12px">
-            <div style="font-size:30px;font-weight:900;color:#0f172a">{{dashboard?.today?.created || 0}} <span style="font-size:16px;font-weight:500;color:#64748b">/ {{dashboard?.today?.quota || settings.daily_quota}} SKU</span></div>
-            <el-progress :percentage="dashboard?.today?.percent || 0" style="flex:1" />
-          </div>
-          <div style="margin-top:10px;color:#64748b;font-size:13px">系统按流水线推进，有问题的商品会进入待人工处理，不会静默丢失。</div>
+      <el-alert
+        title="Ozon 机会池不会自动跑 1688"
+        :description="'每日/手动采集只写入 Ozon 商品候选池；当前商品候选 ' + (collectorStatus?.stats?.total || 0) + ' 个，GEO/蓝海信号 ' + geoMarketSummary.geoRows + ' 条，最新数据 ' + formatTime(collectorStatus?.stats?.latest_captured_at) + '。点击采集会同步返回导入数和失败原因；你勾选商品后才会加入找货候选。'"
+        type="warning"
+        :closable="false"
+        show-icon
+        style="margin-bottom:14px"
+      />
+      <el-alert
+        v-if="collectorResult && !collectorResult.imported"
+        title="本次没有采集到 Ozon 商品候选"
+        type="error"
+        :description="(collectorResult.note || '') + (collectorResultText ? ' ' + collectorResultText : '')"
+        :closable="true"
+        show-icon
+        style="margin-bottom:14px"
+      />
+      <el-alert
+        v-else-if="collectorResult && collectorResult.imported"
+        :title="'本次已采集 ' + collectorResult.imported + ' 个 Ozon 商品候选'"
+        type="success"
+        :description="collectorResult.failed ? ('失败 ' + collectorResult.failed + ' 个，' + collectorResultText) : '可切换到商品榜单勾选后加入找货候选。'"
+        :closable="true"
+        show-icon
+        style="margin-bottom:14px"
+      />
+      <el-alert
+        v-if="sourcingJobState"
+        :title="sourcingJobState.existing ? '已有真实找货任务正在等待处理' : '真实找货任务已创建'"
+        :type="canClaimSourcingWorker ? 'success' : 'warning'"
+        :description="sourcingWorkerHint"
+        :closable="true"
+        show-icon
+        style="margin-bottom:14px"
+      />
+
+      <div class="market-status-strip">
+        <div class="market-status-card">
+          <div class="market-status-label">{{settings.enabled ? '自动运营中' : '自动运营已暂停'}}</div>
+          <div class="market-status-value">{{dashboard?.today?.created || 0}} <small>/ {{dashboard?.today?.quota || settings.daily_quota}} SKU 今日配额</small></div>
+          <el-progress :percentage="dashboard?.today?.percent || 0" style="margin-top:10px" />
         </div>
-        <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px">
-          <div v-for="card in [
-            ['在管商品', dashboard?.cards?.managed || 0, '个 SKU'],
-            ['自动处理中', dashboard?.cards?.processing || 0, '个'],
-            ['Ozon 审核可售', dashboard?.cards?.ozon_ready || 0, 'SKU'],
-            ['需要人工处理', dashboard?.cards?.needs_human || 0, '个'],
-          ]" :key="card[0]" style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:16px">
-            <div style="color:#64748b;font-weight:700">{{card[0]}}</div>
-            <div style="margin-top:12px;font-size:28px;font-weight:900;color:#0f172a">{{card[1]}} <span style="font-size:13px;color:#64748b">{{card[2]}}</span></div>
-          </div>
+        <div v-for="card in [
+          ['GEO 信号商品', geoMarketSummary.geoRows, '条已接入评分'],
+          ['规则通过', geoMarketSummary.passRows, '条可优先找货'],
+          ['平均蓝海分', scoreText(geoMarketSummary.avgScore), '当前页 GEO'],
+          ['找货候选', queuePage.total || 0, '条队列数据'],
+        ]" :key="card[0]" class="market-status-card">
+          <div class="market-status-label">{{card[0]}}</div>
+          <div class="market-status-value">{{card[1]}} <small>{{card[2]}}</small></div>
         </div>
       </div>
 
-      <div style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:18px 20px;margin-bottom:16px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-          <div style="font-size:16px;font-weight:800;color:#0f172a">商品流水线</div>
-          <el-button link type="primary" @click="activeTab='pipeline'">进入流水线</el-button>
+      <div class="market-pipeline">
+        <div class="market-pipeline-head">
+          <div>
+            <div style="font-size:16px;font-weight:800;color:#0f172a">商品流水线</div>
+            <div style="font-size:12px;color:#64748b;margin-top:4px">当前只接入“GEO 入池”和“真实单品找货任务”；资料、图片、核价、提交 Ozon 不再提供假推进。</div>
+          </div>
+          <el-button link type="primary" @click="activeTab='pipeline'">进入找货候选</el-button>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(10,minmax(80px,1fr));gap:8px">
-          <div v-for="(stage,index) in dashboard?.stages || []" :key="stage.key" style="border:1px solid #e2e8f0;border-radius:8px;padding:12px 8px;text-align:center;background:#f8fafc">
-            <div :style="{margin:'0 auto 8px',width:'28px',height:'28px',borderRadius:'50%',lineHeight:'28px',fontWeight:'800',color:'#fff',background:stage.count ? '#16a34a' : '#94a3b8'}">{{String(index+1).padStart(2,'0')}}</div>
-            <div style="font-weight:700;color:#334155;font-size:13px;white-space:nowrap">{{stage.label}}</div>
-            <div style="margin-top:6px;font-size:18px;font-weight:900;color:#0f172a">{{stage.count}}</div>
+        <div class="market-stage-strip">
+          <div v-for="(stage,index) in dashboard?.stages || []" :key="stage.key" class="market-stage">
+            <div class="market-stage-index" :class="{active: stage.count}">{{String(index+1).padStart(2,'0')}}</div>
+            <div class="market-stage-label">{{stage.label}}</div>
+            <div class="market-stage-count">{{stage.count}}</div>
           </div>
         </div>
       </div>
 
       <el-tabs v-model="activeTab">
         <el-tab-pane label="市场调研" name="overview">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 12px">
-            <div style="display:flex;gap:8px">
-              <el-select v-model="filters.strategy" style="width:132px" @change="resetMarket"><el-option label="热销" value="hot"/><el-option label="新品" value="new"/><el-option label="潜力" value="potential"/><el-option label="蓝海" value="blue_ocean"/><el-option label="全部" value="all"/></el-select>
-              <el-input v-model="filters.search" placeholder="搜索 SKU / 商品 / 卖家 / 中文类目" clearable style="width:320px" @keyup.enter="resetMarket"/>
-              <el-button @click="resetMarket">查询</el-button>
+          <div class="market-workspace">
+            <div class="market-filter-panel">
+              <div class="market-filter-title">调研范围</div>
+              <div class="market-filter-stack">
+                <el-tag type="success" effect="plain" style="height:34px;line-height:32px;text-align:center">GEO 商品级机会</el-tag>
+                <el-select v-model="filters.strategy" @change="resetMarket">
+                  <el-option label="蓝海" value="blue_ocean"/>
+                  <el-option label="热销" value="hot"/>
+                  <el-option label="新品" value="new"/>
+                  <el-option label="潜力" value="potential"/>
+                  <el-option label="全部" value="all"/>
+                </el-select>
+                <el-input v-model="filters.search" placeholder="SKU / 商品 / 卖家 / 类目" clearable @keyup.enter="resetMarket"/>
+                <el-button type="primary" @click="resetMarket">查询市场数据</el-button>
+              </div>
+              <div class="market-filter-title" style="margin-top:18px">GEO 入池规则</div>
+              <div class="market-rule-chips">
+                <el-tag v-for="chip in geoRuleChips" :key="chip" type="info">{{chip}}</el-tag>
+              </div>
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
+                <el-switch v-model="rulesOnly" active-text="只看通过"/>
+                <el-button link type="primary" style="padding-left:0" @click="activeTab='rules'">调整规则</el-button>
+              </div>
+              <div class="market-filter-title" style="margin-top:18px">操作</div>
+              <div class="market-filter-stack">
+                <el-button :loading="collectorLoading" @click="runOpportunityCollector">{{discoverCategoryLabel}}</el-button>
+                <el-button type="success" :disabled="!selectedProductCount" @click="discoverSelected()">加入找货候选 ({{selectedProductCount}})</el-button>
+                <el-button type="primary" :disabled="!rulePassedMarketRows.length" @click="discoverRulePassed">规则通过入池 ({{rulePassedMarketRows.length}})</el-button>
+              </div>
             </div>
-            <div style="display:flex;align-items:center;gap:12px">
-              <span style="font-size:12px;color:#94a3b8">最新数据 {{formatTime(marketSource.freshness?.latest)}}</span>
-              <el-button v-if="hasCategoryMarket" :loading="marketLoading" @click="discoverProductsFromCategories">{{discoverCategoryLabel}}</el-button>
-              <el-button type="success" :disabled="!selectedProductCount" @click="discoverSelected()">加入自动队列 ({{selectedProductCount}})</el-button>
+            <div class="market-data-panel">
+              <div class="market-data-toolbar">
+                <div style="font-size:16px;font-weight:900;color:#0f172a">GEO 商品级机会</div>
+                <div class="market-toolbar-meta">
+                  <span>最新数据 {{formatTime(marketSource.freshness?.latest)}}</span>
+                  <span>数据源 {{geoMarketSummary.sourceCount || '-'}}</span>
+                </div>
+              </div>
+              <el-alert v-if="marketSource.note" :title="marketSource.note" type="warning" :closable="false" style="margin-bottom:10px"/>
+              <el-alert
+                v-if="discoveryState && !discoveryState.success"
+                title="暂时没有商品级榜单数据"
+                type="error"
+                :description="(discoveryState.note || '') + (discoveryErrorText ? ' ' + discoveryErrorText : '')"
+                :closable="false"
+                show-icon
+                style="margin-bottom:10px"
+              />
+              <el-alert
+                v-else-if="discoveryState && discoveryState.success"
+                :title="'已发现 ' + (discoveryState.imported || 0) + ' 个商品候选'"
+                type="success"
+                :closable="false"
+                show-icon
+                style="margin-bottom:10px"
+              />
+              <el-table :data="displayedMarketRows" v-loading="marketLoading" border @selection-change="selectedMarketRows=$event" style="width:100%">
+                <el-table-column type="selection" width="44" :selectable="marketRowSelectable"/>
+                <el-table-column label="机会" width="120"><template #default="{row}"><el-tag :type="sourceBadgeType(row)">{{isGeoRow(row) ? 'GEO 蓝海' : (row.strategy_type || '商品机会')}}</el-tag><div class="market-product-sub">{{rowCategory(row)}}</div></template></el-table-column>
+                <el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><a v-if="rowUrl(row)" :href="rowUrl(row)" target="_blank" class="market-product-title">{{rowTitle(row)}}</a><div v-else class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}}{{rowBrand(row) ? ' · ' + rowBrand(row) : ''}}{{row.seller_name ? ' · ' + row.seller_name : ''}}</div></div></div></template></el-table-column>
+                <el-table-column label="蓝海" width="92" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(geoScore(row))}">{{scoreText(geoScore(row))}}</span><div class="market-product-sub">等级 {{geoLevel(row)}}</div></template></el-table-column>
+                <el-table-column label="GEO 信号" width="210"><template #default="{row}"><div class="market-signal-grid"><span>需求 {{signalText(row,'demand_score')}}</span><span>增长 {{signalText(row,'growth_score')}}</span><span>竞争 {{signalText(row,'competition_score')}}</span><span>利润 {{signalText(row,'profit_score')}}</span><span>内容 {{signalText(row,'content_gap_score')}}</span><span>风险 {{signalText(row,'risk_score')}}</span></div></template></el-table-column>
+                <el-table-column label="售价" width="96" align="right"><template #default="{row}">{{moneyRub(rowPrice(row))}}</template></el-table-column>
+                <el-table-column label="30天销量" width="110" align="right"><template #default="{row}">{{Number(rowSales(row) || 0).toLocaleString('zh-CN')}}</template></el-table-column>
+                <el-table-column label="30天销售额" width="130" align="right"><template #default="{row}">{{moneyRubLarge(rowRevenue(row))}}</template></el-table-column>
+                <el-table-column label="卖家数" width="90" align="right"><template #default="{row}">{{row.seller_count ?? '-'}}</template></el-table-column>
+                <el-table-column label="增长" width="90" align="right"><template #default="{row}">{{percentText(rowGrowth(row))}}</template></el-table-column>
+                <el-table-column label="依据" min-width="190" show-overflow-tooltip><template #default="{row}">{{rowReasons(row)}}</template></el-table-column>
+              </el-table>
+              <div style="display:flex;justify-content:flex-end;margin-top:12px"><el-pagination v-model:current-page="marketPage.page" v-model:page-size="marketPage.size" :total="marketPage.total" :page-sizes="[20,30,50,100]" layout="total,sizes,prev,pager,next" @change="loadMarket"/></div>
             </div>
           </div>
-          <el-alert v-if="marketSource.note" :title="marketSource.note" type="warning" :closable="false" style="margin-bottom:12px"/>
-          <el-alert
-            v-if="discoveryState && !discoveryState.success"
-            title="暂时没有商品级榜单数据"
-            type="error"
-            :description="(discoveryState.note || '') + (discoveryErrorText ? ' ' + discoveryErrorText : '')"
-            :closable="false"
-            show-icon
-            style="margin-bottom:12px"
-          />
-          <el-alert
-            v-else-if="discoveryState && discoveryState.success"
-            :title="'已发现 ' + (discoveryState.imported || 0) + ' 个商品候选'"
-            type="success"
-            :closable="false"
-            show-icon
-            style="margin-bottom:12px"
-          />
-          <el-table :data="marketRows" v-loading="marketLoading" border @selection-change="selectedMarketRows=$event" style="width:100%">
-            <el-table-column type="selection" width="44" :selectable="marketRowSelectable"/><el-table-column label="机会" width="120"><template #default="{row}"><el-tag :type="row.row_type==='category'?'warning':'success'">{{row.row_type==='category' ? '类目机会' : (row.strategy_type || 'hot')}}</el-tag><div style="font-size:12px;color:#64748b;margin-top:6px">{{row.category_name_zh || row.category_name || '未分类'}}</div></template></el-table-column>
-            <el-table-column label="商品 / 类目" min-width="360"><template #default="{row}"><div style="display:flex;gap:12px;align-items:center"><el-image v-if="row.main_image" :src="row.main_image" style="width:58px;height:58px;border-radius:6px;background:#f1f5f9" fit="cover"/><div v-else style="width:58px;height:58px;border-radius:6px;background:#f1f5f9;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-weight:800">类目</div><div style="min-width:0"><a v-if="row.ozon_url" :href="row.ozon_url" target="_blank" style="font-weight:800;color:#1e40af;text-decoration:none">{{row.title || row.sku}}</a><div v-else style="font-weight:800;color:#0f172a">{{row.title || row.sku}}</div><div style="font-size:12px;color:#94a3b8;margin-top:5px">{{row.row_type==='category' ? ('类目 ID ' + row.category_id) : ('SKU ' + row.sku + ' · ' + (row.seller_name || '未知卖家'))}}</div></div></div></template></el-table-column>
-            <el-table-column label="售价" width="100" align="right"><template #default="{row}">{{moneyRub(row.price_rub)}}</template></el-table-column>
-            <el-table-column prop="monthly_sales" label="销量" width="100" align="right"/><el-table-column label="销售额" width="130" align="right"><template #default="{row}">{{moneyRubLarge(row.sales_amount_rub)}}</template></el-table-column><el-table-column prop="seller_count" label="卖家数" width="100" align="right"/><el-table-column label="GMV增长" width="105" align="right"><template #default="{row}">{{percentText(row.gmv_growth)}}</template></el-table-column><el-table-column label="退货率" width="95" align="right"><template #default="{row}">{{percentText(row.return_rate)}}</template></el-table-column>
-            <el-table-column label="数据源" width="190"><template #default="{row}"><div>{{row.source_name || '-'}}</div><div style="font-size:12px;color:#94a3b8">{{formatTime(row.source_captured_at)}}</div></template></el-table-column>
-          </el-table>
-          <div style="display:flex;justify-content:flex-end;margin-top:14px"><el-pagination v-model:current-page="marketPage.page" v-model:page-size="marketPage.size" :total="marketPage.total" :page-sizes="[20,30,50,100]" layout="total,sizes,prev,pager,next" @change="loadMarket"/></div>
         </el-tab-pane>
 
-        <el-tab-pane label="自动队列" name="pipeline">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0 12px">
-            <div style="display:flex;gap:8px"><el-select v-model="filters.stage" style="width:160px" @change="resetQueue"><el-option label="全部阶段" value="all"/><el-option v-for="(label,key) in stageLabels" :key="key" :label="label" :value="key"/></el-select><el-input v-model="filters.search" placeholder="搜索 SKU / 商品 / 中文类目" clearable style="width:320px" @keyup.enter="resetQueue"/><el-button @click="resetQueue">查询</el-button></div>
-            <div style="display:flex;gap:8px"><el-button @click="bulkAction('pause')" :disabled="!selectedQueueRows.length">暂停</el-button><el-button @click="bulkAction('resume')" :disabled="!selectedQueueRows.length">恢复</el-button><el-button type="primary" @click="bulkAction('ready')" :disabled="!selectedQueueRows.length">转待上架</el-button></div>
+        <el-tab-pane label="找货候选" name="pipeline">
+          <div class="market-data-panel">
+          <div class="market-data-toolbar">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><el-select v-model="filters.stage" style="width:160px" @change="resetQueue"><el-option label="全部阶段" value="all"/><el-option v-for="(label,key) in stageLabels" :key="key" :label="label" :value="key"/></el-select><el-input v-model="filters.search" placeholder="搜索 SKU / 商品 / 中文类目" clearable style="width:280px" @keyup.enter="resetQueue"/><el-button @click="resetQueue">查询</el-button></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap"><el-button @click="bulkAction('pause')" :disabled="!selectedQueueRows.length">暂停</el-button><el-button @click="bulkAction('resume')" :disabled="!selectedQueueRows.length">恢复</el-button><el-button type="primary" @click="startSourcingJob()" :disabled="!selectedQueueRows.length">启动真实找货</el-button><el-button type="danger" plain @click="bulkAction('delete')" :disabled="!selectedQueueRows.length">移除</el-button></div>
           </div>
+          <el-alert
+            :title="canClaimSourcingWorker ? '采集插件可领取真实找货任务' : '没有检测到可领取任务的采集插件'"
+            :type="canClaimSourcingWorker ? 'success' : 'warning'"
+            :description="canClaimSourcingWorker ? sourcingWorkerHint : '点击启动真实找货会创建队列任务；如果插件未在线或未授权，任务会停在等待领取，不会打开 Ozon/1688 页面。'"
+            :closable="false"
+            show-icon
+            style="margin-bottom:12px"
+          >
+            <template #default>
+              <div style="margin-top:8px"><el-button size="small" @click="loadWorkerStatus">刷新采集端状态</el-button></div>
+            </template>
+          </el-alert>
           <el-table :data="queueRows" v-loading="queueLoading" border @selection-change="selectedQueueRows=$event" style="width:100%">
-            <el-table-column type="selection" width="44"/><el-table-column label="商品" min-width="360"><template #default="{row}"><div style="display:flex;gap:12px;align-items:center"><el-image :src="row.main_image" style="width:58px;height:58px;border-radius:6px;background:#f1f5f9" fit="cover"/><div style="min-width:0"><div style="font-weight:800;color:#0f172a">{{row.title || row.source_sku}}</div><div style="font-size:12px;color:#94a3b8;margin-top:5px">SKU {{row.source_sku}} · {{row.category_name_zh || '未分类'}}</div></div></div></template></el-table-column>
+            <el-table-column type="selection" width="44"/><el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><div class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}} · {{rowCategory(row)}}</div></div></div></template></el-table-column>
             <el-table-column label="阶段" width="130"><template #default="{row}"><el-tag>{{stageLabels[row.stage] || row.stage}}</el-tag></template></el-table-column>
             <el-table-column label="状态" width="105"><template #default="{row}"><el-tag :type="row.status==='needs_human'?'warning':row.status==='failed'?'danger':'info'">{{statusLabels[row.status] || row.status}}</el-tag></template></el-table-column>
-            <el-table-column label="机会分" width="90" align="right"><template #default="{row}">{{Number(row.opportunity_score || 0).toFixed(1)}}</template></el-table-column>
+            <el-table-column label="蓝海分" width="105" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(geoScore(row))}">{{scoreText(geoScore(row))}}</span><div style="font-size:12px;color:#64748b">等级 {{geoLevel(row)}}</div></template></el-table-column>
+            <el-table-column label="来源信号" width="210"><template #default="{row}"><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;font-size:12px;color:#475569"><span>需求 {{signalText(row,'demand_score')}}</span><span>增长 {{signalText(row,'growth_score')}}</span><span>竞争 {{signalText(row,'competition_score')}}</span><span>利润 {{signalText(row,'profit_score')}}</span><span>内容 {{signalText(row,'content_gap_score')}}</span><span>风险 {{signalText(row,'risk_score')}}</span></div></template></el-table-column>
             <el-table-column label="风险" width="90"><template #default="{row}"><el-tag :type="riskTypes[row.risk_level] || 'info'">{{row.risk_level || 'normal'}}</el-tag></template></el-table-column>
+            <el-table-column label="推进依据" min-width="220" show-overflow-tooltip><template #default="{row}">{{rowReasons(row)}}</template></el-table-column>
             <el-table-column label="人工原因" min-width="190" show-overflow-tooltip><template #default="{row}">{{row.human_reason || '-'}}</template></el-table-column>
             <el-table-column label="更新" width="150"><template #default="{row}">{{formatTime(row.updated_at)}}</template></el-table-column>
-            <el-table-column label="操作" width="120" fixed="right"><template #default="{row}"><el-button link type="primary" @click="advanceRow(row)">推进</el-button></template></el-table-column>
+            <el-table-column label="操作" width="230" fixed="right"><template #default="{row}"><el-button link type="primary" @click="openQueueDetail(row)">详情</el-button><el-button link type="primary" @click="startSourcingJob([row])">启动找货</el-button><el-button link type="success" @click="openSourcingReview(row)">核对</el-button><el-button link type="danger" @click="removeQueueRow(row)">移除</el-button></template></el-table-column>
           </el-table>
           <div style="display:flex;justify-content:flex-end;margin-top:14px"><el-pagination v-model:current-page="queuePage.page" v-model:page-size="queuePage.size" :total="queuePage.total" :page-sizes="[20,30,50]" layout="total,sizes,prev,pager,next" @change="loadQueue"/></div>
+          </div>
         </el-tab-pane>
 
         <el-tab-pane label="规则中心" name="rules">
-          <div style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px;max-width:760px">
-            <el-form label-width="160px">
-              <el-form-item label="自动运营"><el-switch v-model="settings.enabled"/></el-form-item>
-              <el-form-item label="每日上架配额"><el-input-number v-model="settings.daily_quota" :min="1" :max="500"/></el-form-item>
-              <el-form-item label="最低利润率"><el-input-number v-model="settings.min_profit_rate" :min="0" :max="5" :step="0.05"/><span style="margin-left:8px;color:#64748b">例如 0.2 = 20%</span></el-form-item>
-              <el-form-item label="AI 日成本上限"><el-input-number v-model="settings.max_ai_cost_cny" :min="0" :max="9999"/></el-form-item>
-              <el-form-item label="允许真实提交 Ozon"><el-switch v-model="settings.submit_to_ozon"/><span style="margin-left:8px;color:#ef4444">测试环境默认建议关闭</span></el-form-item>
-              <el-form-item><el-button type="primary" @click="saveSettings">保存规则</el-button></el-form-item>
-            </el-form>
+          <div class="market-settings-grid">
+            <div style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px">
+              <div style="font-size:16px;font-weight:900;color:#0f172a;margin-bottom:16px">运营推进规则</div>
+              <el-form label-width="160px">
+                <el-form-item label="自动运营"><el-switch v-model="settings.enabled"/></el-form-item>
+                <el-form-item label="每日上架配额"><el-input-number v-model="settings.daily_quota" :min="1" :max="500"/></el-form-item>
+                <el-form-item label="最低利润率"><el-input-number v-model="settings.min_profit_rate" :min="0" :max="5" :step="0.05"/><span style="margin-left:8px;color:#64748b">例如 0.2 = 20%</span></el-form-item>
+                <el-form-item label="AI 日成本上限"><el-input-number v-model="settings.max_ai_cost_cny" :min="0" :max="9999"/></el-form-item>
+                <el-form-item label="允许真实提交 Ozon"><el-switch v-model="settings.submit_to_ozon"/><span style="margin-left:8px;color:#ef4444">测试环境默认建议关闭</span></el-form-item>
+              </el-form>
+            </div>
+            <div style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px">
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+                <div>
+                  <div style="font-size:16px;font-weight:900;color:#0f172a">GEO 蓝海入池规则</div>
+                  <div style="font-size:12px;color:#64748b;margin-top:4px">匹配 ozon-blue-ocean 的需求、增长、竞争、利润、内容缺口、风险评分</div>
+                </div>
+                <el-switch v-model="settings.rules.geo_enabled" active-text="启用"/>
+              </div>
+              <el-form label-width="170px">
+                <el-form-item label="最低蓝海分"><el-input-number v-model="settings.rules.min_blue_ocean_score" :min="0" :max="100" :step="1"/></el-form-item>
+                <el-form-item label="最低 30 天销量"><el-input-number v-model="settings.rules.min_sales_30d" :min="0" :max="999999" :step="10"/></el-form-item>
+                <el-form-item label="最高卖家数"><el-input-number v-model="settings.rules.max_seller_count" :min="0" :max="9999" :step="1"/></el-form-item>
+                <el-form-item label="最高风险分"><el-input-number v-model="settings.rules.max_risk_score" :min="0" :max="100" :step="1"/></el-form-item>
+                <el-form-item label="最低利润分"><el-input-number v-model="settings.rules.min_profit_score" :min="0" :max="100" :step="1"/></el-form-item>
+                <el-form-item label="数据新鲜度"><el-input-number v-model="settings.rules.require_source_fresh_days" :min="1" :max="90" :step="1"/><span style="margin-left:8px;color:#64748b">天内</span></el-form-item>
+                <el-form-item label="优先内容缺口"><el-switch v-model="settings.rules.prefer_content_gap"/><span style="margin-left:8px;color:#64748b">头部内容弱时优先找货</span></el-form-item>
+                <el-form-item label="屏蔽高认证风险"><el-switch v-model="settings.rules.block_high_certification_risk"/></el-form-item>
+              </el-form>
+            </div>
+          </div>
+          <div style="margin-top:16px;display:flex;justify-content:flex-end">
+            <el-button type="primary" @click="saveSettings">保存规则</el-button>
           </div>
         </el-tab-pane>
       </el-tabs>
+      <el-drawer v-model="detailDrawer.visible" title="找货候选详情" size="520px">
+        <div v-loading="detailDrawer.loading">
+          <template v-if="detailDrawer.item">
+            <div class="market-product-cell" style="align-items:flex-start;margin-bottom:16px">
+              <el-image v-if="rowImage(detailDrawer.item)" :src="rowImage(detailDrawer.item)" class="market-thumb" fit="cover"/>
+              <div v-else class="market-thumb market-thumb-empty">SKU</div>
+              <div class="market-product-main">
+                <div style="font-weight:900;color:#0f172a;line-height:1.4">{{rowTitle(detailDrawer.item)}}</div>
+                <div class="market-product-sub">SKU {{rowSku(detailDrawer.item)}} · {{rowCategory(detailDrawer.item)}}</div>
+                <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+                  <el-tag>{{stageLabels[detailDrawer.item.stage] || detailDrawer.item.stage}}</el-tag>
+                  <el-tag type="info">{{statusLabels[detailDrawer.item.status] || detailDrawer.item.status}}</el-tag>
+                  <el-tag :type="riskTypes[detailDrawer.item.risk_level] || 'warning'">风险 {{detailDrawer.item.risk_level}}</el-tag>
+                </div>
+              </div>
+            </div>
+            <el-descriptions :column="2" border style="margin-bottom:16px">
+              <el-descriptions-item label="蓝海分">{{scoreText(geoScore(detailDrawer.item))}}</el-descriptions-item>
+              <el-descriptions-item label="等级">{{geoLevel(detailDrawer.item)}}</el-descriptions-item>
+              <el-descriptions-item label="售价">{{moneyRub(rowPrice(detailDrawer.item))}}</el-descriptions-item>
+              <el-descriptions-item label="销量">{{Number(rowSales(detailDrawer.item) || 0).toLocaleString('zh-CN')}}</el-descriptions-item>
+              <el-descriptions-item label="增长">{{percentText(rowGrowth(detailDrawer.item))}}</el-descriptions-item>
+              <el-descriptions-item label="卖家">{{detailDrawer.item.seller_name || rowBrand(detailDrawer.item) || '-'}}</el-descriptions-item>
+            </el-descriptions>
+            <div style="font-weight:900;color:#0f172a;margin-bottom:8px">备注</div>
+            <el-input v-model="detailDrawer.note" type="textarea" :rows="3" placeholder="记录人工判断、找货要求或排除原因"/>
+            <div style="display:flex;justify-content:flex-end;margin:10px 0 18px"><el-button type="primary" @click="saveQueueNote">保存备注</el-button></div>
+            <div style="font-weight:900;color:#0f172a;margin-bottom:8px">推进记录</div>
+            <el-timeline>
+              <el-timeline-item v-for="event in detailDrawer.events" :key="event.id" :timestamp="formatTime(event.created_at)" placement="top">
+                <div style="font-weight:800;color:#334155">{{stageLabels[event.stage] || event.stage || '记录'}}</div>
+                <div style="color:#64748b;margin-top:4px">{{event.message || event.event_type}}</div>
+              </el-timeline-item>
+            </el-timeline>
+          </template>
+        </div>
+      </el-drawer>
     </div>
   `
 };

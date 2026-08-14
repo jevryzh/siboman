@@ -35,6 +35,44 @@
       .erp-route-page .el-textarea__inner { border-radius:8px; box-shadow:0 0 0 1px #dfe7f1 inset; }
       .erp-route-page .el-button { border-radius:8px; font-weight:700; }
       .erp-route-page .el-pagination { font-weight:700; }
+      .market-discovery-auto { max-width:1760px; margin:0 auto; }
+      .market-discovery-auto * { box-sizing:border-box; }
+      .market-head { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:14px; }
+      .market-title { margin:0; font-size:28px; line-height:1.18; color:#0f172a; letter-spacing:0; }
+      .market-subtitle { margin-top:7px; color:#64748b; font-size:14px; line-height:1.5; }
+      .market-head-actions { display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end; max-width:680px; }
+      .market-status-strip { display:grid; grid-template-columns:minmax(280px,1.2fr) repeat(4,minmax(140px,1fr)); gap:10px; margin-bottom:14px; }
+      .market-status-card { background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:14px 16px; min-width:0; }
+      .market-status-label { color:#64748b; font-size:12px; font-weight:800; }
+      .market-status-value { margin-top:8px; font-size:24px; line-height:1.1; font-weight:900; color:#0f172a; }
+      .market-status-value small { font-size:12px; color:#64748b; font-weight:700; }
+      .market-pipeline { background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:14px 16px; margin-bottom:14px; }
+      .market-pipeline-head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px; }
+      .market-stage-strip { display:grid; grid-template-columns:repeat(10,minmax(92px,1fr)); gap:8px; overflow-x:auto; padding-bottom:2px; }
+      .market-stage { border:1px solid #e2e8f0; border-radius:8px; padding:10px 8px; text-align:center; background:#f8fafc; min-width:92px; }
+      .market-stage-index { margin:0 auto 7px; width:26px; height:26px; border-radius:50%; line-height:26px; font-weight:900; color:#fff; background:#94a3b8; }
+      .market-stage-index.active { background:#16a34a; }
+      .market-stage-label { font-weight:800; color:#334155; font-size:12px; white-space:nowrap; }
+      .market-stage-count { margin-top:5px; font-size:18px; font-weight:900; color:#0f172a; }
+      .market-workspace { display:grid; grid-template-columns:280px minmax(0,1fr); gap:14px; align-items:start; }
+      .market-filter-panel, .market-data-panel { background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:14px; min-width:0; }
+      .market-filter-title { font-size:14px; font-weight:900; color:#0f172a; margin-bottom:10px; }
+      .market-filter-stack { display:flex; flex-direction:column; gap:10px; }
+      .market-filter-stack .el-button, .market-filter-stack .el-select, .market-filter-stack .el-input { width:100%; }
+      .market-rule-chips { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
+      .market-data-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; flex-wrap:wrap; }
+      .market-toolbar-meta { display:flex; align-items:center; gap:10px; flex-wrap:wrap; color:#94a3b8; font-size:12px; }
+      .market-product-cell { display:flex; gap:10px; align-items:center; min-width:0; }
+      .market-thumb { width:54px; height:54px; border-radius:6px; background:#f1f5f9; flex:0 0 auto; }
+      .market-thumb-empty { display:flex; align-items:center; justify-content:center; color:#94a3b8; font-weight:900; }
+      .market-product-main { min-width:0; }
+      .market-product-title { font-weight:900; color:#1e40af; text-decoration:none; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .market-product-sub { font-size:12px; color:#94a3b8; margin-top:5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .market-signal-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:4px; font-size:12px; color:#475569; line-height:1.35; }
+      .market-settings-grid { display:grid; grid-template-columns:minmax(360px,560px) minmax(420px,1fr); gap:14px; align-items:start; }
+      @media(max-width:1400px) { .market-status-strip { grid-template-columns:repeat(3,minmax(0,1fr)); } .market-stage-strip { grid-template-columns:repeat(10,112px); } }
+      @media(max-width:1180px) { .market-workspace, .market-settings-grid { grid-template-columns:1fr; } .market-head { flex-direction:column; } .market-head-actions { justify-content:flex-start; max-width:none; } }
+      @media(max-width:760px) { .erp-route-page { padding:20px 14px; } .market-status-strip { grid-template-columns:1fr 1fr; } .market-title { font-size:24px; } }
       .erp-workbench-title { font-size:28px; line-height:1; font-weight:800; color:#111827; letter-spacing:0; margin:0 0 14px; }
       .erp-muted { color:#64748b; }
       .erp-toolbar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:18px; flex-wrap:wrap; }
@@ -85,20 +123,21 @@
 
     <!-- 业务视图 -->
     <script src="/js/views/Dashboard.js?v=22961"></script>
-    <script src="/js/views/SourcingModule.js?v=22985"></script>
+    <script src="/js/views/SourcingModule.js?v=23017"></script>
+    <script src="/js/views/SingleSourcingReview.js?v=23017"></script>
     <script src="/js/views/CollectionBox.js?v=23003"></script>
     <script src="/js/views/ProductList.js?v=22967"></script>
     <script src="/js/views/InventoryManagement.js?v=23006"></script>
     <script src="/js/views/OrderList.js?v=22964"></script>
-    <script src="/js/views/BatchUpload.js?v=23009"></script>
+    <script src="/js/views/BatchUpload.js?v=23017"></script>
     <script src="/js/views/AIImageGenerator.js?v=22954"></script>
-    <script src="/js/views/StoreManagement.js?v=23007"></script>
+    <script src="/js/views/StoreManagement.js?v=23011"></script>
     <script src="/js/views/ListingHistory.js?v=22955"></script>
     <script src="/js/views/AnalyticsCenter.js?v=22961"></script>
     <script src="/js/views/DataScreen.js?v=22961"></script>
-    <script src="/js/views/MarketDiscovery.js?v=23152"></script>
+    <script src="/js/views/MarketDiscovery.js?v=23168"></script>
 
     <!-- 主逻辑 -->
-    <script src="/js/main.js?v=23152" type="module"></script>
+    <script src="/js/main.js?v=23161" type="module"></script>
   </body>
 </html>

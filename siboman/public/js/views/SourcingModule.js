@@ -44,6 +44,7 @@ window.SourcingModuleView = {
 	    let lastHistoryRefreshAt = 0;
 	    let lastCollectorRefreshAt = 0;
 	    let pollFailures = 0;
+	    let lastPollErrorAt = 0;
 	    let platformAutoRefreshRequested = false;
 	    let adoptWorkerActiveJob = () => {};
 	    const activeStatuses = new Set(['queued', 'claimed', 'running', 'exporting']);
@@ -51,7 +52,7 @@ window.SourcingModuleView = {
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const PLUGIN_ZIP_VERSION = "2.2.9.67";
+    const PLUGIN_ZIP_VERSION = "2.2.9.75";
     window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
 
     const handleExtensionMessage = (event) => {
@@ -279,22 +280,32 @@ window.SourcingModuleView = {
       if (Number.isNaN(d.getTime())) return '--:--:--';
       return d.toLocaleTimeString('zh-CN', { hour12: false });
     };
+    const extractOzonSku = (value) => {
+      const text = String(value || '');
+      return text.match(/product\/(\d+)/)?.[1] || text.match(/Ozon\s+SKU\s+(\d+)/i)?.[1] || '';
+    };
 	    const recentLogs = Vue.computed(() => {
       const logs = (job.value?.logs || []).filter((entry) => !/^实时进度：/.test(String(entry?.message || entry || '').trim()));
       const total = Number(job.value?.sourceTotal || job.value?.total || 0);
+      const rowBySku = new Map();
+      (job.value?.payload?.urlRows || []).forEach((row, index) => {
+        const sku = extractOzonSku(row?.url || row);
+        if (sku) rowBySku.set(sku, Number(row?.sourceRow || index + 1));
+      });
       let currentItem = 0;
       let seenStarts = 0;
       const allLines = logs.map((entry) => {
         const level = String(entry?.level || 'info').toUpperCase();
         const message = String(entry?.message || entry || '');
         let itemNo = 0;
+        const sku = extractOzonSku(message);
         const explicit = message.match(/第\s*(\d+)(?:\s*\/\s*(\d+))?\s*(?:条|行|个)?/);
         if (explicit) {
           itemNo = Number(explicit[1]) || 0;
           if (itemNo) currentItem = itemNo;
         } else if (/开始采集\s+Ozon\s+SKU|正在采集第/.test(message)) {
           seenStarts += 1;
-          currentItem = seenStarts;
+          currentItem = (sku && rowBySku.get(sku)) || seenStarts;
           itemNo = currentItem;
         } else if (/用主图搜索|1688\s*找到|服务器\s*AI\s*审核|候选|采集完成/.test(message)) {
           itemNo = currentItem;
@@ -410,6 +421,10 @@ window.SourcingModuleView = {
     };
 
     const historyDownloadUrl = (item) => item?.downloadUrl || (item?.excelExists && item?.id ? `/api/history/${encodeURIComponent(item.id)}/download` : '');
+    const openHistoryReview = (item) => {
+      if (!item?.id) return;
+      window.location.hash = `#/single-sourcing-review?id=${encodeURIComponent(item.id)}`;
+    };
 
     const loadHistoryJob = async (item) => {
       if (!item?.id) return;
@@ -470,6 +485,9 @@ window.SourcingModuleView = {
 	        const res = await axios.get(`/api/jobs/${encodeURIComponent(currentJobId.value)}`);
 	        liveTick.value = Date.now();
 	        pollFailures = 0;
+	        if (collectorStatus.value.error && /Network Error|网络|请求失败|timeout/i.test(String(collectorStatus.value.error))) {
+	          collectorStatus.value = { ...collectorStatus.value, error: '' };
+	        }
 	        mergeJob(res.data.job || null);
 	        if (job.value && ['done', 'error', 'canceled'].includes(job.value.status)) {
           stopPolling();
@@ -479,8 +497,18 @@ window.SourcingModuleView = {
       } catch (error) {
         pollFailures += 1;
         if (pollFailures >= 3) {
-          stopPolling();
-          ElementPlus.ElMessage.error(apiError(error));
+          const message = apiError(error);
+          collectorStatus.value = {
+            ...(collectorStatus.value || {}),
+            workers: collectorStatus.value.workers || [],
+            queue: collectorStatus.value.queue || { queued: 0, active: 0 },
+            error: `任务进度连接异常，正在自动重试：${message}`,
+          };
+          const now = Date.now();
+          if (now - lastPollErrorAt > 60000) {
+            console.warn('[single-sourcing] 任务进度轮询失败:', message);
+            lastPollErrorAt = now;
+          }
         }
       }
     };
@@ -785,7 +813,7 @@ window.SourcingModuleView = {
       collectorHealthText, activeJobWorker, operatorAlert, jobStatusText, liveStatusText, recentLogs, jobResults, isRunning,
       refreshAndAuthorizePlugin, startSingleSourcing, cancelJob, downloadUrl, open1688, downloadExtension, formatWorkerPlatform,
       formatTime, money, topCandidates, ozonImage, historyLoading, jobHistory, fetchJobHistory,
-	      historyDownloadUrl, loadHistoryJob, jobStatusTagType, formatHistoryRange,
+	      historyDownloadUrl, openHistoryReview, loadHistoryJob, jobStatusTagType, formatHistoryRange,
 	      logPanel,
 	      moneyCny, compactNumber, percentText, trendColor, barWidth, latestSyncText,
 	      currentRows, topCategories, productTreemap, trendMax, priceMax, priceProductMax, productMax, categoryMax,
@@ -1153,9 +1181,10 @@ window.SourcingModuleView = {
               <el-table-column label="状态" width="110">
                 <template #default="{ row }"><el-tag size="small" :type="jobStatusTagType(row.status)">{{ row.status || '-' }}</el-tag></template>
               </el-table-column>
-              <el-table-column label="操作" width="190" fixed="right">
+              <el-table-column label="操作" width="280" fixed="right">
                 <template #default="{ row }">
                   <el-button size="small" @click="loadHistoryJob(row)">查看</el-button>
+                  <el-button size="small" type="primary" plain @click="openHistoryReview(row)">结果核对</el-button>
                   <el-button
                     v-if="historyDownloadUrl(row)"
                     size="small"
