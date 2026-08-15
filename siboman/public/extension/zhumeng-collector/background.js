@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.75";
+const VERSION = "2.2.9.100";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -215,7 +215,70 @@ async function removeTabWithRetry(tabId, label = "关闭标签页") {
 }
 
 // ========== 采集核心: 打开 Ozon 商品前端页 + executeScript 提取 ==========
-async function collectSku(sku, storeIds = [], job = null) {
+
+// v2.2.9.100: 静默采集 — 不打开商品页 tab，直接复用 seller.ozon.ru 登录 tab 走门户 API
+//   (/api/v1/search → seller-prototype/create-bundle-by-variant-id)，对齐 MY ERP 插件：
+//   批量上架全程后台执行，Chrome 不弹任何 Ozon 标签页。
+//   售价不走采集(门户不带价)，由批量上架页行价格/批量售价填写。
+//   无任何 ozon tab 时自动创建一个 seller.ozon.ru 后台 tab(active:false, 不打扰)并常驻复用。
+async function ensureSellerPortalTabForSilent() {
+  const tabs = await chrome.tabs.query({ url: ["*://*.ozon.ru/*"] }).catch(() => []);
+  const usable = tabs.find(t => t.status === "complete") || tabs[0];
+  if (usable?.id) return usable.id;
+  const tab = await createTabWithRetry({ url: "https://seller.ozon.ru/", active: false }, "打开 seller.ozon.ru 后台页");
+  try { await waitForTabComplete(tab.id, 30000); } catch (e) { console.warn(`[SW ${VERSION}] seller.ozon.ru 后台 tab 加载等待: ${e.message}`); }
+  return tab.id;
+}
+
+async function collectSkuSilent(sku, storeIds = []) {
+  const data = {};
+  const companyId = await getSellerCompanyId();
+  if (!companyId) throw new Error("未找到 sc_company_id cookie，请确认 seller.ozon.ru 已登录并选中店铺");
+  const portalTabId = await ensureSellerPortalTabForSilent();
+  await enrichFromSellerPortalBundle(data, sku, portalTabId);  // search → bundle → 组装 attributes/images/weight/类目/富文本
+  data._plugin_version = VERSION;
+  data._collected_via = "seller-portal-silent";
+  data._seller_bundle_enriched = "silent-portal";
+  // v2.2.9.100 debug: 打印 bundle 组装结果，定位 sourceAttr=1 问题
+  console.log(`[SW ${VERSION}] 静默采集 debug ${sku}: sv.attrs=${Array.isArray(data._sourceVariant?.attributes) ? data._sourceVariant.attributes.length : "?"} bundleItem=${data._sourceVariant?._bundleItem ? `obj(attrs=${Array.isArray(data._sourceVariant._bundleItem.attributes) ? data._sourceVariant._bundleItem.attributes.length : "?"})` : "MISSING"} images=${Array.isArray(data.images) ? data.images.length : "?"}`);
+  data.name = String(data.name || "").replace(/\s+/g, " ").trim();
+  if (!data.name) throw new Error(`Seller portal 未取到商品名 (SKU ${sku})`);
+  if (!Array.isArray(data.images) || !data.images.length) {
+    const imgs = extractImagesFromSourceVariant(data._sourceVariant || {});
+    if (imgs.length) data.images = imgs;
+  }
+  data.images = (data.images || [])
+    .filter((u) => u && !isLikelyOzonMarketingImageInPlugin(u))   // v2.2.9.100: banner/logo/qr 图不得上架
+    .filter((u, idx, arr) => arr.indexOf(u) === idx)
+    .slice(0, 15);
+  data.primary_image = data.images?.[0] || "";
+  data.price = data.price || "";
+  data.name = cleanOzonTitle(data.name);   // v2.2.9.100: 去 Ozon 页面标题模板后缀
+  ensureSyntheticRichContent(data);
+  injectRichContentAttr(data);
+  console.log(`[SW ${VERSION}] ✓ 静默采集 ${sku}: ${String(data.name).slice(0, 50)} via seller-portal (attrs=${data.attributes?.length || 0} images=${data.images?.length || 0})`);
+  return data;
+}
+
+// v2.2.9.100: Ozon 商品页 <title> 常带模板后缀 " - купить на OZON" / "- buy on OZON" / "- на OZON"，
+// 直接上架会被 Ozon 拒（"商品名称中提到了品牌OZON"）。提交前统一清洗。
+function cleanOzonTitle(name) {
+  const text = String(name || "").replace(/\s+/g, " ").trim();
+  return text
+    .replace(/\s*-\s*(?:купить|buy|покупать)\s+(?:на\s+)?OZON\s*$/i, "")
+    .replace(/\s*-\s*OZON\s*$/i, "")
+    .replace(/\s*\(\s*(?:купить|buy)\s+(?:на\s+)?OZON\s*\)\s*$/i, "")
+    .replace(/\s*-\s*купить\s*$/i, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+async function collectSku(sku, storeIds = [], job = null, opts = {}) {
+  // v2.2.9.100: 静默采集模式（批量上架）— 绝不开商品页 tab；门户链路失败直接报错（保持全程静默），
+  //   无 seller tab 时 collectSkuSilent 内部会自动建常驻后台 seller tab
+  if (opts.silent === true && !job) {
+    return await collectSkuSilent(sku, storeIds);
+  }
   const url = OZON_PRODUCT_URL(sku);
   console.log(`[SW ${VERSION}] 采集 SKU ${sku}: 准备打开 ${url}, stores=${storeIds.length}`);
   
@@ -290,19 +353,25 @@ async function collectSku(sku, storeIds = [], job = null) {
 
   // v2.2.9.15: 优先复用 Seller 后台“复制商品”链路拿完整跟卖源包。
   // 公开页/OPI 只能兜底，My ERP 的完整属性、尺寸、富内容主要来自这个 bundle item。
+  // v2.2.9.100: 找货模式 (opts.skipEnrichment) 跳过富化链 — 审核页只需要标题/图/价/重/属性，公开页已够用。
   result._plugin_version = VERSION;
-  try {
-    const bundle = await enrichFromSellerPortalBundle(result, sku, tab.id);
-    result._seller_bundle_enriched = Boolean(bundle);
-    if (bundle) {
-      console.log(`[SW ${VERSION}]   Seller bundle: attrs=${bundle.attrCount} images=${bundle.imageCount} dims=${result.depth}x${result.width}x${result.height} weight=${result.weight}`);
-    } else {
-      console.log(`[SW ${VERSION}]   Seller bundle: 未找到可复制源包, 继续用公开页/OPI 兜底`);
+  if (opts.skipEnrichment === true) {
+    result._seller_bundle_enriched = "skipped-sourcing";
+    console.log(`[SW ${VERSION}]   Seller bundle 富化跳过 (找货模式 skipEnrichment=true)`);
+  } else {
+    try {
+      const bundle = await enrichFromSellerPortalBundle(result, sku, tab.id);
+      result._seller_bundle_enriched = Boolean(bundle);
+      if (bundle) {
+        console.log(`[SW ${VERSION}]   Seller bundle: attrs=${bundle.attrCount} images=${bundle.imageCount} dims=${result.depth}x${result.width}x${result.height} weight=${result.weight}`);
+      } else {
+        console.log(`[SW ${VERSION}]   Seller bundle: 未找到可复制源包, 继续用公开页/OPI 兜底`);
+      }
+    } catch (e) {
+      result._seller_bundle_enriched = false;
+      result._seller_bundle_error = e.message || String(e);
+      console.warn(`[SW ${VERSION}]   Seller bundle 增强失败 (非致命): ${result._seller_bundle_error}`);
     }
-  } catch (e) {
-    result._seller_bundle_enriched = false;
-    result._seller_bundle_error = e.message || String(e);
-    console.warn(`[SW ${VERSION}]   Seller bundle 增强失败 (非致命): ${result._seller_bundle_error}`);
   }
 
   // 4. 关闭 tab
@@ -687,7 +756,9 @@ function isLikelyOzonMarketingImageInPlugin(url) {
   return /\/marketing-api\/banners?\//i.test(text)
     || /\/banners?\//i.test(text)
     || /\/brand(?:-|_)?logo/i.test(text)
-    || /\/seller(?:-|_)?logo/i.test(text);
+    || /\/seller(?:-|_)?logo/i.test(text)
+    || /\/qr-code[\/_]/i.test(text)   // v2.2.9.100: 二维码图也不得作为商品图
+    || /qr[_-]?code/i.test(text);
 }
 
 function normalizeOzonForSourcing(data, url, sourceRow) {
@@ -754,9 +825,17 @@ async function runQueuedSourcingJob(remoteJob) {
 
   const maxCandidates = Math.max(1, Math.min(20, Number(options.maxCandidates || 5)));
   const enable1688 = options.enable1688 !== false;
+  // v2.2.9.100: 找货模式轻量采集 — 默认跳过 Ozon Seller 富化链(seller bundle/OPI/类目解析/富文本)
+  //   并启用 1688 详情轻量浏览。富化链是为上架"复制商品"服务的，找货审核页只需要标题/图/价/重/属性。
+  const skipOzonEnrichment = options.skipOzonEnrichment !== false;
+  const fast1688 = options.fast1688 !== false;
+  // v2.2.9.100: 对齐生产插件 — Ozon/1688 滑块/验证码/登录/超时不再整体停止任务，
+  //   改为行级失败 + 连续失败计数(默认 3 次, 前端可配)。用户人工处理后, 下一行成功即自动继续。
+  const maxConsecutiveFailures = Math.max(1, Math.min(20, Number(options.maxConsecutiveFailures || 3)));
   const delayMinMs = Math.max(1000, Number(options.delayMinMs || 8000));
   const delayMaxMs = Math.max(delayMinMs, Number(options.delayMaxMs || 20000));
   let fatalStop = false;
+  let consecutiveFailures = 0;
   const stopCancelMonitor = startSourcingCancelMonitor(job);
 
   try {
@@ -772,7 +851,7 @@ async function runQueuedSourcingJob(remoteJob) {
         job.phase = `采集 Ozon 第 ${sourceRow} 行`;
         job.logs.push(makeLog(`开始采集 Ozon SKU ${sku}`));
         await reportSourcingProgress(job);
-        const ozonRaw = await withSourcingStepTimeout(job, `Ozon 第 ${sourceRow} 行采集`, 90_000, () => collectSku(sku, [], job));
+        const ozonRaw = await withSourcingStepTimeout(job, `Ozon 第 ${sourceRow} 行采集`, 90_000, () => collectSku(sku, [], job, { skipEnrichment: skipOzonEnrichment }));
         if (job.cancelRequested) break;
         result.ozon = normalizeOzonForSourcing(ozonRaw, url, sourceRow);
 
@@ -780,7 +859,7 @@ async function runQueuedSourcingJob(remoteJob) {
           job.phase = `1688 搜图 第 ${sourceRow} 行`;
           job.logs.push(makeLog(`用主图搜索 1688 候选，最多 ${maxCandidates} 个。`));
           await reportSourcingProgress(job);
-          const searchResult = await withSourcingStepTimeout(job, `1688 第 ${sourceRow} 行搜图`, 240_000, () => search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates, job));
+          const searchResult = await withSourcingStepTimeout(job, `1688 第 ${sourceRow} 行搜图`, 240_000, () => search1688ByImageInPlugin(result.ozon.mainImageUrl, maxCandidates, job, { lightMode: fast1688 }));
           if (job.cancelRequested) break;
           if (searchResult.success) {
             result.candidates = searchResult.candidates;
@@ -793,15 +872,11 @@ async function runQueuedSourcingJob(remoteJob) {
           } else {
             result.searchError = searchResult.error;
             job.logs.push(makeLog(`1688 搜图失败：${searchResult.error}`, "warn"));
+            // v2.2.9.100: 1688 登录/验证码/超时降级为行级失败（不整体停止），对齐生产行为
             if (isCriticalSourcingBlockerInPlugin(searchResult.error)) {
-              fatalStop = true;
-              job.error = searchResult.error;
-              job.phase = isSourcingStepTimeoutInPlugin(searchResult.error)
-                ? "已自动停止：当前步骤超时"
-                : "已自动停止：1688 需要人工登录/验证";
               job.logs.push(makeLog(isSourcingStepTimeoutInPlugin(searchResult.error)
-                ? "检测到当前商品采集步骤超时，已停止后续采集。请检查 1688/Ozon 页面是否被验证页阻塞，再从当前行继续。"
-                : "检测到 1688 登录/验证码/安全验证阻塞，已停止后续采集，避免继续触发风控。", "error"));
+                ? "该行 1688 搜图超时（非致命）：已跳过，继续下一行。"
+                : "该行遇到 1688 登录/验证码阻塞（非致命）：请在当前 Chrome 处理验证，后续行会自动继续。", "warn"));
             }
           }
         } else if (enable1688) {
@@ -811,20 +886,32 @@ async function runQueuedSourcingJob(remoteJob) {
       } catch (e) {
         result.error = e.message || String(e);
         job.logs.push(makeLog(`第 ${sourceRow} 行失败：${result.error}`, "error"));
+        // v2.2.9.100: 滑块/验证码/登录/超时降级为行级失败（不整体停止），对齐生产插件行为
         if (isCriticalSourcingBlockerInPlugin(result.error)) {
-          fatalStop = true;
-          job.error = result.error;
-          job.phase = isCriticalOzonBlockerInPlugin(result.error)
-            ? "已自动停止：Ozon 需要人工验证"
-            : "已自动停止：当前步骤超时";
           job.logs.push(makeLog(isCriticalOzonBlockerInPlugin(result.error)
-            ? "检测到 Ozon 商品页滑块/验证码，已停止后续采集。请在当前 Chrome 完成验证后，从这一行继续。"
-            : "检测到当前商品采集步骤超时，已停止后续采集。请检查 Ozon/1688 页面后从这一行继续。", "error"));
+            ? "该行被 Ozon 滑块/验证码阻塞（非致命）：请在当前 Chrome 处理验证，后续行会自动继续。"
+            : isSourcingStepTimeoutInPlugin(result.error)
+              ? "该行采集步骤超时（非致命）：已跳过，继续下一行。"
+              : "该行遇到 1688 登录/验证码阻塞（非致命）：请处理验证，后续行会自动继续。", "warn"));
         }
       }
       if (job.cancelRequested) break;
       job.results.push(result);
       job.processed = Math.min(index + 1, job.total);
+      // v2.2.9.100: 连续失败计数 — 对齐生产 maxConsecutiveFailures 语义；"主图为空"这类可预期跳过不计失败
+      const rowFailed = Boolean(result.error) || (Boolean(result.searchError) && !/主图为空/.test(result.searchError));
+      if (rowFailed) {
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= maxConsecutiveFailures) {
+          fatalStop = true;
+          const nextRow = Math.min(index + 2, job.total);
+          job.error = `连续 ${consecutiveFailures} 行采集失败（可能验证码/登录阻塞或页面异常），已自动停止。请处理后从第 ${nextRow} 行继续。`;
+          job.phase = `已自动停止：连续 ${consecutiveFailures} 行失败`;
+          job.logs.push(makeLog(`连续 ${consecutiveFailures} 行失败，已自动停止。请检查 Ozon/1688 是否被验证码/登录页阻塞，处理完成后可从第 ${nextRow} 行继续。`, "error"));
+        }
+      } else {
+        consecutiveFailures = 0;
+      }
       if (!fatalStop) job.phase = `已完成 ${job.processed}/${job.total}`;
       await reportSourcingProgress(job);
       if (fatalStop || job.cancelRequested) break;
@@ -915,11 +1002,11 @@ async function recover1688SessionInPlugin(reason, attempt) {
   await get1688CookieStateInPlugin().catch((e) => console.warn(`[SW ${VERSION}] 1688 cookie 读取失败: ${e.message}`));
 }
 
-async function search1688ByImageInPlugin(imageUrl, maxCandidates, job = null) {
-  return run1688ImageSearchQueued(() => search1688ByImageInPluginInternal(imageUrl, maxCandidates, job));
+async function search1688ByImageInPlugin(imageUrl, maxCandidates, job = null, opts = {}) {
+  return run1688ImageSearchQueued(() => search1688ByImageInPluginInternal(imageUrl, maxCandidates, job, opts));
 }
 
-async function search1688ByImageInPluginInternal(imageUrl, maxCandidates, job = null) {
+async function search1688ByImageInPluginInternal(imageUrl, maxCandidates, job = null, opts = {}) {
   try {
     assertSourcingNotCanceled(job);
     let state = await ensure1688CookieStateInPlugin(false);
@@ -932,7 +1019,7 @@ async function search1688ByImageInPluginInternal(imageUrl, maxCandidates, job = 
     for (let attempt = 1; attempt <= 2; attempt += 1) {
       try {
         assertSourcingNotCanceled(job);
-        const candidates = await collect1688CandidatesInPlugin(base64Image, state, maxCandidates, job);
+        const candidates = await collect1688CandidatesInPlugin(base64Image, state, maxCandidates, job, opts);
         const ranked = rank1688CandidatesForOzonInPlugin(candidates).slice(0, maxCandidates);
         if (ranked.length) { clear1688Success(); return { success: true, candidates: ranked }; }
         return { success: false, error: "1688 接口搜图未返回候选" };
@@ -1260,7 +1347,7 @@ function is1688RefreshableError(message) {
   return /FAIL_SYS_ILLEGAL_ACCESS|非法请求|FAIL_SYS_TOKEN|FAIL_SYS_TOKEN_EXPIRED|FAIL_SYS_TOKEN_EXOIRED|_m_h5_tk|token|令牌|store image error|没有 imageId|未返回 imageId|imageId|cookie|login|401|403|TOKEN/i.test(String(message || ""));
 }
 
-async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates, job = null) {
+async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandidates, job = null, opts = {}) {
   assertSourcingNotCanceled(job);
   const imageId = await uploadImageTo1688InPlugin(base64Image, cookieState, job);
   assertSourcingNotCanceled(job);
@@ -1268,16 +1355,19 @@ async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandid
   assertSourcingNotCanceled(job);
   const candidates = (await searchOffersByImageIdInPlugin(imageId, cookieState, job)).slice(0, maxCandidates);
   assertSourcingNotCanceled(job);
-  return enrich1688CandidatesInPlugin(candidates, job);
+  return enrich1688CandidatesInPlugin(candidates, job, opts);
 }
 
-async function enrich1688CandidatesInPlugin(candidates, job = null) {
+async function enrich1688CandidatesInPlugin(candidates, job = null, opts = {}) {
   const enriched = [];
   for (const [index, candidate] of candidates.entries()) {
     assertSourcingNotCanceled(job);
-    if (index > 0) await sleep(randomInt(2500, 6500));
+    if (index > 0) {
+      // v2.2.9.100: 轻量模式(找货)缩短候选间停顿，保留防风控最小间隔
+      await sleep(opts.lightMode === true ? randomInt(1200, 3800) : randomInt(2500, 6500));
+    }
     assertSourcingNotCanceled(job);
-    const details = await scrape1688CandidateDetailsInPlugin(candidate, job);
+    const details = await scrape1688CandidateDetailsInPlugin(candidate, job, opts);
     enriched.push(addTrafficBaitAssessmentInPlugin(merge1688CandidateDetailsInPlugin(candidate, details)));
   }
   return enriched;
@@ -1543,7 +1633,7 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState, job = null) {
   });
 }
 
-async function scrape1688CandidateDetailsInPlugin(candidate, job = null) {
+async function scrape1688CandidateDetailsInPlugin(candidate, job = null, opts = {}) {
   assertSourcingNotCanceled(job);
   if (!candidate.link) return { detailError: "没有候选链接" };
   const tab = await createTabWithRetry({ url: candidate.link, active: false }, "打开 1688 候选详情页");
@@ -1552,18 +1642,25 @@ async function scrape1688CandidateDetailsInPlugin(candidate, job = null) {
     assertSourcingNotCanceled(job);
     await waitForTabComplete(tab.id, 45000);
     assertSourcingNotCanceled(job);
-    await sleep(randomInt(2200, 5200));
-    assertSourcingNotCanceled(job);
-    await humanBrowse1688TabInPlugin(tab.id, "1688 候选详情页", {
-      minDurationMs: 3200,
-      maxDurationMs: 8200,
-      dwellChance: 0.18,
-      minStep: 360,
-      maxStep: 950,
-      minDelay: 420,
-      maxDelay: 1150,
-      mouseMoves: randomInt(1, 3),
-    });
+    if (opts.lightMode === true) {
+      // v2.2.9.100: 找货轻量模式 — 缩短固定等待 + 简化浏览动作(保留少量滚动避免风控)，对齐生产插件速度
+      await sleep(randomInt(800, 1600));
+      assertSourcingNotCanceled(job);
+      await browse1688DetailLightInPlugin(tab.id);
+    } else {
+      await sleep(randomInt(2200, 5200));
+      assertSourcingNotCanceled(job);
+      await humanBrowse1688TabInPlugin(tab.id, "1688 候选详情页", {
+        minDurationMs: 3200,
+        maxDurationMs: 8200,
+        dwellChance: 0.18,
+        minStep: 360,
+        maxStep: 950,
+        minDelay: 420,
+        maxDelay: 1150,
+        mouseMoves: randomInt(1, 3),
+      });
+    }
     assertSourcingNotCanceled(job);
     const [execResult] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -1576,6 +1673,26 @@ async function scrape1688CandidateDetailsInPlugin(candidate, job = null) {
   } finally {
     active1688TabIds.delete(tab.id);
     await safeRemoveTab(tab.id);
+  }
+}
+
+// v2.2.9.100: 找货轻量模式的 1688 详情页浏览 — 只做 3 次渐进滚动 + 回到顶部, 约 2-3.5s
+async function browse1688DetailLightInPlugin(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: async () => {
+        const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+        for (let i = 0; i < 3; i += 1) {
+          window.scrollBy(0, 400 + Math.floor(Math.random() * 350));
+          await delay(380 + Math.floor(Math.random() * 520));
+        }
+        window.scrollTo(0, 0);
+        await delay(300);
+      },
+    });
+  } catch (e) {
+    console.warn(`[SW ${VERSION}] 1688 轻量浏览跳过: ${compact1688ErrorInPlugin(e.message || e)}`);
   }
 }
 
@@ -2303,12 +2420,13 @@ function parseMaybeJsonForSyntheticRich(value) {
 function synthesizeRichContentFromImages(images) {
   const urls = [];
   const seen = new Set();
+  // v2.2.9.100: 允许 wc1000 等尺寸变体，归一化去掉 /wc\d+/ 段（对齐 MY ERP 用原始图 URL），
+  //   之前排除 wc1000 导致静默采集的多图全被过滤、富文本只剩 1 张主图
   const normalize = (raw) => {
     const url = String(raw || "").trim().split(/[?#]/)[0];
     if (!/^https?:\/\//i.test(url)) return "";
-    if (/\/wc\d+\//i.test(url)) return "";
-    if (!/(ir-\d+\.ozonru\.cn|ir\.ozone\.ru)\/s3\/multimedia/i.test(url)) return "";
-    return url;
+    if (!/(ir-\d+\.ozonru\.cn|ir-\d+\.ozonstatic\.cn|ir\.ozone\.ru|cdn1\.ozonusercontent\.com)\/s3\/(multimedia|product-service-meta-media)/i.test(url)) return "";
+    return url.replace(/\/wc\d+\//i, "/");
   };
   const keyFor = (url) => {
     try {
@@ -2476,6 +2594,24 @@ function clonePlain(value) {
   return JSON.parse(JSON.stringify(value || null));
 }
 
+// v2.2.9.100: portal 调用重试（对齐 MY ERP withRetry）— 指数退避，解决 seller 后台偶发超时/抖动
+async function portalWithRetry(fn, label, maxAttempts = 3) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastError = e;
+      if (attempt >= maxAttempts) break;
+      // v2.2.9.100: 退避加大到 2s/4s/8s — 短时间大量 bundle 提交触发 Ozon 限流时重试更有效
+      const wait = 2000 * Math.pow(2, attempt - 1);
+      console.warn(`[SW ${VERSION}] portal ${label} 第 ${attempt} 次失败, ${wait}ms 后重试: ${e?.message || e}`);
+      await sleep(wait);
+    }
+  }
+  throw lastError;
+}
+
 async function portalCreateBundle(companyId, preferTabId) {
   const resp = await fetchSellerPortalViaOzonTab("/seller-prototype/create-bundle", {
     company_id: String(companyId),
@@ -2485,12 +2621,13 @@ async function portalCreateBundle(companyId, preferTabId) {
   return String(bundleId);
 }
 
-async function portalUpdateBundleItems(bundleId, companyId, items, preferTabId) {
+async function portalUpdateBundleItems(bundleId, companyId, items, preferTabId, categoryLvl3Name = "") {
   return fetchSellerPortalViaOzonTab("/seller-prototype/update-bundle-items", {
     bundle_id: String(bundleId),
     company_id: String(companyId),
     source: "SOURCE_MERGED",
-    description_category_lvl3_name: "",
+    // v2.2.9.100: 对齐 MY ERP — 必须带类目三级名，空字符串会导致上传任务失败/商品建不出来
+    description_category_lvl3_name: String(categoryLvl3Name || ""),
     items,
   }, { urlPrefix: "/api/site", timeoutMs: 60000, preferTabId });
 }
@@ -2504,6 +2641,46 @@ async function portalUploadBundle(bundleId, companyId, preferTabId) {
   const taskId = resp?.upload_task_id || resp?.task_id;
   if (!taskId) throw new Error("Seller portal upload-bundle 未返回 upload_task_id");
   return String(taskId);
+}
+
+// v2.2.9.100: 轮询 portal 上传任务，确认真实上架结果（对齐 MY ERP getUploadTaskList）。
+// 解决之前"ERP 显示提交但 Ozon 后台无商品"的隐患 — 返回真实 status/processed/failed。
+async function pollPortalUploadTask(companyId, taskId, preferTabId, { intervalMs = 15000, maxPolls = 10 } = {}) {
+  const sleepIn = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  for (let poll = 1; poll <= maxPolls; poll += 1) {
+    try {
+      const resp = await fetchSellerPortalViaOzonTab("/async-upload/v1/task/get-list", {
+        company_id: String(companyId),
+        limit: 30,
+        page: 1,
+      }, { urlPrefix: "/api/site", timeoutMs: 30000, preferTabId });
+      const tasks = Array.isArray(resp?.tasks) ? resp.tasks : (Array.isArray(resp?.list) ? resp.list : []);
+      const task = tasks.find((t) => String(t?.task_id || t?.id || "") === String(taskId)) || null;
+      if (!task) {
+        if (poll >= maxPolls) return { status: "unknown", reason: `轮询 ${maxPolls} 次未找到 task ${taskId}` };
+      } else {
+        const status = String(task?.status || task?.state || "").toLowerCase();
+        const processed = Number(task?.processed || task?.done || 0);
+        const failed = Number(task?.failed || 0);
+        const warned = Number(task?.warned || 0);
+        if (["done", "finished", "success", "completed", "complete"].includes(status) || (task?.finished === true)) {
+          return { status: "done", processed, failed, warned, task };
+        }
+        if (["failed", "error", "canceled", "cancelled"].includes(status)) {
+          return { status: "failed", reason: `upload task ${taskId} 状态=${status}`, processed, failed, warned, task };
+        }
+        // processing / in_progress → 继续轮询
+        if (poll >= maxPolls) {
+          return { status: "processing", reason: `轮询 ${maxPolls} 次仍在处理中`, processed, failed, warned, task };
+        }
+      }
+    } catch (e) {
+      console.warn(`[SW ${VERSION}] portal task 轮询第 ${poll} 次失败: ${e?.message || e}`);
+      if (poll >= maxPolls) return { status: "unknown", reason: `轮询失败: ${e?.message || e}` };
+    }
+    await sleepIn(intervalMs);
+  }
+  return { status: "unknown", reason: "轮询超时" };
 }
 
 function ensurePortalAttr(item, attributeId, values) {
@@ -2551,7 +2728,45 @@ function normalizePortalAttributes(item, opts = {}) {
 function buildPortalItemFromImportItem(importItem) {
   if (!importItem || typeof importItem !== "object") throw new Error("portalImport 缺少 item");
   const sourceVariant = importItem._sourceVariant && typeof importItem._sourceVariant === "object" ? importItem._sourceVariant : null;
-  const sourceBundleItem = sourceVariant?._bundleItem && typeof sourceVariant._bundleItem === "object" ? sourceVariant._bundleItem : null;
+  let sourceBundleItem = sourceVariant?._bundleItem && typeof sourceVariant._bundleItem === "object" ? sourceVariant._bundleItem : null;
+  // v2.2.9.100: _bundleItem 缺失（静默采集/传输精简导致）时，用 _sourceVariant.attributes 重建最小源包，
+  //   避免 portal 静默上架整体回退官方 import
+  if (!sourceBundleItem && sourceVariant && Array.isArray(sourceVariant.attributes)) {
+    sourceBundleItem = {
+      attributes: sourceVariant.attributes.map((a) => {
+        const vals = Array.isArray(a.values)
+          ? a.values
+          : Array.isArray(a.collection)
+            ? a.collection
+            : (a.value !== undefined && a.value !== null ? [a.value] : []);
+        return {
+          attribute_id: String(a.key ?? a.id ?? a.attribute_id ?? ""),
+          name: a.name || "",
+          values: vals
+            .filter((v) => v !== null && v !== undefined && String(v).trim() !== "")
+            .map((v, i) => ({
+              value: String(v),
+              sequence: String(i),
+              is_default: i === 0,
+              complex_sequence: "0",
+              dictionary_value_id: String(a.dictionary_value_id || "0"),
+            })),
+        };
+      }),
+      name: sourceVariant.name || importItem.name || "",
+      images: Array.isArray(importItem.images) ? importItem.images.filter((u) => typeof u === "string") : [],
+      primary_image: Array.isArray(importItem.images) && importItem.images.length ? importItem.images[0] : "",
+      price: importItem.price || "",
+      weight: Number(importItem.weight || sourceVariant.weight || 0),
+      depth: Number(importItem.depth || sourceVariant.depth || 0),
+      width: Number(importItem.width || sourceVariant.width || 0),
+      height: Number(importItem.height || sourceVariant.height || 0),
+      barcode: importItem.barcode || sourceVariant.barcode || "",
+      description: importItem.description || sourceVariant.description || "",
+      _rebuilt_without_bundle_item: true,
+    };
+    console.warn(`[SW ${VERSION}] portalImport: _bundleItem 缺失, 已用 _sourceVariant.attributes(${sourceVariant.attributes.length}) 重建源包`);
+  }
   if (!sourceBundleItem) throw new Error("portalImport 需要 Seller bundle 源包 (_sourceVariant._bundleItem)");
 
   const item = clonePlain(sourceBundleItem);
@@ -2562,7 +2777,17 @@ function buildPortalItemFromImportItem(importItem) {
   item.deleted = false;
   item.unmerged = false;
   item.offer_id = String(importItem.offer_id || "").trim();
-  item.name = String(importItem.name || item.name || "").replace(/\s+/g, " ").trim().slice(0, 200);
+  // v2.2.9.100: 名称对齐 MY ERP — 用采集的 bundle 商品名（如 "Браслет жесткий"），
+  //   不再用 4180 完整标题（"Браслет манжета на руку широкий" 与 MY ERP 不一致）
+  const portalBundleAttrs = Array.isArray(sourceBundleItem.attributes) ? sourceBundleItem.attributes : [];
+  const portalAttrValue = (aid) => {
+    const a = portalBundleAttrs.find((x) => String(x?.attribute_id ?? x?.id ?? x?.key ?? "") === String(aid));
+    const vals = Array.isArray(a?.values) ? a.values : [];
+    const v = vals[0] && typeof vals[0] === "object" ? (vals[0].value ?? vals[0].text ?? vals[0].name ?? "") : vals[0];
+    return v !== null && v !== undefined ? String(v).trim() : "";
+  };
+  const bundleName = portalAttrValue(4180) || importItem.name || item.name || "";
+  item.name = cleanOzonTitle(String(importItem.name || item.name || "")).replace(/\s+/g, " ").trim().slice(0, 200);
   item.price = String(importItem.price || item.price || "");
   item.old_price = String(importItem.old_price || item.old_price || importItem.price || "");
   item.currency = String(importItem.currency_code || importItem.currency || item.currency || "CNY");
@@ -2573,6 +2798,10 @@ function buildPortalItemFromImportItem(importItem) {
   item.width = Number(importItem.width || item.width || 0);
   item.height = Number(importItem.height || item.height || 0);
   item.barcode = String(importItem.barcode || item.barcode || "");
+  // v2.2.9.100: bundle item 没有 description 字段 → 用完整标题兜底（对齐 MY ERP pickFollowSellDescription 的 fallback）
+  if (!String(item.description || "").trim()) {
+    item.description = bundleName || item.name || "";
+  }
   if (images.length) {
     item.images = images;
     item.primary_image = images[0];
@@ -2584,6 +2813,30 @@ function buildPortalItemFromImportItem(importItem) {
   if (item.height) ensurePortalAttr(item, 9456, item.height);
   if (item.barcode) ensurePortalAttr(item, 23524, item.barcode);
   if (importItem.richContent) ensurePortalAttr(item, 11254, importItem.richContent);
+  // v2.2.9.100: 9048(型号名) 对齐 MY ERP — 纯源 SKU（如 4844459482），MY ERP 用 scraped_sku 兜底
+  {
+    const skuDigits = String(item.offer_id || "").match(/\d{6,}/)?.[0] || "";
+    const modelVal = skuDigits ? skuDigits : String(item.offer_id || "").slice(0, 40);
+    const existing9048 = Array.isArray(item.attributes)
+      ? item.attributes.find((a) => String(a?.attribute_id ?? a?.id ?? a?.key ?? "") === "9048")
+      : null;
+    if (existing9048) {
+      existing9048.values = [{ value: modelVal, sequence: "0", is_default: false, complex_sequence: "0", dictionary_value_id: "0" }];
+      if (existing9048.attribute_id === undefined && existing9048.key) {
+        existing9048.attribute_id = existing9048.key;
+        delete existing9048.key;
+      }
+    } else if (modelVal) {
+      const arr = Array.isArray(item.attributes) ? item.attributes : [];
+      arr.push({
+        attribute_id: "9048",
+        name: "Название модели",
+        values: [{ value: modelVal, sequence: "0", is_default: false, complex_sequence: "0", dictionary_value_id: "0" }],
+        complex_id: "0",
+      });
+      item.attributes = arr;
+    }
+  }
   // 图片在 seller-prototype bundle 里走 top-level images/primary_image。
   // 同时带 4194/4195 会被 Ozon 判定“图片字段重复”。
   normalizePortalAttributes(item, { removeIds: [4194, 4195] });
@@ -2854,21 +3107,82 @@ async function discoverOzonCategoryProducts(categoryUrl, categoryName, strategyT
   };
 }
 
+// v2.2.9.100: 从源变体提取类目三级名（upload-bundle 依赖，对齐 MY ERP 后端 prepare 传的类目名）
+function extractPortalCategoryLvl3Name(sourceVariant) {
+  if (!sourceVariant || typeof sourceVariant !== "object") return "";
+  const cats = Array.isArray(sourceVariant.categories) ? sourceVariant.categories : [];
+  if (cats.length) {
+    const last = cats[cats.length - 1];
+    if (last?.name) return String(last.name).trim();
+    if (last?.title) return String(last.title).trim();
+  }
+  return String(sourceVariant.description_type_name
+    || sourceVariant.category_name
+    || sourceVariant.description_category_name
+    || "").trim();
+}
+
 async function portalImportItems(importItems, preferTabId) {
   const companyId = await getSellerCompanyId();
   if (!companyId) throw new Error("未找到 sc_company_id cookie，请确认 seller.ozon.ru 已登录并选中目标店铺");
-  const items = (Array.isArray(importItems) ? importItems : [importItems]).map(buildPortalItemFromImportItem);
-  if (!items.length) throw new Error("portalImport 没有可提交商品");
-  const bundleId = await portalCreateBundle(companyId, preferTabId);
-  await portalUpdateBundleItems(bundleId, companyId, items, preferTabId);
-  const taskId = await portalUploadBundle(bundleId, companyId, preferTabId);
+  const rawList = Array.isArray(importItems) ? importItems : [importItems];
+  if (!rawList.length) throw new Error("portalImport 没有可提交商品");
+  // v2.2.9.100: 每个 SKU 独立一个 bundle 提交 — 实测 Ozon 一个 bundle 塞多个商品时每组只创建 1 个，
+  //   必须每 SKU 一组（每组 1 个 item）才能保证全部独立创建。
+  const groups = new Map();
+  for (const raw of rawList) {
+    const item = buildPortalItemFromImportItem(raw);
+    const cat = String(item.description_category_id || "0");
+    const key = `${cat}:${item.offer_id || Math.random().toString(36).slice(2, 8)}`;
+    groups.set(key, { items: [item], variants: raw && typeof raw === "object" ? [raw._sourceVariant] : [] });
+  }
+  const taskIds = [];
+  const bundleIds = [];
+  const allItems = [];
+  const groupErrors = [];
+  // v2.2.9.100: 每 SKU 一组，并发 5 提交（97 组 5 并发 ≈ 20 轮 × 每组 3 请求）
+  const groupList = [...groups.entries()].map(([cat, g]) => ({ cat, g }));
+  const GROUP_CONCURRENCY = 2;
+  let groupCursor = 0;
+  const runGroupWorker = async () => {
+    while (groupCursor < groupList.length) {
+      const { cat, g } = groupList[groupCursor];
+      groupCursor += 1;
+      // v2.2.9.100: 每组独立容错 — 一组失败不丢其他组（之前一组抛错导致整个批次 0 提交）
+      try {
+        const lvl3Name = extractPortalCategoryLvl3Name(g.variants.find(Boolean));
+        const bundleId = await portalWithRetry(() => portalCreateBundle(companyId, preferTabId), "create-bundle", 3);
+        await portalWithRetry(() => portalUpdateBundleItems(bundleId, companyId, g.items, preferTabId, lvl3Name), "update-bundle-items", 3);
+        const taskId = await portalWithRetry(() => portalUploadBundle(bundleId, companyId, preferTabId), "upload-bundle", 3);
+        taskIds.push(taskId);
+        bundleIds.push(bundleId);
+        for (const i of g.items) allItems.push(i);
+        console.log(`[SW ${VERSION}] portal 分组提交: cat=${cat} items=${g.items.length} bundle=${bundleId} task=${taskId}`);
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 300);
+        groupErrors.push({ category: cat, count: g.items.length, error: msg });
+        console.warn(`[SW ${VERSION}] portal 分组提交失败: cat=${cat} items=${g.items.length} err=${msg}`);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(GROUP_CONCURRENCY, Math.max(1, groupList.length)) }, runGroupWorker));
+  // v2.2.9.100: 不再原地轮询 upload task（省 0~2.5 分钟/店）— 提交即返回，
+  //   真实上架结果由服务端后台 pollPendingListingTasks(每 60s) 通过查 product 确认
   return {
     viaPortal: true,
     company_id: companyId,
-    bundle_id: bundleId,
-    task_id: taskId,
-    upload_task_id: taskId,
-    items: items.map(i => ({ offer_id: i.offer_id, name: i.name, image: i.primary_image || (i.images || [])[0] || "" })),
+    bundle_id: bundleIds[0] || "",
+    task_id: taskIds[0] || "",
+    upload_task_id: taskIds[0] || "",
+    task_ids: taskIds,
+    task_count: taskIds.length,
+    item_count: allItems.length,
+    group_errors: groupErrors,
+    task_status: "processing",
+    task_reason: "已提交，后台确认中",
+    task_processed: 0,
+    task_failed: 0,
+    items: allItems.map(i => ({ offer_id: i.offer_id, name: i.name, image: i.primary_image || (i.images || [])[0] || "" })),
   };
 }
 
@@ -4104,13 +4418,17 @@ async function collectRichContentFromOzonPage(sku) {
   if (!data.attributes.some(a => a.id === 9048)) {
     let model = "";
     if (data.name) {
+      // v2.2.9.100: 先清洗标题（去 " - купить на OZON"），避免把 OZON/купить 当型号
+      const cleanName = cleanOzonTitle(data.name);
       // 1) 取第一个逗号前的主段 (去掉尺寸/容量/颜色等后缀)
-      const mainPart = data.name.split(",")[0].trim();
+      const mainPart = cleanName.split(",")[0].trim();
       // 2) 过滤掉通用俄文词 (帐篷/旅行/大型/参数等), 剩下的英文+数字+括号当型号
       const tokens = mainPart.split(/\s+/);
       const genericRu = /^(большой|маленький|туристический|походный|складной|детский|зимний|летний|домашний|уличный|портативный|новый|оригинальный|универсальный|легкий|тяжелый)$/i;
       const kept = tokens.filter(t => {
         if (genericRu.test(t)) return false;
+        // v2.2.9.100: 平台词(ozon/купить)永远不当型号
+        if (/^(ozon|купить|buy|покупать)$/i.test(t)) return false;
         // 跳过纯俄文长词 (形容词)
         if (/^[А-Яа-яЁё]{4,}$/.test(t) && !/[A-Za-z]/.test(t)) return false;
         // 跳过纯数字 / 数字+单位
@@ -4236,18 +4554,28 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.action === "collectSkus") {
     const skus = msg.skus || [];
     const storeIds = msg.storeIds || [];  // v2.1: ERP 传店铺 ID
+    const silent = msg.silent === true;   // v2.2.9.100: 批量上架静默采集（不弹 Ozon 标签页）
     (async () => {
       const results = {};
       const errors = {};
-      console.log(`[SW ${VERSION}] collectSkus 开始: ${skus.length} 个 SKU, ${storeIds.length} 个店铺`);
-      for (const sku of skus) {
-        try {
-          results[sku] = await collectSku(sku, storeIds);
-        } catch (e) {
-          errors[sku] = e.message;
-          console.error(`[SW ${VERSION}] ✗ 采集失败 ${sku}:`, e.message);
+      console.log(`[SW ${VERSION}] collectSkus 开始: ${skus.length} 个 SKU, ${storeIds.length} 个店铺, silent=${silent}`);
+      // v2.2.9.100: 并发 5 个采集提速（静默走 seller portal API，风控风险低）
+      const CONCURRENCY = 5;
+      const queue = [...skus];
+      let cursor = 0;
+      const runWorker = async () => {
+        while (cursor < queue.length) {
+          const sku = queue[cursor];
+          cursor += 1;
+          try {
+            results[sku] = await collectSku(sku, storeIds, null, { silent });
+          } catch (e) {
+            errors[sku] = e.message;
+            console.error(`[SW ${VERSION}] ✗ 采集失败 ${sku}:`, e.message);
+          }
         }
-      }
+      };
+      await Promise.all(Array.from({ length: Math.min(CONCURRENCY, Math.max(1, queue.length)) }, runWorker));
       const okCount = Object.keys(results).length;
       const failCount = Object.keys(errors).length;
       console.log(`[SW ${VERSION}] collectSkus 完成: ${okCount} 成功, ${failCount} 失败`);

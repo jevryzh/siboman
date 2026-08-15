@@ -15,7 +15,7 @@
   "use strict";
   const PROTO = "__zhumeng_proto";
   const PROTO_VAL = "zhumeng-v1";
-  const VERSION = "2.2.9.75";
+  const VERSION = "2.2.9.100";
 
   console.log(`[逐梦采集器 v${VERSION}][ISO] 启动, 监听 window message`);
 
@@ -87,13 +87,14 @@
     if (kind === "collect.request") {
       const skus = data.skus || [];
       const storeIds = data.storeIds || [];
-      console.log(`[逐梦采集器 v${VERSION}][ISO] collect.request: ${skus.length} SKU, ${storeIds.length} stores`);
+      const silent = data.silent === true;   // v2.2.9.100: 透传静默采集标记，否则 background 走开 tab 采集
+      console.log(`[逐梦采集器 v${VERSION}][ISO] collect.request: ${skus.length} SKU, ${storeIds.length} stores, silent=${silent}`);
       if (!skus.length) {
         replyToMain(reqId, "collect.response", { ok: false, error: "skus 为空" });
         return;
       }
       try {
-        const resp = await chrome.runtime.sendMessage({ action: "collectSkus", skus, storeIds });
+        const resp = await chrome.runtime.sendMessage({ action: "collectSkus", skus, storeIds, silent });
         console.log(`[逐梦采集器 v${VERSION}][ISO] collect 完成 ok=${resp?.ok} 成功=${Object.keys(resp?.results || {}).length}`);
         replyToMain(reqId, "collect.response", resp);
       } catch (e) {

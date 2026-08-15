@@ -199,7 +199,7 @@
       "riskLevel": "external_write_impact",
       "readonlyAcceptance": [
         "Paste parsing shows item validity, category resolution confidence, multi-image payload, rich content, stock, warehouse, and per-store readiness before publish.",
-        "Plugin freshness is checked before collection; publish prefers official import-by-sku and keeps Seller Portal as a disabled fallback.",
+        "Plugin freshness is checked before collection; publish prefers Seller Portal silent bundle upload and falls back to official import-by-sku when the portal channel fails.",
         "Completion copy distinguishes Ozon task submitted/processing from final success."
       ],
       "authorizationAcceptance": [
@@ -496,9 +496,9 @@
       "viewFile": "public/js/views/MarketDiscovery.js",
       "riskLevel": "requires_authorization",
       "readonlyAcceptance": [
-        "Auto-listing overview shows daily quota progress, pipeline stage counts, processing items, and recent events.",
-        "Market opportunities use independent Ozon platform data, show source name, capture time, Chinese category, and can be explicitly added to the auto-listing queue.",
-        "Pipeline items expose current stage, status, risk level, human-handling reason, and next action without silently publishing to Ozon."
+        "Ozon opportunity pool shows daily collection status, product candidate counts, source name, capture time, and Chinese category names.",
+        "Market opportunities use independent Ozon platform data and can be explicitly added to the sourcing candidate queue.",
+        "Pipeline items expose current stage, status, risk level, human-handling reason, and next action; 1688 sourcing only starts after user-selected candidates are manually advanced."
       ],
       "authorizationAcceptance": [
         "Discovering opportunities and queue operations are authenticated and current-store scoped.",
@@ -509,7 +509,8 @@
       ],
       "localSmoke": {
         "viewContains": [
-          "自动上架",
+          "Ozon 机会池不会自动跑 1688",
+          "加入找货候选",
           "商品流水线",
           "规则中心",
           "split(',').map(value => value.trim()).find(Boolean)"
@@ -522,6 +523,8 @@
           "CREATE TABLE IF NOT EXISTS app_top_lists",
           "CREATE TABLE IF NOT EXISTS app_china_sellers",
           "/api/sourcing/bestsellers",
+          "/api/sourcing/opportunity-collector/status",
+          "/api/sourcing/opportunity-collector/run",
           "/api/sourcing/bestsellers/import",
           "/api/sourcing/china-zone",
           "req.user.role !== 'admin'",

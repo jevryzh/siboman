@@ -3,6 +3,7 @@ window.DashboardView = {
     const loading = Vue.ref(false);
     const syncLoading = Vue.ref(false);
     const syncingStore = Vue.ref(null);   // 单店同步 loading
+    const dataAgeText = Vue.ref('实时数据');
     const summary = Vue.ref({
       today_orders: 0, today_gmv: 0,
       yesterday_orders: 0, yesterday_gmv: 0,
@@ -46,6 +47,10 @@ window.DashboardView = {
           },
         });
         if (res.data.success) {
+          // v2.2.9.78: 显示缓存新鲜度（服务端 60s 结果缓存，秒开）
+          dataAgeText.value = res.data.cached === true
+            ? `缓存更新于 ${Number(res.data.ageSeconds || 0)}s 前`
+            : '实时数据';
           const s = res.data.summary || {};
           // 物理兜底: 所有数值字段确保非 null/undefined
           const num = (x) => Number(x || 0);
@@ -148,7 +153,7 @@ window.DashboardView = {
 
     return {
       summary, storeComparison, trends, recentJobs, loading,
-      syncLoading, syncingStore, trendRange, setTrendRange,
+      syncLoading, syncingStore, trendRange, setTrendRange, dataAgeText,
       fetchDashboard,
       fmtMoney, fmtPct, fmtRate, fmtNum0, fmtMoney0, fmtPct0,
       goToStores, goToCollection, goToOrders, goToProducts, goToAIImage, goToInventory,
@@ -162,7 +167,7 @@ window.DashboardView = {
       <div style="background: #fff; padding: 14px 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.04); display: flex; justify-content: space-between; align-items: center">
         <div style="display: flex; align-items: center; gap: 12px">
           <span style="font-size: 20px; font-weight: 800; color: #303133">📊 经营仪表盘</span>
-          <el-tag size="small" type="info" effect="plain">实时数据</el-tag>
+          <el-tag size="small" type="info" effect="plain">{{ dataAgeText }}</el-tag>
         </div>
         <div style="display: flex; gap: 10px; align-items: center">
           <el-button size="small" @click="fetchDashboard" :icon="undefined" style="border-radius: 8px">

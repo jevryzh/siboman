@@ -86,7 +86,7 @@ const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || "agnes-image-2.0-flas
 const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD || 0);
 const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
-const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.75";
+const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.100";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -98,6 +98,7 @@ const DISABLE_SERVER_SCRAPER = /^(1|true|yes)$/i.test(process.env.DISABLE_SERVER
 const SERVER_SINGLE_SOURCING = /^(1|true|yes)$/i.test(process.env.SERVER_SINGLE_SOURCING || "");
 const WORKER_ONLINE_WINDOW_MS = Number(process.env.WORKER_ONLINE_WINDOW_MS || 45000);
 const WORKER_JOB_STALE_MS = Number(process.env.WORKER_JOB_STALE_MS || 10 * 60 * 1000);
+const WORKER_JOB_RECLAIM_MS = Number(process.env.WORKER_JOB_RECLAIM_MS || 90 * 1000);
 const WORKER_IDLE_JOB_RESCUE_MS = Number(process.env.WORKER_IDLE_JOB_RESCUE_MS || 90 * 1000);
 const WORKER_LOST_JOB_RESCUE_MS = Number(process.env.WORKER_LOST_JOB_RESCUE_MS || 120 * 1000);
 const PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS = Number(process.env.PLATFORM_SNAPSHOT_REFRESH_INTERVAL_MS || 0);
@@ -1702,7 +1703,7 @@ app.post("/api/browser/close", async (_req, res) => {
   }
 });
 
-async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, userId = null, baseUrl = OZON_SELLER_BASE_URL } = {}) {
+async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, userId = null, baseUrl = OZON_SELLER_BASE_URL, timeoutMs = 60000 } = {}) {
   let clientId = OZON_SELLER_CLIENT_ID;
   let apiKey = OZON_SELLER_API_KEY;
 
@@ -1726,16 +1727,28 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
     error.statusCode = 503;
     throw error;
   }
-  const response = await fetch(`${baseUrl}${path}`, {
-    method,
-    headers: {
-      "Client-Id": clientId,
-      "Api-Key": apiKey,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  // v2.2.9.100: 给 Ozon Seller API 调用加超时，避免官方接口慢/挂起时请求无限等待（前端会先超时报"插件超时"）
+  let response;
+  try {
+    response = await fetch(`${baseUrl}${path}`, {
+      method,
+      headers: {
+        "Client-Id": clientId,
+        "Api-Key": apiKey,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(Math.max(15000, Number(timeoutMs) || 60000)),
+    });
+  } catch (fetchError) {
+    if (fetchError && fetchError.name === "TimeoutError") {
+      const error = new Error(`Ozon Seller API 请求超时(${timeoutMs}ms)：${path}`);
+      error.statusCode = 504;
+      throw error;
+    }
+    throw fetchError;
+  }
   const text = await response.text();
   let payload = null;
   if (text) {
@@ -2446,6 +2459,66 @@ app.post("/api/seller/products/unarchive", requireAuth, async (req, res) => {
   } catch (error) {
     console.error("[unarchive]", error.message, error.payload);
     res.status(error.statusCode || 500).json({ success: false, error: error.message, payload: error.payload || null });
+  }
+});
+
+/**
+ * v2.2.9.100 批量恢复归档商品 - 供批量上架提交前调用
+ * 输入: store_id + offer_id[]
+ * 行为: 查 Ozon 这些 offer_id 的归档状态 → 已归档的自动 unarchive 恢复可见性
+ * 输出: { checked, restored: product_id[], archived: [{offer_id, product_id}] }
+ */
+app.post("/api/seller/products/bulk-restore", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const userId = req.user.id;
+    let offerIds = req.body?.offer_id || [];
+    if (!Array.isArray(offerIds)) offerIds = [offerIds];
+    offerIds = offerIds.map(v => String(v || "").trim()).filter(Boolean).slice(0, 200);
+    if (!offerIds.length) return res.json({ success: true, checked: 0, restored: [], archived: [] });
+
+    let items = [];
+    try {
+      const data = await callOzonSellerAPI("/v3/product/list", {
+        filter: { offer_id: offerIds, visibility: "ALL" },
+        limit: Math.min(100, offerIds.length),
+      }, { storeId, userId });
+      items = data?.result?.items || [];
+    } catch (e) {
+      console.warn("[bulk-restore] 查询归档状态失败:", e.message);
+      return res.json({ success: true, checked: offerIds.length, restored: [], archived: [], error: e.message });
+    }
+    // v2.2.9.100: 去重检测 — 返回已存在的 offer_id（无论归档/在售），供前端提示"已上架过，跳过"
+    const exists = items.map(i => i.offer_id).filter(Boolean);
+    const archived = items.filter(i => i.archived === true);
+    const archivedIds = archived.map(i => Number(i.product_id)).filter(x => Number.isFinite(x) && x > 0);
+    let restored = [];
+    if (archivedIds.length) {
+      try {
+        const data = await callOzonSellerAPI("/v1/product/unarchive", { product_id: archivedIds }, { storeId, userId });
+        restored = archivedIds;
+        console.log(`[bulk-restore] 已恢复归档商品 ${restored.length} 个: ${archived.map(i => i.offer_id).join(", ")}`);
+        await db.query(
+          `UPDATE app_products SET status = 'READY_TO_SUPPLY', updated_at = now()
+           WHERE user_id = $1 AND store_id = $2 AND product_id = ANY($3::bigint[])`,
+          [userId, storeId, archivedIds],
+        );
+      } catch (e) {
+        console.error("[bulk-restore] unarchive 失败:", e.message);
+      }
+    }
+    res.json({
+      success: true,
+      checked: offerIds.length,
+      restored,
+      exists,
+      archived: archived.map(i => ({ offer_id: i.offer_id, product_id: i.product_id })),
+    });
+  } catch (error) {
+    console.error("[bulk-restore]", error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
@@ -5800,11 +5873,27 @@ app.post("/api/finance/product-cost", requireAuth, async (req, res, next) => {
  *   - app_products 本地聚合 (在售/库存预警)
  *   - app_stores 多店对比
  * 金额: 严格按 v0.3.5c 币种感知 (CNY 直读, RUB × 0.0862)
+ * v2.2.9.100 提速: 每店订单合并为 1 次 7 天全量查询(内存分桶/过滤), 并加 60s 结果缓存
  */
+const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 60 * 1000);
+const dashboardCache = new Map();  // key=`userId:range` → { at, data }
+
 app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const userId = req.user.id;
+    const range = Math.min(30, Math.max(7, Number(req.query.range) || 7));
+    // v2.2.9.100: 结果缓存 — TTL 内重复打开/刷新秒回，显著降低 Ozon API 压力与页面加载耗时
+    const cacheKey = `dashboard:${userId}:${range}`;
+    const cachedEntry = dashboardCache.get(cacheKey);
+    if (cachedEntry && Date.now() - cachedEntry.at < DASHBOARD_CACHE_TTL_MS) {
+      return res.json({
+        ...cachedEntry.data,
+        cached: true,
+        ageSeconds: Math.round((Date.now() - cachedEntry.at) / 1000),
+        generated_at: new Date(cachedEntry.at).toISOString(),
+      });
+    }
     const rateResult = await db.query(
       `SELECT rate FROM app_exchange_rates
         WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
@@ -5812,7 +5901,6 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     );
     const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
     const convertRub = value => Math.round(Number(value || 0) * effectiveRubCnyRate * 100) / 100;
-    const range = Math.min(30, Math.max(7, Number(req.query.range) || 7));
     const now = new Date();
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const weekAgo = new Date(now.getTime() - range * 86400e3);
@@ -5905,16 +5993,16 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     };
 
     // 4. 并行拉每个店铺的数据 (v0.5.1: 加昨日对比 + 争议单)
+    // v2.2.9.100: 合并为 1 次 7 天全量查询，内存分桶/过滤 today/yesterday/各状态（原来 7 次 Ozon API → 1 次）
     const storeData = await Promise.all(stores.map(async (store) => {
-      const [todayOrders, yesterdayOrders, weekOrders, awaitingPkg, awaitingDel, returns, arbitration] = await Promise.all([
-        fetchStoreOrders(store, todayStartISO, nowISO, "all"),
-        fetchStoreOrders(store, yesterdayStartISO, todayStartISO, "all"),   // 昨日对比基数
-        fetchStoreOrders(store, weekAgoISO, nowISO, "all"),
-        fetchStoreOrders(store, weekAgoISO, nowISO, "awaiting_packaging"),
-        fetchStoreOrders(store, weekAgoISO, nowISO, "awaiting_deliver"),
-        fetchStoreOrders(store, weekAgoISO, nowISO, "cancelled"),
-        fetchStoreOrders(store, weekAgoISO, nowISO, "arbitration"),         // 真实争议单
-      ]);
+      const weekOrders = await fetchStoreOrders(store, weekAgoISO, nowISO, "all");
+      const postingTime = (o) => new Date(o.in_process_at || o.created_at || 0).getTime();
+      const todayOrders = weekOrders.filter(o => postingTime(o) >= todayStart.getTime() && postingTime(o) <= now.getTime() + 1000);
+      const yesterdayOrders = weekOrders.filter(o => postingTime(o) >= yesterdayStart.getTime() && postingTime(o) < todayStart.getTime());
+      const awaitingPkg = weekOrders.filter(o => String(o.status || "") === "awaiting_packaging");
+      const awaitingDel = weekOrders.filter(o => String(o.status || "") === "awaiting_deliver");
+      const returns = weekOrders.filter(o => String(o.status || "") === "cancelled");
+      const arbitration = weekOrders.filter(o => String(o.status || "") === "arbitration");
 
       // 今日 GMV + Payout
       let todayGmv = 0, todayPayout = 0;
@@ -6176,7 +6264,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     }))).slice(0, 20);
     const cleanStoreComparison = storeData.map(({ _dailyBuckets, _recentOrders, _stockWarnings, ...rest }) => rest);
 
-    res.json({
+    const dashboardPayload = {
       success: true,
       summary,
       store_comparison: cleanStoreComparison,
@@ -6185,7 +6273,17 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       recent_orders: recentOrders,
       stock_warnings: stockWarnings,
       generated_at: nowISO,
-    });
+    };
+    // v2.2.9.100: 写入结果缓存；Map 超限时清理最旧一半，防止长期运行内存膨胀
+    if (dashboardCache.size > 500) {
+      const oldestKeys = [...dashboardCache.entries()]
+        .sort((a, b) => a[1].at - b[1].at)
+        .slice(0, Math.floor(dashboardCache.size / 2))
+        .map(([k]) => k);
+      for (const k of oldestKeys) dashboardCache.delete(k);
+    }
+    dashboardCache.set(cacheKey, { at: Date.now(), data: dashboardPayload });
+    res.json(dashboardPayload);
   } catch (error) {
     console.error("[dashboard] 统计失败:", error);
     next(error);
@@ -9578,6 +9676,14 @@ async function applyListingAttributesAfterImport(row) {
 const POLL_INTERVAL_MS = 60 * 1000;
 const POLL_BATCH = 50;
 
+// v2.2.9.100: poll 单任务超时保护 — 防止某条 Ozon 调用卡死整个 cycle，导致新任务确认被无限延后
+function withPollTaskTimeout(promiseFactory, timeoutMs = 30000) {
+  return Promise.race([
+    Promise.resolve().then(promiseFactory),
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`poll task timeout ${timeoutMs}ms`)), timeoutMs)),
+  ]);
+}
+
 async function pollPendingListingTasks() {
   if (!db) return;
   try {
@@ -9601,7 +9707,8 @@ async function pollPendingListingTasks() {
              )
            )
          )
-       ORDER BY created_at DESC LIMIT $1`,
+       -- v2.2.9.100: processing/pending（待确认创建）优先于 imported 补全，避免新提交被历史任务挤掉
+       ORDER BY CASE WHEN status IN ('processing','pending') THEN 0 ELSE 1 END, created_at DESC LIMIT $1`,
       [POLL_BATCH],
     );
     if (!r.rows.length) return;
@@ -9611,12 +9718,15 @@ async function pollPendingListingTasks() {
         const rawPayload = row.raw_payload && typeof row.raw_payload === "object" ? row.raw_payload : {};
         if (rawPayload.via_portal === true || rawPayload.via_portal === "true") {
           if (row.status === "imported") {
-            await applyListingAttributesAfterImport(row);
-            await applyListingStocksAfterImport(row);
+            // v2.2.9.100: 跳过补全（提交时已带图片/属性/富文本/库存），只 touch 防超时
+            await db.query(
+              `UPDATE app_listing_history SET updated_at = now() WHERE task_id = $1 AND user_id = $2`,
+              [row.task_id, row.user_id],
+            );
             updated++;
             continue;
           }
-          const info = await callOzonSellerAPI("/v3/product/info/list", { offer_id: [String(row.offer_id)] }, { storeId: row.store_id, userId: row.user_id });
+          const info = await withPollTaskTimeout(() => callOzonSellerAPI("/v3/product/info/list", { offer_id: [String(row.offer_id)] }, { storeId: row.store_id, userId: row.user_id }), 30000);
           const productId = Number((info?.items || [])[0]?.id || 0);
           if (!productId) {
             await db.query(
@@ -9637,20 +9747,21 @@ async function pollPendingListingTasks() {
               WHERE task_id = $2 AND user_id = $3`,
             [productId, row.task_id, row.user_id],
           );
-          await applyListingAttributesAfterImport(portalRow);
-          await applyListingStocksAfterImport(portalRow);
+          // v2.2.9.100: 跳过属性/库存补全（提交已带）
           console.log(`[poll-pending] portal task=${row.task_id} offer=${row.offer_id} → imported product=${productId}`);
           updated++;
           continue;
         }
         if (row.status === "imported") {
-          await applyListingPicturesAfterImport(row);
-          await applyListingAttributesAfterImport(row);
-          await applyListingStocksAfterImport(row);
+          // v2.2.9.100: imported 跳过补图/补属性/补库存 — 提交时已带完整数据，避免堆积任务拖垮 poll
+          await db.query(
+            `UPDATE app_listing_history SET updated_at = now() WHERE task_id = $1 AND user_id = $2`,
+            [row.task_id, row.user_id],
+          );
           updated++;
           continue;
         }
-        const data = await callOzonSellerAPI("/v1/product/import/info", { task_id: String(row.task_id) }, { storeId: row.store_id, userId: row.user_id });
+        const data = await withPollTaskTimeout(() => callOzonSellerAPI("/v1/product/import/info", { task_id: String(row.task_id) }, { storeId: row.store_id, userId: row.user_id }), 30000);
         const it = (data?.result?.items || [])[0];
         if (!it) continue;
         const ozonStatus = it.status || "unknown";
@@ -10258,20 +10369,27 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // v2.2.9.6: attribute 9048 (Название модели) 兜底
     //   Ozon 17029010 (天幕) 等类目必填 attribute 9048, 不填 Ozon 接受商品但报 error_attribute_values_empty
     //   plugin v2.2.9.5+ 应该从 name 提取, 这里 server 端再兜底一次 (plugin 旧版本也不会漏)
+    // v2.2.9.100: 先清洗标题(去 " - купить на OZON")且排除平台词, 避免把 OZON/купить 当型号被拒
     const has9048 = Array.isArray(item.attributes) && item.attributes.some(a => Number(a.id) === 9048);
     if (!has9048 && item.name && item.name.length >= 3) {
-      const mainPart = String(item.name).split(",")[0].trim();
+      const cleanName = String(item.name)
+        .replace(/\s*-\s*(?:купить|buy|покупать)\s+(?:на\s+)?OZON\s*$/i, "")
+        .replace(/\s*-\s*OZON\s*$/i, "")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      const mainPart = cleanName.split(",")[0].trim();
       const tokens = mainPart.split(/\s+/);
       const genericRu = /^(большой|маленький|туристический|походный|складной|детский|зимний|летний|домашний|уличный|портативный|новый|оригинальный|универсальный|легкий|тяжелый)$/i;
       const kept = tokens.filter(t => {
         if (genericRu.test(t)) return false;
+        if (/^(ozon|купить|buy|покупать)$/i.test(t)) return false;
         if (/^[А-Яа-яЁё]{4,}$/.test(t) && !/[A-Za-z]/.test(t)) return false;
         if (/^\d+([.,]\d+)?$/.test(t)) return false;
         if (/^\d+\s*(см|мм|м|г|кг|л|мл|w|wt|hz|×|х)$/i.test(t)) return false;
         return true;
       });
       const model = kept.join(" ").trim();
-      if (model && model.length >= 2) {
+      if (model && model.length >= 2 && !/^ozon$/i.test(model)) {
         if (!Array.isArray(item.attributes)) item.attributes = [];
         item.attributes.push({ id: 9048, values: [{ value: model }] });
         console.log(`[v2.2.9.6 import] attribute 9048 (Название модели) 兜底: "${model}"`);
@@ -11068,16 +11186,24 @@ app.post("/api/batch-ozon/jobs", async (req, res, next) => {
 
 app.get("/api/jobs/:id", async (req, res, next) => {
   try {
+    // v2.2.9.100: light=1 供前端进度轮询 — 不返回大 results JSONB（只给数量），
+    //   避免 5s 轮询每次都传输几 MB 的 77 行结果数据
+    const light = String(req.query.light || "").trim() === "1" || String(req.query.light || "").trim() === "true";
+    const truncateForLight = (job) => {
+      if (!job || !light) return job;
+      const resultCount = Array.isArray(job.results) ? job.results.length : Number(job.processed || 0);
+      return { ...job, results: [], resultsTruncated: true, resultCount };
+    };
     if (db) {
       const job = await getDbJobForUser(req.params.id, req.user);
       if (job) {
-        res.json({ success: true, job });
+        res.json({ success: true, job: truncateForLight(job) });
         return;
       }
     }
     const runtimeJob = jobs.get(req.params.id);
     if (runtimeJob) {
-      res.json({ success: true, job: serializeJob(runtimeJob) });
+      res.json({ success: true, job: truncateForLight(serializeJob(runtimeJob)) });
       return;
     }
     const storedJob = await loadStoredJob(req.params.id);
@@ -11085,7 +11211,7 @@ app.get("/api/jobs/:id", async (req, res, next) => {
       res.status(404).json({ success: false, error: "任务不存在。" });
       return;
     }
-    res.json({ success: true, job: storedJob });
+    res.json({ success: true, job: truncateForLight(storedJob) });
   } catch (error) {
     next(error);
   }
@@ -16571,18 +16697,42 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
     ? options.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
     : [];
   const tokenStoreId = isScopedWorkerUser(user) ? String(user.tokenStoreId || "").trim() : "";
+  // 超时任务重新领取 — 插件掉线后 claimed/running 任务在 reclaim 窗口内自动被续跑（对齐生产旧版机制）。
+  // 守卫：
+  //   ① 排除服务器侧收尾阶段（服务器 AI 审核/生成 Excel），避免 complete 处理中被抢单重复执行；
+  //   ② 排除心跳仍新鲜的任务（该 job 的 current_job_id 心跳在 online 窗口内），避免抢活插件正在跑的任务。
+  const reclaimMs = Math.max(60000, WORKER_JOB_RECLAIM_MS);
+  const heartbeatOnlineMs = Math.max(30000, WORKER_ONLINE_WINDOW_MS);
   try {
     await client.query("BEGIN");
     const selected = await client.query(
       `SELECT j.*
        FROM app_jobs j
-       WHERE j.user_id = $1 AND j.status = 'queued'
+       WHERE j.user_id = $1
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
          AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
-       ORDER BY j.created_at ASC
+         AND (
+           j.status = 'queued'
+           OR (
+             j.kind = 'run'
+             AND j.status IN ('claimed','running')
+             AND COALESCE(j.processed, 0) < COALESCE(j.total, 0)
+             AND j.updated_at < now() - ($4::int * interval '1 millisecond')
+             AND NOT (j.phase LIKE '服务器%' OR j.phase LIKE '%生成 Excel%')
+             AND NOT EXISTS (
+               SELECT 1 FROM app_worker_heartbeats h
+               WHERE h.user_id = j.user_id AND h.current_job_id = j.id
+                 AND h.last_seen_at > now() - ($5::int * interval '1 millisecond')
+             )
+           )
+         )
+       ORDER BY
+         CASE WHEN j.status = 'queued' THEN 0 ELSE 1 END,
+         j.updated_at ASC,
+         j.created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`,
-      [user?.id || "", kinds, tokenStoreId || null],
+      [user?.id || "", kinds, tokenStoreId || null, reclaimMs, heartbeatOnlineMs],
     );
     if (!selected.rowCount) {
       await client.query("COMMIT");
@@ -16590,16 +16740,24 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
     }
     const row = selected.rows[0];
     const logs = Array.isArray(row.logs) ? row.logs : [];
-    logs.push(makeLogEntry(`${workerLabel} 已领取任务。`));
+    const reclaimed = row.status !== "queued";
+    if (reclaimed) {
+      const processed = Number(row.processed || 0);
+      const total = Number(row.total || 0);
+      const nextText = total > 0 ? `第 ${Math.min(processed + 1, total)}/${total} 条` : "断点";
+      logs.push(makeLogEntry(`${workerLabel} 已重新领取超时未推进任务，将从${nextText}继续。`, "warn"));
+    } else {
+      logs.push(makeLogEntry(`${workerLabel} 已领取任务。`));
+    }
     const updated = await client.query(
       `UPDATE app_jobs
        SET status = 'claimed',
-           phase = '本机采集端已领取，等待开始采集',
+           phase = $3,
            logs = $2::jsonb,
            updated_at = now()
        WHERE id = $1
        RETURNING *`,
-      [row.id, JSON.stringify(logs)],
+      [row.id, JSON.stringify(logs), reclaimed ? "采集端已重新领取，从断点继续" : "本机采集端已领取，等待开始采集"],
     );
     await client.query("COMMIT");
     return dbRowToJob(updated.rows[0]);
@@ -16752,8 +16910,14 @@ async function loadDbJobHistory(user) {
     params.push(user?.id || "");
     where = `j.user_id = $1`;
   }
+  // v2.2.9.100: 不再 SELECT j.* — 大 results JSONB 逐个解析会让历史列表很慢。
+  // 只拉展示所需列，result_count 用 SQL 端 jsonb_array_length 计算。
   const result = await db.query(
-    `SELECT j.*, u.username, u.display_name
+    `SELECT j.id, j.kind, j.status, j.phase, j.processed, j.total,
+            j.source_total, j.source_start_row, j.download_url, j.last_downloaded_at,
+            j.created_at, j.updated_at, j.payload,
+            COALESCE(jsonb_array_length(j.results), 0) AS result_count,
+            u.username, u.display_name
      FROM app_jobs j
      LEFT JOIN app_users u ON u.id = j.user_id
      WHERE ${where}
@@ -16761,30 +16925,32 @@ async function loadDbJobHistory(user) {
      LIMIT 200`,
     params,
   );
-  const items = result.rows.map((row) => {
-    const job = dbRowToJob(row);
-    return {
-      id: job.id,
-      kind: job.kind,
-      status: job.status,
-      phase: job.phase,
-      createdAt: job.createdAt,
-      updatedAt: job.updatedAt,
-      processed: job.processed,
-      resultCount: job.results.length || job.processed || job.total || 0,
-      sourceStartRow: job.sourceStartRow,
-      sourceTotal: job.sourceTotal,
-      firstRow: job.payload?.urlRows?.[0]?.sourceRow || "",
-      lastRow: job.payload?.urlRows?.at?.(-1)?.sourceRow || "",
-      firstUrl: job.payload?.urls?.[0] || job.payload?.sourceUrl || "",
-      excelExists: Boolean(job.downloadUrl),
-      excelBytes: 0,
-      downloadUrl: job.downloadUrl,
-      derived: false,
-      owner: job.owner,
-      lastDownloadedAt: row.last_downloaded_at || "",
-    };
-  });
+  const items = result.rows.map((row) => ({
+    id: row.id,
+    kind: row.kind,
+    status: row.status,
+    phase: row.phase || "",
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    processed: Number(row.processed || 0),
+    total: Number(row.total || 0),
+    resultCount: Number(row.result_count || 0) || Number(row.processed || 0) || Number(row.total || 0),
+    sourceStartRow: Number(row.source_start_row || 1),
+    sourceTotal: Number(row.source_total || 0),
+    firstRow: row.payload?.urlRows?.[0]?.sourceRow || "",
+    lastRow: row.payload?.urlRows?.at?.(-1)?.sourceRow || "",
+    firstUrl: row.payload?.urls?.[0] || row.payload?.sourceUrl || "",
+    excelExists: Boolean(row.download_url),
+    excelBytes: 0,
+    downloadUrl: row.download_url || "",
+    derived: false,
+    owner: row.username ? {
+      id: row.user_id,
+      username: row.username,
+      displayName: row.display_name || row.username,
+    } : null,
+    lastDownloadedAt: row.last_downloaded_at || "",
+  }));
   const todayKey = dateKeyInShanghai(new Date());
   const todayItems = items.filter((item) => dateKeyInShanghai(item.createdAt || item.updatedAt) === todayKey);
   return {

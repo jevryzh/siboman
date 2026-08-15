@@ -145,7 +145,20 @@ const initApp = () => {
         window.dispatchEvent(new CustomEvent('shop-changed', { detail: val }));
       };
 
+      // v2.2.9.81: 顶部导航插件下载 — 版本号动态读 manifest，升插件后无需改代码
+      const pluginDownloadUrl = Vue.ref('/extension/zhumeng-collector.zip');
+      const fetchPluginDownloadUrl = async () => {
+        try {
+          const res = await fetch('/extension/zhumeng-collector/manifest.json');
+          const m = await res.json();
+          pluginDownloadUrl.value = `/extension/zhumeng-collector.zip?v=${encodeURIComponent(String(m.version || ''))}`;
+        } catch {
+          pluginDownloadUrl.value = '/extension/zhumeng-collector.zip';
+        }
+      };
+
       Vue.onMounted(fetchInitData);
+      Vue.onMounted(fetchPluginDownloadUrl);
 
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
@@ -155,6 +168,7 @@ const initApp = () => {
         if (path === '#/screen') return 'data-screen';
         if (path === '#/ranking') return 'market-discovery';
         if (path.includes('dashboard')) return 'dashboard';
+        if (path.includes('single-sourcing-review')) return 'single-sourcing-review';
         if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
@@ -171,7 +185,7 @@ const initApp = () => {
         return 'dashboard';
       });
 
-      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange, buildInfo, envLabel };
+      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange, buildInfo, envLabel, pluginDownloadUrl };
     },
     template: `
       <el-container class="layout-container" v-loading="!isReady">
@@ -233,6 +247,11 @@ const initApp = () => {
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
               <shop-switcher v-if="routeName !== 'orders'" @change="handleStoreChange" />
+              <el-tooltip content="下载最新版 Chrome 采集插件 zip（解压后在扩展程序页加载已解压的文件夹）" placement="bottom">
+                <a :href="pluginDownloadUrl" target="_blank" rel="noreferrer" style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; color:#475569; font-size:12px; text-decoration:none; white-space:nowrap">
+                  📦 插件下载
+                </a>
+              </el-tooltip>
               <el-tooltip :content="buildInfo.buildTime ? ('构建时间：' + buildInfo.buildTime) : '版本信息读取中'" placement="bottom">
                 <el-tag size="small" :type="envLabel === '生产环境' ? 'success' : envLabel === '测试环境' ? 'warning' : 'info'">
                   {{ envLabel }}<span v-if="buildInfo.version"> · {{ buildInfo.version }}</span>
@@ -247,6 +266,7 @@ const initApp = () => {
           <el-main class="erp-main">
             <div v-if="routeName === 'dashboard'" class="erp-route-page"><dashboard-view /></div>
             <div v-else-if="routeName === 'sourcing'" class="erp-route-page"><market-discovery-view /></div>
+            <div v-else-if="routeName === 'single-sourcing-review'" class="erp-route-page"><single-sourcing-review-view /></div>
             <div v-else-if="routeName === 'single-sourcing'" class="erp-route-page"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
@@ -283,6 +303,7 @@ const initApp = () => {
   register('collection-edit-drawer', window.CollectionEditDrawer);
   register('dashboard-view', window.DashboardView);
   register('sourcing-module-view', window.SourcingModuleView);
+  register('single-sourcing-review-view', window.SingleSourcingReviewView);
   register('product-list-view', window.ProductListView);
   register('inventory-management-view', window.InventoryManagementView);
   register('order-list-view', window.OrderListView);

@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = '2.2.9.75';
-    const PLUGIN_ZIP_VERSION = '2.2.9.75';
+    const PLUGIN_MANIFEST_VERSION = '2.2.9.100';
+    const PLUGIN_ZIP_VERSION = '2.2.9.100';
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -280,6 +280,10 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.100 批量上架静默采集：采集商品不再打开 Ozon 标签页，直接复用已登录的 seller.ozon.ru 页面走门户 API（/search + 复制商品 bundle）拿全量数据，全程后台执行、Chrome 不弹任何标签（对齐 MY ERP）；仅当 seller 未登录/无标签页时才兜底打开商品页。售价由批量上架页行价格填写（与门户一致不带价）。</li>
+            <li>✅ v2.2.9.78 批量上架恢复 Seller portal 静默上架（对齐 MY ERP 插件）：一次把全店商品提交到草稿再发布，后台执行不弹窗、绕官方 import 限流；已补上传任务轮询，确认真实上架结果（不再"显示提交但后台无商品"）；portal 失败自动回退官方 import-by-sku；Ozon Seller API 调用统一加 60s 超时防挂死，批量上架超时问题缓解。单品找货滑块可续跑：Ozon/1688 遇到滑块、验证码、登录、超时不再整体停止任务，改为该行失败并继续下一行，连续失败 3 次（可配）才停止，人工处理后自动继续。</li>
+            <li>✅ v2.2.9.77 单品找货滑块可续跑（对齐生产）：Ozon/1688 遇到滑块、验证码、登录、超时不再整体停止任务，改为该行失败并继续下一行；连续失败达到阈值（默认 3 次，可配）才停止。你手动处理完滑块后，后续行成功即自动继续，不用重新发任务；失败行原因保留在结果里。批量上架逻辑未调整。</li>
+            <li>✅ v2.2.9.76 单品找货提速+稳定性：找货任务默认跳过 Seller 富化链（复制商品/类目解析等上架用步骤）并对 1688 候选详情启用轻量浏览（保留防风控滚动），单行耗时对标生产；服务端领取任务时支持超时任务重新领取（插件掉线 90s 内自动续跑，不再卡到人工取消）；批量上架逻辑未调整。</li>
             <li>✅ v2.2.9.75 单品找货增强任务续租：行间等待持续回传心跳，服务端可快速救回失联/空闲未收尾任务，避免卡在 N/40 后不继续。</li>
             <li>✅ v2.2.9.72 单品找货识别 Ozon 滑块/验证码页，并给 Ozon/1688 单行采集增加硬超时；停止任务会中断当前步骤，避免卡在 39/40 条仍被心跳保活。</li>
             <li>✅ v2.2.9.63 单品找货降低 1688 风控触发：自适应风控窗口（60s 内失败 / 验证码事件动态拉长下次间隔），normal cooldown 12-22s、连续失败 30-50s/60-90s、触发风控关键字 2-5min 暂停；批量上架逻辑未调整。</li>

@@ -52,7 +52,7 @@ window.SourcingModuleView = {
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const PLUGIN_ZIP_VERSION = "2.2.9.75";
+    const PLUGIN_ZIP_VERSION = "2.2.9.100";
     window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
 
     const handleExtensionMessage = (event) => {
@@ -336,10 +336,20 @@ window.SourcingModuleView = {
         };
       }
       const text = (job.value?.logs || []).map(entry => String(entry?.message || entry || '')).join('\n');
-      if (/验证码|滑块|captcha|verify|验证/.test(text)) {
+      // v2.2.9.100: 验证码/登录提示改为「最近日志 + 真的卡住」才报，避免 1688 已登录/任务已恢复后仍误报
+      const recentText = (job.value?.logs || []).slice(-12).map(entry => String(entry?.message || entry || '')).join('\n');
+      const phaseText = String(job.value?.phase || '');
+      const jobStatus = String(job.value?.status || '');
+      const runningNow = ['queued', 'claimed', 'running', 'exporting'].includes(jobStatus);
+      const progressedAfter = /(?:1688 找到|采集完成|已完成 \d|服务器 AI 审核|任务完成|生成 Excel)/i.test(recentText);
+      const stuckByVerify = /(?:验证码|滑块|captcha|人机验证)/i.test(recentText + ' ' + phaseText)
+        && !progressedAfter
+        && (runningNow || /已自动停止|需要人工/.test(phaseText));
+      if (stuckByVerify) {
         return { type: 'warning', title: '1688 需要人工验证', message: '请点击“打开 1688 首页”在当前 Chrome 里完成登录或验证码，再从失败行继续跑。' };
       }
-      if (/未登录|login|请登录|登录/.test(text)) {
+      const loginStuck = /(?:未登录|登录状态不可用|请先.*1688.*登录|1688.*需要.*登录)/i.test(recentText) && !progressedAfter && runningNow;
+      if (loginStuck) {
         return { type: 'warning', title: '1688 登录状态不可用', message: '请先打开 1688 首页确认已登录；插件会使用当前 Chrome 会话，不需要 ERP 账号密码。' };
       }
       if (/AI.*失败|provider|模型|AI_PROVIDER|AI_ALL_PROVIDERS/.test(text)) {
@@ -363,6 +373,10 @@ window.SourcingModuleView = {
 
 	    const sameJobPayload = (a, b) => {
 	      if (!a || !b || a.id !== b.id) return false;
+	      // v2.2.9.100: light 轮询不带 results，跳过 results 比对（否则每次都触发 merge）
+	      const resultsSame = (a.resultsTruncated || b.resultsTruncated)
+	        ? true
+	        : JSON.stringify(a.results || []) === JSON.stringify(b.results || []);
 	      return [
 	        'status',
 	        'phase',
@@ -372,7 +386,7 @@ window.SourcingModuleView = {
 	        'updatedAt',
 	      ].every((key) => String(a[key] ?? '') === String(b[key] ?? ''))
 	        && logSignature(a.logs) === logSignature(b.logs)
-	        && JSON.stringify(a.results || []) === JSON.stringify(b.results || []);
+	        && resultsSame;
 	    };
 
 	    const mergeJob = (nextJob) => {
@@ -389,6 +403,8 @@ window.SourcingModuleView = {
 	      if (sameJobPayload(job.value, nextJob)) return;
 	      const merged = job.value;
 	      for (const [key, value] of Object.entries(nextJob)) {
+	        // v2.2.9.100: light 轮询不带 results，保留本地已有的完整结果
+	        if (key === 'results' && nextJob.resultsTruncated) continue;
 	        if (key === 'logs') {
 	          if (logSignature(merged.logs) !== logSignature(value)) merged.logs = Array.isArray(value) ? value : [];
 	        } else if (key === 'results') {
@@ -479,10 +495,12 @@ window.SourcingModuleView = {
       pollTimer = null;
     };
 
-	    const pollJob = async () => {
+	    const pollJob = async (opts = {}) => {
 	      if (!currentJobId.value) return;
 	      try {
-	        const res = await axios.get(`/api/jobs/${encodeURIComponent(currentJobId.value)}`);
+	        // v2.2.9.100: 进度轮询用 light=1（服务端不返回大 results），只有首次/手动打开任务才全量
+	        const params = opts.light ? { light: 1 } : undefined;
+	        const res = await axios.get(`/api/jobs/${encodeURIComponent(currentJobId.value)}`, { params });
 	        liveTick.value = Date.now();
 	        pollFailures = 0;
 	        if (collectorStatus.value.error && /Network Error|网络|请求失败|timeout/i.test(String(collectorStatus.value.error))) {
@@ -516,9 +534,9 @@ window.SourcingModuleView = {
     const startPolling = () => {
       stopPolling();
       pollFailures = 0;
-      pollJob();
+      pollJob({ light: true });
 	      pollTimer = setInterval(() => {
-	        pollJob();
+	        pollJob({ light: true });
 	        refreshHistorySilently();
 	        fetchCollectorStatus({ silent: true });
 	      }, 1500);

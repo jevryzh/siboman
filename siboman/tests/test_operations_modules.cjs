@@ -223,14 +223,14 @@ assert(listing.includes('上架记录列表'), 'listing history should use user-
 assert(listing.includes('暂无匹配的上架记录。可调整筛选条件；新记录会在批量上架提交后出现。'), 'listing history must have a non-misleading empty state');
 assert(inventory.includes('暂无库存数据。请先选择店铺并点击同步 Ozon 全量；如已同步，可调整搜索条件。'), 'inventory must explain empty data and next step');
 assert(batchUpload.includes('这不是创建完成'), 'batch upload completion copy must distinguish submitted from completed');
-assert(batchUpload.includes('REQUIRED_BACKGROUND_VERSION = "2.2.9.67"'), 'batch upload must require the current released collector plugin');
+assert(batchUpload.includes('REQUIRED_BACKGROUND_VERSION = "2.2.9.100"'), 'batch upload must require the current released collector plugin');
 assert(batchUpload.includes('pluginVersionOk'), 'batch upload must not show stale plugins as a healthy connection');
 assert(batchUpload.includes('ensureRowsCollected'), 'batch upload must submit first, collect in the background, then continue listing');
 assert(batchUpload.includes('createBatchListingPlaceholders'), 'batch upload must create visible listing-history placeholders before long plugin collection');
 assert(batchUpload.includes('row_key: row._listingRowKey'), 'batch upload placeholders must track rows instead of deduplicating repeated SKUs');
 assert(batchUpload.includes('/api/seller/listing-history/batch-start'), 'batch upload must persist batch placeholders before collection');
 assert(batchUpload.includes('listingPlaceholderTaskId'), 'batch upload must bind the real Ozon task back to the visible placeholder');
-assert(batchUpload.includes('提交后台批采 + 上架'), 'batch upload primary action must describe async background processing');
+assert(batchUpload.includes('一键解析+采集+上架'), 'batch upload primary action must describe async background processing');
 assert(!batchUpload.includes('!items.filter(r=>r.valid&&r.distilled).length || !!items.filter'), 'batch upload primary action must not require pre-collected rows before submission');
 assert(stores.includes('PLUGIN_MANIFEST_VERSION'), 'store management must expose manifest version');
 assert(stores.includes('PLUGIN_ZIP_VERSION'), 'store management must expose zip version');
