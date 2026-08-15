@@ -4785,18 +4785,27 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
         LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
       [...args, limit, offset],
     );
-    // 附加“当前店铺是否已入找货队列”状态，方便榜单页直接看出每个 SKU 的流程进度（取每条 top_list 最新一条）
+    // 附加“当前店铺是否已入找货队列”状态，方便榜单页直接看出每个 SKU 的流程进度。
+    // 匹配方式：优先 top_list_id，兼容旧数据按 source_sku = app_top_lists.sku 匹配；每个榜单行取最新一条队列记录。
     const queueStates = new Map();
     if (storeId && rows.rows.length) {
       const qr = await db.query(
-        `SELECT DISTINCT ON (top_list_id) top_list_id, stage, status, updated_at
-           FROM app_auto_listing_items
-          WHERE user_id=$1 AND store_id=$2 AND top_list_id=ANY($3::uuid[])
-          ORDER BY top_list_id, updated_at DESC`,
+        `SELECT DISTINCT ON (matched_key) matched_key, stage, status
+           FROM (
+             SELECT top_list_id AS matched_key, stage, status, updated_at
+               FROM app_auto_listing_items
+              WHERE user_id=$1 AND store_id=$2 AND top_list_id=ANY($3::uuid[])
+             UNION ALL
+             SELECT t.id, i.stage, i.status, i.updated_at
+               FROM app_auto_listing_items i
+               JOIN app_top_lists t ON i.source_sku = t.sku
+              WHERE i.user_id=$1 AND i.store_id=$2 AND t.id=ANY($3::uuid[])
+           ) matched
+          ORDER BY matched_key, updated_at DESC`,
         [req.user.id, storeId, rows.rows.map(r => r.id)],
       );
       for (const q of qr.rows) {
-        queueStates.set(q.top_list_id, { in_queue: true, queue_stage: q.stage, queue_status: q.status });
+        queueStates.set(q.matched_key, { in_queue: true, queue_stage: q.stage, queue_status: q.status });
       }
     }
     const freshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_top_lists WHERE active=TRUE`);
