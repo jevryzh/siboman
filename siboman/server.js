@@ -10341,9 +10341,19 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
         ? stripBrandAttributes(sourceVariantAttributesToImportAttrs(sourceVariant))
         : sourceVariantAttributesToImportAttrs(sourceVariant);
       if (sourceAttrs.length) {
-        const existing = new Set((Array.isArray(item.attributes) ? item.attributes : [])
-          .map(a => `${Number(a?.id ?? a?.attribute_id) || 0}:${Number(a?.complex_id || 0)}`));
-        item.attributes = [...(Array.isArray(item.attributes) ? item.attributes : [])];
+        const sourceById = new Map(sourceAttrs.map(a => [`${a.id}:${a.complex_id || 0}`, a]));
+        // v2.2.9.102: 前端扁平属性({id,name,value})没有 dictionary_value_id，Ozon 枚举属性(性别/材料/包装等)
+        //   只认词典 ID 会被忽略。对前端已有属性：若源属性带 dictionary_value_id 则用源属性替换。
+        item.attributes = (Array.isArray(item.attributes) ? item.attributes : []).map(attr => {
+          const key = `${Number(attr?.id ?? attr?.attribute_id) || 0}:${Number(attr?.complex_id || 0)}`;
+          const src = sourceById.get(key);
+          if (src && Array.isArray(src.values) && src.values.length
+            && (!Array.isArray(attr.values) || !attr.values.length || !attr.values[0]?.dictionary_value_id)) {
+            return src;
+          }
+          return attr;
+        });
+        const existing = new Set(item.attributes.map(a => `${Number(a?.id ?? a?.attribute_id) || 0}:${Number(a?.complex_id || 0)}`));
         for (const attr of sourceAttrs) {
           const key = `${attr.id}:${attr.complex_id || 0}`;
           if (!existing.has(key)) {

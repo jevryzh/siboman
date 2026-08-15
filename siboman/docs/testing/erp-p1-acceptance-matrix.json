@@ -216,7 +216,7 @@
           "ensureFreshPlugin",
           "const canUsePortal = false",
           "复制源卡片",
-          "importMode === 'sku'",
+          "import_mode: 'v3'",
           "collectViaExtension",
           "portalImportViaExtension",
           "buildV3Item",
