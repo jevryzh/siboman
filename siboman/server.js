@@ -7962,6 +7962,7 @@ app.post("/api/seller/import/sync-task", requireAuth, async (req, res, next) => 
 function translateOzonListingError(error) {
   const source = `${error?.code || ""} ${error?.message || error?.description || ""}`.toLowerCase();
   const rules = [
+    [/periodic_limit_exceeded|суточн.*лимит|лимит.*создан/i, "当前店铺今日创建商品额度已用完，Ozon 会在莫斯科 03:00（北京时间 08:00）重置额度；请等额度恢复后再提交，或换有额度的店铺。"],
     [/attribute.*(?:empty|required)|error_attribute_values_empty|missing.*attribute/, "缺少必填商品属性，请检查错误代码对应的属性 ID。"],
     [/category.*(?:not found|invalid)|levels_category_not_found|description_category/, "商品类目无效或与类型不匹配，请重新选择 Ozon Seller 类目。"],
     [/type[_ ]?id|product type/, "商品类型不正确，请核对类目下允许的 type_id。"],
@@ -9360,6 +9361,18 @@ function sourceVariantAttributesToImportAttrs(sourceVariant) {
   return out;
 }
 
+function isBrandAttributeId(value) {
+  return Number(value) === 85;
+}
+
+function stripBrandAttributes(attributes) {
+  if (!Array.isArray(attributes)) return [];
+  return attributes.filter((attr) => {
+    const id = Number(attr?.id ?? attr?.attribute_id ?? attr?.key);
+    return !isBrandAttributeId(id);
+  });
+}
+
 function extractSourceVariantImages(sourceVariant) {
   const attrs = Array.isArray(sourceVariant?.attributes) ? sourceVariant.attributes : [];
   const images = [];
@@ -9602,13 +9615,18 @@ async function applyListingAttributesAfterImport(row) {
 
   const item = raw.item && typeof raw.item === "object" ? raw.item : {};
   const sourceItem = raw.source_item && typeof raw.source_item === "object" ? raw.source_item : {};
+  const noBrandMode = raw.no_brand_mode === true
+    || raw.no_brand_mode === "true"
+    || item._no_brand === true
+    || item.no_brand === true
+    || String(item.brand_mode || item.brandMode || "").trim() === "no_brand";
   const attributes = [
     ...(Array.isArray(item.attributes) ? item.attributes : []),
     ...(Array.isArray(sourceItem.attributes) ? sourceItem.attributes : []),
     ...sourceVariantAttributesToImportAttrs(sourceItem),
   ]
     .map(normalizeOzonAttributeForUpdate)
-    .filter(attr => attr && attr.id !== 4194 && attr.id !== 4195);
+    .filter(attr => attr && attr.id !== 4194 && attr.id !== 4195 && (!noBrandMode || !isBrandAttributeId(attr.id)));
 
   const attrById = new Map();
   for (const attr of attributes) {
@@ -10143,6 +10161,10 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     const offerId = String(item.offer_id || item.sku || "").trim();
     const sourceSku = Number(item.source_sku || item.sourceSku || item.ozon_sku || item.ozonSku || 0);
     const importMode = String(item.import_mode || item.importMode || "").trim().toLowerCase();
+    const noBrandMode = item._no_brand === true
+      || item.no_brand === true
+      || String(item.brand_mode || item.brandMode || "").trim() === "no_brand"
+      || String(item.scraped_brand || "").trim() === "no_brand";
 
     // v2.2.9.12: 跟卖优先走 Ozon 官方按 SKU 创建接口.
     // /v3/product/import 需要本系统自己拼完整类目/属性, 容易出现必填属性缺失或信息不一致;
@@ -10315,7 +10337,9 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     // 先把 _sourceVariant 合并成 Ozon /v3/product/import 能识别的扁平 attributes/images,
     // 再删除内部字段，避免发给 Ozon 的 payload 出现未知 key。
     if (sourceVariant) {
-      const sourceAttrs = sourceVariantAttributesToImportAttrs(sourceVariant);
+      const sourceAttrs = noBrandMode
+        ? stripBrandAttributes(sourceVariantAttributesToImportAttrs(sourceVariant))
+        : sourceVariantAttributesToImportAttrs(sourceVariant);
       if (sourceAttrs.length) {
         const existing = new Set((Array.isArray(item.attributes) ? item.attributes : [])
           .map(a => `${Number(a?.id ?? a?.attribute_id) || 0}:${Number(a?.complex_id || 0)}`));
@@ -10364,7 +10388,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             }))
           : (a.value !== undefined ? [{ value: String(a.value), ...(dictId ? { dictionary_value_id: dictId } : {}) }] : []);
         return { id: aId, values };
-      }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && a.values.length);
+      }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && (!noBrandMode || !isBrandAttributeId(a.id)) && a.values.length);
     }
     // v2.2.9.6: attribute 9048 (Название модели) 兜底
     //   Ozon 17029010 (天幕) 等类目必填 attribute 9048, 不填 Ozon 接受商品但报 error_attribute_values_empty
@@ -10414,10 +10438,15 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
             }))
           : (a.value !== undefined ? [{ value: String(a.value), ...(dictId ? { dictionary_value_id: dictId } : {}) }] : []);
         return { id: aId, values };
-      }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && a.values.length);
+      }).filter(a => a.id && a.id !== 4194 && a.id !== 4195 && (!noBrandMode || !isBrandAttributeId(a.id)) && a.values.length);
     }
     delete item._sourceVariant;
     delete item._collect_meta;
+    delete item._no_brand;
+    delete item.no_brand;
+    delete item.brand_mode;
+    delete item.brandMode;
+    delete item.scraped_brand;
     delete item.richContent;
     delete item.rich_content;
     delete item.richAnnotationJson;
@@ -10439,7 +10468,7 @@ app.post("/api/seller/products/import", requireAuth, async (req, res, next) => {
     if (db && req.user?.id && taskId) {
       try {
         const placeholderTaskId = String(req.body?.meta?.listingPlaceholderTaskId || req.body?.meta?.placeholderTaskId || "").trim();
-        const historyPayload = JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, stocks: ozonStocks || rawStocks || [], submitted_at: new Date().toISOString(), placeholder_task_id: placeholderTaskId });
+        const historyPayload = JSON.stringify({ item, source_item: sourceVariant || null, collect_meta: collectMeta || null, no_brand_mode: noBrandMode, stocks: ozonStocks || rawStocks || [], submitted_at: new Date().toISOString(), placeholder_task_id: placeholderTaskId });
         let updatedPlaceholder = { rowCount: 0 };
         if (placeholderTaskId) {
           updatedPlaceholder = await db.query(

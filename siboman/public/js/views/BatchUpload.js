@@ -863,6 +863,10 @@ window.BatchUploadView = {
       };
       // v2.2.9.100: 品牌处理 — 'no_brand' 必须真正不传品牌（之前把字符串 "no_brand" 当品牌名提交了）
       const brandOpt = String(opts.brand || '').trim();
+      if (brandOpt === 'no_brand') {
+        item._no_brand = true;
+        item.brand_mode = 'no_brand';
+      }
       if (brandOpt && brandOpt !== 'no_brand') {
         if (brandOpt === 'copy') {
           // 复制源品牌：从源变体提取（attributes 85 / brand_name）
@@ -991,6 +995,44 @@ window.BatchUploadView = {
         primary_image: images[0] || item.primary_image || '',
         _watermark_text: text,
       };
+    };
+
+    const shouldRetryWithV3Import = (message) => {
+      const text = String(message || '');
+      return /запрещено|запрещен|禁止|SKU_IS_HIDDEN|другой товар|нельзя|скрыт|выберите, пожалуйста/i.test(text)
+        || /brand|бренд|товарный знак|сертификат|certificate|认证|品牌/i.test(text)
+        || /copy|копир|复制/i.test(text);
+    };
+
+    const submitOzonItem = async ({ storeId, storeName, row, item, stocks }) => {
+      const placeholderTaskId = placeholderForRow(storeId, row);
+      const submitOnce = (payloadItem, timeout = 120000) => axios.post('/api/seller/products/import', {
+        store_id: storeId,
+        item: payloadItem,
+        stocks,
+        meta: {
+          ...(row.collectId ? { collectId: row.collectId } : {}),
+          listingPlaceholderTaskId: placeholderTaskId,
+        },
+      }, { timeout });
+
+      const forceV3 = String(config.brand || '').trim() === 'no_brand';
+      if (forceV3) {
+        appendLog(`  ℹ #${row.index} SKU ${row.sku}: 品牌=无品牌，走无品牌 v3 自建商品，不复制源品牌、不走 portal`, 'info');
+        const res = await submitOnce({ ...item, import_mode: 'v3' }, 180000);
+        return { res, mode: 'v3', fallback: false };
+      }
+
+      try {
+        const res = await submitOnce(item);
+        return { res, mode: res.data?.importMode || 'sku', fallback: false };
+      } catch (e) {
+        const errMsg = e.response?.data?.error || e.message;
+        if (!shouldRetryWithV3Import(errMsg)) throw e;
+        appendLog(`  ⚠ #${row.index} SKU ${row.sku}: 复制源链路被拒，改用 v3 自建商品提交: ${String(errMsg).slice(0, 160)}`, 'warn');
+        const res = await submitOnce({ ...item, import_mode: 'v3' }, 180000);
+        return { res, mode: 'v3', fallback: true };
+      }
     };
 
     // ========== 多店铺扇出发布 (保留) ==========
@@ -1194,105 +1236,29 @@ window.BatchUploadView = {
               await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: '货号已在 Ozon 上架过（去重跳过）' });
             }
           }
-          // v2.2.9.100: 官方 import-by-sku 优先；遇到"禁止复制"（SKU_IS_HIDDEN）自动切 Seller portal 复制通道（MY ERP 同款）
-          // v2.2.9.100: 品牌=无品牌 时直接走 portal — 官方 import-by-sku 会继承源商品品牌触发"品牌需认证"，无法真正无品牌
-          const portalFallbackItems = [];
-          const forcePortal = String(config.brand || '').trim() === 'no_brand';
-          if (forcePortal) {
-            appendLog(`  ℹ [${storeName}] 品牌=无品牌：改用 Seller portal 复制通道（官方通道会继承源品牌触发认证）`, 'warn');
-            portalFallbackItems.push(...dedupedItems);
-          } else {
+          // v2.2.9.101: portal 提交会返回 upload task 但 Ozon 商品 API 查不到 offer_id，不能再作为自动兜底。
+          // 批量上架只走可由 Ozon Seller API 轮询确认的两条链路：
+          //   1) 默认 import-by-sku 复制源卡片；
+          //   2) 无品牌/复制源被拒时切 v3/product/import，自建商品并剥离源品牌。
           for (const { row, item } of dedupedItems) {
             try {
-              const res = await axios.post('/api/seller/products/import', {
-                store_id: storeId,
-                item,
-                stocks: storeStocks.filter(s => s.offer_id === item.offer_id),  // 只发当前这个 offer 的 stock
-                meta: {
-                  ...(row.collectId ? { collectId: row.collectId } : {}),
-                  listingPlaceholderTaskId: placeholderForRow(storeId, row),
-                },
-              }, { timeout: 120000 });
+              const stocksForItem = storeStocks.filter(s => s.offer_id === item.offer_id);  // 只发当前这个 offer 的 stock
+              const { res, mode, fallback } = await submitOzonItem({ storeId, storeName, row, item, stocks: stocksForItem });
               const tid = res.data?.task_id || res.data?.data?.result?.task_id || '?';
-              const importMode = res.data?.importMode || '';
               const stockTip = whId && defaultStock > 0
-                ? (importMode === 'sku'
+                ? (mode === 'sku'
                   ? ` + stock=${defaultStock} → wh=${whId}（商品创建后由库存同步确认）`
                   : ` + stock=${defaultStock} → wh=${whId}`)
                 : '';
               // v2.2.0: 不再用 成功/失败 二元标记, 只说"已提交" (Ozon 后台异步审核)
-              appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 task_id=${tid}${importMode === 'sku' ? ' (复制源卡片)' : ''}${stockTip}`, 'info');
+              appendLog(`  ✓ #${row.index} SKU ${row.sku} → 已提交 Ozon Seller API task_id=${tid}${mode === 'sku' ? ' (复制源卡片)' : ' (v3 创建商品)'}${fallback ? ' [兜底]' : ''}${stockTip}`, 'info');
               // 后台 polling 每 60s 同步 Ozon 真实状态
               totalOk++;
             } catch(e) {
               const errMsg = e.response?.data?.error || e.message;
-              if (/запрещено|запрещен|禁止|SKU_IS_HIDDEN|другой товар|нельзя|скрыт|выберите, пожалуйста/i.test(String(errMsg || ''))) {
-                appendLog(`  ⚠ #${row.index} SKU ${row.sku} → Ozon 禁止复制该源，自动切换 Seller portal 复制通道重试`, 'warn');
-                portalFallbackItems.push({ row, item });
-              } else {
-                appendLog(`  ✗ #${row.index} SKU ${row.sku} → 提交失败: ${errMsg}`, 'error');
-                await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: errMsg });
-                totalFail++;
-              }
-            }
-          }
-          }
-          // 官方路径"禁止复制"的商品走 portal（seller 后台复制通道，绕过 SKU_IS_HIDDEN）
-          if (portalFallbackItems.length) {
-            appendLog(`  ℹ [${storeName}] ${portalFallbackItems.length} 个商品切换到 Seller portal 复制通道提交（后台执行）`, 'info');
-            try {
-              const resp = await portalImportViaExtension(portalFallbackItems.map(x => x.item));
-              if (resp?.ok) {
-                const tid = resp.result?.task_id || resp.result?.upload_task_id || '?';
-                const taskStatus = resp.result?.task_status || 'unknown';
-                // v2.2.9.100: 用插件返回的成功 items 对账 — 只有真正提交成功的才标成功，失败的标 failed
-                const okIds = new Set((resp.result?.items || []).map(i => String(i?.offer_id || '')));
-                const gErrors = Array.isArray(resp.result?.group_errors) ? resp.result.group_errors : [];
-                if (gErrors.length) {
-                  appendLog(`  ⚠ [${storeName}] ${gErrors.length} 个类目组提交失败: ${gErrors.map(g => `类目${g.category}(${g.count}品) ${g.error}`).join('; ')}`, 'warn');
-                }
-                await axios.post('/api/seller/import/portal-record', {
-                  store_id: storeId,
-                  task_id: tid,
-                  bundle_id: resp.result?.bundle_id || '',
-                  company_id: resp.result?.company_id || '',
-                  items: portalFallbackItems
-                    .filter(({ item }) => okIds.has(String(item.offer_id || '')))
-                    .map(({ row, item }) => ({
-                      source_sku: row.sku,
-                      collect_id: row.collectId || '',
-                      offer_id: item.offer_id,
-                      name: item.name,
-                      image: item.primary_image || item.images?.[0] || '',
-                      price: item.price,
-                      item,
-                      stocks: storeStocks.filter(s => s.offer_id === item.offer_id),
-                    })),
-                }, { timeout: 30000 }).catch(e => appendLog(`  ⚠ portal 历史记录写入失败: ${e.response?.data?.error || e.message}`, 'warn'));
-                for (const { row, item } of portalFallbackItems) {
-                  if (okIds.has(String(item.offer_id || ''))) {
-                    const statusTip = taskStatus === 'done' ? '' : (taskStatus === 'processing' ? '（Ozon 后台处理中）' : '（已提交，后台确认中）');
-                    appendLog(`  ✓ #${row.index} SKU ${row.sku} → portal 已提交 upload_task_id=${tid}${statusTip}`, 'info');
-                    totalOk++;
-                  } else {
-                    appendLog(`  ✗ #${row.index} SKU ${row.sku} → portal 未创建（该类目组提交失败）`, 'error');
-                    await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: 'portal 分组提交失败，请查看日志错误' });
-                    totalFail++;
-                  }
-                }
-              } else {
-                for (const { row } of portalFallbackItems) {
-                  appendLog(`  ✗ #${row.index} SKU ${row.sku} → portal 兜底失败: ${resp?.error || '未知错误'}`, 'error');
-                  await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: resp?.error || 'portal 兜底失败' });
-                  totalFail++;
-                }
-              }
-            } catch (e) {
-              for (const { row } of portalFallbackItems) {
-                appendLog(`  ✗ #${row.index} SKU ${row.sku} → portal 兜底异常: ${e.message}`, 'error');
-                await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: e.message });
-                totalFail++;
-              }
+              appendLog(`  ✗ #${row.index} SKU ${row.sku} → Ozon Seller API 提交失败: ${errMsg}`, 'error');
+              await updateBatchListingPlaceholder(storeId, row, { status: 'failed', error: errMsg });
+              totalFail++;
             }
           }
         }

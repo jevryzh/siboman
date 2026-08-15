@@ -47,7 +47,7 @@ for (const needle of [
   'compareVersion(bg, REQUIRED_BACKGROUND_VERSION) < 0',
   'const canUsePortal = false',
   '复制源卡片',
-  "importMode === 'sku'",
+  "mode === 'sku'",
   'collectViaExtension',
   'collectTimeoutMs',
   'ensureRowsCollected',
@@ -84,7 +84,7 @@ for (const needle of [
   'collection_box_listing_prefill',
   'consumeCollectionPrefill',
   'collectionPrefill.value?.item?.id',
-  'listingPlaceholderTaskId: placeholderForRow(storeId, row)',
+  'listingPlaceholderTaskId: placeholderTaskId',
   '不会自动提交 Ozon',
 ]) {
   assert(batch.includes(needle), `BatchUpload protection missing: ${needle}`);
