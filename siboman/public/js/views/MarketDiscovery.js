@@ -107,6 +107,7 @@ window.MarketDiscoveryView = {
         const response = await axios.get('/api/sourcing/bestsellers', {
           params: {
             view: marketView.value,
+            store_id: storeId(),
             strategy: filters.strategy,
             search: filters.search,
             limit: marketPage.size,
@@ -199,7 +200,7 @@ window.MarketDiscoveryView = {
         });
         ElementPlus.ElMessage.success(`已加入找货候选 ${response.data.insertedCount || 0} 个商品`);
         activeTab.value = 'pipeline';
-        await Promise.all([loadDashboard(), loadQueue()]);
+        await Promise.all([loadDashboard(), loadQueue(), loadMarket()]);
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
     }
 
@@ -611,12 +612,43 @@ window.MarketDiscoveryView = {
     });
     Vue.watch(() => window.currentStoreId, refreshAll);
 
+    // ---- 主流程五步：把“榜单 → 勾选 → 入队 → 找货 → 上架”串成一条可点击的流程 ----
+    const stageCountOf = (key) => (dashboard.value?.stages || []).find(s => s.key === key)?.count || 0;
+    const flowSteps = Vue.computed(() => {
+      const discovered = queuePage.total || 0;
+      const sourcing = stageCountOf('sourcing');
+      const reviewReady = stageCountOf('ready') + stageCountOf('submitted') + stageCountOf('listed');
+      return [
+        { step: 1, title: '看榜单', desc: '蓝海分·信号·销量', count: marketPage.total || 0, countSuffix: '条机会', active: activeTab.value === 'overview', jump: () => { activeTab.value = 'overview'; } },
+        { step: 2, title: '勾选候选', desc: '勾选感兴趣的 SKU', count: selectedProductCount.value, countSuffix: '已选', active: false, jump: () => { activeTab.value = 'overview'; } },
+        { step: 3, title: '加入找货候选', desc: '进入找货队列', count: discovered, countSuffix: '条候选', active: activeTab.value === 'pipeline', jump: () => { activeTab.value = 'pipeline'; } },
+        { step: 4, title: '启动真实找货', desc: '采集端执行 1688 找货', count: sourcing, countSuffix: '找货中', active: false, jump: () => { activeTab.value = 'pipeline'; } },
+        { step: 5, title: '审核并上架', desc: '核对后提交 Ozon', count: reviewReady, countSuffix: '待上架', active: false, jump: () => { window.location.hash = '#/upload'; } },
+      ];
+    });
+
+    // 榜单行 → 流程状态标签（是否已入队 / 处于哪个阶段）
+    const queueStateOf = (row) => {
+      if (!row.in_queue) return { text: '未入队', type: 'info', plain: true };
+      const stage = row.queue_stage;
+      const status = row.queue_status;
+      const stageText = stageLabels[stage] || stage || '';
+      if (status === 'running') return { text: '找货中', type: 'warning' };
+      if (status === 'needs_human') return { text: '待人工', type: 'danger' };
+      if (status === 'failed') return { text: '已失败', type: 'danger' };
+      if (status === 'paused') return { text: '已暂停', type: 'info' };
+      if (status === 'done' || stage === 'listed') return { text: '已上架', type: 'success' };
+      if (stage === 'ready' || stage === 'submitted') return { text: '待上架', type: 'success' };
+      if (stage === 'sourcing') return { text: '找货中', type: 'warning' };
+      return { text: stageText || '排队中', type: 'primary' };
+    };
+
     return {
       activeTab, loading, marketLoading, queueLoading, selectedMarketRows, selectedQueueRows, rulesOnly, detailDrawer,
       marketRows, queueRows, dashboard, collectorStatus, collectorResult, collectorLoading, workerStatus, sourcingJobState, settings, filters, marketPage, queuePage, marketSource,
       discoveryState, marketView, moneyRub, moneyRubLarge, formatTime, percentText, stageLabels, statusLabels, riskTypes, selectedProductCount, selectedCategoryCount, hasCategoryMarket, discoverCategoryLabel, primaryDiscoverLabel, discoveryErrorText, collectorResultText,
       payloadOf, isGeoRow, scoreText, scoreColor, geoScore, geoLevel, signalText, rowReasons, sourceBadgeType,
-      rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, geoMarketSummary, geoRuleChips, displayedMarketRows, rulePassedMarketRows, passesGeoRules,
+      rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, geoMarketSummary, geoRuleChips, displayedMarketRows, rulePassedMarketRows, passesGeoRules, queueStateOf, flowSteps,
       onlineSourcingWorkers, canClaimSourcingWorker, sourcingWorkerHint,
       refreshAll, loadMarket, loadQueue, loadCollectorStatus, loadWorkerStatus, runOpportunityCollector, discoverSelected, discoverRulePassed, discoverProductsFromCategories, advanceRow, advanceTo, startSourcingJob, openSourcingReview, bulkAction, removeQueueRow, openQueueDetail, saveQueueNote, saveSettings,
       resetMarket, resetQueue, marketRowSelectable, switchToCategoryView: () => { marketView.value = 'product'; marketPage.page = 1; loadMarket(); },
@@ -631,8 +663,7 @@ window.MarketDiscoveryView = {
         </div>
         <div class="market-head-actions">
           <el-button @click="runOpportunityCollector" :loading="collectorLoading">采集 Ozon 机会池</el-button>
-          <el-button type="primary" @click="startSourcingJob()" :disabled="!selectedQueueRows.length">启动真实找货</el-button>
-          <el-button :type="settings.enabled ? 'warning' : 'success'" @click="settings.enabled=!settings.enabled;saveSettings()">{{settings.enabled ? '暂停自动运营' : '启动自动运营'}}</el-button>
+          <el-button type="primary" @click="startSourcingJob()" :disabled="!selectedQueueRows.length">启动真实找货</el-button>          <el-button :type="settings.enabled ? 'warning' : 'success'" @click="settings.enabled=!settings.enabled;saveSettings()">{{settings.enabled ? '暂停自动运营' : '启动自动运营'}}</el-button>
         </div>
       </div>
 
@@ -689,19 +720,20 @@ window.MarketDiscoveryView = {
         </div>
       </div>
 
-      <div class="market-pipeline">
-        <div class="market-pipeline-head">
-          <div>
-            <div style="font-size:16px;font-weight:800;color:#0f172a">商品流水线</div>
-            <div style="font-size:12px;color:#64748b;margin-top:4px">当前只接入“GEO 入池”和“真实单品找货任务”；资料、图片、核价、提交 Ozon 不再提供假推进。</div>
-          </div>
-          <el-button link type="primary" @click="activeTab='pipeline'">进入找货候选</el-button>
+      <div class="market-flow">
+        <div class="market-flow-head">
+          <div style="font-size:16px;font-weight:800;color:#0f172a">选品 → 找货 → 上架 主流程</div>
+          <div style="font-size:12px;color:#64748b;margin-top:4px">点任一步直接跳转；按顺序做完 ①榜单 → ②勾选 → ③入队 → ④找货 → ⑤上架 即可完成一次选品。</div>
         </div>
-        <div class="market-stage-strip">
-          <div v-for="(stage,index) in dashboard?.stages || []" :key="stage.key" class="market-stage">
-            <div class="market-stage-index" :class="{active: stage.count}">{{String(index+1).padStart(2,'0')}}</div>
-            <div class="market-stage-label">{{stage.label}}</div>
-            <div class="market-stage-count">{{stage.count}}</div>
+        <div class="market-flow-strip">
+          <div v-for="(f,index) in flowSteps" :key="f.step" class="market-flow-step" :class="{active: f.active, done: f.count > 0}" @click="f.jump()">
+            <div class="market-flow-index" :class="{active: f.active, done: f.count > 0}">{{f.step}}</div>
+            <div class="market-flow-body">
+              <div class="market-flow-title">{{f.title}}</div>
+              <div class="market-flow-desc">{{f.desc}}</div>
+              <div class="market-flow-count">{{f.count}} <small>{{f.countSuffix}}</small></div>
+            </div>
+            <div v-if="index < flowSteps.length - 1" class="market-flow-arrow">›</div>
           </div>
         </div>
       </div>
@@ -731,11 +763,12 @@ window.MarketDiscoveryView = {
                 <el-switch v-model="rulesOnly" active-text="只看通过"/>
                 <el-button link type="primary" style="padding-left:0" @click="activeTab='rules'">调整规则</el-button>
               </div>
-              <div class="market-filter-title" style="margin-top:18px">操作</div>
+              <div class="market-filter-title" style="margin-top:18px">操作（主流程 ②③）</div>
               <div class="market-filter-stack">
                 <el-button :loading="collectorLoading" @click="runOpportunityCollector">{{discoverCategoryLabel}}</el-button>
-                <el-button type="success" :disabled="!selectedProductCount" @click="discoverSelected()">加入找货候选 ({{selectedProductCount}})</el-button>
+                <el-button type="success" :disabled="!selectedProductCount" @click="discoverSelected()"><b>② 加入找货候选</b> ({{selectedProductCount}})</el-button>
                 <el-button type="primary" :disabled="!rulePassedMarketRows.length" @click="discoverRulePassed">规则通过入池 ({{rulePassedMarketRows.length}})</el-button>
+                <div style="font-size:12px;color:#94a3b8;line-height:1.5">勾选榜单 SKU 后点「加入找货候选」，商品进入找货队列（见顶部流程条 ③）；再到「找货候选」页勾选并「启动真实找货」（④）。</div>
               </div>
             </div>
             <div class="market-data-panel">
@@ -766,6 +799,7 @@ window.MarketDiscoveryView = {
               />
               <el-table :data="displayedMarketRows" v-loading="marketLoading" border @selection-change="selectedMarketRows=$event" style="width:100%">
                 <el-table-column type="selection" width="44" :selectable="marketRowSelectable"/>
+                <el-table-column label="流程" width="104"><template #default="{row}"><el-tag :type="queueStateOf(row).type" :effect="queueStateOf(row).plain ? 'plain' : 'light'" size="small" style="font-weight:800">{{queueStateOf(row).text}}</el-tag><div v-if="row.in_queue" class="market-product-sub" style="margin-top:3px">{{stageLabels[row.queue_stage] || row.queue_stage || ''}}</div></template></el-table-column>
                 <el-table-column label="机会" width="120"><template #default="{row}"><el-tag :type="sourceBadgeType(row)">{{isGeoRow(row) ? 'GEO 蓝海' : (row.strategy_type || '商品机会')}}</el-tag><div class="market-product-sub">{{rowCategory(row)}}</div></template></el-table-column>
                 <el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><a v-if="rowUrl(row)" :href="rowUrl(row)" target="_blank" class="market-product-title">{{rowTitle(row)}}</a><div v-else class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}}{{rowBrand(row) ? ' · ' + rowBrand(row) : ''}}{{row.seller_name ? ' · ' + row.seller_name : ''}}</div></div></div></template></el-table-column>
                 <el-table-column label="蓝海" width="92" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(geoScore(row))}">{{scoreText(geoScore(row))}}</span><div class="market-product-sub">等级 {{geoLevel(row)}}</div></template></el-table-column>
@@ -786,7 +820,7 @@ window.MarketDiscoveryView = {
           <div class="market-data-panel">
           <div class="market-data-toolbar">
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><el-select v-model="filters.stage" style="width:160px" @change="resetQueue"><el-option label="全部阶段" value="all"/><el-option v-for="(label,key) in stageLabels" :key="key" :label="label" :value="key"/></el-select><el-input v-model="filters.search" placeholder="搜索 SKU / 商品 / 中文类目" clearable style="width:280px" @keyup.enter="resetQueue"/><el-button @click="resetQueue">查询</el-button></div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap"><el-button @click="bulkAction('pause')" :disabled="!selectedQueueRows.length">暂停</el-button><el-button @click="bulkAction('resume')" :disabled="!selectedQueueRows.length">恢复</el-button><el-button type="primary" @click="startSourcingJob()" :disabled="!selectedQueueRows.length">启动真实找货</el-button><el-button type="danger" plain @click="bulkAction('delete')" :disabled="!selectedQueueRows.length">移除</el-button></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap"><el-button @click="bulkAction('pause')" :disabled="!selectedQueueRows.length">暂停</el-button><el-button @click="bulkAction('resume')" :disabled="!selectedQueueRows.length">恢复</el-button><el-button type="primary" @click="startSourcingJob()" :disabled="!selectedQueueRows.length"><b>④ 启动真实找货</b></el-button><el-button type="danger" plain @click="bulkAction('delete')" :disabled="!selectedQueueRows.length">移除</el-button></div>
           </div>
           <el-alert
             :title="canClaimSourcingWorker ? '采集插件可领取真实找货任务' : '没有检测到可领取任务的采集插件'"
@@ -800,6 +834,13 @@ window.MarketDiscoveryView = {
               <div style="margin-top:8px"><el-button size="small" @click="loadWorkerStatus">刷新采集端状态</el-button></div>
             </template>
           </el-alert>
+          <el-alert
+            title="这里是主流程 ③④：勾选下方候选，点「启动真实找货」交给采集端执行；完成后在「核对」里人工确认，再进入批量上架（主流程 ⑤）。"
+            type="info"
+            :closable="false"
+            show-icon
+            style="margin-bottom:12px"
+          />
           <el-table :data="queueRows" v-loading="queueLoading" border @selection-change="selectedQueueRows=$event" style="width:100%">
             <el-table-column type="selection" width="44"/><el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><div class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}} · {{rowCategory(row)}}</div></div></div></template></el-table-column>
             <el-table-column label="阶段" width="130"><template #default="{row}"><el-tag>{{stageLabels[row.stage] || row.stage}}</el-tag></template></el-table-column>

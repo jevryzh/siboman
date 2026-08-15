@@ -511,7 +511,7 @@
         "viewContains": [
           "Ozon 机会池不会自动跑 1688",
           "加入找货候选",
-          "商品流水线",
+          "选品 → 找货 → 上架 主流程",
           "规则中心",
           "split(',').map(value => value.trim()).find(Boolean)"
         ],

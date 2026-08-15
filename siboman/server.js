@@ -4768,6 +4768,8 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
     const search = String(req.query.search || '').trim();
     const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
     const offset = Math.max(0, Number(req.query.offset || 0));
+    const storeId = String(req.query.store_id || req.query.storeId || "").split(",")[0].trim();
+    if (storeId) await assertActiveStoreAccess(storeId, req.user.id, "id");
     const args = [];
     const where = ['active=TRUE'];
     if (strategy && strategy !== 'all') { args.push(strategy); where.push(`strategy_type=$${args.length}`); }
@@ -4783,12 +4785,32 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
         LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
       [...args, limit, offset],
     );
+    // 附加“当前店铺是否已入找货队列”状态，方便榜单页直接看出每个 SKU 的流程进度（取每条 top_list 最新一条）
+    const queueStates = new Map();
+    if (storeId && rows.rows.length) {
+      const qr = await db.query(
+        `SELECT DISTINCT ON (top_list_id) top_list_id, stage, status, updated_at
+           FROM app_auto_listing_items
+          WHERE user_id=$1 AND store_id=$2 AND top_list_id=ANY($3::uuid[])
+          ORDER BY top_list_id, updated_at DESC`,
+        [req.user.id, storeId, rows.rows.map(r => r.id)],
+      );
+      for (const q of qr.rows) {
+        queueStates.set(q.top_list_id, { in_queue: true, queue_stage: q.stage, queue_status: q.status });
+      }
+    }
     const freshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_top_lists WHERE active=TRUE`);
-    const items = rows.rows.map((row) => ({
-      ...row,
-      row_type: "product",
-      category_name_zh: categoryNameZh(row.category_name, row.category_id),
-    }));
+    const items = rows.rows.map((row) => {
+      const queueState = queueStates.get(row.id) || { in_queue: false, queue_stage: null, queue_status: null };
+      return {
+        ...row,
+        row_type: "product",
+        category_name_zh: categoryNameZh(row.category_name, row.category_id),
+        in_queue: queueState.in_queue,
+        queue_stage: queueState.queue_stage,
+        queue_status: queueState.queue_status,
+      };
+    });
     const productTotal = Number(count.rows[0]?.total || 0);
     return res.json({
       success: true,
