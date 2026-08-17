@@ -837,51 +837,49 @@ window.MarketDiscoveryView = {
         </el-tab-pane>
 
         <el-tab-pane label="商品机会" name="overview">
-          <div class="market-workspace">
-            <div class="market-filter-panel">
-              <div class="market-filter-title">筛选范围</div>
-              <div class="market-filter-stack">
-                <el-tag type="success" effect="plain" style="height:34px;line-height:32px;text-align:center">每日采集 · 蓝海/热销</el-tag>
-                <el-select v-model="filters.rank" @change="resetMarket">
+          <div class="market-data-panel">
+            <div class="market-data-toolbar">
+              <div style="font-size:16px;font-weight:900;color:#0f172a">{{filters.rank === 'keyword' ? '蓝海关键词机会' : '商品机会'}}</div>
+              <div class="market-toolbar-meta">
+                <span>最新数据 {{formatTime(marketSource.freshness?.latest)}}</span>
+                <span>数据源 {{marketSummary.sourceCount || '-'}}</span>
+              </div>
+            </div>
+            <div class="market-filter-bar">
+              <div class="market-filter-bar-group">
+                <el-select v-model="filters.rank" style="width:150px" @change="resetMarket">
                   <el-option label="商品（蓝海+热销）" value="product"/>
                   <el-option label="蓝海关键词" value="keyword"/>
                 </el-select>
-                <el-select v-model="filters.strategy" @change="resetMarket">
+                <el-select v-model="filters.strategy" style="width:130px" @change="resetMarket">
                   <el-option label="蓝海" value="blue_ocean"/>
                   <el-option label="热销" value="hot"/>
                   <el-option label="全部" value="all"/>
                 </el-select>
-                <el-input v-model="filters.search" placeholder="SKU / 商品 / 类目" clearable @keyup.enter="resetMarket"/>
+                <el-input v-model="filters.search" placeholder="SKU / 商品 / 类目" clearable style="width:230px" @keyup.enter="resetMarket"/>
                 <el-button type="primary" @click="resetMarket">查询</el-button>
               </div>
-              <div class="market-filter-title" style="margin-top:18px">选品规则</div>
-              <div class="market-rule-chips">
-                <el-tag v-for="chip in ruleChips" :key="chip" type="info">{{chip}}</el-tag>
-              </div>
-              <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
-                <el-switch v-model="rulesOnly" active-text="只看通过"/>
-                <el-button link type="primary" style="padding-left:0" @click="activeTab='rules'">调整规则</el-button>
-              </div>
-              <div v-if="selectedCategory" class="market-filter-title" style="margin-top:18px">
-                当前类目：<span style="color:#2563eb">{{selectedCategory}}</span>
-                <el-button link type="danger" @click="clearCategory">清除</el-button>
-              </div>
-              <div class="market-filter-title" style="margin-top:18px">操作（主流程 ②③）</div>
-              <div class="market-filter-stack">
+              <div class="market-filter-bar-group">
+                <el-switch v-model="rulesOnly" active-text="只看通过" style="margin-right:10px"/>
+                <el-popover trigger="hover" placement="bottom" :width="320">
+                  <template #reference>
+                    <el-button link type="primary" style="margin-right:10px">选品规则 ›</el-button>
+                  </template>
+                  <div style="font-weight:800;color:#0f172a;margin-bottom:8px">当前选品规则（规则中心可调整）</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:6px">
+                    <el-tag v-for="chip in ruleChips" :key="chip" type="info" size="small">{{chip}}</el-tag>
+                  </div>
+                </el-popover>
                 <el-button type="success" :disabled="!selectedProductCount" @click="discoverSelected()"><b>② 加入找货候选</b> ({{selectedProductCount}})</el-button>
                 <el-button type="primary" :disabled="!rulePassedMarketRows.length" @click="discoverRulePassed">规则通过入池 ({{rulePassedMarketRows.length}})</el-button>
-                <div style="font-size:12px;color:#94a3b8;line-height:1.5">勾选商品后点「加入找货候选」，进入找货队列（流程条 ③）；再到「找货候选」页启动真实找货（④）。</div>
               </div>
             </div>
-            <div class="market-data-panel">
-              <div class="market-data-toolbar">
-                <div style="font-size:16px;font-weight:900;color:#0f172a">{{filters.rank === 'keyword' ? '蓝海关键词机会' : '商品机会'}}</div>
-                <div class="market-toolbar-meta">
-                  <span>最新数据 {{formatTime(marketSource.freshness?.latest)}}</span>
-                  <span>数据源 {{marketSummary.sourceCount || '-'}}</span>
-                </div>
-              </div>
-              <el-alert v-if="marketSource.note" :title="marketSource.note" type="warning" :closable="false" style="margin-bottom:10px"/>
+            <div v-if="selectedCategory" class="market-filter-bar-cat">
+              <el-tag type="warning" effect="plain">当前类目：{{selectedCategory}}</el-tag>
+              <el-button link type="danger" @click="clearCategory">清除类目筛选</el-button>
+            </div>
+            <div style="font-size:12px;color:#94a3b8;line-height:1.5;margin-bottom:10px">勾选商品后点「② 加入找货候选」进入找货队列（流程条 ③）；再到「找货候选」页启动真实找货（④）。</div>
+            <el-alert v-if="marketSource.note" :title="marketSource.note" type="warning" :closable="false" style="margin-bottom:10px"/>
               <el-alert
                 v-if="discoveryState && !discoveryState.success"
                 title="暂时没有商品级榜单数据"
@@ -914,7 +912,6 @@ window.MarketDiscoveryView = {
                 <el-table-column label="依据" min-width="190" show-overflow-tooltip><template #default="{row}">{{rowReasons(row)}}</template></el-table-column>
               </el-table>
               <div style="display:flex;justify-content:flex-end;margin-top:12px"><el-pagination v-model:current-page="marketPage.page" v-model:page-size="marketPage.size" :total="marketPage.total" :page-sizes="[20,30,50,100]" layout="total,sizes,prev,pager,next" @change="loadMarket"/></div>
-            </div>
           </div>
         </el-tab-pane>
 

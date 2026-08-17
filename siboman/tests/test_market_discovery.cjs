@@ -50,8 +50,7 @@ assert(!view.includes('/api/sourcing/category-opportunities'), 'market discovery
 assert.match(view, /选品 → 找货 → 上架 主流程|商品流水线/);
 assert.match(view, /规则中心/);
 assert.match(view, /选品规则/);
-assert.match(view, /market-workspace/);
-assert.match(view, /market-filter-panel/);
+assert.match(view, /market-filter-bar/);
 assert.match(view, /商品机会/);
 assert.match(view, /rowImage/);
 assert.match(view, /rowRevenue/);
