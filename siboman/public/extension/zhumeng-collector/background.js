@@ -89,6 +89,20 @@ function getSourcingAbortSignal(job) {
   return job?.stepAbortController?.signal || job?.abortController?.signal;
 }
 
+// v2.2.9.101 (fix): 1688 接口 fetch 必须带硬超时 —— 步骤超时 abort 依赖 stepAbortController，
+//   但部分流程（队列等待/详情页 executeScript）不受 abort 中断，1688 接口挂起时任务会永久卡住。
+//   这里把任务级 signal 与 45s 硬超时合并，保证单次 1688 网络调用最多 45s 必返回。
+function sourcingFetchSignal(job, timeoutMs = 45000) {
+  const base = getSourcingAbortSignal(job);
+  const hard = AbortSignal.timeout(timeoutMs);
+  if (!base) return hard;
+  try {
+    return AbortSignal.any([base, hard]);
+  } catch {
+    return hard;
+  }
+}
+
 async function withSourcingStepTimeout(job, label, timeoutMs, fn) {
   if (!job || typeof AbortController !== "function") return fn();
   const previousController = job.stepAbortController || null;
@@ -963,7 +977,11 @@ async function run1688ImageSearchQueued(fn) {
   const previous = imageSearchQueue.catch(() => {});
   let release = () => {};
   imageSearchQueue = new Promise((resolve) => { release = resolve; });
-  await previous;
+  // v2.2.9.101 (fix): 前一个 1688 搜索若卡死未 resolve，后续任务会永久等队列 → 加 90s 上限，超时强制放行
+  await Promise.race([
+    previous,
+    new Promise((resolve) => setTimeout(resolve, 90000)),
+  ]);
   try {
     const cooldown = adaptiveCooldownMs();
     const baseGap = last1688SearchAt ? 0 : randomInt(2_000, 5_000);
@@ -1532,7 +1550,7 @@ async function uploadImageTo1688InPlugin(base64Image, cookieState, job = null) {
         method: "POST",
         headers: build1688HeadersInPlugin(state.cookieHeader, { "Content-Type": "application/x-www-form-urlencoded" }),
         credentials: "include",
-        signal: getSourcingAbortSignal(job),
+        signal: sourcingFetchSignal(job),
         body: `data=${encodeURIComponent(dataStr)}`,
       });
       assertSourcingNotCanceled(job);
@@ -1585,7 +1603,7 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState, job = null) {
     method: "GET",
     headers: build1688HeadersInPlugin(cookieState.cookieHeader),
     credentials: "include",
-    signal: getSourcingAbortSignal(job),
+    signal: sourcingFetchSignal(job),
   });
   assertSourcingNotCanceled(job);
   const json = parseMtopTextInPlugin(await resp.text());
