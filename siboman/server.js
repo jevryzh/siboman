@@ -4760,28 +4760,76 @@ async function maybeRefreshOzonOpportunityPool(reason = "opportunity-interval") 
   });
 }
 
+// ---- dz_blue_ocean 商品主图回填（采集侧不写 main_image，这里按 sku 调 Ozon API 补图，内存缓存 6 小时）----
+const dzProductImageCache = new Map(); // sku -> { url, expiresAt }
+async function fillDzProductImages(items, { storeId, userId } = {}) {
+  const missing = [];
+  for (const item of items) {
+    const sku = String(item.sku || "").trim();
+    if (!/^\d+$/.test(sku) || item.main_image) continue;
+    const cached = dzProductImageCache.get(sku);
+    if (cached && cached.expiresAt > Date.now()) {
+      item.main_image = cached.url;
+      continue;
+    }
+    missing.push(sku);
+  }
+  if (!missing.length || !storeId || !userId) return;
+  // 分批查询（Ozon /v3/product/info/list 单次最多 100 个 sku）
+  const chunks = [];
+  for (let i = 0; i < missing.length; i += 100) chunks.push(missing.slice(i, i + 100));
+  for (const chunk of chunks) {
+    try {
+      const info = await callOzonSellerAPI("/v3/product/info/list", { sku: chunk }, { storeId, userId, timeoutMs: 30000 });
+      for (const it of info?.items || []) {
+        const url = Array.isArray(it.primary_image) ? (it.primary_image[0] || "") : (it.primary_image || "");
+        if (url) dzProductImageCache.set(String(it.sku), { url, expiresAt: Date.now() + 6 * 3600e3 });
+      }
+    } catch (e) {
+      console.warn("[dz-images] Ozon API 图片回填失败:", e.message);
+    }
+  }
+  for (const item of items) {
+    const sku = String(item.sku || "").trim();
+    const cached = dzProductImageCache.get(sku);
+    if (!item.main_image && cached && cached.expiresAt > Date.now()) item.main_image = cached.url;
+  }
+}
+
 app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
-    const strategy = String(req.query.strategy || 'hot').trim();
+    const strategy = String(req.query.strategy || 'blue_ocean').trim();
     const category = String(req.query.category || '').trim();
     const search = String(req.query.search || '').trim();
+    const rank = String(req.query.rank || 'product').trim(); // product=商品(默认) | keyword=关键词 | all=全部
+    const source = String(req.query.source || 'dz_blue_ocean').trim(); // 默认只读采集系统数据
+    const sort = String(req.query.sort || 'blue_ocean').trim(); // blue_ocean | sales
     const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
     const offset = Math.max(0, Number(req.query.offset || 0));
     const storeId = String(req.query.store_id || req.query.storeId || "").split(",")[0].trim();
     if (storeId) await assertActiveStoreAccess(storeId, req.user.id, "id");
     const args = [];
     const where = ['active=TRUE'];
+    if (source && source !== 'all') { args.push(source); where.push(`source_name=$${args.length}`); }
     if (strategy && strategy !== 'all') { args.push(strategy); where.push(`strategy_type=$${args.length}`); }
+    if (rank === 'product') {
+      where.push(`COALESCE(source_payload->>'rank','hot') <> 'blue_keyword'`);
+    } else if (rank === 'keyword') {
+      where.push(`source_payload->>'rank' = 'blue_keyword'`);
+    }
     if (category) { args.push(category); where.push(`(category_id=$${args.length} OR category_name ILIKE '%' || $${args.length} || '%')`); }
     if (search) { args.push(search); where.push(`(sku ILIKE '%' || $${args.length} || '%' OR title ILIKE '%' || $${args.length} || '%' OR seller_name ILIKE '%' || $${args.length} || '%')`); }
     const count = await db.query(`SELECT COUNT(*)::int AS total FROM app_top_lists WHERE ${where.join(' AND ')}`, args);
+    const orderBy = sort === 'sales'
+      ? 'monthly_sales DESC, review_count DESC, updated_at DESC'
+      : `(COALESCE((source_payload->>'blueOceanScore')::numeric,0)) DESC, monthly_sales DESC, updated_at DESC`;
     const rows = await db.query(
       `SELECT id, sku, title, main_image, price_rub, monthly_sales, review_count, seller_count,
               category_id, category_name, strategy_type, ozon_url, seller_name, origin_country,
               source_name, source_url, source_captured_at, source_payload, updated_at
          FROM app_top_lists WHERE ${where.join(' AND ')}
-        ORDER BY monthly_sales DESC, review_count DESC, updated_at DESC
+        ORDER BY ${orderBy}
         LIMIT $${args.length + 1} OFFSET $${args.length + 2}`,
       [...args, limit, offset],
     );
@@ -4808,7 +4856,7 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
         queueStates.set(q.matched_key, { in_queue: true, queue_stage: q.stage, queue_status: q.status });
       }
     }
-    const freshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_top_lists WHERE active=TRUE`);
+    const freshness = await db.query(`SELECT MAX(source_captured_at) AS latest, MIN(source_captured_at) AS oldest FROM app_top_lists WHERE active=TRUE AND source_name=$1`, [source || 'dz_blue_ocean']);
     const items = rows.rows.map((row) => {
       const queueState = queueStates.get(row.id) || { in_queue: false, queue_stage: null, queue_status: null };
       return {
@@ -4820,15 +4868,54 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
         queue_status: queueState.queue_status,
       };
     });
+    // 商品行（非关键词）按 sku 回填主图
+    await fillDzProductImages(items, { storeId, userId: req.user.id });
     const productTotal = Number(count.rows[0]?.total || 0);
     return res.json({
       success: true,
       items,
       total: productTotal,
       freshness: freshness.rows[0] || {},
-      source_policy: 'geo_ozon_blue_ocean',
-      note: productTotal ? "" : "当前没有 GEO 商品级机会数据，请先运行 GEO 采集或点击采集 Ozon 机会池导入最新 JSON。",
+      source_policy: 'dz_blue_ocean',
+      note: productTotal ? "" : "当前没有采集数据，请先运行「采集 Ozon 机会池」或等待每日 08:00 自动采集。",
     });
+  } catch (error) { next(error); }
+});
+
+// 类目分析：按类目聚合 dz 采集数据（蓝海商品 + 热销商品，不含关键词行）
+app.get("/api/sourcing/category-analysis", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const limit = Math.min(200, Math.max(1, Number(req.query.limit || 50)));
+    const source = String(req.query.source || 'dz_blue_ocean').trim();
+    const minProducts = Math.max(1, Number(req.query.min_products || 1));
+    const rows = await db.query(
+      `SELECT category_id, category_name,
+              COUNT(*)::int AS product_count,
+              ROUND(AVG(COALESCE((source_payload->>'blueOceanScore')::numeric, 0)), 3) AS avg_blue_ocean,
+              ROUND(AVG(price_rub), 0) AS avg_price,
+              SUM(monthly_sales)::bigint AS total_sales,
+              ROUND(AVG(monthly_sales), 0) AS avg_sales,
+              MAX(source_captured_at) AS latest_capture
+         FROM app_top_lists
+        WHERE active=TRUE AND source_name=$1
+          AND COALESCE(source_payload->>'rank','hot') <> 'blue_keyword'
+          AND category_name <> ''
+        GROUP BY category_id, category_name
+       HAVING COUNT(*) >= $2
+        ORDER BY avg_blue_ocean DESC, total_sales DESC
+        LIMIT $3`,
+      [source, minProducts, limit],
+    );
+    const items = rows.rows.map((row) => ({
+      ...row,
+      category_name_zh: categoryNameZh(row.category_name, row.category_id),
+      avg_blue_ocean_100: Math.round(Number(row.avg_blue_ocean || 0) * 1000) / 10,
+      avg_price: Number(row.avg_price || 0),
+      total_sales: Number(row.total_sales || 0),
+      avg_sales: Number(row.avg_sales || 0),
+    }));
+    return res.json({ success: true, items, total: items.length, source_policy: source });
   } catch (error) { next(error); }
 });
 

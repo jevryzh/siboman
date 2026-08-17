@@ -1,6 +1,6 @@
 window.MarketDiscoveryView = {
   setup() {
-    const activeTab = Vue.ref('overview');
+    const activeTab = Vue.ref('category');
     const loading = Vue.ref(false);
     const marketLoading = Vue.ref(false);
     const queueLoading = Vue.ref(false);
@@ -31,9 +31,12 @@ window.MarketDiscoveryView = {
       block_high_certification_risk: true,
     });
     const settings = Vue.reactive({ enabled: false, daily_quota: 30, min_profit_rate: 0.2, max_ai_cost_cny: 50, submit_to_ozon: false, rules: defaultGeoRules() });
-    const filters = Vue.reactive({ strategy: 'blue_ocean', search: '', stage: 'all' });
+    const filters = Vue.reactive({ strategy: 'blue_ocean', search: '', stage: 'all', rank: 'product' });
     const marketPage = Vue.reactive({ page: 1, size: 30, total: 0 });
     const queuePage = Vue.reactive({ page: 1, size: 30, total: 0 });
+    const categoryRows = Vue.ref([]);
+    const categoryLoading = Vue.ref(false);
+    const selectedCategory = Vue.ref('');
 
     const storeId = () => String(window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '')
       .split(',').map(value => value.trim()).find(Boolean) || '';
@@ -50,25 +53,65 @@ window.MarketDiscoveryView = {
       if (raw && typeof raw === 'object') return raw;
       try { return JSON.parse(raw); } catch { return {}; }
     };
-    const isGeoRow = row => {
-      const source = `${row?.source_name || row?.payload?.source_name || ''} ${row?.strategy_type || ''}`.toLowerCase();
+    const isDzRow = row => {
+      const source = `${row?.source_name || row?.payload?.source_name || ''}`.toLowerCase();
       const payload = payloadOf(row);
-      return source.includes('geo') || source.includes('blue_ocean') || source.includes('blue-ocean') || payload.blue_ocean_score != null || payload.demand_score != null;
+      return source.includes('dz_blue_ocean') || payload.blueOceanScore != null || payload.blue_ocean_score != null || payload.demandScore != null;
     };
     const scoreText = value => value == null || value === '' ? '-' : Number(value).toFixed(1);
     const scoreColor = value => Number(value || 0) >= 75 ? '#16a34a' : Number(value || 0) >= 62 ? '#2563eb' : Number(value || 0) >= 48 ? '#d97706' : '#64748b';
-    const geoScore = row => {
+    // 蓝海分归一化到 0-100：dz 数据为 0-1 的 blueOceanScore，旧数据为 0-100
+    const blueScore = row => {
       const payload = payloadOf(row);
-      return Number(payload.blue_ocean_score ?? row?.opportunity_score ?? 0);
+      const raw = payload.blueOceanScore ?? payload.blue_ocean_score ?? row?.opportunity_score;
+      if (raw == null || raw === '') return 0;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) return 0;
+      return value > 1 && value <= 100 ? value : Math.round(value * 1000) / 10;
     };
-    const geoLevel = row => payloadOf(row).opportunity_level || (geoScore(row) >= 75 ? 'A' : geoScore(row) >= 62 ? 'B' : geoScore(row) >= 48 ? 'C' : 'D');
+    const blueLevel = row => {
+      const payload = payloadOf(row);
+      return payload.opportunity_level || (blueScore(row) >= 75 ? 'A' : blueScore(row) >= 62 ? 'B' : blueScore(row) >= 48 ? 'C' : 'D');
+    };
+    // 信号读取：兼容 dz 驼峰（demandScore/competitionScore/salesDynamics/conversion）与旧下划线命名
+    const signalValue = (row, key) => {
+      const payload = payloadOf(row);
+      const value = payload[key] ?? payload[{
+        demand: 'demandScore', competition: 'competitionScore', growth: 'salesDynamics',
+        conversion: 'conversion', profit: 'profitScore', risk: 'riskScore', content: 'contentGapScore',
+      }[key]] ?? row[key];
+      return value == null || value === '' ? null : Number(value);
+    };
     const signalText = (row, key) => {
-      const payload = payloadOf(row);
-      const value = payload[key];
-      return value == null || value === '' ? '-' : Number(value).toFixed(0);
+      const value = signalValue(row, key);
+      return value == null ? '-' : key === 'growth' || key === 'conversion' ? `${Number(value).toFixed(1)}%` : Number(value).toFixed(0);
     };
-    const rowReasons = row => payloadOf(row).reasons || (isGeoRow(row) ? 'GEO 采集信号已接入，建议按蓝海分和风险规则复核。' : 'Ozon 榜单候选，建议先看销量、评论和卖家数。');
-    const sourceBadgeType = row => isGeoRow(row) ? 'success' : row?.row_type === 'category' ? 'warning' : 'info';
+    const rowReasons = row => {
+      const reasons = payloadOf(row).reasons;
+      if (reasons) return reasons;
+      if (isDzRow(row)) {
+        const parts = [];
+        if (signalValue(row, 'demand') != null) parts.push(`需求分 ${signalText(row, 'demand')}`);
+        if (signalValue(row, 'competition') != null) parts.push(`竞争分 ${signalText(row, 'competition')}`);
+        if (signalValue(row, 'growth') != null) parts.push(`增速 ${signalText(row, 'growth')}`);
+        if (signalValue(row, 'conversion') != null) parts.push(`转化 ${signalText(row, 'conversion')}`);
+        return parts.length ? parts.join(' · ') : '蓝海采集数据，建议按蓝海分和风险复核。';
+      }
+      return 'Ozon 榜单候选，建议先看销量、评论和卖家数。';
+    };
+    // 机会标签：蓝海商品 / 热销 / 蓝海关键词
+    const sourceBadgeText = row => {
+      const rank = payloadOf(row).rank || row?.strategy_type;
+      if (rank === 'blue_keyword') return '蓝海关键词';
+      if (row?.strategy_type === 'hot' || rank === 'hot') return '热销';
+      return '蓝海商品';
+    };
+    const sourceBadgeType = row => {
+      const rank = payloadOf(row).rank || row?.strategy_type;
+      if (rank === 'blue_keyword') return 'warning';
+      if (row?.strategy_type === 'hot' || rank === 'hot') return 'info';
+      return 'success';
+    };
     const rowTitle = row => row?.title || row?.product_name || payloadOf(row).product_name || payloadOf(row).keyword || row?.sku || '-';
     const rowSku = row => row?.sku || row?.source_sku || payloadOf(row).sku || payloadOf(row).product_key || '';
     const rowBrand = row => row?.brand || payloadOf(row).brand || '';
@@ -109,7 +152,9 @@ window.MarketDiscoveryView = {
             view: marketView.value,
             store_id: storeId(),
             strategy: filters.strategy,
+            rank: filters.rank,
             search: filters.search,
+            category: selectedCategory.value,
             limit: marketPage.size,
             offset: (marketPage.page - 1) * marketPage.size,
           },
@@ -125,6 +170,29 @@ window.MarketDiscoveryView = {
         if ((response.data.items || []).some(row => row.row_type !== 'category')) discoveryState.value = null;
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
       finally { marketLoading.value = false; }
+    }
+
+    async function loadCategoryAnalysis() {
+      categoryLoading.value = true;
+      try {
+        const response = await axios.get('/api/sourcing/category-analysis', { params: { limit: 100 } });
+        categoryRows.value = response.data.items || [];
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+      finally { categoryLoading.value = false; }
+    }
+
+    // 点击类目 → 跳到商品机会并按该类目过滤
+    function browseCategory(row) {
+      selectedCategory.value = row.category_id || row.category_name || '';
+      filters.rank = 'product';
+      marketPage.page = 1;
+      activeTab.value = 'overview';
+      loadMarket();
+    }
+    function clearCategory() {
+      selectedCategory.value = '';
+      marketPage.page = 1;
+      loadMarket();
     }
 
     async function loadQueue() {
@@ -160,7 +228,7 @@ window.MarketDiscoveryView = {
       if (!storeId()) return ElementPlus.ElMessage.warning('请先选择店铺');
       loading.value = true;
       try {
-        await Promise.all([loadDashboard(), loadMarket(), loadQueue(), loadCollectorStatus()]);
+        await Promise.all([loadDashboard(), loadMarket(), loadCategoryAnalysis(), loadQueue(), loadCollectorStatus()]);
       } finally { loading.value = false; }
     }
 
@@ -189,7 +257,7 @@ window.MarketDiscoveryView = {
     async function discoverSelected(limit = 20) {
       if (!storeId()) return ElementPlus.ElMessage.warning('请先选择店铺');
       const sourceRows = selectedMarketRows.value.filter(row => row.row_type !== 'category');
-      if (!sourceRows.length) return ElementPlus.ElMessage.warning('请先勾选 GEO 商品级机会。');
+      if (!sourceRows.length) return ElementPlus.ElMessage.warning('请先勾选商品机会。');
       const sourceIds = sourceRows.map(row => row.id);
       try {
         const response = await axios.post('/api/auto-listing/discover', {
@@ -507,8 +575,8 @@ window.MarketDiscoveryView = {
     const selectedProductCount = Vue.computed(() => selectedMarketRows.value.filter(row => row.row_type !== 'category').length);
     const selectedCategoryCount = Vue.computed(() => 0);
     const hasCategoryMarket = Vue.computed(() => false);
-    const discoverCategoryLabel = Vue.computed(() => '导入 GEO 商品机会');
-    const primaryDiscoverLabel = Vue.computed(() => '导入 GEO 商品机会');
+    const discoverCategoryLabel = Vue.computed(() => '采集 Ozon 机会池');
+    const primaryDiscoverLabel = Vue.computed(() => '采集 Ozon 机会池');
     const discoveryErrorText = Vue.computed(() => {
       const state = discoveryState.value || {};
       const errors = Array.isArray(state.errors) ? state.errors.slice(0, 3) : [];
@@ -519,7 +587,7 @@ window.MarketDiscoveryView = {
       if (categoryNames.length) parts.push(`已尝试类目：${categoryNames.join('、')}`);
       if (errors.length) parts.push(`失败明细：${errors.map(item => [item.category, item.query, item.error].filter(Boolean).join(' / ')).join('；')}`);
       if (!parts.length && state.code === 'PRODUCT_LEVEL_SOURCE_UNAVAILABLE') {
-        parts.push('当前还没有 GEO 商品级 SKU 数据。');
+        parts.push('当前还没有采集到的商品级 SKU 数据。');
       }
       return parts.join('。');
     });
@@ -543,50 +611,50 @@ window.MarketDiscoveryView = {
       if (Math.abs(n) >= 10000) return `₽${(n / 10000).toFixed(2)}万`;
       return `₽${n.toFixed(0)}`;
     };
-    const geoMarketSummary = Vue.computed(() => {
+    const marketSummary = Vue.computed(() => {
       const rows = marketRows.value || [];
-      const geoRows = rows.filter(isGeoRow);
-      const scored = geoRows.map(geoScore).filter(value => Number.isFinite(value) && value > 0);
+      const dzRows = rows.filter(isDzRow);
+      const scored = dzRows.map(blueScore).filter(value => Number.isFinite(value) && value > 0);
       const avgScore = scored.length ? scored.reduce((sum, value) => sum + value, 0) / scored.length : 0;
-      const passRows = geoRows.filter(row => {
+      const passRows = dzRows.filter(row => {
         const payload = payloadOf(row);
-        const score = geoScore(row);
+        const score = blueScore(row);
         const sales = Number(payload.sales_30d ?? row.monthly_sales ?? 0);
         const sellers = Number(row.seller_count ?? payload.seller_count ?? 0);
-        const risk = Number(payload.risk_score ?? 0);
+        const risk = Number(payload.risk_score ?? payload.riskScore ?? 0);
         return score >= Number(settings.rules.min_blue_ocean_score || 0)
           && sales >= Number(settings.rules.min_sales_30d || 0)
           && (!sellers || sellers <= Number(settings.rules.max_seller_count || 9999))
           && (!risk || risk <= Number(settings.rules.max_risk_score || 100));
       });
       return {
-        geoRows: geoRows.length,
+        dzRows: dzRows.length,
         avgScore,
         passRows: passRows.length,
         sourceCount: new Set(rows.map(row => row.source_name).filter(Boolean)).size,
       };
     });
-    const geoRuleChips = Vue.computed(() => [
+    const ruleChips = Vue.computed(() => [
       `蓝海分 ≥ ${settings.rules.min_blue_ocean_score}`,
       `30天销量 ≥ ${settings.rules.min_sales_30d}`,
       `卖家数 ≤ ${settings.rules.max_seller_count}`,
       `风险分 ≤ ${settings.rules.max_risk_score}`,
     ]);
-    const passesGeoRules = row => {
+    const passesRules = row => {
       const payload = payloadOf(row);
-      const score = geoScore(row);
+      const score = blueScore(row);
       const sales = Number(payload.sales_30d ?? row.monthly_sales ?? 0);
       const sellers = Number(row.seller_count ?? payload.seller_count ?? 0);
-      const risk = Number(payload.risk_score ?? 0);
-      const profit = Number(payload.profit_score ?? 0);
+      const risk = Number(payload.risk_score ?? payload.riskScore ?? 0);
+      const profit = Number(payload.profit_score ?? payload.profitScore ?? 0);
       return score >= Number(settings.rules.min_blue_ocean_score || 0)
         && sales >= Number(settings.rules.min_sales_30d || 0)
         && (!sellers || sellers <= Number(settings.rules.max_seller_count || 9999))
         && (!risk || risk <= Number(settings.rules.max_risk_score || 100))
         && (!profit || profit >= Number(settings.rules.min_profit_score || 0));
     };
-    const displayedMarketRows = Vue.computed(() => rulesOnly.value ? marketRows.value.filter(passesGeoRules) : marketRows.value);
-    const rulePassedMarketRows = Vue.computed(() => marketRows.value.filter(row => row.row_type !== 'category' && passesGeoRules(row)));
+    const displayedMarketRows = Vue.computed(() => rulesOnly.value ? marketRows.value.filter(passesRules) : marketRows.value);
+    const rulePassedMarketRows = Vue.computed(() => marketRows.value.filter(row => row.row_type !== 'category' && passesRules(row)));
     const onlineSourcingWorkers = Vue.computed(() => (workerStatus.value.workers || []).filter(worker => worker.online));
     const canClaimSourcingWorker = Vue.computed(() => onlineSourcingWorkers.value.some(worker => worker.canClaimJobs && worker.storeMatch !== false && !worker.versionTooOld));
     const sourcingWorkerHint = Vue.computed(() => {
@@ -601,7 +669,7 @@ window.MarketDiscoveryView = {
     });
     async function discoverRulePassed() {
       const rows = rulePassedMarketRows.value;
-      if (!rows.length) return ElementPlus.ElMessage.warning('当前页没有符合规则的 GEO 商品');
+      if (!rows.length) return ElementPlus.ElMessage.warning('当前页没有符合规则的商品');
       selectedMarketRows.value = rows;
       await discoverSelected();
     }
@@ -646,11 +714,12 @@ window.MarketDiscoveryView = {
     return {
       activeTab, loading, marketLoading, queueLoading, selectedMarketRows, selectedQueueRows, rulesOnly, detailDrawer,
       marketRows, queueRows, dashboard, collectorStatus, collectorResult, collectorLoading, workerStatus, sourcingJobState, settings, filters, marketPage, queuePage, marketSource,
+      categoryRows, categoryLoading, selectedCategory, browseCategory, clearCategory,
       discoveryState, marketView, moneyRub, moneyRubLarge, formatTime, percentText, stageLabels, statusLabels, riskTypes, selectedProductCount, selectedCategoryCount, hasCategoryMarket, discoverCategoryLabel, primaryDiscoverLabel, discoveryErrorText, collectorResultText,
-      payloadOf, isGeoRow, scoreText, scoreColor, geoScore, geoLevel, signalText, rowReasons, sourceBadgeType,
-      rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, geoMarketSummary, geoRuleChips, displayedMarketRows, rulePassedMarketRows, passesGeoRules, queueStateOf, flowSteps,
+      payloadOf, isDzRow, scoreText, scoreColor, blueScore, blueLevel, signalText, rowReasons, sourceBadgeType, sourceBadgeText,
+      rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, marketSummary, ruleChips, displayedMarketRows, rulePassedMarketRows, passesRules, queueStateOf, flowSteps,
       onlineSourcingWorkers, canClaimSourcingWorker, sourcingWorkerHint,
-      refreshAll, loadMarket, loadQueue, loadCollectorStatus, loadWorkerStatus, runOpportunityCollector, discoverSelected, discoverRulePassed, discoverProductsFromCategories, advanceRow, advanceTo, startSourcingJob, openSourcingReview, bulkAction, removeQueueRow, openQueueDetail, saveQueueNote, saveSettings,
+      refreshAll, loadMarket, loadCategoryAnalysis, loadQueue, loadCollectorStatus, loadWorkerStatus, runOpportunityCollector, discoverSelected, discoverRulePassed, discoverProductsFromCategories, advanceRow, advanceTo, startSourcingJob, openSourcingReview, bulkAction, removeQueueRow, openQueueDetail, saveQueueNote, saveSettings,
       resetMarket, resetQueue, marketRowSelectable, switchToCategoryView: () => { marketView.value = 'product'; marketPage.page = 1; loadMarket(); },
     };
   },
@@ -659,7 +728,7 @@ window.MarketDiscoveryView = {
       <div class="market-head">
         <div>
           <h1 class="market-title">选品中心</h1>
-          <div class="market-subtitle">结合 GEO 商品级 Ozon 数据，按蓝海评分、需求、竞争、利润和风险筛选，再加入 1688 找货候选。</div>
+          <div class="market-subtitle">基于每日采集的 Ozon 蓝海/热销数据，按蓝海分、需求、竞争、增速筛选，再加入 1688 找货候选。</div>
         </div>
         <div class="market-head-actions">
           <el-button @click="runOpportunityCollector" :loading="collectorLoading">采集 Ozon 机会池</el-button>
@@ -669,7 +738,7 @@ window.MarketDiscoveryView = {
 
       <el-alert
         title="Ozon 机会池不会自动跑 1688"
-        :description="'每日/手动采集只写入 Ozon 商品候选池；当前商品候选 ' + (collectorStatus?.stats?.total || 0) + ' 个，GEO/蓝海信号 ' + geoMarketSummary.geoRows + ' 条，最新数据 ' + formatTime(collectorStatus?.stats?.latest_captured_at) + '。点击采集会同步返回导入数和失败原因；你勾选商品后才会加入找货候选。'"
+        :description="'每日/手动采集只写入 Ozon 商品候选池；当前商品候选 ' + (collectorStatus?.stats?.total || 0) + ' 个，蓝海/热销信号 ' + marketSummary.dzRows + ' 条，最新数据 ' + formatTime(collectorStatus?.stats?.latest_captured_at) + '。点击采集会同步返回导入数和失败原因；你勾选商品后才会加入找货候选。'"
         type="warning"
         :closable="false"
         show-icon
@@ -710,9 +779,9 @@ window.MarketDiscoveryView = {
           <el-progress :percentage="dashboard?.today?.percent || 0" style="margin-top:10px" />
         </div>
         <div v-for="card in [
-          ['GEO 信号商品', geoMarketSummary.geoRows, '条已接入评分'],
-          ['规则通过', geoMarketSummary.passRows, '条可优先找货'],
-          ['平均蓝海分', scoreText(geoMarketSummary.avgScore), '当前页 GEO'],
+          ['采集商品数', marketSummary.dzRows, '条蓝海/热销'],
+          ['规则通过', marketSummary.passRows, '条可优先找货'],
+          ['平均蓝海分', scoreText(marketSummary.avgScore), '当前页'],
           ['找货候选', queuePage.total || 0, '条队列数据'],
         ]" :key="card[0]" class="market-status-card">
           <div class="market-status-label">{{card[0]}}</div>
@@ -739,44 +808,77 @@ window.MarketDiscoveryView = {
       </div>
 
       <el-tabs v-model="activeTab">
-        <el-tab-pane label="市场调研" name="overview">
+        <el-tab-pane label="类目分析" name="category">
+          <div class="market-data-panel">
+            <div class="market-data-toolbar">
+              <div style="font-size:16px;font-weight:900;color:#0f172a">类目机会总览（每日采集）</div>
+              <div class="market-toolbar-meta">
+                <span>共 {{categoryRows.length}} 个类目</span>
+                <span>按平均蓝海分排序</span>
+              </div>
+            </div>
+            <el-alert
+              title="点类目行可进入「商品机会」查看该类目下所有候选 SKU，再勾选加入找货队列。"
+              type="info"
+              :closable="false"
+              show-icon
+              style="margin-bottom:12px"
+            />
+            <el-table :data="categoryRows" v-loading="categoryLoading" border style="width:100%" @row-click="browseCategory" class="market-category-table">
+              <el-table-column label="类目" min-width="240"><template #default="{row}"><div style="font-weight:800;color:#0f172a">{{row.category_name_zh}}</div><div class="market-product-sub">{{row.category_name}}</div></template></el-table-column>
+              <el-table-column label="商品机会数" width="120" align="right"><template #default="{row}"><span style="font-weight:900;color:#0f172a">{{row.product_count}}</span> <small class="market-product-sub">SKU</small></template></el-table-column>
+              <el-table-column label="平均蓝海分" width="120" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(row.avg_blue_ocean_100)}">{{row.avg_blue_ocean_100}}</span></template></el-table-column>
+              <el-table-column label="平均售价" width="110" align="right"><template #default="{row}">{{moneyRub(row.avg_price)}}</template></el-table-column>
+              <el-table-column label="月销总量" width="120" align="right"><template #default="{row}">{{Number(row.total_sales || 0).toLocaleString('zh-CN')}}</template></el-table-column>
+              <el-table-column label="平均月销" width="120" align="right"><template #default="{row}">{{Number(row.avg_sales || 0).toLocaleString('zh-CN')}}</template></el-table-column>
+              <el-table-column label="操作" width="130" fixed="right"><template #default="{row}"><el-button link type="primary" @click.stop="browseCategory(row)">看商品机会 ›</el-button></template></el-table-column>
+            </el-table>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="商品机会" name="overview">
           <div class="market-workspace">
             <div class="market-filter-panel">
-              <div class="market-filter-title">调研范围</div>
+              <div class="market-filter-title">筛选范围</div>
               <div class="market-filter-stack">
-                <el-tag type="success" effect="plain" style="height:34px;line-height:32px;text-align:center">GEO 商品级机会</el-tag>
+                <el-tag type="success" effect="plain" style="height:34px;line-height:32px;text-align:center">每日采集 · 蓝海/热销</el-tag>
+                <el-select v-model="filters.rank" @change="resetMarket">
+                  <el-option label="商品（蓝海+热销）" value="product"/>
+                  <el-option label="蓝海关键词" value="keyword"/>
+                </el-select>
                 <el-select v-model="filters.strategy" @change="resetMarket">
                   <el-option label="蓝海" value="blue_ocean"/>
                   <el-option label="热销" value="hot"/>
-                  <el-option label="新品" value="new"/>
-                  <el-option label="潜力" value="potential"/>
                   <el-option label="全部" value="all"/>
                 </el-select>
-                <el-input v-model="filters.search" placeholder="SKU / 商品 / 卖家 / 类目" clearable @keyup.enter="resetMarket"/>
-                <el-button type="primary" @click="resetMarket">查询市场数据</el-button>
+                <el-input v-model="filters.search" placeholder="SKU / 商品 / 类目" clearable @keyup.enter="resetMarket"/>
+                <el-button type="primary" @click="resetMarket">查询</el-button>
               </div>
-              <div class="market-filter-title" style="margin-top:18px">GEO 入池规则</div>
+              <div class="market-filter-title" style="margin-top:18px">选品规则</div>
               <div class="market-rule-chips">
-                <el-tag v-for="chip in geoRuleChips" :key="chip" type="info">{{chip}}</el-tag>
+                <el-tag v-for="chip in ruleChips" :key="chip" type="info">{{chip}}</el-tag>
               </div>
               <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px">
                 <el-switch v-model="rulesOnly" active-text="只看通过"/>
                 <el-button link type="primary" style="padding-left:0" @click="activeTab='rules'">调整规则</el-button>
               </div>
+              <div v-if="selectedCategory" class="market-filter-title" style="margin-top:18px">
+                当前类目：<span style="color:#2563eb">{{selectedCategory}}</span>
+                <el-button link type="danger" @click="clearCategory">清除</el-button>
+              </div>
               <div class="market-filter-title" style="margin-top:18px">操作（主流程 ②③）</div>
               <div class="market-filter-stack">
-                <el-button :loading="collectorLoading" @click="runOpportunityCollector">{{discoverCategoryLabel}}</el-button>
                 <el-button type="success" :disabled="!selectedProductCount" @click="discoverSelected()"><b>② 加入找货候选</b> ({{selectedProductCount}})</el-button>
                 <el-button type="primary" :disabled="!rulePassedMarketRows.length" @click="discoverRulePassed">规则通过入池 ({{rulePassedMarketRows.length}})</el-button>
-                <div style="font-size:12px;color:#94a3b8;line-height:1.5">勾选榜单 SKU 后点「加入找货候选」，商品进入找货队列（见顶部流程条 ③）；再到「找货候选」页勾选并「启动真实找货」（④）。</div>
+                <div style="font-size:12px;color:#94a3b8;line-height:1.5">勾选商品后点「加入找货候选」，进入找货队列（流程条 ③）；再到「找货候选」页启动真实找货（④）。</div>
               </div>
             </div>
             <div class="market-data-panel">
               <div class="market-data-toolbar">
-                <div style="font-size:16px;font-weight:900;color:#0f172a">GEO 商品级机会</div>
+                <div style="font-size:16px;font-weight:900;color:#0f172a">{{filters.rank === 'keyword' ? '蓝海关键词机会' : '商品机会'}}</div>
                 <div class="market-toolbar-meta">
                   <span>最新数据 {{formatTime(marketSource.freshness?.latest)}}</span>
-                  <span>数据源 {{geoMarketSummary.sourceCount || '-'}}</span>
+                  <span>数据源 {{marketSummary.sourceCount || '-'}}</span>
                 </div>
               </div>
               <el-alert v-if="marketSource.note" :title="marketSource.note" type="warning" :closable="false" style="margin-bottom:10px"/>
@@ -800,10 +902,10 @@ window.MarketDiscoveryView = {
               <el-table :data="displayedMarketRows" v-loading="marketLoading" border @selection-change="selectedMarketRows=$event" style="width:100%">
                 <el-table-column type="selection" width="44" :selectable="marketRowSelectable"/>
                 <el-table-column label="流程" width="104"><template #default="{row}"><el-tag :type="queueStateOf(row).type" :effect="queueStateOf(row).plain ? 'plain' : 'light'" size="small" style="font-weight:800">{{queueStateOf(row).text}}</el-tag><div v-if="row.in_queue" class="market-product-sub" style="margin-top:3px">{{stageLabels[row.queue_stage] || row.queue_stage || ''}}</div></template></el-table-column>
-                <el-table-column label="机会" width="120"><template #default="{row}"><el-tag :type="sourceBadgeType(row)">{{isGeoRow(row) ? 'GEO 蓝海' : (row.strategy_type || '商品机会')}}</el-tag><div class="market-product-sub">{{rowCategory(row)}}</div></template></el-table-column>
+                <el-table-column label="机会" width="120"><template #default="{row}"><el-tag :type="sourceBadgeType(row)">{{sourceBadgeText(row)}}</el-tag><div class="market-product-sub">{{rowCategory(row)}}</div></template></el-table-column>
                 <el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><a v-if="rowUrl(row)" :href="rowUrl(row)" target="_blank" class="market-product-title">{{rowTitle(row)}}</a><div v-else class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}}{{rowBrand(row) ? ' · ' + rowBrand(row) : ''}}{{row.seller_name ? ' · ' + row.seller_name : ''}}</div></div></div></template></el-table-column>
-                <el-table-column label="蓝海" width="92" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(geoScore(row))}">{{scoreText(geoScore(row))}}</span><div class="market-product-sub">等级 {{geoLevel(row)}}</div></template></el-table-column>
-                <el-table-column label="GEO 信号" width="210"><template #default="{row}"><div class="market-signal-grid"><span>需求 {{signalText(row,'demand_score')}}</span><span>增长 {{signalText(row,'growth_score')}}</span><span>竞争 {{signalText(row,'competition_score')}}</span><span>利润 {{signalText(row,'profit_score')}}</span><span>内容 {{signalText(row,'content_gap_score')}}</span><span>风险 {{signalText(row,'risk_score')}}</span></div></template></el-table-column>
+                <el-table-column label="蓝海" width="92" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(blueScore(row))}">{{scoreText(blueScore(row))}}</span><div class="market-product-sub">等级 {{blueLevel(row)}}</div></template></el-table-column>
+                <el-table-column label="机会信号" width="210"><template #default="{row}"><div class="market-signal-grid"><span>需求 {{signalText(row,'demand')}}</span><span>增长 {{signalText(row,'growth')}}</span><span>竞争 {{signalText(row,'competition')}}</span><span>转化 {{signalText(row,'conversion')}}</span><span>利润 {{signalText(row,'profit')}}</span><span>风险 {{signalText(row,'risk')}}</span></div></template></el-table-column>
                 <el-table-column label="售价" width="96" align="right"><template #default="{row}">{{moneyRub(rowPrice(row))}}</template></el-table-column>
                 <el-table-column label="30天销量" width="110" align="right"><template #default="{row}">{{Number(rowSales(row) || 0).toLocaleString('zh-CN')}}</template></el-table-column>
                 <el-table-column label="30天销售额" width="130" align="right"><template #default="{row}">{{moneyRubLarge(rowRevenue(row))}}</template></el-table-column>
@@ -845,8 +947,8 @@ window.MarketDiscoveryView = {
             <el-table-column type="selection" width="44"/><el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><div class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}} · {{rowCategory(row)}}</div></div></div></template></el-table-column>
             <el-table-column label="阶段" width="130"><template #default="{row}"><el-tag>{{stageLabels[row.stage] || row.stage}}</el-tag></template></el-table-column>
             <el-table-column label="状态" width="105"><template #default="{row}"><el-tag :type="row.status==='needs_human'?'warning':row.status==='failed'?'danger':'info'">{{statusLabels[row.status] || row.status}}</el-tag></template></el-table-column>
-            <el-table-column label="蓝海分" width="105" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(geoScore(row))}">{{scoreText(geoScore(row))}}</span><div style="font-size:12px;color:#64748b">等级 {{geoLevel(row)}}</div></template></el-table-column>
-            <el-table-column label="来源信号" width="210"><template #default="{row}"><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;font-size:12px;color:#475569"><span>需求 {{signalText(row,'demand_score')}}</span><span>增长 {{signalText(row,'growth_score')}}</span><span>竞争 {{signalText(row,'competition_score')}}</span><span>利润 {{signalText(row,'profit_score')}}</span><span>内容 {{signalText(row,'content_gap_score')}}</span><span>风险 {{signalText(row,'risk_score')}}</span></div></template></el-table-column>
+            <el-table-column label="蓝海分" width="105" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(blueScore(row))}">{{scoreText(blueScore(row))}}</span><div style="font-size:12px;color:#64748b">等级 {{blueLevel(row)}}</div></template></el-table-column>
+            <el-table-column label="来源信号" width="210"><template #default="{row}"><div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;font-size:12px;color:#475569"><span>需求 {{signalText(row,'demand')}}</span><span>增长 {{signalText(row,'growth')}}</span><span>竞争 {{signalText(row,'competition')}}</span><span>转化 {{signalText(row,'conversion')}}</span><span>利润 {{signalText(row,'profit')}}</span><span>风险 {{signalText(row,'risk')}}</span></div></template></el-table-column>
             <el-table-column label="风险" width="90"><template #default="{row}"><el-tag :type="riskTypes[row.risk_level] || 'info'">{{row.risk_level || 'normal'}}</el-tag></template></el-table-column>
             <el-table-column label="推进依据" min-width="220" show-overflow-tooltip><template #default="{row}">{{rowReasons(row)}}</template></el-table-column>
             <el-table-column label="人工原因" min-width="190" show-overflow-tooltip><template #default="{row}">{{row.human_reason || '-'}}</template></el-table-column>
@@ -872,7 +974,7 @@ window.MarketDiscoveryView = {
             <div style="background:#fff;border:1px solid #dfe7f1;border-radius:8px;padding:22px">
               <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
                 <div>
-                  <div style="font-size:16px;font-weight:900;color:#0f172a">GEO 蓝海入池规则</div>
+                  <div style="font-size:16px;font-weight:900;color:#0f172a">选品规则</div>
                   <div style="font-size:12px;color:#64748b;margin-top:4px">匹配 ozon-blue-ocean 的需求、增长、竞争、利润、内容缺口、风险评分</div>
                 </div>
                 <el-switch v-model="settings.rules.geo_enabled" active-text="启用"/>
@@ -911,8 +1013,8 @@ window.MarketDiscoveryView = {
               </div>
             </div>
             <el-descriptions :column="2" border style="margin-bottom:16px">
-              <el-descriptions-item label="蓝海分">{{scoreText(geoScore(detailDrawer.item))}}</el-descriptions-item>
-              <el-descriptions-item label="等级">{{geoLevel(detailDrawer.item)}}</el-descriptions-item>
+              <el-descriptions-item label="蓝海分">{{scoreText(blueScore(detailDrawer.item))}}</el-descriptions-item>
+              <el-descriptions-item label="等级">{{blueLevel(detailDrawer.item)}}</el-descriptions-item>
               <el-descriptions-item label="售价">{{moneyRub(rowPrice(detailDrawer.item))}}</el-descriptions-item>
               <el-descriptions-item label="销量">{{Number(rowSales(detailDrawer.item) || 0).toLocaleString('zh-CN')}}</el-descriptions-item>
               <el-descriptions-item label="增长">{{percentText(rowGrowth(detailDrawer.item))}}</el-descriptions-item>
