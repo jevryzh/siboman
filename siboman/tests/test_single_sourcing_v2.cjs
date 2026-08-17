@@ -124,8 +124,8 @@ assert(background.includes('collect1688CandidatesInPlugin'), 'direct MTOP search
 assert(!background.includes('run1688ImageSearchQueued(() => withTimeoutInPlugin'), 'restored stable chain must not use the later timeout wrapper');
 
 // Candidate count and operator controls: default remains 5 and is passed through, never hard-coded to 3.
-assert(sourcing.includes('const maxCandidates = Vue.ref(5)'), 'single sourcing default candidate count must remain 5');
-assert(sourcing.includes('maxCandidates: Number(maxCandidates.value || 5)'), 'single sourcing job payload must use the user-provided candidate count');
+assert(sourcing.includes('const maxCandidates = Vue.ref(10)'), 'single sourcing default candidate count must remain 10');
+assert(sourcing.includes('maxCandidates: Number(maxCandidates.value || 10)'), 'single sourcing job payload must use the user-provided candidate count');
 assert(sourcing.includes('<el-input-number v-model="maxCandidates" :min="1" :max="20"'), 'candidate count input must remain user-configurable');
 assert(background.includes('Number(options.maxCandidates || 5)'), 'extension worker must read candidate count from job options');
 assert(background.includes('最多 ${maxCandidates} 个'), 'worker logs must show the actual candidate limit');

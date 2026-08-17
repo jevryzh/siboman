@@ -5853,7 +5853,7 @@ app.post("/api/auto-listing/items/start-sourcing", requireAuth, async (req, res,
         urlRows: urlRows.map(({ sourceRow, url }) => ({ sourceRow, url })),
         startRow: 1,
         sourceTotal: urls.length,
-        maxCandidates: Math.min(8, Math.max(3, Number(req.body?.maxCandidates || 5))),
+        maxCandidates: Math.min(20, Math.max(3, Number(req.body?.maxCandidates || 10))),
         storeId,
         enable1688: true,
         enableAI: true,
@@ -11543,7 +11543,7 @@ app.post("/api/jobs", async (req, res, next) => {
       urlRows,
       startRow,
       sourceTotal: allUrlRows.length,
-      maxCandidates: clampInt(req.body.maxCandidates, 1, 20, 5),
+      maxCandidates: clampInt(req.body.maxCandidates, 1, 20, 10),
       storeId,
       enable1688: req.body.enable1688 !== false,
       enableAI: req.body.enableAI !== false,
@@ -15577,7 +15577,7 @@ ${JSON.stringify({
 ${JSON.stringify(compactCandidates, null, 2)}
 
 审核规则：
-1. 优先找 exact：同款、同功能、同外观、同关键规格。
+1. 优先找 exact：同款、同功能、同外观、同关键规格。**在所有候选里尽量搜索真同款**：品牌/款式/功能/规格/容量/型号一致、仅颜色/包装/店铺图不同仍是 exact；不要因为候选排序靠后或图片角度不同就漏掉真同款。
 2. 如果没有 exact，可以选 approximate：图片/标题/用途高度相近，但存在颜色、套装、细节、规格、品牌不明等风险，需要人工复核。
 3. 重量和尺寸只作为参考信息，不作为硬性一致条件；Ozon 和 1688 都可能乱标重量或尺寸。
 4. Ozon 图片角落里的商家水印、平台贴纸、后期叠字（例如右下角 MAOLA 这类标记）不要当成品牌或产品本体；只有印在实物/包装上的标识才算产品特征。

@@ -22,7 +22,7 @@ window.SourcingModuleView = {
     const getStoreId = () => (window.getCurrentStoreId ? window.getCurrentStoreId() : (localStorage.getItem('currentStoreId') || ''));
 
     const urlsText = Vue.ref('');
-    const maxCandidates = Vue.ref(5);
+    const maxCandidates = Vue.ref(10);
     const startRow = Vue.ref(1);
     const delayMin = Vue.ref(8);
     const delayMax = Vue.ref(20);
@@ -598,7 +598,7 @@ window.SourcingModuleView = {
       try {
         const res = await axios.post('/api/jobs', {
           urlsText: text,
-          maxCandidates: Number(maxCandidates.value || 5),
+          maxCandidates: Number(maxCandidates.value || 10),
           delayMinMs: Math.round(Number(delayMin.value || 8) * 1000),
           delayMaxMs: Math.round(Number(delayMax.value || 20) * 1000),
           startRow: Number(startRow.value || 1),
@@ -767,7 +767,7 @@ window.SourcingModuleView = {
 	    const priceProductMax = Vue.computed(() => metricMax(overview.value.price_distribution || [], 'product_count'));
 	    const productMax = Vue.computed(() => metricMax(overview.value.products || [], 'gmv_cny'));
 	    const categoryMax = Vue.computed(() => metricMax(overview.value.categories || [], 'gmv_cny'));
-    const topCandidates = (row) => (row.candidates || []).slice(0, Math.max(1, Number(maxCandidates.value || 5)));
+    const topCandidates = (row) => (row.candidates || []).slice(0, Math.max(1, Number(maxCandidates.value || 10)));
     const ozonImage = (row) => row.ozon?.mainImage?.publicUrl || row.ozon?.mainImageUrl || '';
     const proxiedCandidateImage = (url) => {
       const text = String(url || '').trim();
