@@ -775,6 +775,15 @@ window.ProductListView = {
         notify.warning('复制失败，请手动复制');
       }
     };
+    // 拼 Ozon 前台商品链接：优先 sku（数字商品 ID），无 sku 时从货号里提取数字段兜底
+    const productFrontUrl = (row) => {
+      const sku = String(row?.sku || '').trim();
+      if (/^\d+$/.test(sku)) return `https://www.ozon.ru/product/${sku}/`;
+      const offer = String(row?.offer_id || row?.sourceSku || '').trim();
+      const digits = offer.match(/\d{6,}/);
+      if (digits) return `https://www.ozon.ru/product/${digits[0]}/`;
+      return `https://www.ozon.ru/search/?text=${encodeURIComponent(offer || row?.name || '')}`;
+    };
     const handleProductAction = ({ action, row }) => {
       if (action === 'edit') return editProduct(row);
       if (action === 'archive') return archiveProduct(row);
@@ -885,7 +894,7 @@ window.ProductListView = {
       fetchProducts, handleSyncAll, editProduct, saveProduct,
       archiveProduct, unarchiveProduct,
       onPageChange, onSizeChange, onTabChange, onSearch, onPriceFilterChange, onSearchInput,
-      copyOfferId, onSelectionChange, bulkArchive, openBulkStockEditor, refreshBulkStockPreview, saveBulkStockDrafts,
+      copyOfferId, productFrontUrl, onSelectionChange, bulkArchive, openBulkStockEditor, refreshBulkStockPreview, saveBulkStockDrafts,
       bulkPriceDialog, openBulkPriceEditor, saveBulkPrices,
       exportCsv, onStoreScopeChange, selectStatusTab, handleProductAction,
       statusCn, statusHint, productStatusLabel, issueSummary, syncFieldsNote,
@@ -1013,11 +1022,17 @@ window.ProductListView = {
           <el-table-column label="商品" min-width="390">
             <template #default="{ row }">
               <div style="min-width:0">
-                <div style="font-size:15px; color:#1f2937; font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ row.name || '(无标题)' }}</div>
+                <a
+                  :href="productFrontUrl(row)"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style="font-size:15px; color:#1e40af; font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:block; text-decoration:none"
+                  :title="'打开 Ozon 前台：' + productFrontUrl(row)">{{ row.name || '(无标题)' }}</a>
                 <div style="margin-top:6px; display:flex; align-items:center; gap:6px; font-size:12px; color:#94a3b8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">
                   <span>SKU {{ row.sku || '-' }}</span>
                   <span>货号 {{ row.offer_id || '-' }}</span>
                   <el-button link type="primary" size="small" title="复制货号" @click.stop="copyOfferId(row.offer_id)"><el-icon><CopyDocument /></el-icon></el-button>
+                  <el-button link type="primary" size="small" title="打开 Ozon 前台" @click.stop="window.open(productFrontUrl(row), '_blank')">前台 ›</el-button>
                 </div>
               </div>
             </template>
