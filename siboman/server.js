@@ -144,6 +144,32 @@ function formatCny(rub) {
 
 // 具体类目词典（俄语类目名 → 中文），优先于大类规则；覆盖 dz 采集的常见具体类目
 const OZON_CATEGORY_ZH_SPECIFIC = [
+  // ---- Ozon 顶级类目（编辑抽屉类目树一级节点）----
+  [/^одежда$/i, "服装"],
+  [/^антиквариат/i, "古董收藏"],
+  [/^товары для животных/i, "宠物用品"],
+  [/^книги$/i, "图书"],
+  [/^бытовая техника/i, "家用电器"],
+  [/^красота и гигиена/i, "美妆个护"],
+  [/^бытовая химия/i, "家居清洁"],
+  [/^музыкальные инструменты/i, "乐器"],
+  [/^дом и сад/i, "家居家装"],
+  [/^продукты питания/i, "食品饮料"],
+  [/^мебель$/i, "家具"],
+  [/^товары для курения/i, "烟具配件"],
+  [/^аптека$/i, "医药保健"],
+  [/^фермерское хозяйство/i, "农资园艺"],
+  [/^обувь$/i, "鞋靴"],
+  [/^галантерея и аксессуары/i, "服饰配件"],
+  [/^детские товары/i, "母婴玩具"],
+  [/^хобби и творчество/i, "手工爱好"],
+  [/^кино, музыка/i, "影音娱乐"],
+  [/^строительство и ремонт/i, "建材装修"],
+  [/^автотовары$/i, "汽摩用品"],
+  [/^спорт и отдых/i, "运动户外"],
+  [/^товары для взрослых/i, "成人用品"],
+  [/^канцелярские товары/i, "办公文具"],
+  [/^электроника$/i, "电子产品"],
   [/тетрадь/i, "笔记本"],
   [/корм сухой|корм для/i, "宠物干粮"],
   [/туалетная бумага/i, "卫生纸"],
@@ -1227,6 +1253,8 @@ async function initDatabase() {
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS source_url_1688 TEXT DEFAULT '';
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS description_category_id BIGINT;   -- v0.6.1 Ozon 类目 ID
       ALTER TABLE app_products ADD COLUMN IF NOT EXISTS type_id BIGINT;                    -- v0.6.1 Ozon 类目类型 ID
+      ALTER TABLE app_products ADD COLUMN IF NOT EXISTS marketing_seller_price NUMERIC(12,2);  -- 促销价(Ozon 自动拉活动后的实际卖价), 0/空=未促销
+      CREATE INDEX IF NOT EXISTS idx_app_products_promo ON app_products(marketing_seller_price) WHERE marketing_seller_price IS NOT NULL AND marketing_seller_price > 0;
 
       CREATE INDEX IF NOT EXISTS idx_app_products_store ON app_products(store_id, status);
       CREATE INDEX IF NOT EXISTS idx_app_products_updated ON app_products(updated_at DESC);
@@ -1814,7 +1842,7 @@ async function updateProductField(req, res, next) {
       if (!Number.isFinite(numericValue) || numericValue <= 0) {
         return res.status(400).json({ success: false, error: "售价必须是大于 0 的数字" });
       }
-      await callOzonSellerAPI("/v1/product/import-prices", {
+      await callOzonSellerAPI("/v1/product/import/prices", {
         prices: [{ offer_id: offerId, price: String(numericValue) }]
       }, { storeId, userId });
     } else if (key === 'stock') {
@@ -1991,6 +2019,55 @@ app.post("/api/seller/test", async (req, res, next) => {
 /* ============================================================
    商品管理增强 - 全字段物理同步接口 (v0.3.1)
    ============================================================ */
+
+// 批量改价：跨店铺同 SKU 价格统一（每店一次 import/prices）
+app.post("/api/seller/products/prices/bulk", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.body?.store_id || req.body?.storeId || "").split(",")[0].trim();
+    const prices = Array.isArray(req.body?.prices) ? req.body.prices : [];
+    if (!storeId) return res.status(400).json({ success: false, error: "未指定店铺" });
+    if (!prices.length) return res.status(400).json({ success: false, error: "prices 数组为空" });
+    const userId = req.user.id;
+    // 校验商品归属（DB 有记录才允许改价）
+    const offerIds = prices.map((p) => String(p.offer_id || "")).filter(Boolean);
+    const owned = await db.query(
+      `SELECT offer_id FROM app_products WHERE user_id=$1 AND store_id=$2 AND offer_id=ANY($3::text[])`,
+      [userId, storeId, offerIds],
+    );
+    const ownedSet = new Set(owned.rows.map((r) => r.offer_id));
+    const valid = prices.filter((p) => ownedSet.has(String(p.offer_id)));
+    const skipped = prices.length - valid.length;
+    if (!valid.length) return res.status(404).json({ success: false, error: "所选商品不在当前店铺或不存在" });
+    const result = await callOzonSellerAPI("/v1/product/import/prices", {
+      prices: valid.map((p) => ({
+        offer_id: p.offer_id,
+        price: String(Number(p.price || 0)),
+        currency_code: String(p.currency_code || "RUB"),
+      })),
+    }, { storeId, userId });
+    const items = Array.isArray(result?.result) ? result.result : [];
+    const succeeded = items.filter((it) => !(it.errors && it.errors.length)).length;
+    const errors = items.filter((it) => it.errors && it.errors.length).map((it) => ({
+      offer_id: it.offer_id,
+      message: (it.errors || []).map((e) => e.message || e.code).join("; "),
+    }));
+    // 本地同步最新价格
+    if (valid.length) {
+      const newPrice = Number(valid[0].price || 0);
+      const ids = valid.map((p) => String(p.offer_id));
+      await db.query(
+        `UPDATE app_products SET price = $1, marketing_seller_price = NULL, updated_at = now()
+          WHERE user_id=$2 AND store_id=$3 AND offer_id=ANY($4::text[])`,
+        [newPrice, userId, storeId, ids],
+      );
+    }
+    res.json({ success: true, submitted: valid.length, succeeded, skipped, errors, result });
+  } catch (error) {
+    console.error("[prices/bulk] err:", error);
+    res.status(error.statusCode || 500).json({ success: false, error: error.message, payload: error.payload || null });
+  }
+});
 app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -2023,7 +2100,7 @@ app.patch("/api/seller/products/:offer_id/full-update", requireAuth, async (req,
     );
     if (priceChanged) {
       try {
-        await callOzonSellerAPI("/v1/product/import-prices", {
+        await callOzonSellerAPI("/v1/product/import/prices", {
           prices: [{
             offer_id,
             price: String(price),
@@ -2823,10 +2900,25 @@ app.post("/api/seller/products/sync-all", requireAuth, async (req, res, next) =>
       const attrItems = attrRes?.result || [];
       const attrByOffer = new Map(attrItems.map(x => [x.offer_id, x]));
 
+      // 3.5) 促销价 v5/product/info/prices (marketing_seller_price=Ozon 自动拉活动后的实际卖价)
+      let priceByOffer = new Map();
+      try {
+        const priceRes = await callOzonSellerAPI("/v5/product/info/prices", {
+          filter: { offer_id: offerIds, product_id: [], visibility: "ALL" },
+          limit: offerIds.length || 100,
+          offset: 0,
+        }, { storeId, userId });
+        priceByOffer = new Map((priceRes?.items || []).map(x => [x.offer_id, x?.price || {}]));
+      } catch (priceErr) {
+        console.warn(`[Sync-All] v5 prices 促销价拉取失败(不影响主同步): ${priceErr.message}`);
+      }
+
       // 4) UPSERT 落库 (13 参数 -> 22 参数全字段)
       for (const offerId of offerIds) {
         const info = infoByOffer.get(offerId) || {};
         const attr = attrByOffer.get(offerId) || {};
+        const priceObj = priceByOffer.get(offerId) || {};
+        const marketingPrice = Number(priceObj.marketing_seller_price || 0);
 
         const primaryImage = Array.isArray(info.primary_image)
           ? (info.primary_image[0] || "")
@@ -2845,7 +2937,7 @@ app.post("/api/seller/products/sync-all", requireAuth, async (req, res, next) =>
         await db.query(
           `INSERT INTO app_products (
              user_id, store_id, offer_id, name, image, images,
-             price, min_price, old_price, currency_code, vat, stock,
+             price, min_price, old_price, marketing_seller_price, currency_code, vat, stock,
              brand, country_of_origin, description,
              status, status_name, category_name, description_category_id, type_id, price_index,
              product_id, sku, model_id, barcode,
@@ -2854,16 +2946,17 @@ app.post("/api/seller/products/sync-all", requireAuth, async (req, res, next) =>
            )
            VALUES (
              $1,$2,$3,$4,$5,$6,
-             $7,$8,$9,$10,$11,$12,
-             $13,$14,$15,
-             $16,$17,$18,$19,$20,$21,
-             $22,$23,$24,$25,
-             $26,$27,$28,$29,$30,$31,
-             $32, $33, now(), $34
+             $7,$8,$9,$10,$11,$12,$13,
+             $14,$15,$16,
+             $17,$18,$19,$20,$21,$22,
+             $23,$24,$25,$26,
+             $27,$28,$29,$30,$31,$32,
+             $33, $34, now(), $35
            )
            ON CONFLICT (store_id, offer_id) DO UPDATE SET
              name = EXCLUDED.name, image = EXCLUDED.image, images = EXCLUDED.images,
              price = EXCLUDED.price, min_price = EXCLUDED.min_price, old_price = EXCLUDED.old_price,
+             marketing_seller_price = EXCLUDED.marketing_seller_price,
              currency_code = EXCLUDED.currency_code, vat = EXCLUDED.vat, stock = EXCLUDED.stock,
              brand = EXCLUDED.brand, country_of_origin = EXCLUDED.country_of_origin, description = EXCLUDED.description,
              status = EXCLUDED.status, status_name = EXCLUDED.status_name,
@@ -2884,6 +2977,7 @@ app.post("/api/seller/products/sync-all", requireAuth, async (req, res, next) =>
             Number(info.price || 0),
             info.min_price ? Number(info.min_price) : null,
             info.old_price ? Number(info.old_price) : null,
+            marketingPrice > 0 ? marketingPrice : null,
             String(info.currency_code || "RUB"),
             String(info.vat || "0"),
             stockNum,
@@ -6735,6 +6829,7 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
     const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 50)));
     const offset = Math.max(0, Number(req.body?.offset || 0));
     const search = String(req.body?.search || "").trim();
+    const priceFilter = String(req.body?.price_filter || "all").trim();
 
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
     if (!OZON_VISIBILITY_ENUM.has(visibility)) {
@@ -6742,7 +6837,8 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
     }
 
     let livePage = null;
-    if (!search) {
+    // price_filter 有值时跳过 Ozon 实时页（其 total 不含过滤条件），走纯本地 SQL 过滤
+    if (!search && priceFilter === "all") {
       try {
         livePage = await fetchOzonProductListPage(storeId, userId, visibility, limit, offset);
       } catch (error) {
@@ -6767,9 +6863,14 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
       where.push(`(name ILIKE $${params.length} OR offer_id ILIKE $${params.length} OR sku::text ILIKE $${params.length})`);
     }
 
+    // 促销价筛选: promo=当前价与促销价不一致(被Ozon拉活动)
+    if (priceFilter === "promo") {
+      where.push(`COALESCE(marketing_seller_price, 0) > 0 AND marketing_seller_price <> price`);
+    }
+
     // 2. 分页查询记录 (全字段回传给前端抽屉编辑) - v0.3.3 加 stocks_json 分仓原始数据
     const rows = await db.query(
-      `SELECT id, store_id, offer_id, name, image, images, price, min_price, old_price, currency_code, vat, stock,
+      `SELECT id, store_id, offer_id, name, image, images, price, min_price, old_price, marketing_seller_price, currency_code, vat, stock,
               brand, country_of_origin, description,
               status, status_name, category_name, description_category_id, type_id, price_index,
               product_id, sku, model_id, barcode,
@@ -6806,7 +6907,8 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
 
     let responseTotal = parseInt(countRes.rows[0].count);
     let countsSource = "local";
-    if (!search) {
+    // 有价格筛选时不覆盖 total（Ozon 实时 count 不含价格过滤条件）
+    if (!search && priceFilter === "all") {
       try {
         const ozonCounts = await fetchOzonProductStatusCounts(storeId, userId);
         if (Object.keys(ozonCounts).length) {
@@ -8700,7 +8802,23 @@ app.post("/api/seller/categories/tree", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     const data = await callOzonSellerAPI("/v1/description-category/tree", { language: "DEFAULT" }, { storeId, userId: req.user.id });
-    res.json({ success: true, data });
+    // 服务端把俄文类目名翻译成中文（categoryNameZh），前端编辑抽屉可直接显示中文
+    const translateTree = (nodes, inherited = {}) => (nodes || []).map((n) => {
+      const ownCatId = Number(n.description_category_id || 0) || 0;
+      const effectiveCatId = ownCatId || Number(inherited.description_category_id || 0) || 0;
+      const zh = categoryNameZh(n.category_name || n.type_name || "", effectiveCatId ? String(effectiveCatId) : "");
+      return {
+        ...n,
+        category_name_zh: zh,
+        category_label: zh !== "未翻译类目" && zh !== "未分类" ? `${zh}（${n.category_name || n.type_name || ""}）` : (n.category_name || n.type_name || ""),
+        children: translateTree(n.children, {
+          description_category_id: effectiveCatId,
+          category_name: n.category_name || inherited.category_name || "",
+        }),
+      };
+    });
+    const translated = translateTree(data?.result || []);
+    res.json({ success: true, data: { result: translated } });
   } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
 });
 

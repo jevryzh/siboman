@@ -6,6 +6,7 @@ window.ProductListView = {
     const saveLoading = Vue.ref(false);
     const activeTab = Vue.ref('ALL');
     const search = Vue.ref('');
+    const priceFilter = Vue.ref('all'); // all | promo(当前价与划线价不一致) | price_changed(本地价与Ozon价不一致)
     const drawer = Vue.reactive({ visible: false, itemId: '', form: {}, categoryPath: [] });
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 50, total: 0 });
     const statusCounts = Vue.reactive({ ALL: 0 });
@@ -22,6 +23,12 @@ window.ProductListView = {
       submitNow: false,
       preview: [],
       skipped: 0,
+    });
+    const bulkPriceDialog = Vue.reactive({
+      visible: false,
+      submitting: false,
+      newPrice: 0,
+      rows: [],
     });
     const shops = Vue.ref([]);
     const ALL_STORES = '__all__';
@@ -276,6 +283,57 @@ window.ProductListView = {
       }
     };
 
+    const openBulkPriceEditor = () => {
+      if (!selectedRows.value.length) return notify.warning('请先勾选要批量改价的商品');
+      bulkPriceDialog.rows = selectedRows.value.map((row) => ({
+        offer_id: row.offer_id,
+        store_id: row.store_id || row.storeId,
+        name: row.name || row.offer_id,
+        price: Number(row.price || 0),
+        currency_code: row.currency_code || 'RUB',
+        marketing_seller_price: Number(row.marketing_seller_price || 0),
+        selected: true,
+      }));
+      bulkPriceDialog.newPrice = 0;
+      bulkPriceDialog.visible = true;
+    };
+
+    const saveBulkPrices = async () => {
+      const rows = bulkPriceDialog.rows.filter((r) => r.selected);
+      const newPrice = Number(bulkPriceDialog.newPrice);
+      if (!rows.length) return notify.warning('没有勾选要改价的商品');
+      if (!Number.isFinite(newPrice) || newPrice <= 0) return notify.warning('请输入大于 0 的新价格');
+      bulkPriceDialog.submitting = true;
+      try {
+        // 按店铺分组，每店一次 import/prices 批量提交（跨店铺同 SKU 价格统一）
+        const groups = rows.reduce((map, row) => {
+          if (!map.has(row.store_id)) map.set(row.store_id, []);
+          map.get(row.store_id).push(row);
+          return map;
+        }, new Map());
+        let succeeded = 0;
+        const errors = [];
+        for (const [storeId, items] of groups.entries()) {
+          try {
+            const res = await axios.post('/api/seller/products/prices/bulk', {
+              store_id: storeId,
+              prices: items.map((r) => ({ offer_id: r.offer_id, price: newPrice, currency_code: r.currency_code })),
+            });
+            succeeded += Number(res.data?.succeeded || items.length);
+            if (res.data?.errors?.length) errors.push(...res.data.errors.map((e) => `${e.offer_id}: ${e.message}`));
+          } catch (e) {
+            errors.push(`${storeId.slice(0, 8)}: ${e.response?.data?.error || e.message}`);
+          }
+        }
+        if (errors.length) notify.warning(`批量改价部分完成：成功 ${succeeded} 个，失败 ${errors.length} 个。${errors.slice(0, 3).join('；')}`);
+        else notify.success(`批量改价完成：${succeeded} 个商品已提交 Ozon`);
+        bulkPriceDialog.visible = false;
+        await fetchProducts();
+      } finally {
+        bulkPriceDialog.submitting = false;
+      }
+    };
+
     const openBulkStockEditor = async () => {
       if (!selectedRows.value.length) return notify.warning('请先勾选要批量修改库存的商品');
       bulkStockDialog.warehouseMode = 'default';
@@ -367,6 +425,7 @@ window.ProductListView = {
           visibility: activeTab.value,
           store_id: sid,
           search: search.value,
+          price_filter: priceFilter.value,
           limit,
           offset,
         }).then((res) => ({ sid, data: res.data }))));
@@ -492,7 +551,7 @@ window.ProductListView = {
         categoryNodeByKey.clear();
         const clean = (nodes, indexPath = [], inherited = {}) => (nodes || []).map((n, index) => {
           const nextIndexPath = [...indexPath, index];
-          const label = n.category_name || n.type_name || '未命名类目';
+          const label = n.category_name_zh || n.category_name || n.type_name || '未命名类目';
           const ownCategoryId = Number(n.description_category_id || 0) || 0;
           const ownTypeId = Number(n.type_id || 0) || 0;
           const inheritedCategoryId = ownCategoryId || Number(inherited.description_category_id || 0) || null;
@@ -502,6 +561,7 @@ window.ProductListView = {
             label,
             category_key: categoryKey,
             category_name: n.category_name || inheritedCategoryName || label,
+            category_name_zh: n.category_name_zh || label,
             description_category_id: inheritedCategoryId,
             type_id: ownTypeId || null,
             children: n.children && n.children.length ? clean(n.children, nextIndexPath, {
@@ -818,6 +878,7 @@ window.ProductListView = {
       archiveProduct, unarchiveProduct,
       onPageChange, onSizeChange, onTabChange, onSearch, onSearchInput,
       copyOfferId, onSelectionChange, bulkArchive, openBulkStockEditor, refreshBulkStockPreview, saveBulkStockDrafts,
+      bulkPriceDialog, openBulkPriceEditor, saveBulkPrices,
       exportCsv, onStoreScopeChange, selectStatusTab, handleProductAction,
       statusCn, statusHint, productStatusLabel, issueSummary, syncFieldsNote,
       parseStocks, stockDisplay, warehouseLabel,
@@ -890,14 +951,19 @@ window.ProductListView = {
           <el-input v-model="search" size="large" placeholder="搜索 SKU / 货号 / 标题..." clearable style="width:100%" @input="onSearchInput" @keyup.enter="onSearch">
             <template #prefix><el-icon><Search /></el-icon></template>
           </el-input>
+          <el-select v-model="priceFilter" size="large" style="width:100%" @change="onSearch">
+            <el-option label="全部价格" value="all" />
+            <el-option label="当前价与促销价不一致" value="promo" />
+          </el-select>
           <el-button size="large" style="width:100%" @click="onSearch">筛选</el-button>
-          <el-button size="large" style="width:100%" @click="() => { search=''; activeTab='ALL'; pagination.currentPage=1; fetchProducts(); }">重置</el-button>
+          <el-button size="large" style="width:100%" @click="() => { search=''; priceFilter='all'; activeTab='ALL'; pagination.currentPage=1; fetchProducts(); }">重置</el-button>
         </div>
 
         <div v-if="selectedRows.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
           <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedRows.length }} 个商品</span>
           <div style="display:flex; gap:8px">
             <el-button type="primary" size="small" plain :loading="bulkStockDialog.loadingDetails" @click="openBulkStockEditor">批量改库存</el-button>
+            <el-button type="warning" size="small" plain :disabled="!selectedRows.length" @click="openBulkPriceEditor">批量改价</el-button>
             <el-button type="danger" size="small" :loading="bulkLoading" @click="bulkArchive">批量归档</el-button>
             <el-button size="small" @click="exportCsv">导出当前筛选</el-button>
           </div>
@@ -967,9 +1033,14 @@ window.ProductListView = {
               <span v-else style="color:#909399; font-size:12px">{{ statusHint(row.status) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="价格" width="130" sortable prop="price">
+          <el-table-column label="价格" width="150" sortable prop="price">
             <template #default="{ row }">
-              <span style="font-weight:bold">{{ row.currency_code || 'RUB' }} {{ Number(row.price).toFixed(2) }}</span>
+              <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+                <span style="font-weight:bold">{{ row.currency_code || 'RUB' }} {{ Number(row.price).toFixed(2) }}</span>
+                <el-tag v-if="row.marketing_seller_price && Number(row.marketing_seller_price) > 0 && Number(row.marketing_seller_price) !== Number(row.price)" type="danger" size="small" effect="dark">
+                  促销 {{ Number(row.marketing_seller_price).toFixed(2) }}
+                </el-tag>
+              </div>
               <div v-if="row.old_price && Number(row.old_price) > Number(row.price)" style="font-size:11px; color:#999; text-decoration:line-through">
                 {{ row.currency_code }} {{ Number(row.old_price).toFixed(2) }}
               </div>
@@ -1343,6 +1414,35 @@ window.ProductListView = {
           <el-button type="primary" :loading="bulkStockDialog.submitting" @click="saveBulkStockDrafts">
             {{ bulkStockDialog.submitNow ? '保存并提交' : '保存草稿' }}
           </el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog v-model="bulkPriceDialog.visible" title="批量改价（跨店铺同 SKU 统一价格）" width="640px" destroy-on-close>
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px">
+          勾选要改价的商品，输入新售价后批量提交 Ozon。同 SKU 在多个店铺时逐店铺提交（服务端按店铺分组），改价后本地同步并清除促销标记。
+        </el-alert>
+        <div style="display:flex; align-items:center; gap:12px; margin-bottom:14px">
+          <span style="font-weight:700; color:#0f172a; white-space:nowrap">新售价（{{ bulkPriceDialog.rows[0]?.currency_code || 'RUB' }}）</span>
+          <el-input-number v-model="bulkPriceDialog.newPrice" :min="1" :precision="2" :step="1" style="width:180px" />
+          <span style="font-size:12px; color:#94a3b8">将覆盖所选商品当前价</span>
+        </div>
+        <el-table :data="bulkPriceDialog.rows" max-height="360" border size="small" style="width:100%">
+          <el-table-column type="selection" width="44" :selectable="() => true" @selection-change="(rows) => { bulkPriceDialog.rows.forEach(r => r.selected = rows.includes(r)); }" />
+          <el-table-column label="货号" min-width="150" show-overflow-tooltip prop="offer_id" />
+          <el-table-column label="商品" min-width="180" show-overflow-tooltip prop="name" />
+          <el-table-column label="当前价" width="100" align="right">
+            <template #default="{ row }">{{ row.currency_code }} {{ Number(row.price).toFixed(2) }}</template>
+          </el-table-column>
+          <el-table-column label="促销价" width="100" align="right">
+            <template #default="{ row }">
+              <span v-if="row.marketing_seller_price > 0" style="color:#f56c6c; font-weight:700">{{ Number(row.marketing_seller_price).toFixed(2) }}</span>
+              <span v-else style="color:#c0c4cc">-</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button @click="bulkPriceDialog.visible=false">取消</el-button>
+          <el-button type="primary" :loading="bulkPriceDialog.submitting" @click="saveBulkPrices">提交改价</el-button>
         </template>
       </el-dialog>
     </div>
