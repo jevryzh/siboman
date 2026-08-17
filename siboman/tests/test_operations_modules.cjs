@@ -209,7 +209,7 @@ assert(sourcing.includes('插件需要重新授权'), 'single sourcing must expl
 assert(sourcing.includes('1688 需要人工验证'), 'single sourcing must surface captcha/verification state');
 assert(sourcing.includes('1688 登录状态不可用'), 'single sourcing must surface 1688 login state');
 assert(sourcing.includes('AI 审核失败'), 'single sourcing must surface AI provider failures');
-assert(sourcing.includes('Math.max(1, Number(maxCandidates.value || 10))'), 'candidate display must respect the user candidate count with default 10');
+assert(sourcing.includes('Math.max(1, Number(maxCandidates.value || 5))'), 'candidate display must respect the user candidate count with default 5');
 assert(sourcing.includes('最多展示 {{ maxCandidates }} 个候选/商品'), 'candidate count must be visible to the operator');
 assert(sourcing.includes('MOQ {{ candidateMoq(c)'), 'candidate rows must expose MOQ');
 assert(sourcing.includes('运费 {{ candidateFreight(c)'), 'candidate rows must expose freight status');
