@@ -772,14 +772,6 @@ window.MarketDiscoveryView = {
       </div>
 
       <el-alert
-        title="Ozon 机会池不会自动跑 1688"
-        :description="'每日/手动采集只写入 Ozon 商品候选池；当前商品候选 ' + (collectorStatus?.stats?.total || 0) + ' 个，蓝海/热销信号 ' + marketSummary.dzRows + ' 条，最新数据 ' + formatTime(collectorStatus?.stats?.latest_captured_at) + '。点击采集会同步返回导入数和失败原因；你勾选商品后才会加入找货候选。'"
-        type="warning"
-        :closable="false"
-        show-icon
-        style="margin-bottom:14px"
-      />
-      <el-alert
         v-if="collectorResult && !collectorResult.imported"
         title="本次没有采集到 Ozon 商品候选"
         type="error"
