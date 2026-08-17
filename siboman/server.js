@@ -5277,7 +5277,15 @@ app.get("/api/auto-listing/items", requireAuth, async (req, res, next) => {
     const offset = Math.max(0, Number(req.query.offset || 0));
     const args = [req.user.id, storeId];
     const where = ["user_id=$1", "store_id=$2"];
-    if (stage !== "all") { args.push(stage); where.push(`stage=$${args.length}`); }
+    if (stage !== "all") {
+      const stages = stage.split(",").map(s => s.trim()).filter(Boolean);
+      if (stages.length === 1) {
+        args.push(stages[0]); where.push(`stage=$${args.length}`);
+      } else if (stages.length > 1) {
+        args.push(stages);
+        where.push(`stage=ANY($${args.length}::text[])`);
+      }
+    }
     if (search) {
       args.push(`%${search}%`);
       where.push(`(source_sku ILIKE $${args.length} OR title ILIKE $${args.length} OR category_name_zh ILIKE $${args.length})`);

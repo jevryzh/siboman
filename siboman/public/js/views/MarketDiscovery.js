@@ -37,6 +37,9 @@ window.MarketDiscoveryView = {
     const categoryRows = Vue.ref([]);
     const categoryLoading = Vue.ref(false);
     const selectedCategory = Vue.ref('');
+    const reviewRows = Vue.ref([]);
+    const reviewLoading = Vue.ref(false);
+    const reviewStage = Vue.ref('ready,submitted,listed');
 
     const storeId = () => String(window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '')
       .split(',').map(value => value.trim()).find(Boolean) || '';
@@ -179,6 +182,24 @@ window.MarketDiscoveryView = {
         categoryRows.value = response.data.items || [];
       } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
       finally { categoryLoading.value = false; }
+    }
+
+    // 审核上架：加载待上架/已提交/已上架 阶段的队列项（主流程 ⑤）
+    async function loadReview() {
+      if (!storeId()) return;
+      reviewLoading.value = true;
+      try {
+        const response = await axios.get('/api/auto-listing/items', {
+          params: {
+            store_id: storeId(),
+            stage: reviewStage.value,
+            limit: 100,
+            offset: 0,
+          },
+        });
+        reviewRows.value = response.data.items || [];
+      } catch (error) { ElementPlus.ElMessage.error(errorText(error)); }
+      finally { reviewLoading.value = false; }
     }
 
     // 点击类目 → 跳到商品机会并按该类目过滤
@@ -691,7 +712,7 @@ window.MarketDiscoveryView = {
         { step: 2, title: '勾选候选', desc: '勾选感兴趣的 SKU', count: selectedProductCount.value, countSuffix: '已选', active: false, jump: () => { activeTab.value = 'overview'; } },
         { step: 3, title: '加入找货候选', desc: '进入找货队列', count: discovered, countSuffix: '条候选', active: activeTab.value === 'pipeline', jump: () => { activeTab.value = 'pipeline'; } },
         { step: 4, title: '启动真实找货', desc: '采集端执行 1688 找货', count: sourcing, countSuffix: '找货中', active: false, jump: () => { activeTab.value = 'pipeline'; } },
-        { step: 5, title: '审核并上架', desc: '核对后提交 Ozon', count: reviewReady, countSuffix: '待上架', active: false, jump: () => { window.location.hash = '#/upload'; } },
+        { step: 5, title: '审核并上架', desc: '核对后提交 Ozon', count: reviewReady, countSuffix: '待上架', active: activeTab.value === 'review', jump: () => { activeTab.value = 'review'; loadReview(); } },
       ];
     });
 
@@ -715,6 +736,7 @@ window.MarketDiscoveryView = {
       activeTab, loading, marketLoading, queueLoading, selectedMarketRows, selectedQueueRows, rulesOnly, detailDrawer,
       marketRows, queueRows, dashboard, collectorStatus, collectorResult, collectorLoading, workerStatus, sourcingJobState, settings, filters, marketPage, queuePage, marketSource,
       categoryRows, categoryLoading, selectedCategory, browseCategory, clearCategory,
+      reviewRows, reviewLoading, reviewStage, loadReview,
       discoveryState, marketView, moneyRub, moneyRubLarge, formatTime, percentText, stageLabels, statusLabels, riskTypes, selectedProductCount, selectedCategoryCount, hasCategoryMarket, discoverCategoryLabel, primaryDiscoverLabel, discoveryErrorText, collectorResultText,
       payloadOf, isDzRow, scoreText, scoreColor, blueScore, blueLevel, signalText, rowReasons, sourceBadgeType, sourceBadgeText,
       rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, marketSummary, ruleChips, displayedMarketRows, rulePassedMarketRows, passesRules, queueStateOf, flowSteps,
@@ -912,6 +934,46 @@ window.MarketDiscoveryView = {
                 <el-table-column label="依据" min-width="190" show-overflow-tooltip><template #default="{row}">{{rowReasons(row)}}</template></el-table-column>
               </el-table>
               <div style="display:flex;justify-content:flex-end;margin-top:12px"><el-pagination v-model:current-page="marketPage.page" v-model:page-size="marketPage.size" :total="marketPage.total" :page-sizes="[20,30,50,100]" layout="total,sizes,prev,pager,next" @change="loadMarket"/></div>
+          </div>
+        </el-tab-pane>
+
+        <el-tab-pane label="审核上架" name="review">
+          <div class="market-data-panel">
+            <div class="market-data-toolbar">
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <div style="font-size:16px;font-weight:900;color:#0f172a">待审核 / 待上架</div>
+                <el-select v-model="reviewStage" style="width:220px" @change="loadReview">
+                  <el-option label="待上架 + 已提交 + 已上架" value="ready,submitted,listed"/>
+                  <el-option label="仅待上架" value="ready"/>
+                  <el-option label="仅已提交 Ozon" value="submitted"/>
+                  <el-option label="仅已上架" value="listed"/>
+                </el-select>
+              </div>
+              <div class="market-toolbar-meta">
+                <span>共 {{reviewRows.length}} 条</span>
+              </div>
+            </div>
+            <el-alert
+              title="主流程 ⑤：这里列出从找货队列推进到上架阶段的商品。确认无误后，点击「去批量上架」打开上架页完成提交。"
+              type="info"
+              :closable="false"
+              show-icon
+              style="margin-bottom:12px"
+            />
+            <div style="display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+              <el-button type="primary" @click="window.location.hash = '#/upload'">去批量上架 ›</el-button>
+              <el-button @click="loadReview">刷新列表</el-button>
+            </div>
+            <el-table :data="reviewRows" v-loading="reviewLoading" border style="width:100%">
+              <el-table-column label="商品" min-width="320" show-overflow-tooltip><template #default="{row}"><div class="market-product-cell"><el-image v-if="rowImage(row)" :src="rowImage(row)" class="market-thumb" fit="cover"/><div v-else class="market-thumb market-thumb-empty">SKU</div><div class="market-product-main"><div class="market-product-title" style="color:#0f172a">{{rowTitle(row)}}</div><div class="market-product-sub">SKU {{rowSku(row)}} · {{rowCategory(row)}}</div></div></div></template></el-table-column>
+              <el-table-column label="阶段" width="130"><template #default="{row}"><el-tag>{{stageLabels[row.stage] || row.stage}}</el-tag></template></el-table-column>
+              <el-table-column label="状态" width="105"><template #default="{row}"><el-tag :type="row.status==='needs_human'?'warning':row.status==='failed'?'danger':'info'">{{statusLabels[row.status] || row.status}}</el-tag></template></el-table-column>
+              <el-table-column label="蓝海分" width="105" align="right"><template #default="{row}"><span :style="{fontWeight:900,color:scoreColor(blueScore(row))}">{{scoreText(blueScore(row))}}</span></template></el-table-column>
+              <el-table-column label="风险" width="90"><template #default="{row}"><el-tag :type="riskTypes[row.risk_level] || 'info'">{{row.risk_level || 'normal'}}</el-tag></template></el-table-column>
+              <el-table-column label="人工原因" min-width="190" show-overflow-tooltip><template #default="{row}">{{row.human_reason || '-'}}</template></el-table-column>
+              <el-table-column label="更新" width="150"><template #default="{row}">{{formatTime(row.updated_at)}}</template></el-table-column>
+              <el-table-column label="操作" width="170" fixed="right"><template #default="{row}"><el-button link type="success" @click="openSourcingReview(row)">核对</el-button><el-button link type="primary" @click="window.location.hash = '#/upload'">去上架</el-button></template></el-table-column>
+            </el-table>
           </div>
         </el-tab-pane>
 
