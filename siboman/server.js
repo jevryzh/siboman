@@ -15445,7 +15445,7 @@ async function reviewCandidatesWithMiniMax(ozon, candidates) {
           {
             role: "system",
             content:
-              "你是跨境电商货源匹配审核员。你的任务是在候选里给出一个最优货源：优先选择与 Ozon 商品同款、同功能、同外观、同关键规格的 exact；如果没有 exact，但有外观/功能/用途高度相近且可供人工复核的候选，选择 approximate；如果候选明显不相关、都是引流款或没有满足一件起购的候选，返回 none。1688 候选的 MOQ/起批量大于 1 是硬性淘汰条件，不能选为 exact 或 approximate。同时根据商品标题、属性、尺寸、图片和候选信息估算单个 Ozon 销售单位的包装后重量（克）。首单减、新人价、券后价等只属于价格风险备注，不影响产品是否一致；图片水印、平台贴纸、标题噪音也不能把真实同款降级为近似。只输出 JSON，不要输出 Markdown。",
+              "你是跨境电商货源匹配审核员。你的任务是在候选里给出一个最优货源：优先选择与 Ozon 商品同款、同功能、同外观、同关键规格的 exact；如果没有 exact，但有外观/功能/用途高度相近且可供人工复核的候选，选择 approximate；如果候选明显不相关或都是引流款，返回 none。同时根据商品标题、属性、尺寸、图片和候选信息估算单个 Ozon 销售单位的包装后重量（克）。首单减、新人价、券后价等只属于价格风险备注，不影响产品是否一致。只输出 JSON，不要输出 Markdown。",
           },
           { role: "user", content },
         ],
@@ -15574,17 +15574,15 @@ ${JSON.stringify({
 ${JSON.stringify(compactCandidates, null, 2)}
 
 审核规则：
-1. 1688 候选必须明确满足一件起购：只有 minOrderQuantity/MOQ/起批量能解析为 1 的候选才可选中。起批量大于 1 或起批量未取到的候选都必须判为 not_match，不能作为 selected_rank，也不能作为 approximate 兜底，这是硬规则。
-2. 优先找 exact：同款、同功能、同外观、同关键规格。若实物、款式、功能和关键规格一致，不要因为 Ozon 水印、商家贴纸、标题翻译、品牌缺失、拍摄角度、光线、背景或店铺图差异把它降级成 approximate。
-3. approximate 只能用于产品可替代但不是严格同款的情况。尺寸、颜色、型号、材质、版本、接口、适用对象、套装数量、容量、功率、功能、细节造型存在差异时，必须保持 approximate 或 not_match，不能为了看起来像而强行 exact。
-4. 重量和尺寸只作为参考信息，不作为硬性一致条件；Ozon 和 1688 都可能乱标重量或尺寸。候选都相近时，优先选择 shippingFee、weightText、dimensionsText、priceDetails、detailAttributes 更完整的候选，但不能突破 MOQ=1 规则。
-5. Ozon 图片角落里的商家水印、平台贴纸、后期叠字（例如右下角 MAOLA 这类标记）不要当成品牌或产品本体；只有印在实物/包装上的标识才算产品特征。
-6. 如果候选存在 trafficBaitRisk，通常视为 1688 引流款，不要选中；除非其他候选更差且它仍是最接近项，则只能作为 approximate，并明确写出引流风险。
-7. promotionRisk 只代表价格可能依赖首单减、新人价、新客价、券后价、补贴、限时优惠等，属于采购价风险备注；它不能作为判断产品是否一致的依据，也不能因为 promotionRisk 把 exact 降级成 approximate 或 none。
-8. 必须核对 Ozon 标题、属性和图片中是否写了多件/套装/pack/pcs/шт 等数量。若 Ozon 是多件一起卖，而 1688 候选是单件或较少件数，不能把单件价当成 Ozon 一套的采购价；需要按 purchaseMultiplier 或你从图片识别到的数量倍数计算，并在 reason 里说明数量风险。若 Ozon 明确是多表带/礼盒套装（例如 3 条、10 条表带），1688 候选只是单只手表且没有对应表带套装，不要作为 selected_rank，只能判 not_match。
-9. 智能手表、儿童电话手表、扫地机器人、净水器、电器等功能型商品，核心功能/适用对象/型号系列优先于外观相似。儿童 4G 电话手表不能优先选择普通运动手环；手表本体不能选择表带、保护壳、充电器等配件；净水器不能选择花洒、充电线、车充等相邻图片误召回。
-10. 只返回一个 selected_rank。若所有候选都明显不相关、数量无法合理对应、都是引流款或都不满足一件起购，decision 返回 "none"，selected_rank 返回 null。
-11. 需要估算 Ozon 当前销售单位的包装后重量，单位为克。优先参考明确尺寸、材质、件数、同类商品常见重量和图片体积感；Ozon/1688 抓到的重量只作为参考，发现明显异常时不要盲信。估算不确定时仍给出合理区间里的中位估计，并降低 estimated_weight_confidence。
+1. 优先找 exact：同款、同功能、同外观、同关键规格。
+2. 如果没有 exact，可以选 approximate：图片/标题/用途高度相近，但存在颜色、套装、细节、规格、品牌不明等风险，需要人工复核。
+3. 重量和尺寸只作为参考信息，不作为硬性一致条件；Ozon 和 1688 都可能乱标重量或尺寸。
+4. Ozon 图片角落里的商家水印、平台贴纸、后期叠字（例如右下角 MAOLA 这类标记）不要当成品牌或产品本体；只有印在实物/包装上的标识才算产品特征。
+5. 如果候选存在 trafficBaitRisk，通常视为 1688 引流款，不要选中；除非其他候选更差且它仍是最接近项，则只能作为 approximate，并明确写出引流风险。
+6. promotionRisk 只代表价格可能依赖首单减、新人价、新客价、券后价、补贴、限时优惠等，属于采购价风险备注；它不能作为判断产品是否一致的依据，也不能因为 promotionRisk 把 exact 降级成 approximate 或 none。
+7. 必须核对 Ozon 标题、属性和图片中是否写了多件/套装/pack/pcs/шт 等数量。若 Ozon 是多件一起卖，而 1688 候选是单件或较少件数，不能把单件价当成 Ozon 一套的采购价；需要按 purchaseMultiplier 或你从图片识别到的数量倍数计算，并在 reason 里说明数量风险。
+8. 只返回一个 selected_rank。若所有候选都明显不相关、数量无法合理对应或都是引流款，decision 返回 "none"，selected_rank 返回 null。
+9. 需要估算 Ozon 当前销售单位的包装后重量，单位为克。优先参考明确尺寸、材质、件数、同类商品常见重量和图片体积感；Ozon/1688 抓到的重量只作为参考，发现明显异常时不要盲信。估算不确定时仍给出合理区间里的中位估计，并降低 estimated_weight_confidence。
 
 只返回 JSON，格式如下：
 {
@@ -15870,21 +15868,6 @@ function normalizeAiEstimatedWeightGrams(value) {
   return Math.min(300000, Math.max(1, Math.round(number)));
 }
 
-function shouldPromoteApproximateAiReview(review, selected, selectedConfidence) {
-  if (review.decision !== "approximate" || selected?.verdict !== "approximate") return false;
-  if (selectedConfidence < AI_CONFIDENCE_THRESHOLD) return false;
-  const text = [review.reason, selected.reason, review.quantity_reason]
-    .filter(Boolean)
-    .join(" ")
-    .toLowerCase();
-  if (!text) return false;
-  const displayNoisePattern = /水印|贴纸|角落|后期|叠字|商家标记|平台标记|背景|拍摄|角度|图片差异|标题|翻译|品牌缺失|品牌未体现|logo|watermark|sticker|background|angle|photo|translation/i;
-  const displayNoiseOnlyPattern = /(?:仅|只是|只有|主要是|差异为|区别为|不同点为|不一致的是).{0,24}(?:水印|贴纸|角落|后期|叠字|商家标记|平台标记|背景|拍摄|角度|图片|标题|翻译|品牌|logo|watermark|sticker|background|angle|photo|translation)/i;
-  const exactIdentityPattern = /同款|同一商品|同一个商品|本体一致|实物一致|主体一致|外观一致|功能一致|same\s+item|same\s+product|identical\s+item|same\s+model|only\s+packaging|仅包装|仅赠品|仅促销|仅店铺图/i;
-  const realRiskPattern = /规格|尺寸|尺码|大小|颜色|色号|型号|款式|造型|形状|套装|数量|件数|容量|毫升|升|材质|材料|功能不同|功能差异|功能缺失|功能不一致|功能少|功能多|接口|版本|适配|兼容|多出|少了|缺少|可能不是|pack\s*(?:count|size)|pcs\s*(?:count|diff|different)|piece\s*(?:count|diff|different)|size|color|model|material|version|mismatch|different\s+function|function\s+mismatch|missing\s+function/i;
-  return (displayNoiseOnlyPattern.test(text) || exactIdentityPattern.test(text) || displayNoisePattern.test(text)) && !realRiskPattern.test(text);
-}
-
 function enforceStrictAiReview(review) {
   if (review.decision === "none" || !review.selected_rank) {
     return { ...review, decision: "none", selected_rank: null };
@@ -15914,17 +15897,6 @@ function enforceStrictAiReview(review) {
       decision: "approximate",
       confidence: selectedConfidence,
       reason: review.reason || "AI 返回了最接近候选，但判断为不完全匹配，需要人工确认。",
-    };
-  }
-  if (shouldPromoteApproximateAiReview(review, selected, selectedConfidence)) {
-    return {
-      ...review,
-      decision: "exact",
-      confidence: selectedConfidence,
-      reason: [review.reason || selected.reason || "差异仅为展示噪音。", "系统校正：水印、贴纸、标题翻译、拍摄角度或背景差异不降级为近似匹配。"].filter(Boolean).join(" "),
-      candidate_reviews: review.candidate_reviews.map((item) => Number(item.rank) === Number(selected.rank)
-        ? { ...item, verdict: "exact", confidence: Math.max(Number(item.confidence) || 0, selectedConfidence), reason: item.reason || review.reason || "差异仅为展示噪音。" }
-        : item),
     };
   }
   return { ...review, confidence: selectedConfidence };
