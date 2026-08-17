@@ -1041,12 +1041,18 @@ window.ProductListView = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="活动价" width="110" sortable>
+          <el-table-column label="活动价" width="120" sortable>
             <template #default="{ row }">
               <template v-if="row.marketing_seller_price && Number(row.marketing_seller_price) > 0">
-                <span v-if="Number(row.marketing_seller_price) !== Number(row.price)" style="color:#f56c6c; font-weight:900">{{ row.currency_code }} {{ Number(row.marketing_seller_price).toFixed(2) }}</span>
+                <!-- 活动价 < 设置价：红色（被平台拉低促销） -->
+                <span v-if="Number(row.marketing_seller_price) < Number(row.price)" style="color:#f56c6c; font-weight:900">{{ row.currency_code }} {{ Number(row.marketing_seller_price).toFixed(2) }}</span>
+                <!-- 活动价 > 设置价：蓝色（高于设置价） -->
+                <span v-else-if="Number(row.marketing_seller_price) > Number(row.price)" style="color:#2563eb; font-weight:900">{{ row.currency_code }} {{ Number(row.marketing_seller_price).toFixed(2) }}</span>
                 <span v-else style="color:#94a3b8">{{ row.currency_code }} {{ Number(row.marketing_seller_price).toFixed(2) }}</span>
-                <div v-if="Number(row.marketing_seller_price) !== Number(row.price)"><el-tag type="danger" size="small" effect="dark">已促销</el-tag></div>
+                <div v-if="Number(row.marketing_seller_price) !== Number(row.price)">
+                  <el-tag v-if="Number(row.marketing_seller_price) < Number(row.price)" type="danger" size="small" effect="dark">已促销</el-tag>
+                  <el-tag v-else type="primary" size="small" effect="dark">高于售价</el-tag>
+                </div>
               </template>
               <span v-else style="color:#c0c4cc">-</span>
             </template>

@@ -2977,8 +2977,8 @@ app.post("/api/seller/products/sync-all", requireAuth, async (req, res, next) =>
             Number(info.price || 0),
             info.min_price ? Number(info.min_price) : null,
             info.old_price ? Number(info.old_price) : null,
-            // 促销价只存"真正被拉低"的值（< 设置价）；等于/高于设置价视为无促销存 null，
-            // 否则列表活动价列显示与价格相同会让用户误以为筛选失效
+            // 促销价存"与设置价不一致"的值（marketing ≠ price，可低于或高于设置价）；
+            // 等于设置价视为无促销存 null。前端按高/低用不同颜色标注。
             (marketingPrice > 0 && marketingPrice !== Number(info.price || 0)) ? marketingPrice : null,
             String(info.currency_code || "RUB"),
             String(info.vat || "0"),
@@ -6865,7 +6865,8 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
       where.push(`(name ILIKE $${params.length} OR offer_id ILIKE $${params.length} OR sku::text ILIKE $${params.length})`);
     }
 
-    // 促销价筛选: promo=当前价与促销价不一致(被Ozon拉活动)
+    // 促销价筛选: promo=当前价与促销价不一致（marketing ≠ price，可低于或高于设置价）。
+    //   空值(无促销)和相等值(未促销)都不会筛出。
     if (priceFilter === "promo") {
       where.push(`COALESCE(marketing_seller_price, 0) > 0 AND marketing_seller_price <> price`);
     }
