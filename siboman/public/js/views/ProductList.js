@@ -933,7 +933,7 @@ window.ProductListView = {
           </button>
         </div>
 
-        <div style="display:grid; grid-template-columns:260px minmax(260px,1fr) 70px 70px; gap:10px; align-items:center; margin-bottom:14px">
+        <div style="display:grid; grid-template-columns:260px minmax(200px,1fr) 230px 70px 70px; gap:10px; align-items:center; margin-bottom:14px">
           <el-select
             v-model="storeScope"
             size="large"
@@ -953,7 +953,7 @@ window.ProductListView = {
           </el-input>
           <el-select v-model="priceFilter" size="large" style="width:100%" @change="onSearch">
             <el-option label="全部价格" value="all" />
-            <el-option label="当前价与促销价不一致" value="promo" />
+            <el-option label="价格与促销价不一致" value="promo" />
           </el-select>
           <el-button size="large" style="width:100%" @click="onSearch">筛选</el-button>
           <el-button size="large" style="width:100%" @click="() => { search=''; priceFilter='all'; activeTab='ALL'; pagination.currentPage=1; fetchProducts(); }">重置</el-button>
@@ -1033,17 +1033,22 @@ window.ProductListView = {
               <span v-else style="color:#909399; font-size:12px">{{ statusHint(row.status) }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="价格" width="150" sortable prop="price">
+          <el-table-column label="价格" width="110" sortable prop="price">
             <template #default="{ row }">
-              <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
-                <span style="font-weight:bold">{{ row.currency_code || 'RUB' }} {{ Number(row.price).toFixed(2) }}</span>
-                <el-tag v-if="row.marketing_seller_price && Number(row.marketing_seller_price) > 0 && Number(row.marketing_seller_price) !== Number(row.price)" type="danger" size="small" effect="dark">
-                  促销 {{ Number(row.marketing_seller_price).toFixed(2) }}
-                </el-tag>
-              </div>
+              <span style="font-weight:bold">{{ row.currency_code || 'RUB' }} {{ Number(row.price).toFixed(2) }}</span>
               <div v-if="row.old_price && Number(row.old_price) > Number(row.price)" style="font-size:11px; color:#999; text-decoration:line-through">
                 {{ row.currency_code }} {{ Number(row.old_price).toFixed(2) }}
               </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="活动价" width="110" sortable>
+            <template #default="{ row }">
+              <template v-if="row.marketing_seller_price && Number(row.marketing_seller_price) > 0">
+                <span v-if="Number(row.marketing_seller_price) !== Number(row.price)" style="color:#f56c6c; font-weight:900">{{ row.currency_code }} {{ Number(row.marketing_seller_price).toFixed(2) }}</span>
+                <span v-else style="color:#94a3b8">{{ row.currency_code }} {{ Number(row.marketing_seller_price).toFixed(2) }}</span>
+                <div v-if="Number(row.marketing_seller_price) !== Number(row.price)"><el-tag type="danger" size="small" effect="dark">已促销</el-tag></div>
+              </template>
+              <span v-else style="color:#c0c4cc">-</span>
             </template>
           </el-table-column>
           <el-table-column label="库存" prop="stock" width="120" sortable>
