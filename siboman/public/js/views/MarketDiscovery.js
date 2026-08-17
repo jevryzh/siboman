@@ -514,7 +514,7 @@ window.MarketDiscoveryView = {
         const response = await axios.post('/api/auto-listing/items/start-sourcing', {
           store_id: storeId(),
           ids: targets.map(row => row.id),
-          maxCandidates: 5,
+          maxCandidates: 10,
         });
         sourcingJobState.value = {
           jobId: response.data.jobId,
