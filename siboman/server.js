@@ -2977,7 +2977,9 @@ app.post("/api/seller/products/sync-all", requireAuth, async (req, res, next) =>
             Number(info.price || 0),
             info.min_price ? Number(info.min_price) : null,
             info.old_price ? Number(info.old_price) : null,
-            marketingPrice > 0 ? marketingPrice : null,
+            // 促销价只存"真正被拉低"的值（< 设置价）；等于/高于设置价视为无促销存 null，
+            // 否则列表活动价列显示与价格相同会让用户误以为筛选失效
+            (marketingPrice > 0 && marketingPrice !== Number(info.price || 0)) ? marketingPrice : null,
             String(info.currency_code || "RUB"),
             String(info.vat || "0"),
             stockNum,
