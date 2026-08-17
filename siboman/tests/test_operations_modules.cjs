@@ -223,7 +223,7 @@ assert(listing.includes('上架记录列表'), 'listing history should use user-
 assert(listing.includes('暂无匹配的上架记录。可调整筛选条件；新记录会在批量上架提交后出现。'), 'listing history must have a non-misleading empty state');
 assert(inventory.includes('暂无库存数据。请先选择店铺并点击同步 Ozon 全量；如已同步，可调整搜索条件。'), 'inventory must explain empty data and next step');
 assert(batchUpload.includes('这不是创建完成'), 'batch upload completion copy must distinguish submitted from completed');
-assert(batchUpload.includes('REQUIRED_BACKGROUND_VERSION = "2.2.9.100"'), 'batch upload must require the current released collector plugin');
+assert(batchUpload.includes('REQUIRED_BACKGROUND_VERSION = "2.2.9.101"'), 'batch upload must require the current released collector plugin');
 assert(batchUpload.includes('pluginVersionOk'), 'batch upload must not show stale plugins as a healthy connection');
 assert(batchUpload.includes('ensureRowsCollected'), 'batch upload must submit first, collect in the background, then continue listing');
 assert(batchUpload.includes('createBatchListingPlaceholders'), 'batch upload must create visible listing-history placeholders before long plugin collection');

@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.100";
+const VERSION = "2.2.9.101";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -3806,6 +3806,19 @@ function mergeProductObject(data, obj) {
   if (Array.isArray(obj.complex_attributes) && data.complex_attributes.length === 0) {
     data.complex_attributes = obj.complex_attributes;
   }
+}
+
+// v2.2.9.101 (fix): 注入函数闭包内必须自带 cleanOzonTitle —— executeScript 注入到商品页的函数
+//   只能引用自己函数体内的代码，顶层同名函数不在作用域，会导致 ReferenceError 整行失败
+function cleanOzonTitle(name) {
+  const text = String(name || "").replace(/\s+/g, " ").trim();
+  return text
+    .replace(/\s*-\s*(?:купить|buy|покупать)\s+(?:на\s+)?OZON\s*$/i, "")
+    .replace(/\s*-\s*OZON\s*$/i, "")
+    .replace(/\s*\(\s*(?:купить|buy)\s+(?:на\s+)?OZON\s*\)\s*$/i, "")
+    .replace(/\s*-\s*купить\s*$/i, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function parseWeight(w) {
