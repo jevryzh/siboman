@@ -37,6 +37,13 @@ window.MarketDiscoveryView = {
     const categoryRows = Vue.ref([]);
     const categoryLoading = Vue.ref(false);
     const selectedCategory = Vue.ref('');
+    const selectedCategoryLabel = Vue.ref('');
+    function clearCategory() {
+      selectedCategory.value = '';
+      selectedCategoryLabel.value = '';
+      marketPage.page = 1;
+      loadMarket();
+    }
     const reviewRows = Vue.ref([]);
     const reviewLoading = Vue.ref(false);
     const reviewStage = Vue.ref('ready,submitted,listed');
@@ -202,17 +209,15 @@ window.MarketDiscoveryView = {
       finally { reviewLoading.value = false; }
     }
 
-    // 点击类目 → 跳到商品机会并按该类目过滤
+    // 点击类目 → 跳到商品机会并按该类目过滤（合并行传多个俄语原名）
     function browseCategory(row) {
-      selectedCategory.value = row.category_id || row.category_name || '';
+      const names = Array.isArray(row.ru_names) && row.ru_names.length ? row.ru_names : [row.category_name || ''];
+      const ids = Array.isArray(row.category_ids) && row.category_ids.length ? row.category_ids : [];
+      selectedCategory.value = [...ids, ...names].filter(Boolean).join(',');
+      selectedCategoryLabel.value = row.category_name_zh || names.join(' / ');
       filters.rank = 'product';
       marketPage.page = 1;
       activeTab.value = 'overview';
-      loadMarket();
-    }
-    function clearCategory() {
-      selectedCategory.value = '';
-      marketPage.page = 1;
       loadMarket();
     }
 
@@ -735,7 +740,7 @@ window.MarketDiscoveryView = {
     return {
       activeTab, loading, marketLoading, queueLoading, selectedMarketRows, selectedQueueRows, rulesOnly, detailDrawer,
       marketRows, queueRows, dashboard, collectorStatus, collectorResult, collectorLoading, workerStatus, sourcingJobState, settings, filters, marketPage, queuePage, marketSource,
-      categoryRows, categoryLoading, selectedCategory, browseCategory, clearCategory,
+      categoryRows, categoryLoading, selectedCategory, selectedCategoryLabel, browseCategory, clearCategory,
       reviewRows, reviewLoading, reviewStage, loadReview,
       discoveryState, marketView, moneyRub, moneyRubLarge, formatTime, percentText, stageLabels, statusLabels, riskTypes, selectedProductCount, selectedCategoryCount, hasCategoryMarket, discoverCategoryLabel, primaryDiscoverLabel, discoveryErrorText, collectorResultText,
       payloadOf, isDzRow, scoreText, scoreColor, blueScore, blueLevel, signalText, rowReasons, sourceBadgeType, sourceBadgeText,
@@ -897,7 +902,7 @@ window.MarketDiscoveryView = {
               </div>
             </div>
             <div v-if="selectedCategory" class="market-filter-bar-cat">
-              <el-tag type="warning" effect="plain">当前类目：{{selectedCategory}}</el-tag>
+              <el-tag type="warning" effect="plain">当前类目：{{selectedCategoryLabel || selectedCategory}}</el-tag>
               <el-button link type="danger" @click="clearCategory">清除类目筛选</el-button>
             </div>
             <div style="font-size:12px;color:#94a3b8;line-height:1.5;margin-bottom:10px">勾选商品后点「② 加入找货候选」进入找货队列（流程条 ③）；再到「找货候选」页启动真实找货（④）。</div>

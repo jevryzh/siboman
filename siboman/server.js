@@ -152,17 +152,18 @@ const OZON_CATEGORY_ZH_SPECIFIC = [
   [/вертикальный пылесос/i, "立式吸尘器"],
   [/аэрогриль/i, "空气炸锅"],
   [/наполнитель/i, "猫砂"],
-  [/вода/i, "瓶装水"],
+  [/вода парфюмерная/i, "香氛水"],
+  [/вода\s*$|бутилированн|минеральн|питьев/i, "瓶装水"],
   [/стиральный порошок/i, "洗衣粉"],
   [/моющий пылесос/i, "洗地机"],
   [/чистящее средство/i, "清洁剂"],
   [/салфетки для уборки|салфетк/i, "清洁湿巾"],
-  [/обложк/i, "保护套"],
+  [/обложк/i, "封面/书套"],
   [/пятновыводител/i, "去渍剂"],
   [/комплект штор|штор/i, "窗帘"],
   [/сушилка для овощей|сушилк/i, "果蔬烘干机"],
   [/рубашк/i, "衬衫"],
-  [/дрель-шуруповерт|шуруповерт|дрель/i, "电钻/螺丝刀"],
+  [/дрель-шуруповерт|шуруповерт/i, "电动螺丝刀"],
   [/кроссовк/i, "运动鞋"],
   [/бумажные полотенца|полотенц/i, "厨房纸"],
   [/канистра/i, "油桶"],
@@ -198,14 +199,26 @@ const OZON_CATEGORY_ZH_SPECIFIC = [
   [/изолента/i, "电工胶带"],
   [/антенный усилитель|усилител/i, "天线放大器"],
   [/статуэтк/i, "摆件"],
-  [/бумага для принтера|бумага цветная|бумаг/i, "纸张"],
+  [/^бумага$|бумага\s+офисн|бумажн/i, "纸张"],
   [/вафельница/i, "华夫饼机"],
   [/протеин/i, "蛋白粉"],
-  [/мобиль/i, "婴儿床铃"],
+  [/мобиль[\s-]?для кроватки|детский мобиль|мобиль-подвеск|^мобиль$/i, "婴儿床铃"],
   [/мастурбатор/i, "成人用品"],
   [/ключ/i, "钥匙/扳手"],
-  [/чехол/i, "保护套"],
+  [/чехол на мебель|чехол для/i, "家具保护套"],
   [/косметический набор/i, "美妆套装"],
+  [/автоматическая кофемашина|кофемашин/i, "咖啡机"],
+  [/кофе растворим/i, "速溶咖啡"],
+  [/кофе в зернах|зернов/i, "咖啡豆"],
+  [/бумага цветная|цветная бумага/i, "彩纸"],
+  [/бумага для принтера|офисная бумага/i, "打印纸"],
+  [/дрель-шуруповерт|шуруповерт/i, "电动螺丝刀"],
+  [/дрель[\s\-]|^дрель$/i, "电钻"],
+  [/фигурк|статуэтк/i, "摆件"],
+  [/таблетк|для посудомоечной/i, "洗碗机清洁片"],
+  [/шины для|шин[ыа] легков|покрышк/i, "轮胎"],
+  [/сабвуфер|колонк/i, "音响"],
+  [/компрессор автомобильный|компрессор/i, "车载压缩机"],
   [/кофе/i, "咖啡"],
   [/чай\b/i, "茶叶"],
   [/наушник/i, "耳机"],
@@ -4967,7 +4980,17 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
     } else if (rank === 'keyword') {
       where.push(`source_payload->>'rank' = 'blue_keyword'`);
     }
-    if (category) { args.push(category); where.push(`(category_id=$${args.length} OR category_name ILIKE '%' || $${args.length} || '%')`); }
+    if (category) {
+      const categories = category.split(",").map(v => v.trim()).filter(Boolean);
+      if (categories.length === 1) {
+        args.push(categories[0]); where.push(`(category_id=$${args.length} OR category_name ILIKE '%' || $${args.length} || '%')`);
+      } else if (categories.length > 1) {
+        const ids = categories.filter(v => /^[0-9a-f-]{8,36}$/i.test(v));
+        const names = categories.filter(v => !/^[0-9a-f-]{8,36}$/i.test(v)).map(v => `%${v}%`);
+        if (ids.length) { args.push(ids); where.push(`category_id=ANY($${args.length}::text[])`); }
+        if (names.length) { args.push(names); where.push(`category_name ILIKE ANY($${args.length}::text[])`); }
+      }
+    }
     if (search) { args.push(search); where.push(`(sku ILIKE '%' || $${args.length} || '%' OR title ILIKE '%' || $${args.length} || '%' OR seller_name ILIKE '%' || $${args.length} || '%')`); }
     const count = await db.query(`SELECT COUNT(*)::int AS total FROM app_top_lists WHERE ${where.join(' AND ')}`, args);
     const orderBy = sort === 'sales'
@@ -5050,18 +5073,50 @@ app.get("/api/sourcing/category-analysis", requireAuth, async (req, res, next) =
           AND category_name <> ''
         GROUP BY category_id, category_name
        HAVING COUNT(*) >= $2
-        ORDER BY avg_blue_ocean DESC, total_sales DESC
-        LIMIT $3`,
-      [source, minProducts, limit],
+        ORDER BY avg_blue_ocean DESC, total_sales DESC`,
+      [source, minProducts],
     );
-    const items = rows.rows.map((row) => ({
-      ...row,
-      category_name_zh: categoryNameZh(row.category_name, row.category_id),
-      avg_blue_ocean_100: Math.round(Number(row.avg_blue_ocean || 0) * 1000) / 10,
-      avg_price: Number(row.avg_price || 0),
-      total_sales: Number(row.total_sales || 0),
-      avg_sales: Number(row.avg_sales || 0),
-    }));
+    // 按中文类目名合并（多个俄语同义类目 → 一个中文行），并保留俄语原名作辅助
+    const merged = new Map();
+    for (const row of rows.rows) {
+      const zh = categoryNameZh(row.category_name, row.category_id);
+      const key = zh;
+      const entry = merged.get(key) || {
+        category_name_zh: zh,
+        ru_names: [],
+        category_ids: [],
+        product_count: 0,
+        avg_blue_ocean: 0,
+        avg_price: 0,
+        total_sales: 0,
+        latest_capture: null,
+        _boWeighted: 0,
+        _priceWeighted: 0,
+      };
+      entry.ru_names.push(row.category_name);
+      if (row.category_id) entry.category_ids.push(row.category_id);
+      entry.product_count += Number(row.product_count || 0);
+      entry._boWeighted += Number(row.avg_blue_ocean || 0) * Number(row.product_count || 0);
+      entry._priceWeighted += Number(row.avg_price || 0) * Number(row.product_count || 0);
+      entry.total_sales += Number(row.total_sales || 0);
+      const cap = row.latest_capture ? new Date(row.latest_capture).getTime() : 0;
+      if (cap > (entry.latest_capture ? entry.latest_capture.getTime() : 0)) entry.latest_capture = row.latest_capture;
+      merged.set(key, entry);
+    }
+    const items = [...merged.values()]
+      .map((entry) => ({
+        ...entry,
+        avg_blue_ocean: Math.round(entry._boWeighted / Math.max(1, entry.product_count) * 1000) / 10,
+        avg_blue_ocean_100: Math.round(entry._boWeighted / Math.max(1, entry.product_count) * 1000) / 10,
+        avg_price: Math.round(entry._priceWeighted / Math.max(1, entry.product_count)),
+        avg_sales: Math.round(entry.total_sales / Math.max(1, entry.product_count)),
+        total_sales: Number(entry.total_sales || 0),
+        category_name: entry.ru_names.join(' / '),
+        ru_names: entry.ru_names,
+        category_id: entry.category_ids[0] || '',
+      }))
+      .sort((a, b) => b.avg_blue_ocean_100 - a.avg_blue_ocean_100 || b.total_sales - a.total_sales)
+      .slice(0, limit);
     return res.json({ success: true, items, total: items.length, source_policy: source });
   } catch (error) { next(error); }
 });
