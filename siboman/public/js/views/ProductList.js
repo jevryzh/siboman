@@ -447,10 +447,15 @@ window.ProductListView = {
           }
         }
         rows.sort((a, b) => new Date(b.updated_at || 0) - new Date(a.updated_at || 0));
-        products.value = aggregateStoreMode
-          ? rows.slice((pagination.currentPage - 1) * pagination.pageSize, pagination.currentPage * pagination.pageSize)
+        // v2.2.9.102 双保险：促销筛选时前端再过滤一次，绝不让活动价为空的商品出现在结果里
+        const visibleRows = priceFilter.value === 'promo'
+          ? rows.filter((row) => row.marketing_seller_price && Number(row.marketing_seller_price) > 0 && Number(row.marketing_seller_price) !== Number(row.price))
           : rows;
-        pagination.total = total;
+        products.value = aggregateStoreMode
+          ? visibleRows.slice((pagination.currentPage - 1) * pagination.pageSize, pagination.currentPage * pagination.pageSize)
+          : visibleRows;
+        if (priceFilter.value === 'promo') pagination.total = visibleRows.length;
+        else pagination.total = total;
         Object.assign(statusCounts, { ALL: 0 }, mergedCounts);
         if (failures.length) notify.warning(`部分店铺读取失败：${failures.slice(0, 2).join('；')}`);
       } catch (e) {
@@ -898,6 +903,10 @@ window.ProductListView = {
           <div>
             <div style="font-size:28px; line-height:1; font-weight:800; color:#111827; letter-spacing:0">商品</div>
             <div style="margin-top:14px; font-size:14px; color:#64748b">{{ currentStoreName }} · 共 {{ pagination.total }} 个 SKU</div>
+            <div v-if="priceFilter !== 'all'" style="margin-top:8px; display:inline-flex; align-items:center; gap:6px; padding:4px 10px; background:#fef2f2; border:1px solid #fecaca; border-radius:6px; font-size:12px; color:#dc2626; font-weight:700">
+              <span style="width:6px; height:6px; border-radius:50%; background:#ef4444"></span>
+              已筛选：价格与促销价不一致（活动价≠设置价），仅显示被促销/调价的商品
+            </div>
           </div>
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end">
             <el-button size="large" @click="fetchProducts">
