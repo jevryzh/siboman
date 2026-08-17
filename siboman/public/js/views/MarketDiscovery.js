@@ -15,6 +15,7 @@ window.MarketDiscoveryView = {
     const collectorResult = Vue.ref(null);
     const collectorLoading = Vue.ref(false);
     const workerStatus = Vue.ref({ workers: [], queue: { queued: 0, active: 0 } });
+    const workerStatusLoading = Vue.ref(false);
     const sourcingJobState = Vue.ref(null);
     const marketView = Vue.ref('product');
     const marketSource = Vue.ref({ policy: '', note: '', freshness: {} });
@@ -464,16 +465,24 @@ window.MarketDiscoveryView = {
     }
 
     async function loadWorkerStatus() {
+      workerStatusLoading.value = true;
       try {
+        // 先主动 ping 插件（workerAuth.request）唤醒 service worker 并触发重新上报心跳，
+        // 再读 DB——否则插件休眠时只读 DB 拿到的是旧数据（表现为“点刷新没反应”）
+        const pinged = await authorizePluginWorker().catch(() => false);
+        if (pinged) await new Promise((resolve) => setTimeout(resolve, 800));
         const response = await axios.get('/api/worker/status', { params: { store_id: storeId() } });
         workerStatus.value = {
           workers: response.data.workers || [],
           queue: response.data.queue || { queued: 0, active: 0 },
+          pinged,
         };
         return workerStatus.value;
       } catch (error) {
         workerStatus.value = { workers: [], queue: { queued: 0, active: 0 }, error: errorText(error) };
         return workerStatus.value;
+      } finally {
+        workerStatusLoading.value = false;
       }
     }
 
@@ -501,7 +510,6 @@ window.MarketDiscoveryView = {
         await ElementPlus.ElMessageBox.confirm(`将为 ${targets.length} 个候选创建真实单品找货任务，由本机采集端执行 Ozon 采集、1688 以图搜货和 AI 审核。继续吗？`, '启动真实找货', { type: 'warning' });
       } catch { return; }
       try {
-        await authorizePluginWorker().catch(() => false);
         await loadWorkerStatus().catch(() => null);
         const response = await axios.post('/api/auto-listing/items/start-sourcing', {
           store_id: storeId(),
@@ -746,7 +754,7 @@ window.MarketDiscoveryView = {
       payloadOf, isDzRow, scoreText, scoreColor, blueScore, blueLevel, signalText, rowReasons, sourceBadgeType, sourceBadgeText,
       rowTitle, rowSku, rowBrand, rowImage, rowUrl, rowCategory, rowPrice, rowSales, rowRevenue, rowGrowth, marketSummary, ruleChips, displayedMarketRows, rulePassedMarketRows, passesRules, queueStateOf, flowSteps,
       onlineSourcingWorkers, canClaimSourcingWorker, sourcingWorkerHint,
-      refreshAll, loadMarket, loadCategoryAnalysis, loadQueue, loadCollectorStatus, loadWorkerStatus, runOpportunityCollector, discoverSelected, discoverRulePassed, discoverProductsFromCategories, advanceRow, advanceTo, startSourcingJob, openSourcingReview, bulkAction, removeQueueRow, openQueueDetail, saveQueueNote, saveSettings,
+      refreshAll, loadMarket, loadCategoryAnalysis, loadQueue, loadCollectorStatus, loadWorkerStatus, workerStatusLoading, runOpportunityCollector, discoverSelected, discoverRulePassed, discoverProductsFromCategories, advanceRow, advanceTo, startSourcingJob, openSourcingReview, bulkAction, removeQueueRow, openQueueDetail, saveQueueNote, saveSettings,
       resetMarket, resetQueue, marketRowSelectable, switchToCategoryView: () => { marketView.value = 'product'; marketPage.page = 1; loadMarket(); },
     };
   },
@@ -997,7 +1005,7 @@ window.MarketDiscoveryView = {
             style="margin-bottom:12px"
           >
             <template #default>
-              <div style="margin-top:8px"><el-button size="small" @click="loadWorkerStatus">刷新采集端状态</el-button></div>
+              <div style="margin-top:8px"><el-button size="small" :loading="workerStatusLoading" @click="loadWorkerStatus">刷新采集端状态</el-button></div>
             </template>
           </el-alert>
           <el-alert
