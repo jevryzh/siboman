@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.101";
+const VERSION = "2.2.9.102";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -780,6 +780,8 @@ function normalizeOzonForSourcing(data, url, sourceRow) {
   const mainImageUrl = images[0] || "";
   const weightGrams = Number(data.weight || data.weightGrams || 0) || "";
   const priceText = data.price || data.currentBlackPriceCny || data.currentBlackPrice || "";
+  // v2.2.9.101: 透传页面 finalPrice（买家实际支付价，含平台自动拉活动折扣）；无促销时与 price 相同
+  const finalPriceText = data.final_price || "";
   return {
     sourceUrl: url,
     sku: data.sku || data.product_id || extractOzonSkuFromUrl(url),
@@ -791,6 +793,8 @@ function normalizeOzonForSourcing(data, url, sourceRow) {
     type_id: data.type_id || 0,
     currentBlackPriceCny: priceText,
     currentBlackPriceCnyValue: parseFloat(String(priceText).replace(/[^\d.,]/g, "").replace(",", ".")) || "",
+    finalPriceCny: finalPriceText,
+    finalPriceCnyValue: parseFloat(String(finalPriceText).replace(/[^\d.,]/g, "").replace(",", ".")) || "",
     weightGrams,
     weightText: weightGrams ? `${weightGrams} g` : (data.weightText || ""),
     weightSource: weightGrams ? "ozon-plugin" : "",
@@ -4364,15 +4368,33 @@ async function collectRichContentFromOzonPage(sku) {
 	  dbg.imageCount = data.images.length;
 
   // ========== 6. 提取价格 ==========
+  // v2.2.9.101 (fix): Ozon 页面同时有 webPrice（卖家设置价 95）和 finalPrice（买家实际支付价 69，含平台自动拉活动折扣）。
+  //   之前只取第一个匹配（webPrice）→ 拿到的都是设置价，取不到"被拉活动"后的买家价。
+  //   现在独立提取：webPrice→data.price(设置价)，finalPrice→data.final_price(买家价)，两者都保留。
+  const readWidgetPrice = (selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return "";
+    const text = (el.textContent || el.getAttribute("content") || "").trim();
+    const m = text.match(/(\d[\d\s]*)/);
+    return m ? m[1].replace(/\s/g, "") : "";
+  };
+  const webPrice = readWidgetPrice('[data-widget="webPrice"] [class*="price"]');
+  const finalPrice = readWidgetPrice('[data-widget="finalPrice"] [class*="price"]');
+  if (finalPrice) {
+    data.final_price = finalPrice;
+    dbg.attributeSources.push(`finalPrice.webPrice-vs-final=${webPrice}/${finalPrice}`);
+  }
   if (!data.price) {
-    const priceSelectors = [
-      '[data-widget="webPrice"] [class*="price"]',
-      '[data-widget="finalPrice"] [class*="price"]',
+    data.price = webPrice || finalPrice;
+    if (data.price) dbg.attributeSources.push(`price.webPrice`);
+  }
+  if (!data.price) {
+    const legacySelectors = [
       '[itemprop="price"]',
       '[data-widget="price"]',
       '.price-block [class*="final"]',
     ];
-    for (const sel of priceSelectors) {
+    for (const sel of legacySelectors) {
       const el = document.querySelector(sel);
       if (el) {
         const text = (el.textContent || el.getAttribute("content") || "").trim();

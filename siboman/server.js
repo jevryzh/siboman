@@ -86,7 +86,7 @@ const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || "agnes-image-2.0-flas
 const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD || 0);
 const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
-const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.101";
+const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.102";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -12868,6 +12868,13 @@ function normalizePluginOzonResult(ozon = {}) {
       ? Number(ozon.currentBlackPriceCnyValue)
       : (Number.isFinite(blackValue) ? blackValue : ""),
     currentGreenPriceCny: ozon.currentGreenPriceCny || ozon.price || ozon.currentBlackPriceCny || "",
+    // v2.2.9.101: 页面 finalPrice（买家实际支付价，含平台自动拉活动折扣），无促销时与设置价相同
+    finalPriceCny: ozon.finalPriceCny || ozon.final_price || "",
+    finalPriceCnyValue: Number.isFinite(Number(ozon.finalPriceCnyValue))
+      ? Number(ozon.finalPriceCnyValue)
+      : Number.isFinite(Number(ozon.final_price))
+        ? Number(ozon.final_price)
+        : "",
     weightGrams: ozon.weightGrams || weight.weightGrams || "",
     weightText: ozon.weightText || (weight.weightGrams ? `${weight.weightGrams} g` : ""),
     weightSource: ozon.weightSource || weight.source || "",
@@ -16633,6 +16640,7 @@ async function writeBatchOzonArtifacts(job) {
       "低价推荐黑标价RMB": formatOzonCnyForExport(ozon.sellerLowestBlackPriceCny || ""),
       "Ozon跟卖数量": ozon.sellerOfferCount ?? "",
       "Ozon价格": getOzonDisplayPriceText(ozon),
+      "Ozon买家价RMB(含活动)": formatOzonCnyForExport(ozon.finalPriceCny || ozon.final_price || ""),
       "Ozon价格采集备注": ozon.ozonPriceNote || "",
       "Ozon重量（克）": formatNumberForSheet(ozon.weightGrams || normalizeWeightGrams(ozon.weightText)),
       "Ozon重量来源": ozon.weightSource || "",

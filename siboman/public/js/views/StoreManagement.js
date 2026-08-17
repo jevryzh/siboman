@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.101";
-    const PLUGIN_ZIP_VERSION = "2.2.9.101";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.102";
+    const PLUGIN_ZIP_VERSION = "2.2.9.102";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -280,6 +280,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.102 单品找货采集买家实际支付价：Ozon 页面同时有 webPrice（卖家设置价）和 finalPrice（买家实际支付价，含平台自动拉活动的折扣后价，如 69）。现在独立提取两者，Excel 新增「Ozon买家价RMB(含活动)」列，方便看出哪些商品被平台拉低价格。</li>
             <li>✅ v2.2.9.101 修复单品找货必现报错：采集商品页时注入函数缺少 cleanOzonTitle 导致 ReferenceError 整行失败（连续 3 行即自动停止）。已把标题清洗函数内置到注入函数闭包内，采集恢复。</li>
             <li>✅ v2.2.9.100 批量上架静默采集：采集商品不再打开 Ozon 标签页，直接复用已登录的 seller.ozon.ru 页面走门户 API（/search + 复制商品 bundle）拿全量数据，全程后台执行、Chrome 不弹任何标签（对齐 MY ERP）；仅当 seller 未登录/无标签页时才兜底打开商品页。售价由批量上架页行价格填写（与门户一致不带价）。</li>
             <li>✅ v2.2.9.78 批量上架恢复 Seller portal 静默上架（对齐 MY ERP 插件）：一次把全店商品提交到草稿再发布，后台执行不弹窗、绕官方 import 限流；已补上传任务轮询，确认真实上架结果（不再"显示提交但后台无商品"）；portal 失败自动回退官方 import-by-sku；Ozon Seller API 调用统一加 60s 超时防挂死，批量上架超时问题缓解。单品找货滑块可续跑：Ozon/1688 遇到滑块、验证码、登录、超时不再整体停止任务，改为该行失败并继续下一行，连续失败 3 次（可配）才停止，人工处理后自动继续。</li>
