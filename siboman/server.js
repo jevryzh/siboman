@@ -4760,42 +4760,6 @@ async function maybeRefreshOzonOpportunityPool(reason = "opportunity-interval") 
   });
 }
 
-// ---- dz_blue_ocean 商品主图回填（采集侧不写 main_image，这里按 sku 调 Ozon API 补图，内存缓存 6 小时）----
-const dzProductImageCache = new Map(); // sku -> { url, expiresAt }
-async function fillDzProductImages(items, { storeId, userId } = {}) {
-  const missing = [];
-  for (const item of items) {
-    const sku = String(item.sku || "").trim();
-    if (!/^\d+$/.test(sku) || item.main_image) continue;
-    const cached = dzProductImageCache.get(sku);
-    if (cached && cached.expiresAt > Date.now()) {
-      item.main_image = cached.url;
-      continue;
-    }
-    missing.push(sku);
-  }
-  if (!missing.length || !storeId || !userId) return;
-  // 分批查询（Ozon /v3/product/info/list 单次最多 100 个 sku）
-  const chunks = [];
-  for (let i = 0; i < missing.length; i += 100) chunks.push(missing.slice(i, i + 100));
-  for (const chunk of chunks) {
-    try {
-      const info = await callOzonSellerAPI("/v3/product/info/list", { sku: chunk }, { storeId, userId, timeoutMs: 30000 });
-      for (const it of info?.items || []) {
-        const url = Array.isArray(it.primary_image) ? (it.primary_image[0] || "") : (it.primary_image || "");
-        if (url) dzProductImageCache.set(String(it.sku), { url, expiresAt: Date.now() + 6 * 3600e3 });
-      }
-    } catch (e) {
-      console.warn("[dz-images] Ozon API 图片回填失败:", e.message);
-    }
-  }
-  for (const item of items) {
-    const sku = String(item.sku || "").trim();
-    const cached = dzProductImageCache.get(sku);
-    if (!item.main_image && cached && cached.expiresAt > Date.now()) item.main_image = cached.url;
-  }
-}
-
 app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -4868,8 +4832,6 @@ app.get("/api/sourcing/bestsellers", requireAuth, async (req, res, next) => {
         queue_status: queueState.queue_status,
       };
     });
-    // 商品行（非关键词）按 sku 回填主图
-    await fillDzProductImages(items, { storeId, userId: req.user.id });
     const productTotal = Number(count.rows[0]?.total || 0);
     return res.json({
       success: true,
