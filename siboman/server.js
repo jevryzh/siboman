@@ -15222,9 +15222,10 @@ function getMoqAvoidReason(candidate) {
   return quantity > 1 ? `1688 起批量为 ${quantity}，不满足一件代采规则。` : "";
 }
 
+// v2.2.9.101 (fix): 对齐生产 — 只把引流款作为硬排除；MOQ/起批量不再淘汰候选
+//   （MOQ>1 仅作 AI 参考，不作为"无候选"原因；生产靠 trafficBaitRisk 排除引流款后
+//   仍返回最靠前候选供人工确认）。getMoqAvoidReason 保留供打分参考，不再用于排除。
 function getCandidateAvoidReason(candidate) {
-  const moqReason = getMoqAvoidReason(candidate);
-  if (moqReason) return moqReason;
   if (candidate?.trafficBaitRisk) return candidate.trafficBaitReason || "1688 候选疑似引流款，不作为最终货源。";
   return "";
 }
@@ -15293,8 +15294,10 @@ function compareExactSourcingCandidates(a, b) {
 }
 
 function findBestFallbackCandidate(candidates = []) {
+  // v2.2.9.101 (fix): 对齐生产 — 兜底只排除引流款，不再排除 aiVerdict=not_match 的候选。
+  //   AI 判 none 时所有候选都可能标 not_match，若这里过滤则永远无兜底候选（生产不过滤）。
   return candidates
-    .filter((candidate) => !isAvoidedCandidate(candidate) && candidate?.aiVerdict !== "not_match")
+    .filter((candidate) => !isAvoidedCandidate(candidate))
     .sort(compareSourcingCandidates)[0] || null;
 }
 
@@ -15949,16 +15952,16 @@ function applyAiReview(result) {
   const reviews = new Map((result.aiReview.candidate_reviews || []).map((item) => [Number(item.rank), item]));
   result.candidates = result.candidates.map((candidate) => {
     const review = reviews.get(Number(candidate.rank));
-    const avoidReason = getCandidateAvoidReason(candidate);
-    const functionalMismatchReason = getFunctionalMismatchReason(result.ozon || {}, candidate);
-    const rejectReason = avoidReason || functionalMismatchReason;
+    // v2.2.9.101 (fix): 对齐生产 — 完全信任 AI verdict，不再用 MOQ/功能误配覆盖为 not_match。
+    //   引流款排除统一由 chooseFinalCandidate 的 isAvoidedCandidate 处理；AI 判 none 时
+    //   也能靠 findBestFallbackCandidate 兜底返回最靠前候选供人工确认。
     const selectedByAi = result.aiReview.decision !== "none" && Number(result.aiReview.selected_rank) === Number(candidate.rank);
     return {
       ...candidate,
-      aiVerdict: rejectReason ? "not_match" : (review?.verdict || "approximate"),
-      aiConfidence: rejectReason ? 0 : (review?.confidence ?? 0),
-      aiReason: rejectReason || review?.reason || "",
-      aiSelected: selectedByAi && !rejectReason,
+      aiVerdict: review?.verdict || "approximate",
+      aiConfidence: review?.confidence ?? 0,
+      aiReason: review?.reason || "",
+      aiSelected: selectedByAi,
     };
   });
   result.selectedCandidate = chooseFinalCandidate(result);
@@ -15969,7 +15972,9 @@ function applyAiReview(result) {
 }
 
 function chooseFinalCandidate(result) {
-  if (result.aiReview?.decision === "none") return null;
+  // v2.2.9.101 (fix): 对齐生产 — decision=none 时不再直接返回 null，继续走
+  //   exact → approximate → findBestFallbackCandidate 兜底，保证"找不到完全一致时
+  //   也返回最靠前的非引流/非促销候选供人工确认"（生产行为），而不是整行无候选。
   const skippedSelected = result.candidates.find((candidate) => Number(candidate.rank) === Number(result.aiReview?.selected_rank));
   const skippedSelectedReason = skippedSelected ? getCandidateAvoidReason(skippedSelected) : "";
 
