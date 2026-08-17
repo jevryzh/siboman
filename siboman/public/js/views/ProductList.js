@@ -758,6 +758,9 @@ window.ProductListView = {
     const onSizeChange = () => { pagination.currentPage = 1; fetchProducts(); };
     const onTabChange = () => { pagination.currentPage = 1; fetchProducts(); };
     const onSearch = () => { pagination.currentPage = 1; fetchProducts(); };
+    // v2.2.9.102 (fix): el-select @change 时 v-model 可能尚未同步（读到旧值导致筛选不生效）。
+    //   显式接收 change 事件的选中值并立即赋值，再刷新列表。
+    const onPriceFilterChange = (val) => { priceFilter.value = val === undefined ? priceFilter.value : val; pagination.currentPage = 1; fetchProducts(); };
     let searchTimer = null;
     const onSearchInput = () => {
       clearTimeout(searchTimer);
@@ -881,7 +884,7 @@ window.ProductListView = {
       selectedRows, bulkLoading, bulkStockDialog, selectedWarehouseOptions, selectedStoreWarehouseGroups, storeScope, storeScopeOptions, currentStoreName,
       fetchProducts, handleSyncAll, editProduct, saveProduct,
       archiveProduct, unarchiveProduct,
-      onPageChange, onSizeChange, onTabChange, onSearch, onSearchInput,
+      onPageChange, onSizeChange, onTabChange, onSearch, onPriceFilterChange, onSearchInput,
       copyOfferId, onSelectionChange, bulkArchive, openBulkStockEditor, refreshBulkStockPreview, saveBulkStockDrafts,
       bulkPriceDialog, openBulkPriceEditor, saveBulkPrices,
       exportCsv, onStoreScopeChange, selectStatusTab, handleProductAction,
@@ -960,7 +963,7 @@ window.ProductListView = {
           <el-input v-model="search" size="large" placeholder="搜索 SKU / 货号 / 标题..." clearable style="width:100%" @input="onSearchInput" @keyup.enter="onSearch">
             <template #prefix><el-icon><Search /></el-icon></template>
           </el-input>
-          <el-select v-model="priceFilter" size="large" style="width:100%" @change="onSearch">
+          <el-select v-model="priceFilter" size="large" style="width:100%" @change="onPriceFilterChange">
             <el-option label="全部价格" value="all" />
             <el-option label="价格与促销价不一致" value="promo" />
           </el-select>
