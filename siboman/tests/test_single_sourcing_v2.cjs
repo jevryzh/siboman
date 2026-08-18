@@ -68,7 +68,7 @@ assert(server.includes('id, user_id, store_id, kind, status'), 'app_jobs insert 
 assert(server.includes('AND ($3::uuid IS NULL OR j.store_id = $3::uuid)'), 'worker claim must filter queued jobs by scoped store id');
 assert(server.includes('storeMatch'), 'worker status must expose whether the plugin is authorized for the selected store');
 assert(background.includes('kinds: ["run"]'), 'extension single-sourcing worker may only claim run jobs');
-assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.102"'), 'server must force the current stable plugin version');
+assert(server.includes('MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.103"'), 'server must force the current stable plugin version');
 assert(server.includes('const WORKER_JOB_STALE_MS'), 'server must configure stale worker job rescue timeout');
 assert(server.includes('async function rescueStaleDbJobsForUser'), 'server must rescue stale claimed/running worker jobs');
 assert(server.includes("AND j.status IN ('claimed','running')"), 'stale rescue must target claimed/running jobs');
@@ -80,9 +80,9 @@ assert(server.includes('["done", "error", "canceled"].includes(existing.status)'
 assert(server.includes('totalLimit > 0 ? totalLimit : 999999'), 'worker progress must clamp processed to total when total is known');
 assert(server.includes('initialUpdates.results = job.results'), 'worker completion should persist incoming results only when progress has not already stored them');
 assert(!server.includes('phase: `服务器 AI 审核第 ${rowLabel} 行`,\n          processed: job.processed,\n          total: job.total,\n          logs: job.logs,\n          results: job.results'), 'AI review progress must not rewrite the full results JSON before each model call');
-assert.strictEqual(manifest.version, '2.2.9.102', 'manifest version must match current plugin version');
-assert(background.includes('const VERSION = "2.2.9.102"'), 'background version must match current plugin version');
-assert(bridge.includes('const VERSION = "2.2.9.102"'), 'bridge version must match current plugin version');
+assert.strictEqual(manifest.version, '2.2.9.103', 'manifest version must match current plugin version');
+assert(background.includes('const VERSION = "2.2.9.103"'), 'background version must match current plugin version');
+assert(bridge.includes('const VERSION = "2.2.9.103"'), 'bridge version must match current plugin version');
 assert(background.includes('startSourcingCancelMonitor'), 'worker must poll cancellation while long collection/search steps are running');
 assert(server.includes('if (existing.status === "canceled")'), 'server must not let worker progress/complete overwrite canceled jobs');
 assert(server.includes('clearWorkerCurrentJobRefs'), 'server must clear worker current-job pointers when a job is canceled');

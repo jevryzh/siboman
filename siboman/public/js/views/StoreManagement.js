@@ -10,8 +10,8 @@ window.StoreManagementView = {
       client_id: '',
       api_key: ''
     });
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.102";
-    const PLUGIN_ZIP_VERSION = "2.2.9.102";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.103";
+    const PLUGIN_ZIP_VERSION = "2.2.9.103";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -280,6 +280,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.103 修复单品找货"Ozon 主图为空"：Ozon 商品图 CDN 域名升级为 ozonstatic.cn，插件域名白名单/图片正则未覆盖新域名导致主图全被丢弃。已补 ozonstatic.cn/com 域名 + DOM 图片兜底采集 + 过滤价格标签营销图（payments-cdn）。</li>
             <li>✅ v2.2.9.102 单品找货采集买家实际支付价：Ozon 页面同时有 webPrice（卖家设置价）和 finalPrice（买家实际支付价，含平台自动拉活动的折扣后价，如 69）。现在独立提取两者，Excel 新增「Ozon买家价RMB(含活动)」列，方便看出哪些商品被平台拉低价格。</li>
             <li>✅ v2.2.9.101 修复单品找货必现报错：采集商品页时注入函数缺少 cleanOzonTitle 导致 ReferenceError 整行失败（连续 3 行即自动停止）。已把标题清洗函数内置到注入函数闭包内，采集恢复。</li>
             <li>✅ v2.2.9.100 批量上架静默采集：采集商品不再打开 Ozon 标签页，直接复用已登录的 seller.ozon.ru 页面走门户 API（/search + 复制商品 bundle）拿全量数据，全程后台执行、Chrome 不弹任何标签（对齐 MY ERP）；仅当 seller 未登录/无标签页时才兜底打开商品页。售价由批量上架页行价格填写（与门户一致不带价）。</li>

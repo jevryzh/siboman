@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.102";
+const VERSION = "2.2.9.103";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -772,7 +772,10 @@ function isLikelyOzonMarketingImageInPlugin(url) {
     || /\/brand(?:-|_)?logo/i.test(text)
     || /\/seller(?:-|_)?logo/i.test(text)
     || /\/qr-code[\/_]/i.test(text)   // v2.2.9.100: 二维码图也不得作为商品图
-    || /qr[_-]?code/i.test(text);
+    || /qr[_-]?code/i.test(text)
+    // v2.2.9.102 (fix): 价格标签/营销角标图（如 payments-cdn/ozon-price-compact-new）不得作为商品主图
+    || /\/payments-cdn\//i.test(text)
+    || /price-compact|price-ribbon|price-tag|promo-badge|sale-badge/i.test(text);
 }
 
 function normalizeOzonForSourcing(data, url, sourceRow) {
@@ -3868,7 +3871,8 @@ function normalizeImageUrl(url) {
     .replace(/&amp;/g, "&");
   if (s.startsWith("//")) s = "https:" + s;
   if (!/^https?:\/\//i.test(s)) return "";
-  if (!/(ozone\.ru|ozonusercontent\.com|ozonru\.cn)/i.test(s)) return "";
+  // v2.2.9.102 (fix): 域名白名单补 ozonstatic.cn / ozonstatic.com（Ozon 新 CDN），否则新域名图片全被丢弃
+  if (!/(ozone\.ru|ozonusercontent\.com|ozonru\.cn|ozonstatic\.cn|ozonstatic\.com)/i.test(s)) return "";
   if (/\.(svg|gif)(?:[?#]|$)/i.test(s)) return "";
   if (/(logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(s)) return "";
   s = s.split("?")[0];
@@ -3913,7 +3917,9 @@ function collectImagesFromText(data, text) {
   if (!text || typeof text !== "string") return 0;
   const before = data.images.length;
   const normalizedText = text.replace(/\\u002F/g, "/").replace(/\\\//g, "/");
-  const re = /(?:https?:)?\/\/(?:ir(?:-\d+)?\.ozonru\.cn|ir\.ozone\.ru|cdn1\.ozone\.ru|[^"'<>\s()]+ozonusercontent\.com)\/[^"'<>\s()\\]+/gi;
+  // v2.2.9.102 (fix): Ozon 图片 CDN 域名已扩展到 ozonstatic.cn / ozonstatic.com 等，
+  //   之前只匹配 ir.ozone.ru / ozonru.ru / ozonusercontent.com，新域名图片全部漏掉导致主图为空。
+  const re = /(?:https?:)?\/\/(?:ir(?:-\d+)?\.(?:ozonru\.cn|ozone\.ru|ozonstatic\.cn|ozonstatic\.com)|cdn1\.ozone\.ru|[^"'<>\s()]+ozonusercontent\.com)\/[^"'<>\s()\\]+/gi;
   let m;
   while ((m = re.exec(normalizedText)) && data.images.length < 80) {
     addImageUrl(data, m[0]);
@@ -4327,11 +4333,26 @@ async function collectRichContentFromOzonPage(sku) {
 	    const scripts = Array.from(document.scripts || []);
 	    for (const s of scripts) {
 	      const text = s.textContent || "";
-	      if (!text || !/(ozone\.ru|ozonusercontent\.com|ozonru\.cn|multimedia|images)/i.test(text)) continue;
+	      if (!text || !/(ozone\.ru|ozonusercontent\.com|ozonru\.cn|ozonstatic|multimedia|images)/i.test(text)) continue;
 	      scriptAdded += collectImagesFromText(data, text);
 	      if (data.images.length >= 80) break;
 	    }
 	    if (scriptAdded > 0) dbg.attributeSources.push(`script-images.+${scriptAdded}`);
+	  } catch (e) {}
+	  // v2.2.9.102 (fix): DOM img 兜底 — 轮播图/主图一定渲染在 <img> 上，
+	  //   script/state 都漏时从 img 标签直接收（含 ozonstatic.cn 新 CDN 域名）
+	  try {
+	    let domAdded = 0;
+	    const imgEls = Array.from(document.querySelectorAll('img[src*="multimedia"], img[src*="ozonstatic"], img[src*="ozone"], img[src*="ozon"]'));
+	    for (const img of imgEls) {
+	      const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+	      if (!src || !/^https?:\/\//i.test(src)) continue;
+	      const before = data.images.length;
+	      addImageUrl(data, src);
+	      if (data.images.length > before) domAdded++;
+	      if (data.images.length >= 80) break;
+	    }
+	    if (domAdded > 0) dbg.attributeSources.push(`dom-img.+${domAdded}`);
 	  } catch (e) {}
     }
   } catch (e) {}
