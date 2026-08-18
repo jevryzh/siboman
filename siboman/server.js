@@ -9871,8 +9871,10 @@ function normalizeImportImageUrl(raw) {
     if (/^\/uploads\/[^/]+\.(?:jpg|jpeg|png|webp)$/i.test(parsed.pathname)) {
       return parsed.toString();
     }
-    if (!/(ozone\.ru|ozonru\.cn|ozonusercontent\.com)/i.test(parsed.hostname)) return "";
-    if (/(payments-cdn|marketing-api|seller-edu|cdn-cgi|static|assets|banner|promo|advert|logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
+    if (!/(ozone\.ru|ozonru\.cn|ozonstatic\.cn|ozonstatic\.com|ozonusercontent\.com)/i.test(parsed.hostname)) return "";
+    if (/(payments-cdn|marketing-api|seller-edu|cdn-cgi|assets|banner|promo|advert|logo|sprite|icon|avatar|placeholder|transparent|empty)/i.test(u)) return "";
+    // static 只检查路径（避免误伤 ozonstatic.cn 域名）
+    if (/\/(?:static|assets)\//i.test(parsed.pathname) || /\/static\//i.test(u)) return "";
     if (/\.(svg|gif)(?:[?#]|$)/i.test(u)) return "";
     if (/\/s3\/(?:cms|rp-photo|cdn-cgi|certificate|payments-cdn|marketing-api)\//i.test(parsed.pathname)) return "";
     if (/(banner|promo|advert|avatar|review|feedback)/i.test(u)) return "";
