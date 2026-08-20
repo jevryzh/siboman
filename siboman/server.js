@@ -9929,7 +9929,7 @@ function normalizeOzonRichContentForSubmit(raw) {
     const url = String(rawUrl || "").trim().split(/[?#]/)[0];
     if (!/^https?:\/\//i.test(url)) return "";
     if (/\/wc\d+\//i.test(url)) return "";
-    if (!/(ir-\d+\.ozonru\.cn|ir\.ozone\.ru)\/s3\/multimedia/i.test(url)) return "";
+    if (!/(ir-\d+\.ozon(?:ru\.cn|static\.cn|static\.com)|ir\.ozone\.ru)\/s3\/multimedia/i.test(url)) return "";
     return url;
   };
   const walk = (node) => {
@@ -10053,7 +10053,10 @@ function canonicalImportImageKey(url) {
     const file = path.split("/").filter(Boolean).pop() || path;
     if (/\/s3\/(?:multimedia|rp-photo)[^/]*\//i.test(path) && file) return `ozon:${file}`;
     if (/\/s3\/cms\//i.test(path)) return `drop:${path}`;
-    return `${u.hostname.replace(/^ir-\d+\.ozonru\.cn$/, "ir.ozone.ru")}:${path}`;
+    return `${u.hostname
+      .replace(/^ir-\d+\.ozonru\.cn$/, "ir.ozone.ru")
+      .replace(/^ir-\d+\.ozonstatic\.cn$/, "ir.ozone.ru")
+      .replace(/^ir-\d+\.ozonstatic\.com$/, "ir.ozone.ru")}:${path}`;
   } catch {
     return lower.replace(/[?#].*$/, "").replace(/\/(?:wc|c)\d+\//g, "/");
   }
@@ -13160,7 +13163,7 @@ async function scrapeOzonProduct(context, url, jobId, index) {
         if (!absolute) return;
         if (isBadProductImage(absolute)) return;
         const lower = absolute.toLowerCase();
-        if (!/\.(jpg|jpeg|png|webp)(\?|$)/.test(lower) && !lower.includes("ozone.ru")) return;
+        if (!/\.(jpg|jpeg|png|webp)(\?|$)/.test(lower) && !/(ozone\.ru|ozonru\.cn|ozonstatic\.cn|ozonstatic\.com)/i.test(lower)) return;
         bucket.push({ url: absolute, source, area });
       };
       const addSrcset = (bucket, srcset, source) => {
