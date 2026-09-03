@@ -10,11 +10,14 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { Pool } from "pg";
+import dnsDefault from "node:dns";
 import dns from "node:dns/promises";
+import https from "node:https";
 import net from "node:net";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+dnsDefault.setDefaultResultOrder?.("ipv4first");
 
 // 配置 multer 用于文件上传 (v0.3.2 修复: 异常回调兜底防进程崩溃)
 // 注意: PUBLIC_DIR 在此文件下方才定义, 因此这里不能预建目录; 改为运行时懒建 + err 回调
@@ -113,6 +116,11 @@ const MYERP_API_TOKEN = String(process.env.MYERP_API_TOKEN || "").trim().replace
 const MYERP_PLATFORM_PERIOD = process.env.MYERP_PLATFORM_PERIOD || "monthly";
 const MYERP_PLATFORM_SYNC_PAGES = Math.min(20, Math.max(1, Number(process.env.MYERP_PLATFORM_SYNC_PAGES || 5)));
 const MYERP_PLATFORM_SYNC_MAX_REQUESTS = Math.min(1000, Math.max(50, Number(process.env.MYERP_PLATFORM_SYNC_MAX_REQUESTS || 400)));
+const YANDEX_MARKET_BASE_URL = (process.env.YANDEX_MARKET_BASE_URL || "https://api.partner.market.yandex.ru").replace(/\/$/, "");
+const YANDEX_MARKET_CLIENT_ID = String(process.env.YANDEX_MARKET_CLIENT_ID || "").trim();
+const YANDEX_MARKET_API_SECRET = String(process.env.YANDEX_MARKET_API_SECRET || "").trim();
+const YANDEX_MARKET_CAMPAIGN_ID = String(process.env.YANDEX_MARKET_CAMPAIGN_ID || "").trim();
+const YANDEX_MARKET_BUSINESS_ID = String(process.env.YANDEX_MARKET_BUSINESS_ID || "").trim();
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const INITIAL_USERS = process.env.INITIAL_USERS || "";
 const USER_AGENT =
@@ -1996,6 +2004,258 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
   return payload;
 }
 
+let yandexMarketContextCache = null;
+
+function yandexQueryString(query = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value === undefined || value === null || value === "") continue;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item !== undefined && item !== null && item !== "") params.append(key, String(item));
+      }
+    } else {
+      params.set(key, String(value));
+    }
+  }
+  const text = params.toString();
+  return text ? `?${text}` : "";
+}
+
+function requestJsonOverHttps(url, { method = "GET", headers = {}, body, timeoutMs = 60000, family = 4 } = {}) {
+  return new Promise((resolve, reject) => {
+    const requestUrl = new URL(url);
+    const requestHeaders = { ...headers };
+    if (body !== undefined && !requestHeaders["Content-Length"]) {
+      requestHeaders["Content-Length"] = Buffer.byteLength(body);
+    }
+    const request = https.request(
+      requestUrl,
+      {
+        method,
+        headers: requestHeaders,
+        family,
+        timeout: Math.max(15000, Number(timeoutMs) || 60000),
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => {
+          resolve({
+            ok: response.statusCode >= 200 && response.statusCode < 300,
+            status: response.statusCode || 0,
+            statusText: response.statusMessage || "",
+            text: Buffer.concat(chunks).toString("utf8"),
+          });
+        });
+      },
+    );
+    request.on("timeout", () => request.destroy(new Error(`request timeout after ${timeoutMs}ms`)));
+    request.on("error", reject);
+    if (body !== undefined) request.write(body);
+    request.end();
+  });
+}
+
+async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, timeoutMs = 60000 } = {}) {
+  if (!YANDEX_MARKET_API_SECRET) {
+    const error = new Error("Yandex Market API Secret 未配置。");
+    error.statusCode = 503;
+    throw error;
+  }
+  let response;
+  const requestBody = body !== undefined ? JSON.stringify(body) : undefined;
+  try {
+    response = await requestJsonOverHttps(`${YANDEX_MARKET_BASE_URL}${apiPath}${yandexQueryString(query)}`, {
+      method,
+      headers: {
+        "Api-Key": YANDEX_MARKET_API_SECRET,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: requestBody,
+      timeoutMs,
+      family: 4,
+    });
+  } catch (requestError) {
+    if (/timeout/i.test(String(requestError?.message || ""))) {
+      const error = new Error(`Yandex Market API 请求超时(${timeoutMs}ms)：${apiPath}`);
+      error.statusCode = 504;
+      throw error;
+    }
+    throw requestError;
+  }
+  const text = response.text;
+  let payload = null;
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      payload = { raw: text.slice(0, 4000) };
+    }
+  }
+  if (!response.ok) {
+    const detail = typeof payload === "object" && payload
+      ? JSON.stringify(payload).slice(0, 1500)
+      : String(text).slice(0, 1500);
+    const error = new Error(`Yandex Market API ${response.status} ${response.statusText || ""}：${detail}`);
+    error.statusCode = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return payload || {};
+}
+
+async function getYandexMarketContext({ refresh = false } = {}) {
+  if (!refresh && yandexMarketContextCache) return yandexMarketContextCache;
+  const configuredBusinessId = YANDEX_MARKET_BUSINESS_ID || YANDEX_MARKET_CLIENT_ID;
+  const configuredCampaignId = YANDEX_MARKET_CAMPAIGN_ID;
+  const payload = await callYandexMarketAPI("/v2/campaigns", { query: { limit: 100 }, timeoutMs: 30000 });
+  const campaigns = Array.isArray(payload.campaigns) ? payload.campaigns : [];
+  const selected = campaigns.find((item) => configuredCampaignId && String(item.id) === configuredCampaignId)
+    || campaigns.find((item) => configuredBusinessId && String(item.business?.id || "") === configuredBusinessId)
+    || campaigns[0];
+  if (!selected?.id || !selected?.business?.id) {
+    const error = new Error("没有从 Yandex Market 账号读取到可用店铺。");
+    error.statusCode = 404;
+    throw error;
+  }
+  yandexMarketContextCache = {
+    campaignId: String(selected.id),
+    businessId: String(selected.business.id),
+    campaignName: selected.domain || selected.business.name || "Yandex 店铺",
+    placementType: selected.placementType || "",
+    apiAvailability: selected.apiAvailability || "",
+    campaigns,
+  };
+  return yandexMarketContextCache;
+}
+
+function normalizeYandexProductMapping(item = {}, context = {}) {
+  const offer = item.offer || {};
+  const mapping = item.mapping || {};
+  const campaign = (offer.campaigns || []).find((entry) => String(entry.campaignId || "") === String(context.campaignId))
+    || (offer.campaigns || [])[0]
+    || {};
+  const cardStatus = String(offer.cardStatus || "").toUpperCase();
+  const campaignStatus = String(campaign.status || "").toUpperCase();
+  const rawStatus = offer.archived ? "ARCHIVED" : (campaignStatus || cardStatus);
+  const status = rawStatus === "PUBLISHED" ? "published"
+    : ["CHECKING", "CREATING_CARD", "HAS_CARD_CAN_UPDATE_PROCESSING", "NO_CARD_PROCESSING", "READY_FOR_PUBLICATION"].includes(rawStatus) ? "moderation"
+    : ["REJECTED_BY_MARKET", "DISABLED_AUTOMATICALLY", "NO_CARD", "NO_CARD_NEED_CONTENT", "NO_CARD_ERRORS", "HAS_CARD_CAN_UPDATE_ERRORS"].includes(rawStatus) ? "need_attention"
+    : ["DISABLED_BY_PARTNER", "NO_STOCKS"].includes(rawStatus) ? "hidden"
+    : rawStatus === "ARCHIVED" ? "archived"
+    : rawStatus.toLowerCase() || "unknown";
+  const pictures = Array.isArray(offer.pictures) ? offer.pictures : [];
+  const mediaPictures = Array.isArray(offer.mediaFiles?.pictures) ? offer.mediaFiles.pictures.map((pic) => pic.url || pic) : [];
+  const price = offer.basicPrice || offer.price || {};
+  return {
+    platform: "yandex",
+    store_name: context.campaignName,
+    offer_id: offer.offerId || "",
+    sku: mapping.marketSku || mapping.marketSkuId || "",
+    product_id: mapping.marketSku || mapping.marketSkuId || "",
+    name: offer.name || mapping.marketSkuName || mapping.marketModelName || "",
+    title: offer.name || mapping.marketSkuName || mapping.marketModelName || "",
+    image: pictures[0] || mediaPictures[0] || "",
+    images: pictures.length ? pictures : mediaPictures,
+    status,
+    status_name: rawStatus || offer.cardStatus || "",
+    card_status: offer.cardStatus || "",
+    campaign_status: campaign.status || "",
+    price: Number(price.value || 0),
+    old_price: Number(price.discountBase || 0),
+    currency_code: price.currencyId || "RUB",
+    stock: Number(offer.stock || offer.stocks || 0),
+    brand: offer.vendor || "",
+    category_name: mapping.marketCategoryName || offer.category || "",
+    category_id: mapping.marketCategoryId || offer.marketCategoryId || "",
+    updated_at: price.updatedAt || offer.updatedAt || "",
+    raw: item,
+  };
+}
+
+function normalizeYandexOrder(order = {}, context = {}) {
+  const items = Array.isArray(order.items) ? order.items : [];
+  const products = items.map((item) => ({
+    offer_id: item.offerId || item.shopSku || "",
+    sku: item.id || item.marketSku || "",
+    name: item.offerName || "",
+    quantity: Number(item.count || 1),
+    price: Number(item.price || item.buyerPrice || 0),
+    price_cny: rubToCny(item.price || item.buyerPrice || 0),
+    currency_code: order.currency || "RUB",
+    image: item.picture || "",
+  }));
+  const statusRaw = String(order.status || "").toUpperCase();
+  const substatusRaw = String(order.substatus || "").toUpperCase();
+  const status = statusRaw === "PROCESSING" && substatusRaw === "READY_TO_SHIP" ? "awaiting_delivery"
+    : statusRaw === "PROCESSING" || statusRaw === "PENDING" ? "processing"
+    : statusRaw === "DELIVERY" || statusRaw === "PICKUP" ? "delivering"
+    : statusRaw === "DELIVERED" ? "delivered"
+    : statusRaw === "CANCELLED" ? "cancelled"
+    : statusRaw.toLowerCase() || "unknown";
+  return {
+    platform: "yandex",
+    store_name: context.campaignName,
+    order_id: String(order.id || ""),
+    posting_number: String(order.id || ""),
+    external_order_id: order.externalOrderId || "",
+    status,
+    status_name: order.status || "",
+    substatus: order.substatus || "",
+    created_at: order.creationDate || "",
+    updated_at: order.updatedAt || "",
+    shipment_date: order.delivery?.shipments?.[0]?.shipmentDate || order.delivery?.dates?.fromDate || "",
+    delivery_date: order.delivery?.dates?.toDate || order.delivery?.dates?.fromDate || "",
+    total: Number(order.itemsTotal || order.buyerItemsTotal || 0),
+    total_rub: Number(order.itemsTotal || order.buyerItemsTotal || 0),
+    total_cny: rubToCny(order.itemsTotal || order.buyerItemsTotal || 0),
+    currency_code: order.currency || "RUB",
+    product_count: products.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    products,
+    delivery: order.delivery || null,
+    buyer: order.buyer || null,
+    raw: order,
+  };
+}
+
+async function fetchYandexOfferMappingsPage(context, { pageToken = "", limit = 100, archived = false } = {}) {
+  const payload = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings`, {
+    method: "POST",
+    query: { limit, pageToken, language: "RU" },
+    body: { archived },
+    timeoutMs: 60000,
+  });
+  const result = payload.result || {};
+  return {
+    items: Array.isArray(result.offerMappings) ? result.offerMappings : [],
+    nextPageToken: result.paging?.nextPageToken || payload.paging?.nextPageToken || "",
+  };
+}
+
+async function getYandexProductStatusCounts(context, { maxItems = 10000 } = {}) {
+  const counts = { all: 0, published: 0, moderation: 0, need_attention: 0, hidden: 0, archived: 0, unknown: 0 };
+  for (const archived of [false, true]) {
+    let pageToken = "";
+    for (let scanned = 0; scanned < maxItems;) {
+      const page = await fetchYandexOfferMappingsPage(context, { pageToken, limit: 100, archived });
+      if (!page.items.length) break;
+      for (const raw of page.items) {
+        const item = normalizeYandexProductMapping(raw, context);
+        if (archived) item.status = "archived";
+        counts.all += archived ? 0 : 1;
+        counts[item.status] = Number(counts[item.status] || 0) + 1;
+      }
+      scanned += page.items.length;
+      if (!page.nextPageToken) break;
+      pageToken = page.nextPageToken;
+    }
+  }
+  counts.all += counts.archived;
+  return counts;
+}
+
 function sellerConfiguredResponse(_req, res) {
   res.json({
     success: true,
@@ -3069,6 +3329,169 @@ app.get("/api/inventory", requireAuth, async (req, res, next) => {
 
     res.json({ success: true, items: result.rows.map(enrichProductReadModel), total });
   } catch (e) { next(e); }
+});
+
+app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
+  try {
+    const context = await getYandexMarketContext();
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || req.query.limit || 50)));
+    const status = String(req.query.status || "all").trim().toLowerCase();
+    const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
+    const archived = status === "archived";
+    const maxPages = q ? 10 : page;
+    let pageToken = "";
+    let items = [];
+    let nextPageToken = "";
+
+    for (let currentPage = 1; currentPage <= maxPages; currentPage++) {
+      const pageData = await fetchYandexOfferMappingsPage(context, { pageToken, limit: pageSize, archived });
+      const pageItems = pageData.items.map((item) => normalizeYandexProductMapping(item, context));
+      nextPageToken = pageData.nextPageToken;
+      if (q) {
+        items.push(...pageItems.filter((item) => [
+          item.offer_id, item.sku, item.name, item.category_name, item.brand,
+        ].some((value) => String(value || "").toLowerCase().includes(q))));
+      } else if (currentPage === page) {
+        items = pageItems;
+      }
+      if (!nextPageToken) break;
+      pageToken = nextPageToken;
+    }
+
+    if (status !== "all" && status !== "archived") {
+      items = items.filter((item) => item.status === status);
+    }
+    const hasNext = Boolean(nextPageToken);
+    const statusCounts = await getYandexProductStatusCounts(context);
+    const total = q || status !== "all"
+      ? items.length
+      : Number(statusCounts[status] || statusCounts.all || (((page - 1) * pageSize) + items.length + (hasNext ? pageSize : 0)));
+    res.json({
+      success: true,
+      api_ready: true,
+      platform: "yandex",
+      context: {
+        campaign_id: context.campaignId,
+        business_id: context.businessId,
+        store_name: context.campaignName,
+        placement_type: context.placementType,
+      },
+      items,
+      total,
+      status_counts: statusCounts,
+      has_next: hasNext,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/yandex/products/:offerId", requireAuth, async (req, res, next) => {
+  try {
+    const context = await getYandexMarketContext();
+    const offerId = String(req.params.offerId || "").trim();
+    if (!offerId) return res.status(400).json({ success: false, error: "缺少 Yandex 货号" });
+
+    const body = req.body || {};
+    const offer = { offerId };
+    const name = String(body.name || body.title || "").trim();
+    const vendor = String(body.vendor || body.brand || "").trim();
+    const description = String(body.description || "").trim();
+    const categoryId = String(body.marketCategoryId || body.category_id || "").trim();
+    const currency = String(body.currency_code || body.currencyId || "RUB").trim().toUpperCase();
+    const priceValue = Number(body.price || 0);
+    const pictures = Array.isArray(body.images)
+      ? body.images.map((item) => String(item || "").trim()).filter(Boolean)
+      : String(body.pictures || body.image || "").split(/\n|,/).map((item) => item.trim()).filter(Boolean);
+
+    if (name) offer.name = name;
+    if (vendor) offer.vendor = vendor;
+    if (description) offer.description = description;
+    if (categoryId && /^\d+$/.test(categoryId)) offer.marketCategoryId = Number(categoryId);
+    if (pictures.length) offer.pictures = pictures.slice(0, 30);
+
+    const updates = {};
+    if (Object.keys(offer).length > 1) {
+      updates.mapping = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings/update`, {
+        method: "POST",
+        query: { language: "RU" },
+        body: { offerMappings: [{ offer }] },
+        timeoutMs: 60000,
+      });
+    }
+    if (priceValue > 0) {
+      updates.price = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices/updates`, {
+        method: "POST",
+        body: { offers: [{ offerId, price: { value: priceValue, currencyId: currency } }] },
+        timeoutMs: 60000,
+      });
+    }
+
+    yandexMarketContextCache = null;
+    res.json({ success: true, platform: "yandex", offer_id: offerId, updates });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
+  try {
+    const context = await getYandexMarketContext();
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(50, Math.max(1, Number(req.query.page_size || req.query.limit || 20)));
+    const activeStatus = String(req.query.status || "all").trim().toLowerCase();
+    const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
+    const to = new Date();
+    const from = new Date(to.getTime() - 29 * 86400e3);
+    const formatDate = (date) => {
+      const dd = String(date.getDate()).padStart(2, "0");
+      const mm = String(date.getMonth() + 1).padStart(2, "0");
+      return `${dd}-${mm}-${date.getFullYear()}`;
+    };
+    const query = {
+      limit: pageSize,
+      page,
+      fromDate: formatDate(from),
+      toDate: formatDate(to),
+      fake: false,
+    };
+    if (activeStatus === "processing" || activeStatus === "awaiting_delivery") query.status = ["PROCESSING", "PENDING"];
+    else if (activeStatus === "delivering") query.status = ["DELIVERY", "PICKUP"];
+    else if (activeStatus === "delivered") query.status = ["DELIVERED"];
+    else if (activeStatus === "cancelled") query.status = ["CANCELLED"];
+
+    const payload = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/orders`, {
+      method: "GET",
+      query,
+      timeoutMs: 60000,
+    });
+    let items = (payload.orders || []).map((order) => normalizeYandexOrder(order, context));
+    if (activeStatus === "awaiting_delivery") items = items.filter((item) => String(item.substatus || "").toUpperCase() === "READY_TO_SHIP");
+    else if (activeStatus === "processing") items = items.filter((item) => String(item.substatus || "").toUpperCase() !== "READY_TO_SHIP");
+    if (q) {
+      items = items.filter((item) => [
+        item.order_id, item.external_order_id, item.status_name,
+        ...(item.products || []).flatMap((product) => [product.offer_id, product.sku, product.name]),
+      ].some((value) => String(value || "").toLowerCase().includes(q)));
+    }
+    res.json({
+      success: true,
+      api_ready: true,
+      platform: "yandex",
+      context: {
+        campaign_id: context.campaignId,
+        business_id: context.businessId,
+        store_name: context.campaignName,
+        placement_type: context.placementType,
+      },
+      items,
+      total: Number(payload.pager?.total || ((page - 1) * pageSize + items.length)),
+      has_next: Boolean(payload.paging?.nextPageToken),
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.get("/api/seller/stocks/drafts", requireAuth, async (req, res, next) => {

@@ -30,6 +30,7 @@ const requiredModuleIds = [
 const allowedRiskLevels = new Set(['read_only', 'requires_authorization', 'external_write_impact']);
 const modules = new Map(matrix.modules.map((item) => [item.id, item]));
 const formalItems = new Map(formalChecklist.items.map((item) => [item.id, item]));
+const hiddenMenuRoutes = new Set(['#/analytics', '#/market-discovery']);
 const requiredFormalIds = [
   'FA-001-product-image-zoom',
   'FA-002-product-status-chinese',
@@ -61,6 +62,10 @@ assert(main.includes("axios.get('/api/version')"), 'main shell must fetch build 
 assert(main.includes('envLabel'), 'main shell must expose environment label for test/prod clarity');
 assert(main.includes('测试环境') && main.includes('生产环境'), 'main shell must label test and production environments');
 assert(main.includes('buildInfo.version'), 'main shell must render the current BUILD_VERSION in the header');
+assert(main.includes('index="#/yandex-products"'), 'Yandex products must have a sidebar entry');
+assert(main.includes('index="#/yandex-orders"'), 'Yandex orders must have a sidebar entry');
+assert(!main.includes('index="#/analytics"'), 'analytics menu must stay hidden');
+assert(!main.includes('index="#/market-discovery"'), 'market discovery menu must stay hidden');
 
 for (const mod of matrix.modules) {
   assert(allowedRiskLevels.has(mod.riskLevel), `${mod.id} has an unknown risk level`);
@@ -72,7 +77,9 @@ for (const mod of matrix.modules) {
   assert(mod.localSmoke.viewContains.length >= 2, `${mod.id} must have meaningful view checks`);
   assert(report.includes(mod.menuLabel), `report must mention ${mod.menuLabel}`);
   assert(report.includes(mod.route), `report must mention ${mod.route}`);
-  assert(main.includes(`index="${mod.route}"`) || main.includes(`goTo('${mod.route}')`), `main menu missing ${mod.route}`);
+  if (!hiddenMenuRoutes.has(mod.route)) {
+    assert(main.includes(`index="${mod.route}"`) || main.includes(`goTo('${mod.route}')`), `main menu missing ${mod.route}`);
+  }
 
   const view = read(mod.viewFile);
   for (const needle of mod.localSmoke.viewContains) {

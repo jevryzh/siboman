@@ -172,6 +172,8 @@ const initApp = () => {
         if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
+        if (path.includes('yandex-products')) return 'yandex-products';
+        if (path.includes('yandex-orders')) return 'yandex-orders';
         if (path.includes('product')) return 'products';
         if (path.includes('inventory')) return 'inventory';
         if (path.includes('order')) return 'orders';
@@ -210,11 +212,17 @@ const initApp = () => {
             <el-menu-item index="#/products" @click="goTo('#/products')">
               <el-icon><Goods /></el-icon><span>商品管理</span>
             </el-menu-item>
+            <el-menu-item index="#/yandex-products" @click="goTo('#/yandex-products')">
+              <el-icon><GoodsFilled /></el-icon><span>Yandex 商品</span>
+            </el-menu-item>
             <el-menu-item index="#/inventory" @click="goTo('#/inventory')">
               <el-icon><House /></el-icon><span>库存管理</span>
             </el-menu-item>
             <el-menu-item index="#/orders" @click="goTo('#/orders')">
               <el-icon><ShoppingCart /></el-icon><span>订单管理</span>
+            </el-menu-item>
+            <el-menu-item index="#/yandex-orders" @click="goTo('#/yandex-orders')">
+              <el-icon><Tickets /></el-icon><span>Yandex 订单</span>
             </el-menu-item>
             <el-menu-item index="#/upload" @click="goTo('#/upload')">
               <el-icon><UploadFilled /></el-icon><span>批量上架</span>
@@ -225,14 +233,8 @@ const initApp = () => {
             <el-menu-item index="#/ai-generator" @click="goTo('#/ai-generator')">
               <el-icon><MagicStick /></el-icon><span>AI 套图</span>
             </el-menu-item>
-            <el-menu-item index="#/analytics" @click="goTo('#/analytics')">
-              <el-icon><DataAnalysis /></el-icon><span>经营分析</span>
-            </el-menu-item>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
-            </el-menu-item>
-            <el-menu-item index="#/market-discovery" @click="goTo('#/market-discovery')">
-              <el-icon><Histogram /></el-icon><span>市场榜单</span>
             </el-menu-item>
             <el-menu-item index="#/stores" @click="goTo('#/stores')">
               <el-icon><Setting /></el-icon><span>店铺管理</span>
@@ -246,7 +248,7 @@ const initApp = () => {
               <el-breadcrumb-item>{{ routeName }}</el-breadcrumb-item>
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
-              <shop-switcher v-if="routeName !== 'orders'" @change="handleStoreChange" />
+              <shop-switcher v-if="routeName !== 'orders' && routeName !== 'yandex-orders'" @change="handleStoreChange" />
               <el-tooltip content="下载最新版 Chrome 采集插件 zip（解压后在扩展程序页加载已解压的文件夹）" placement="bottom">
                 <a :href="pluginDownloadUrl" target="_blank" rel="noreferrer" style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; color:#475569; font-size:12px; text-decoration:none; white-space:nowrap">
                   📦 插件下载
@@ -270,8 +272,10 @@ const initApp = () => {
             <div v-else-if="routeName === 'single-sourcing'" class="erp-route-page"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
+            <div v-else-if="routeName === 'yandex-products'" class="erp-route-page"><yandex-product-list-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
             <div v-else-if="routeName === 'orders'"><order-list-view /></div>
+            <div v-else-if="routeName === 'yandex-orders'" class="erp-route-page"><yandex-order-list-view /></div>
             <div v-else-if="routeName === 'upload'" class="erp-route-page"><batch-upload-view /></div>
             <div v-else-if="routeName === 'listing-history'" class="erp-route-page"><listing-history-view /></div>
             <div v-else-if="routeName === 'ai-generator'" class="erp-route-page"><ai-image-generator-view /></div>
@@ -305,8 +309,10 @@ const initApp = () => {
   register('sourcing-module-view', window.SourcingModuleView);
   register('single-sourcing-review-view', window.SingleSourcingReviewView);
   register('product-list-view', window.ProductListView);
+  register('yandex-product-list-view', window.YandexProductListView);
   register('inventory-management-view', window.InventoryManagementView);
   register('order-list-view', window.OrderListView);
+  register('yandex-order-list-view', window.YandexOrderListView);
   register('batch-upload-view', window.BatchUploadView);
   register('listing-history-view', window.ListingHistoryView);
   register('ai-image-generator-view', window.AIImageGeneratorView);

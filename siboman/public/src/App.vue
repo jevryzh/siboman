@@ -19,13 +19,17 @@
           <el-icon><Goods /></el-icon>
           <span>商品列表</span>
         </el-menu-item>
+        <el-menu-item index="/yandex-products">
+          <el-icon><GoodsFilled /></el-icon>
+          <span>Yandex 商品</span>
+        </el-menu-item>
         <el-menu-item index="/orders">
           <el-icon><ShoppingCart /></el-icon>
           <span>订单管理</span>
         </el-menu-item>
-        <el-menu-item index="/analytics">
-          <el-icon><PieChart /></el-icon>
-          <span>类目分析</span>
+        <el-menu-item index="/yandex-orders">
+          <el-icon><Tickets /></el-icon>
+          <span>Yandex 订单</span>
         </el-menu-item>
       </el-menu>
     </el-aside>
@@ -75,7 +79,7 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
-import { Odometer, Box, Goods, ShoppingCart, PieChart, ArrowDown } from '@element-plus/icons-vue';
+import { Odometer, Box, Goods, GoodsFilled, ShoppingCart, Tickets, ArrowDown } from '@element-plus/icons-vue';
 import axios from 'axios';
 
 const route = useRoute();
@@ -89,8 +93,9 @@ const currentPageTitle = computed(() => {
     '/dashboard': '仪表盘',
     '/collection': '采集箱',
     '/products': '商品列表',
+    '/yandex-products': 'Yandex 商品',
     '/orders': '订单管理',
-    '/analytics': '类目分析',
+    '/yandex-orders': 'Yandex 订单',
   };
   return titles[route.path] || '';
 });
