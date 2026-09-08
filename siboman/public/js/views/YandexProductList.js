@@ -2,6 +2,9 @@ window.YandexProductListView = {
   setup() {
     const products = Vue.ref([]);
     const loading = Vue.ref(false);
+    const pulling = Vue.ref(false);       // 正在全量拉取店铺商品（后台刷新中）
+    const pullSeconds = Vue.ref(0);
+    let pullTimer = null;
     const saveLoading = Vue.ref(false);
     const hasFetched = Vue.ref(false);
     const activeTab = Vue.ref('all');
@@ -214,6 +217,44 @@ window.YandexProductListView = {
       }
     };
 
+    // 拉取店铺商品（强制后台全量刷新 active+archived），旧数据继续展示，轮询直到快照更新
+    const cacheReady = Vue.ref(false);
+    const cachedAt = Vue.ref(0);
+    const pullProducts = async () => {
+      pulling.value = true;
+      pullSeconds.value = 0;
+      if (pullTimer) clearInterval(pullTimer);
+      pullTimer = setInterval(() => { pullSeconds.value += 1; }, 1000);
+      const beforeAt = Date.now();
+      try {
+        const res = await axios.post('/api/yandex/products/pull', {}, { timeout: 30000 });
+        if (!res.data?.success) throw new Error(res.data?.error || '拉取失败');
+        notify.warning('已在后台拉取店铺商品（active + 归档），通常需 1-3 分钟，完成后自动刷新');
+        // 轮询直到缓存就绪且快照更新
+        const poll = setInterval(async () => {
+          try {
+            const r = await axios.get('/api/yandex/products', {
+              params: { status: activeTab.value, page: 1, page_size: pagination.pageSize },
+            });
+            if (r.data?.cache_ready && Number(r.data?.cached_at || 0) > 0 && Number(r.data.cached_at) >= beforeAt - 5000) {
+              clearInterval(poll);
+              stopPullProgress();
+              fetchProducts();
+            }
+          } catch { /* 网络抖动继续轮询 */ }
+        }, 5000);
+        setTimeout(() => { clearInterval(poll); stopPullProgress(); fetchProducts(); }, 240000);
+      } catch (e) {
+        notify.error('拉取失败: ' + (e.response?.data?.error || e.message));
+        stopPullProgress();
+      }
+    };
+    const stopPullProgress = () => {
+      pulling.value = false;
+      if (pullTimer) { clearInterval(pullTimer); pullTimer = null; }
+    };
+    Vue.onBeforeUnmount(stopPullProgress);
+
     const fetchProducts = async () => {
       loading.value = true;
       try {
@@ -230,6 +271,8 @@ window.YandexProductListView = {
         pagination.total = Number(res.data?.total || products.value.length || 0);
         apiReady.value = res.data?.api_ready !== false;
         context.value = res.data?.context || null;
+        cacheReady.value = Boolean(res.data?.cache_ready);
+        cachedAt.value = Number(res.data?.cached_at || 0);
         applyCounts(res.data?.status_counts || {});
         aiStats.value = res.data?.ai_stats || {};
         const stateIds = (res.data?.items || []).map((it) => it.offer_id).filter(Boolean);
@@ -1283,8 +1326,8 @@ window.YandexProductListView = {
     Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return {
-      products, loading, saveLoading, hasFetched, activeTab, search, qualityFilter, qualityOptions, pagination, apiReady, statusTabItems,
-      context, drawer, statusText, statusTagType, moneyText, fetchProducts, selectStatusTab, resetFilters,
+      products, loading, pulling, pullSeconds, saveLoading, hasFetched, activeTab, search, qualityFilter, qualityOptions, pagination, apiReady, statusTabItems,
+      context, drawer, statusText, statusTagType, moneyText, fetchProducts, pullProducts, selectStatusTab, resetFilters,
       profitDialog, fixedCostCny, currentPriceCny, currentProfitPreview, suggestedPriceDisplay, strikePriceDisplay,
       currentCrossBorder, suggestedCrossBorder,
       openEdit, saveProduct, openProfitDialog, applySuggestedPrice, applyCandidateFields, candRowStyle,
@@ -1314,7 +1357,14 @@ window.YandexProductListView = {
         <el-button size="large" @click="fetchProducts">
           <el-icon><RefreshRight /></el-icon><span>刷新</span>
         </el-button>
+        <el-button size="large" type="primary" plain :loading="pulling" @click="pullProducts">
+          <el-icon><Download /></el-icon><span>{{ pulling ? '正在拉取商品... ' + pullSeconds + 's' : '拉取店铺商品' }}</span>
+        </el-button>
       </div>
+
+      <el-alert v-if="pulling" type="info" :closable="false" show-icon style="margin-bottom:14px"
+        title="正在从 Yandex 后台拉取店铺全部商品（含归档）"
+        :description="'后台全量拉取中，已等待 ' + pullSeconds + ' 秒。期间页面继续显示上次已拉取的商品，完成后自动刷新。'" />
 
       <el-alert
         v-if="!apiReady"

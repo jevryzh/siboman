@@ -170,13 +170,28 @@ window.YandexInventoryManagementView = {
       }
     };
 
-    // 批量涉及到的仓库（从勾选行去重收集，保证用户只选到真实存在的仓库）
+    // 批量可选的仓库 = 当前店铺下全部可用仓库（动态取自后端 stocks/warehouses 接口，非写死）
+    // warehouses 元素形如 { id, name, campaignId }（business 级仓库列表）
     const bulkWarehouseOptions = Vue.computed(() => {
       const map = new Map();
-      for (const r of (bulkDialog.selectedRows || [])) {
-        for (const w of (r.perWarehouse || [])) {
-          const key = String(w.warehouseId);
-          if (!map.has(key)) map.set(key, { warehouseId: key, warehouseName: w.warehouseName || String(w.warehouseId) });
+      for (const w of (warehouses.value || [])) {
+        const key = String(w.id ?? w.warehouseId);
+        if (!key) continue;
+        if (!map.has(key)) {
+          map.set(key, {
+            warehouseId: key,
+            warehouseName: String(w.name || w.warehouseName || key),
+            campaignId: String(w.campaignId || ''),
+          });
+        }
+      }
+      // 兼容旧缓存：若接口 warehouses 尚未就绪，退回从勾选行补全（仍带 campaignId 则保留）
+      if (!map.size) {
+        for (const r of (bulkDialog.selectedRows || [])) {
+          for (const w of (r.perWarehouse || [])) {
+            const key = String(w.warehouseId);
+            if (!map.has(key)) map.set(key, { warehouseId: key, warehouseName: w.warehouseName || String(w.warehouseId), campaignId: String(w.campaignId || '') });
+          }
         }
       }
       return Array.from(map.values());
@@ -313,16 +328,17 @@ window.YandexInventoryManagementView = {
           <el-tag v-if="syncError" type="danger" size="small">上次同步失败：{{ syncError }}</el-tag>
         </div>
 
-        <div style="display:grid; grid-template-columns:minmax(280px,1fr) 110px 150px auto; gap:10px; align-items:center; margin-bottom:12px">
-          <el-input v-model="search" clearable placeholder="搜索货号 (offerId) / 商品名称" size="large" @keyup.enter="onSearch">
+        <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap">
+          <el-input v-model="search" clearable placeholder="搜索货号 (offerId) / 商品名称" size="large" style="width:min(420px,100%); max-width:420px" @keyup.enter="onSearch">
             <template #prefix><el-icon><Search /></el-icon></template>
           </el-input>
           <el-button size="large" type="primary" @click="onSearch">查询</el-button>
-          <div style="display:flex; align-items:center; gap:6px">
-            <el-input-number v-model="threshold" :min="1" :max="999" size="large" style="width:100px" @change="onThresholdChange" />
-            <span style="font-size:13px; color:#64748b; white-space:nowrap">低库存阈值</span>
-          </div>
           <el-button size="large" @click="resetSearch">重置</el-button>
+          <div style="flex:1"></div>
+          <div style="display:flex; align-items:center; gap:6px">
+            <span style="font-size:13px; color:#64748b; white-space:nowrap">低库存阈值</span>
+            <el-input-number v-model="threshold" :min="1" :max="999" size="large" style="width:110px" @change="onThresholdChange" />
+          </div>
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap">

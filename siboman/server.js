@@ -4292,18 +4292,29 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       total = items.length + (hasNext ? pageSize : 0);
     }
 
-    // 状态计数走缓存+单飞；扫描失败只降级计数，不阻塞商品列表返回
+    // 状态计数：有缓存直接用；无缓存不阻塞列表返回（后台预热，前端下一轮拉取自动补上）
     let statusCounts = null;
     try {
-      statusCounts = await getYandexProductStatusCountsCached(context);
+      const countKey = String(context.storeId || context.businessId || "default");
+      const cc = yandexStatusCountsCacheByStore.get(countKey);
+      if (cc?.data && Date.now() - cc.at < YANDEX_STATUS_COUNTS_TTL_MS) {
+        statusCounts = cc.data;
+      } else if (!cc?.inflight) {
+        // 后台触发一次全店计数扫描（不 await），本次返回 null，前端标签计数稍后自愈
+        getYandexProductStatusCountsCached(context).catch((e) => {
+          console.error("yandex 状态计数后台扫描失败:", e.message);
+        });
+      }
     } catch (countError) {
-      console.error("yandex 状态计数扫描失败，降级返回商品列表:", countError.message);
+      console.error("yandex 状态计数读取失败，降级返回商品列表:", countError.message);
     }
     res.json({
       success: true,
       api_ready: true,
       platform: "yandex",
       syncing,
+      cache_ready: cacheReady,
+      cached_at: cache.at || 0,
       context: {
         store_id: context.storeId || storeId || "",
         campaign_id: context.campaignId,
@@ -4320,6 +4331,36 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+// 拉取/强制刷新店铺商品：清 offer 缓存 + 状态计数缓存后后台全量重拉（active+archived），
+// 旧数据继续服务（stale-while-revalidate），前端轮询 GET /api/yandex/products 直到 cache_ready && cached_at 更新。
+app.post("/api/yandex/products/pull", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const key = String(context.storeId || context.businessId || storeId || "__env__");
+    // 清状态计数缓存（列表计数在缓存未就绪时会扫描全店，属于慢点之一）
+    const countCache = yandexStatusCountsCacheByStore.get(key);
+    if (countCache) { countCache.at = 0; countCache.data = null; }
+    const offerCache = yandexOfferCacheObj(context.storeId || "__env__");
+    const beforeAt = offerCache.at || 0;
+    // 后台全量刷新（保留旧数据；inflight 期间前端展示"正在拉取"）
+    if (!offerCache.inflight) {
+      setTimeout(() => {
+        refreshYandexStoreCache(context.storeId || "__env__").catch((e) => {
+          console.error("[yandex-products-pull] 刷新失败:", e.message);
+        });
+      }, 100);
+    }
+    res.json({
+      success: true,
+      triggered: true,
+      store_id: context.storeId || storeId || "",
+      campaign_id: context.campaignId,
+      cached_at: beforeAt,
+    });
+  } catch (error) { next(error); }
 });
 
 app.patch("/api/yandex/products/:offerId", requireAuth, async (req, res, next) => {
@@ -4409,42 +4450,68 @@ let yandexStocksLoopStarted = false;
 async function fetchYandexStocksRaw(context) {
   const storeKey = String(context.storeId || context.businessId || "default");
   console.log("[yandex-stocks] 开始预取", storeKey, "campaign=", context.campaignId);
-  // 仓库列表
+  // 仓库列表（business 级，含全部 campaign 的仓库）
   const whResp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/warehouses`, {
     query: { language: "RU" }, timeoutMs: 30000, apiSecret: context.apiSecret,
   });
   const warehouses = Array.isArray(whResp?.result?.warehouses) ? whResp.result.warehouses : [];
-  // 库存分页：limit 作为 query 参数（Yandex 上限每页 100），串行翻页直到拉完
-  const offers = []; let pageToken = ""; let pageNum = 0; let prevOffersCount = 0;
-  const stocksUrl = `https://api.partner.market.yandex.ru/v2/campaigns/${encodeURIComponent(context.campaignId)}/offers/stocks?language=RU&limit=100`;
-  do {
-    pageNum++;
-    if (pageNum > 500) { console.warn("[yandex-stocks] 页数超 500 强制中断"); break; }
-    const bodyStr = pageToken ? JSON.stringify({ pageToken }) : "{}";
-    const r = await requestJsonOverHttps(stocksUrl, {
-      method: "POST",
-      headers: { "Api-Key": context.apiSecret, "Content-Type": "application/json" },
-      body: bodyStr,
-      timeoutMs: 90000,
-    });
-    const rj = r.ok ? JSON.parse(r.text || "{}") : {};
-    const result = rj?.result || {};
-    for (const wh of (result.warehouses || [])) {
-      const wid = wh.warehouseId;
-      for (const o of (wh.offers || [])) {
-        const fit = (o.stocks || []).find((s) => s.type === "FIT");
-        const avail = (o.stocks || []).find((s) => s.type === "AVAILABLE");
-        offers.push({ offerId: o.offerId, warehouseId: wid, fit: Number(fit?.count || 0), available: Number(avail?.count || 0), updatedAt: o.updatedAt || "" });
+  // warehouseId -> campaignId 映射（business 下每个 campaign 各挂一个或多个仓库）
+  const campaignByWarehouse = new Map();
+  for (const w of warehouses) campaignByWarehouse.set(String(w.id), String(w.campaignId || ""));
+
+  // 需要遍历的 campaign：优先该账号在 app_stores 里登记的 campaign；库存要覆盖全部仓库，
+  // 因此对 business 下实际存在的每个 campaign 都拉一次 stocks（offers/stocks 是按 campaign 查询的）。
+  let campaignIds = [];
+  try {
+    const camps = Array.isArray(context.campaigns) && context.campaigns.length
+      ? context.campaigns
+      : ((await callYandexMarketAPI("/v2/campaigns", { query: { limit: 100 }, timeoutMs: 30000, apiSecret: context.apiSecret }))?.campaigns || []);
+    campaignIds = camps.map((c) => String(c.id)).filter(Boolean);
+  } catch (e) {
+    console.warn("[yandex-stocks] 读取 campaign 列表失败:", e.message);
+  }
+  if (!campaignIds.length && context.campaignId) campaignIds = [String(context.campaignId)];
+
+  const offers = [];
+  for (const campaignId of campaignIds) {
+    let pageToken = ""; let pageNum = 0;
+    const stocksUrl = `https://api.partner.market.yandex.ru/v2/campaigns/${encodeURIComponent(campaignId)}/offers/stocks?language=RU&limit=100`;
+    do {
+      pageNum++;
+      if (pageNum > 500) { console.warn(`[yandex-stocks] campaign ${campaignId} 页数超 500 强制中断`); break; }
+      const bodyStr = pageToken ? JSON.stringify({ pageToken }) : "{}";
+      const r = await requestJsonOverHttps(stocksUrl, {
+        method: "POST",
+        headers: { "Api-Key": context.apiSecret, "Content-Type": "application/json" },
+        body: bodyStr,
+        timeoutMs: 90000,
+      });
+      const rj = r.ok ? JSON.parse(r.text || "{}") : {};
+      const result = rj?.result || {};
+      for (const wh of (result.warehouses || [])) {
+        const wid = wh.warehouseId;
+        for (const o of (wh.offers || [])) {
+          const fit = (o.stocks || []).find((s) => s.type === "FIT");
+          const avail = (o.stocks || []).find((s) => s.type === "AVAILABLE");
+          offers.push({
+            offerId: o.offerId,
+            warehouseId: wid,
+            campaignId: String(campaignByWarehouse.get(String(wid)) || campaignId),
+            fit: Number(fit?.count || 0),
+            available: Number(avail?.count || 0),
+            updatedAt: o.updatedAt || "",
+          });
+        }
       }
-    }
-    const prevToken = pageToken;
-    pageToken = result.paging?.nextPageToken || "";
-    const pageOffers = (result.warehouses || []).reduce((a, w) => a + (w.offers || []).length, 0);
-    console.log(`[yandex-stocks] p${pageNum} +${pageOffers} 累计 ${offers.length} 条${pageToken ? "，继续..." : "，完成"}`);
-    // 死循环保护：本页 0 条 或 token 重复且累计未增长 → 终止
-    if (pageOffers === 0 || (pageToken && pageToken === prevToken && offers.length === prevOffersCount)) { console.warn("[yandex-stocks] 无新数据，终止"); break; }
-    prevOffersCount = offers.length;
-  } while (pageToken && offers.length < 200000);
+      const prevToken = pageToken;
+      pageToken = result.paging?.nextPageToken || "";
+      const pageOffers = (result.warehouses || []).reduce((a, w) => a + (w.offers || []).length, 0);
+      console.log(`[yandex-stocks] campaign ${campaignId} p${pageNum} +${pageOffers} 累计 ${offers.length} 条${pageToken ? "，继续..." : "，完成"}`);
+      // 死循环保护：本页 0 条 或 pageToken 原地重复 → 终止
+      if (pageOffers === 0) break;
+      if (pageToken && pageToken === prevToken) { console.warn(`[yandex-stocks] campaign ${campaignId} pageToken 重复，终止`); break; }
+    } while (pageToken && offers.length < 200000);
+  }
   // 合并商品元数据（名称/图片/类目/价格）——来自 offer-mappings 全量缓存，保证列表能像商品页一样展示
   const metaByOffer = new Map();
   try {
@@ -4603,7 +4670,7 @@ function serveYandexStocksPage(cache, query = {}, res) {
     if (item.whSeen.has(key)) continue;
     item.whSeen.add(key);
     item.totalFit += o.fit; item.totalAvail += o.available;
-    item.perWarehouse.push({ warehouseId: o.warehouseId, fit: o.fit, available: o.available, updatedAt: o.updatedAt });
+    item.perWarehouse.push({ warehouseId: o.warehouseId, campaignId: o.campaignId || "", fit: o.fit, available: o.available, updatedAt: o.updatedAt });
   }
   let items = Array.from(map.values());
   if (q) {
@@ -4640,24 +4707,50 @@ app.post("/api/yandex/stocks/update", requireAuth, async (req, res, next) => {
     // Yandex 官方：更新库存用 PUT /v2/campaigns/{campaignId}/offers/stocks，
     // body: { skus: [{ warehouseId, sku, items: [{ type:"FIT", count }] }] }
     // 旧实现用了不存在的 POST .../offers/stocks/update → 一直 404，批量改库存不可用。
-    const skus = items.filter((it) => it.offerId && it.warehouseId).map((it) => ({
-      warehouseId: Number(it.warehouseId),
-      sku: String(it.offerId),
-      items: [{ type: "FIT", count: Math.max(0, Math.floor(Number(it.stock) || 0)) }],
-    }));
-    if (!skus.length) return res.status(400).json({ success: false, error: "无有效行（缺少 offerId/warehouseId）" });
+    // 仓库可能分属多个 campaign（店铺下多个可用仓库）→ 按 warehouseId→campaignId 分组，
+    // 每组单独 PUT 到对应 campaign，保证跨仓库批量都能写进去。
+    const storeKey = String(context.storeId || context.businessId || "default");
+    const cached = yandexStocksCache.get(storeKey);
+    const cachedWh = (cached?.warehouses || []);
+    let campaignByWarehouse = new Map();
+    for (const w of cachedWh) campaignByWarehouse.set(String(w.id), String(w.campaignId || ""));
+    if (!campaignByWarehouse.size) {
+      // 缓存未就绪时实时拉一次仓库列表补映射
+      try {
+        const whResp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/warehouses`, {
+          query: { language: "RU" }, timeoutMs: 30000, apiSecret: context.apiSecret,
+        });
+        for (const w of (whResp?.result?.warehouses || [])) campaignByWarehouse.set(String(w.id), String(w.campaignId || ""));
+      } catch (e) { console.warn("[yandex-stocks] update 读取仓库映射失败:", e.message); }
+    }
+    // 分组：campaignId -> [{warehouseId, sku, items}]
+    const groups = new Map();
+    for (const it of items) {
+      if (!it.offerId || !it.warehouseId) continue;
+      const cid = campaignByWarehouse.get(String(it.warehouseId)) || String(context.campaignId || "");
+      const skuItem = {
+        warehouseId: Number(it.warehouseId),
+        sku: String(it.offerId),
+        items: [{ type: "FIT", count: Math.max(0, Math.floor(Number(it.stock) || 0)) }],
+      };
+      if (!groups.has(cid)) groups.set(cid, []);
+      groups.get(cid).push(skuItem);
+    }
+    if (!groups.size) return res.status(400).json({ success: false, error: "无有效行（缺少 offerId/warehouseId）" });
     // 单次请求过大时分批（Yandex 建议单批 ≤500），避免超时/被拒
     const CHUNK = 500;
     const results = [];
-    for (let i = 0; i < skus.length; i += CHUNK) {
-      const chunk = skus.slice(i, i + CHUNK);
-      const resp = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/offers/stocks`, {
-        method: "PUT", query: { language: "RU" }, body: { skus: chunk }, timeoutMs: 90000, apiSecret: context.apiSecret,
-      });
-      results.push(resp?.result || resp || {});
+    for (const [cid, skus] of groups.entries()) {
+      for (let i = 0; i < skus.length; i += CHUNK) {
+        const chunk = skus.slice(i, i + CHUNK);
+        const resp = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(cid)}/offers/stocks`, {
+          method: "PUT", query: { language: "RU" }, body: { skus: chunk }, timeoutMs: 90000, apiSecret: context.apiSecret,
+        });
+        results.push({ campaignId: cid, result: resp?.result || resp || {} });
+      }
     }
     // 让下次读取尽快看到新库存：保留旧数据服务，同时后台刷新
-    yandexStocksCache.delete(String(context.storeId || context.businessId || "default"));
+    yandexStocksCache.delete(storeKey);
     setTimeout(() => { refreshYandexStocksStore(context.storeId || "__env__").catch(() => {}); }, 500);
     res.json({ success: true, chunks: results.length, response: results });
   } catch (error) { next(error); }
