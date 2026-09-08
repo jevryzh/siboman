@@ -45,6 +45,30 @@ window.YandexOrderListView = {
       return `${currency} ${n.toFixed(2)}`;
     };
 
+    // Yandex 多店铺：页内店铺选择（顶栏切换器在订单页隐藏，参照 Ozon 订单页）
+    const yandexStores = Vue.ref([]);
+    const currentStoreId = Vue.ref(localStorage.getItem('currentStoreId') || '');
+    const storeContext = Vue.ref(null);
+    const fetchYandexStores = async () => {
+      try {
+        const res = await axios.get('/api/seller/shops', { params: { platform: 'yandex' } });
+        yandexStores.value = res.data.shops || [];
+        const sid = localStorage.getItem('currentStoreId') || '';
+        if (!yandexStores.value.some((s) => s.id === sid) && yandexStores.value.length) {
+          currentStoreId.value = yandexStores.value[0].id;
+          localStorage.setItem('currentStoreId', currentStoreId.value);
+        } else {
+          currentStoreId.value = sid;
+        }
+      } catch (_e) { /* 店铺列表失败不阻塞订单页 */ }
+    };
+    const changeYandexStore = (val) => {
+      localStorage.setItem('currentStoreId', val);
+      window.dispatchEvent(new CustomEvent('shop-changed', { detail: val }));
+      pagination.currentPage = 1;
+      fetchOrders();
+    };
+
     const fetchOrders = async () => {
       loading.value = true;
       try {
@@ -59,6 +83,7 @@ window.YandexOrderListView = {
         orders.value = res.data?.items || res.data?.orders || [];
         pagination.total = Number(res.data?.total || orders.value.length || 0);
         apiReady.value = res.data?.api_ready !== false;
+        storeContext.value = res.data?.context || null;
       } catch (error) {
         if (error.response?.status === 404) {
           apiReady.value = false;
@@ -81,11 +106,12 @@ window.YandexOrderListView = {
       fetchOrders();
     };
 
-    Vue.onMounted(fetchOrders);
+    Vue.onMounted(() => { fetchYandexStores(); fetchOrders(); });
 
     return {
       orders, loading, hasFetched, activeTab, search, pagination, apiReady, statusTabs,
       statusText, statusTagType, primaryProduct, moneyText, fetchOrders, resetFilters,
+      yandexStores, currentStoreId, storeContext, changeYandexStore,
     };
   },
   template: `
@@ -93,7 +119,12 @@ window.YandexOrderListView = {
       <div class="erp-toolbar">
         <div>
           <h1 class="erp-workbench-title">Yandex 订单</h1>
-          <div class="erp-muted">字段先按 Ozon 订单管理复制，后续接 Yandex API 后同步订单、商品、金额和发货状态。</div>
+          <div class="erp-muted" style="display:flex; align-items:center; gap:10px; flex-wrap:wrap">
+            <el-select v-model="currentStoreId" size="small" style="width:200px" placeholder="切换 Yandex 店铺" @change="changeYandexStore">
+              <el-option v-for="s in yandexStores" :key="s.id" :label="s.name" :value="s.id" />
+            </el-select>
+            <span>{{ storeContext?.store_name || '' }}</span>
+          </div>
         </div>
         <div style="display:flex; gap:8px; flex-wrap:wrap">
           <el-button size="large" @click="fetchOrders">

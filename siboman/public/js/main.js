@@ -173,6 +173,7 @@ const initApp = () => {
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
         if (path.includes('yandex-products')) return 'yandex-products';
+        if (path.includes('yandex-inventory')) return 'yandex-inventory';
         if (path.includes('yandex-orders')) return 'yandex-orders';
         if (path.includes('product')) return 'products';
         if (path.includes('inventory')) return 'inventory';
@@ -187,7 +188,25 @@ const initApp = () => {
         return 'dashboard';
       });
 
-      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange, buildInfo, envLabel, pluginDownloadUrl };
+      // Yandex 多店铺：按当前路由决定顶栏切换器展示的平台，并自动对齐当前店铺
+      const headerPlatform = Vue.computed(() => {
+        const r = routeName.value;
+        if (r === 'yandex-products' || r === 'yandex-orders' || r === 'yandex-inventory') return 'yandex';
+        if (r === 'stores') return 'all';
+        return 'ozon';
+      });
+      Vue.watch(headerPlatform, (platform) => {
+        if (platform === 'all') return;
+        const sid = localStorage.getItem('currentStoreId') || '';
+        const shop = shops.value.find((s) => s.id === sid);
+        const list = shops.value.filter((s) => s.platform === platform && s.active !== false);
+        if (!list.length) return;
+        if (!shop || shop.platform !== platform) {
+          handleStoreChange(list[0].id);
+        }
+      });
+
+      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl };
     },
     template: `
       <el-container class="layout-container" v-loading="!isReady">
@@ -214,6 +233,9 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/yandex-products" @click="goTo('#/yandex-products')">
               <el-icon><GoodsFilled /></el-icon><span>Yandex 商品</span>
+            </el-menu-item>
+            <el-menu-item index="#/yandex-inventory" @click="goTo('#/yandex-inventory')">
+              <el-icon><House /></el-icon><span>Yandex 库存</span>
             </el-menu-item>
             <el-menu-item index="#/inventory" @click="goTo('#/inventory')">
               <el-icon><House /></el-icon><span>库存管理</span>
@@ -248,7 +270,7 @@ const initApp = () => {
               <el-breadcrumb-item>{{ routeName }}</el-breadcrumb-item>
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
-              <shop-switcher v-if="routeName !== 'orders' && routeName !== 'yandex-orders'" @change="handleStoreChange" />
+              <shop-switcher v-if="routeName !== 'orders' && routeName !== 'yandex-orders'" :platform="headerPlatform" @change="handleStoreChange" />
               <el-tooltip content="下载最新版 Chrome 采集插件 zip（解压后在扩展程序页加载已解压的文件夹）" placement="bottom">
                 <a :href="pluginDownloadUrl" target="_blank" rel="noreferrer" style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; color:#475569; font-size:12px; text-decoration:none; white-space:nowrap">
                   📦 插件下载
@@ -273,6 +295,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'yandex-products'" class="erp-route-page"><yandex-product-list-view /></div>
+            <div v-else-if="routeName === 'yandex-inventory'" class="erp-route-page"><yandex-inventory-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
             <div v-else-if="routeName === 'orders'"><order-list-view /></div>
             <div v-else-if="routeName === 'yandex-orders'" class="erp-route-page"><yandex-order-list-view /></div>
@@ -311,6 +334,7 @@ const initApp = () => {
   register('product-list-view', window.ProductListView);
   register('yandex-product-list-view', window.YandexProductListView);
   register('inventory-management-view', window.InventoryManagementView);
+  register('yandex-inventory-view', window.YandexInventoryManagementView);
   register('order-list-view', window.OrderListView);
   register('yandex-order-list-view', window.YandexOrderListView);
   register('batch-upload-view', window.BatchUploadView);

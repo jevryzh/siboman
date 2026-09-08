@@ -8,10 +8,44 @@ window.StoreManagementView = {
     const form = Vue.reactive({
       name: '',
       client_id: '',
-      api_key: ''
+      api_key: '',
+      platform: 'ozon',
+      campaign_id: ''
     });
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.103";
-    const PLUGIN_ZIP_VERSION = "2.2.9.103";
+    // Yandex 多店铺：列表平台筛选 + 新增弹窗平台 + campaign 探测
+    const listPlatform = Vue.ref('all'); // all|ozon|yandex
+    const dialogPlatform = Vue.ref('ozon'); // 新增弹窗当前平台
+    const yandexCampaigns = Vue.ref([]);
+    const probingCampaigns = Vue.ref(false);
+    const filteredShops = Vue.computed(() => {
+      if (listPlatform.value === 'all') return shops.value;
+      return shops.value.filter((s) => (s.platform || 'ozon') === listPlatform.value);
+    });
+    const probeYandexCampaigns = async () => {
+      const secret = String(form.api_key || '').trim();
+      if (!secret) return ElementPlus.ElMessage.warning('请先填写 Yandex API Key');
+      probingCampaigns.value = true;
+      try {
+        const res = await axios.post('/api/yandex/campaigns-probe', { api_key: secret });
+        yandexCampaigns.value = res.data.campaigns || [];
+        if (yandexCampaigns.value.length === 1) {
+          form.campaign_id = yandexCampaigns.value[0].id;
+          form.client_id = yandexCampaigns.value[0].businessId;
+          if (!form.name) form.name = yandexCampaigns.value[0].name;
+          ElementPlus.ElMessage.success('已识别店铺：' + yandexCampaigns.value[0].name);
+        } else if (yandexCampaigns.value.length > 1) {
+          ElementPlus.ElMessage.success('该账号下有 ' + yandexCampaigns.value.length + ' 个店铺，请选择要授权的 campaign');
+        } else {
+          ElementPlus.ElMessage.warning('该账号下没有可用店铺(campaign)');
+        }
+      } catch (e) {
+        ElementPlus.ElMessage.error('探测失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        probingCampaigns.value = false;
+      }
+    };
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.104";
+    const PLUGIN_ZIP_VERSION = "2.2.9.104";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -99,16 +133,31 @@ window.StoreManagementView = {
       form.name = '';
       form.client_id = '';
       form.api_key = '';
+      form.campaign_id = '';
+      dialogPlatform.value = listPlatform.value === 'yandex' ? 'yandex' : 'ozon';
+      form.platform = dialogPlatform.value;
+      yandexCampaigns.value = [];
       dialogVisible.value = true;
     };
 
+    const switchDialogPlatform = (platform) => {
+      dialogPlatform.value = platform;
+      form.platform = platform;
+      form.client_id = '';
+      form.campaign_id = '';
+      yandexCampaigns.value = [];
+    };
+
     const submitForm = async () => {
-      if (!form.name || !form.client_id || !form.api_key) {
+      if (dialogPlatform.value === 'yandex') {
+        if (!form.name || !form.api_key) return ElementPlus.ElMessage.warning('请填写店铺名称与 Yandex API Key');
+      } else if (!form.name || !form.client_id || !form.api_key) {
         return ElementPlus.ElMessage.warning('请填写完整信息');
       }
       submitLoading.value = true;
       try {
-        await axios.post('/api/seller/shops', form);
+        const payload = { ...form, platform: dialogPlatform.value };
+        await axios.post('/api/seller/shops', payload);
         ElementPlus.ElMessage.success('授权成功');
         dialogVisible.value = false;
         fetchShops();
@@ -159,6 +208,53 @@ window.StoreManagementView = {
       link.click();
     };
 
+    // AI 文本模型设置（Yandex AI 优化等功能共用）
+    const llm = Vue.reactive({ provider: '', baseUrl: '', model: '', apiKey: '', configured: false, apiKeyLast4: '' });
+    const llmSaving = Vue.ref(false);
+    const llmTesting = Vue.ref(false);
+    const LLM_PRESETS = {
+      dashscope: { baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-plus' },
+      minimax: { baseUrl: 'https://api.minimaxi.com/v1', model: 'MiniMax-M3' },
+      custom: { baseUrl: '', model: '' },
+    };
+    const fetchLlmSettings = async () => {
+      try {
+        const res = await axios.get('/api/settings/llm');
+        Object.assign(llm, res.data || {});
+      } catch (_e) { /* 未配置时静默 */ }
+    };
+    const switchLlmProvider = (provider) => {
+      llm.provider = provider;
+      const preset = LLM_PRESETS[provider] || LLM_PRESETS.custom;
+      if (provider !== 'custom') { llm.baseUrl = preset.baseUrl; llm.model = preset.model; }
+    };
+    const saveLlmSettings = async () => {
+      const key = String(llm.apiKey || '').trim();
+      if (!llm.provider) return ElementPlus.ElMessage.warning('请选择 AI 服务商');
+      if (!key) return ElementPlus.ElMessage.warning('请填写 API Key');
+      llmSaving.value = true;
+      try {
+        await axios.post('/api/settings/llm', { provider: llm.provider, apiKey: key, baseUrl: llm.baseUrl, model: llm.model });
+        ElementPlus.ElMessage.success('AI 设置已保存');
+        await fetchLlmSettings();
+      } catch (e) {
+        ElementPlus.ElMessage.error('保存失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        llmSaving.value = false;
+      }
+    };
+    const testLlm = async () => {
+      llmTesting.value = true;
+      try {
+        const res = await axios.post('/api/settings/llm/test', {});
+        ElementPlus.ElMessage.success('连接正常：' + String(res.data?.replied || 'OK').slice(0, 60));
+      } catch (e) {
+        ElementPlus.ElMessage.error('测试失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        llmTesting.value = false;
+      }
+    };
+
     const maskClientId = (id) => {
       if (!id) return '';
       return id.length > 8 ? id.slice(0, 4) + '****' + id.slice(-4) : id;
@@ -170,7 +266,7 @@ window.StoreManagementView = {
       return maskClientId(row.client_id);
     };
 
-    Vue.onMounted(() => { fetchShops(); refreshPluginStatus(); });
+    Vue.onMounted(() => { fetchShops(); refreshPluginStatus(); fetchLlmSettings(); });
     const onShopChanged = () => fetchShops();
     window.addEventListener('shop-changed', onShopChanged);
     Vue.onBeforeUnmount(() => {
@@ -179,9 +275,11 @@ window.StoreManagementView = {
     });
 
     return {
-      shops, loading, dialogVisible, submitLoading, form,
+      shops, filteredShops, listPlatform, dialogPlatform, yandexCampaigns, probingCampaigns,
+      loading, dialogVisible, submitLoading, form,
       PLUGIN_MANIFEST_VERSION, PLUGIN_ZIP_VERSION, pluginDetected, pluginChecking, installedPluginVersion, pluginStatusText, needsPluginRefresh,
-      fetchShops, handleAdd, submitForm, handleDelete, saveShopSettings, maskClientId, displayClientId, downloadExtension, refreshPluginStatus,
+      fetchShops, handleAdd, switchDialogPlatform, probeYandexCampaigns, submitForm, handleDelete, saveShopSettings, maskClientId, displayClientId, downloadExtension, refreshPluginStatus,
+      llm, llmSaving, llmTesting, switchLlmProvider, saveLlmSettings, testLlm,
     };
   },
   template: `
@@ -190,7 +288,14 @@ window.StoreManagementView = {
         <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
           <div>
             <div style="font-size:28px; line-height:1.2; font-weight:900; color:#111827">店铺授权</div>
-            <div style="margin-top:14px; font-size:14px; color:#64748b; font-weight:700">共 {{ shops.length }} 个店铺 · Ozon API 授权与插件状态</div>
+            <div style="margin-top:14px; font-size:14px; color:#64748b; font-weight:700">
+              <el-radio-group v-model="listPlatform" size="small" style="margin-right:12px">
+                <el-radio-button value="all">全部</el-radio-button>
+                <el-radio-button value="ozon">Ozon</el-radio-button>
+                <el-radio-button value="yandex">Yandex Market</el-radio-button>
+              </el-radio-group>
+              <span>共 {{ filteredShops.length }} 个店铺</span>
+            </div>
           </div>
           <div style="display:flex; gap:10px; justify-content:flex-end; flex-wrap:wrap">
             <el-button size="large" @click="fetchShops">
@@ -202,13 +307,18 @@ window.StoreManagementView = {
           </div>
         </div>
 
-        <el-table :data="shops" v-loading="loading" element-loading-text="正在读取店铺" stripe border size="large" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04); margin-bottom:20px" empty-text="暂无店铺授权。新增授权后才能同步商品、库存、订单和采集任务。">
+        <el-table :data="filteredShops" v-loading="loading" element-loading-text="正在读取店铺" stripe border size="large" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04); margin-bottom:20px" empty-text="暂无店铺授权。新增授权后才能同步商品、库存、订单和采集任务。">
+          <el-table-column label="平台" width="110">
+            <template #default="{ row }">
+              <el-tag :type="(row.platform || 'ozon') === 'yandex' ? 'warning' : 'success'" effect="light">{{ (row.platform || 'ozon') === 'yandex' ? 'Yandex' : 'Ozon' }}</el-tag>
+            </template>
+          </el-table-column>
           <el-table-column label="店铺名称" prop="name" min-width="180">
             <template #default="{ row }">
               <div style="font-size:15px; font-weight:800; color:#1f2937">{{ row.name }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="Client ID">
+          <el-table-column label="Client / Business ID">
             <template #default="{ row }">
               <code>{{ displayClientId(row) }}</code>
             </template>
@@ -242,6 +352,43 @@ window.StoreManagementView = {
             </template>
           </el-table-column>
         </el-table>
+
+      <!-- AI 文本模型设置 -->
+      <el-card style="background-color:#fff; border:1px solid #dfe7f1; border-radius:8px; box-shadow:none; overflow:hidden; margin-bottom:18px">
+        <template #header>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap">
+            <div style="font-weight: bold; color: #16a34a">AI 设置（文本模型）</div>
+            <el-tag :type="llm.configured ? 'success' : 'info'" size="small">{{ llm.configured ? '已配置 · ' + llm.provider + (llm.apiKeyLast4 ? ' · key ****' + llm.apiKeyLast4 : '') : '未配置' }}</el-tag>
+          </div>
+        </template>
+        <div style="display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px; align-items:end">
+          <div>
+            <div style="font-size:12px; color:#909399; margin-bottom:6px">服务商</div>
+            <el-select v-model="llm.provider" style="width:100%" @change="switchLlmProvider" placeholder="选择服务商">
+              <el-option label="通义 DashScope（qwen-plus）" value="dashscope" />
+              <el-option label="MiniMax（MiniMax-M3）" value="minimax" />
+              <el-option label="自定义（OpenAI 兼容）" value="custom" />
+            </el-select>
+          </div>
+          <div>
+            <div style="font-size:12px; color:#909399; margin-bottom:6px">API Key</div>
+            <el-input v-model="llm.apiKey" type="password" show-password placeholder="sk-..." />
+          </div>
+          <div>
+            <div style="font-size:12px; color:#909399; margin-bottom:6px">Base URL</div>
+            <el-input v-model="llm.baseUrl" placeholder="自动填充；custom 需手动" :disabled="llm.provider !== 'custom'" />
+          </div>
+          <div>
+            <div style="font-size:12px; color:#909399; margin-bottom:6px">模型名</div>
+            <el-input v-model="llm.model" placeholder="自动填充；custom 需手动" :disabled="llm.provider !== 'custom'" />
+          </div>
+        </div>
+        <div style="display:flex; gap:10px; margin-top:14px; align-items:center; flex-wrap:wrap">
+          <el-button type="success" :loading="llmSaving" @click="saveLlmSettings">保存 AI 设置</el-button>
+          <el-button :loading="llmTesting" :disabled="!llm.configured" @click="testLlm">测试连接</el-button>
+          <span style="font-size:12px; color:#94a3b8">用于 Yandex 商品「AI 优化」（生成俄语标题/描述）。获取：DashScope console.aliyun.com 或 platform.minimaxi.com。</span>
+        </div>
+      </el-card>
 
       <!-- 插件下载引导 -->
       <el-card style="background-color:#fff; border:1px solid #dfe7f1; border-radius:8px; box-shadow:none; overflow:hidden">
@@ -280,7 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
-            <li>✅ v2.2.9.103 修复单品找货"Ozon 主图为空"：Ozon 商品图 CDN 域名升级为 ozonstatic.cn，插件域名白名单/图片正则未覆盖新域名导致主图全被丢弃。已补 ozonstatic.cn/com 域名 + DOM 图片兜底采集 + 过滤价格标签营销图（payments-cdn）。</li>
+            <li>✅ v2.2.9.104 修复单品找货"Ozon 主图为空"：Ozon 商品图 CDN 域名升级为 ozonstatic.cn，插件域名白名单/图片正则未覆盖新域名导致主图全被丢弃。已补 ozonstatic.cn/com 域名 + DOM 图片兜底采集 + 过滤价格标签营销图（payments-cdn）。</li>
             <li>✅ v2.2.9.102 单品找货采集买家实际支付价：Ozon 页面同时有 webPrice（卖家设置价）和 finalPrice（买家实际支付价，含平台自动拉活动的折扣后价，如 69）。现在独立提取两者，Excel 新增「Ozon买家价RMB(含活动)」列，方便看出哪些商品被平台拉低价格。</li>
             <li>✅ v2.2.9.101 修复单品找货必现报错：采集商品页时注入函数缺少 cleanOzonTitle 导致 ReferenceError 整行失败（连续 3 行即自动停止）。已把标题清洗函数内置到注入函数闭包内，采集恢复。</li>
             <li>✅ v2.2.9.100 批量上架静默采集：采集商品不再打开 Ozon 标签页，直接复用已登录的 seller.ozon.ru 页面走门户 API（/search + 复制商品 bundle）拿全量数据，全程后台执行、Chrome 不弹任何标签（对齐 MY ERP）；仅当 seller 未登录/无标签页时才兜底打开商品页。售价由批量上架页行价格填写（与门户一致不带价）。</li>
@@ -371,17 +518,45 @@ window.StoreManagementView = {
       </el-card>
       </div>
 
-      <el-dialog v-model="dialogVisible" title="新增 Ozon 店铺授权" width="500px">
+      <el-dialog v-model="dialogVisible" :title="dialogPlatform === 'yandex' ? '新增 Yandex Market 店铺授权' : '新增 Ozon 店铺授权'" width="540px">
+        <div style="margin-bottom:16px">
+          <el-radio-group v-model="dialogPlatform" @change="switchDialogPlatform">
+            <el-radio-button value="ozon">Ozon</el-radio-button>
+            <el-radio-button value="yandex">Yandex Market</el-radio-button>
+          </el-radio-group>
+        </div>
         <el-form :model="form" label-position="top">
-          <el-form-item label="店铺名称" required>
-            <el-input v-model="form.name" placeholder="例如：我的 Ozon 一号店" />
-          </el-form-item>
-          <el-form-item label="Client ID" required>
-            <el-input v-model="form.client_id" placeholder="从 Ozon Seller 后台获取" />
-          </el-form-item>
-          <el-form-item label="API Key" required>
-            <el-input v-model="form.api_key" type="password" show-password placeholder="从 Ozon Seller 后台获取" />
-          </el-form-item>
+          <template v-if="dialogPlatform === 'ozon'">
+            <el-form-item label="店铺名称" required>
+              <el-input v-model="form.name" placeholder="例如：我的 Ozon 一号店" />
+            </el-form-item>
+            <el-form-item label="Client ID" required>
+              <el-input v-model="form.client_id" placeholder="从 Ozon Seller 后台获取" />
+            </el-form-item>
+            <el-form-item label="API Key" required>
+              <el-input v-model="form.api_key" type="password" show-password placeholder="从 Ozon Seller 后台获取" />
+            </el-form-item>
+          </template>
+          <template v-else>
+            <el-alert type="info" :closable="false" style="margin-bottom:12px"
+              title="Yandex Market API Key 获取方式"
+              description="登录 partner.market.yandex.ru → 设置/开发者 → API Keys，复制 Api-Key（形如 ACMA:...）。填好后点「探测店铺」自动识别账号下的店铺。" />
+            <el-form-item label="API Key (Api-Key)" required>
+              <el-input v-model="form.api_key" type="password" show-password placeholder="ACMA:xxxxxxxx" />
+            </el-form-item>
+            <el-form-item>
+              <el-button :loading="probingCampaigns" @click="probeYandexCampaigns">探测店铺</el-button>
+            </el-form-item>
+            <el-form-item v-if="yandexCampaigns.length" label="选择要授权的店铺（business 下的 campaign）" required>
+              <el-select v-model="form.campaign_id" style="width:100%" placeholder="请选择 campaign"
+                @change="(val) => { const c = yandexCampaigns.find(x => x.id === val); if (c) { form.client_id = c.businessId; if (!form.name) form.name = c.name; } }">
+                <el-option v-for="c in yandexCampaigns" :key="c.id" :label="(c.name || c.businessName) + '（business ' + c.businessId + '）'" :value="c.id" />
+              </el-select>
+            </el-form-item>
+            <el-form-item label="店铺名称（展示用，可修改）" required>
+              <el-input v-model="form.name" placeholder="例如：ThreeLatte" />
+            </el-form-item>
+          </template>
         </el-form>
         <template #footer>
           <el-button @click="dialogVisible = false">取消</el-button>

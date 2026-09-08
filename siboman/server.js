@@ -14,6 +14,7 @@ import dnsDefault from "node:dns";
 import dns from "node:dns/promises";
 import https from "node:https";
 import net from "node:net";
+import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -89,7 +90,7 @@ const AGNES_IMAGE_MODEL = process.env.AGNES_IMAGE_MODEL || "agnes-image-2.0-flas
 const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD || 0);
 const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
-const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.103";
+const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.104";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -502,9 +503,11 @@ function serializeStoreForFrontend(store) {
   return {
     id: store.id,
     name: store.name,
+    platform: store.platform || "ozon",
     active: store.active === true,
     client_id_masked: maskSecret(clientId),
     client_id_last4: clientId ? clientId.slice(-4) : "",
+    campaign_id: String(store.campaign_id || ""),
     watermark_enabled: store.watermark_enabled === true,
     watermark_text: store.watermark_text || "",
     ai_image_provider: store.ai_image_provider || AI_IMAGE_PROVIDER,
@@ -521,10 +524,11 @@ function normalizeStoreAiProvider(value) {
 app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
-    const result = await db.query(
-      "SELECT id, name, client_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model FROM app_stores WHERE user_id = $1 ORDER BY updated_at DESC",
-      [req.user.id]
-    );
+    const platformFilter = String(req.query.platform || "").trim();
+    const sql = "SELECT id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model FROM app_stores WHERE user_id = $1"
+      + (platformFilter ? " AND platform = $2" : "")
+      + " ORDER BY updated_at DESC";
+    const result = await db.query(sql, platformFilter ? [req.user.id, platformFilter] : [req.user.id]);
     res.setHeader("Cache-Control", "no-store");
     res.json({ success: true, shops: result.rows.map(serializeStoreForFrontend) });
   } catch (error) { next(error); }
@@ -534,25 +538,551 @@ app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const { name, client_id, api_key } = req.body;
+    const platform = String(req.body?.platform || "ozon").trim().toLowerCase() === "yandex" ? "yandex" : "ozon";
     const watermarkEnabled = req.body?.watermark_enabled === true;
     const watermarkText = String(req.body?.watermark_text || name || "逐梦ERP").trim().slice(0, 80);
     const aiImageProvider = normalizeStoreAiProvider(req.body?.ai_image_provider);
     const aiImageModel = String(req.body?.ai_image_model || "").trim().slice(0, 80);
-    if (!name || !client_id || !api_key) {
+    let campaignId = String(req.body?.campaign_id || "").trim();
+    let resolvedClientId = String(client_id || "").trim();
+    const resolvedName = String(name || "").trim();
+
+    if (platform === "yandex") {
+      const secret = String(api_key || "").trim();
+      if (!secret) return res.status(400).json({ success: false, error: "Yandex API Key 必填" });
+      if (!resolvedName) return res.status(400).json({ success: false, error: "请填写店铺名称" });
+      const info = await validateYandexCredentials(secret);
+      // 选定 campaign：优先 body.campaign_id → body.client_id(businessId) → 账号首个
+      const campaigns = info.campaigns;
+      const selected = campaigns.find((item) => campaignId && String(item.id) === String(campaignId))
+        || campaigns.find((item) => resolvedClientId && String(item.business?.id || "") === String(resolvedClientId))
+        || campaigns[0];
+      if (!selected?.id) return res.status(400).json({ success: false, error: "该账号下没有可用店铺(campaign)" });
+      campaignId = String(selected.id);
+      resolvedClientId = String(selected.business?.id || resolvedClientId || "");
+      const finalName = resolvedName || selected.domain || selected.business?.name || "Yandex 店铺";
+      const result = await db.query(
+        `INSERT INTO app_stores (user_id, name, client_id, api_key, campaign_id, api_secret, platform, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
+         VALUES ($1, $2, $3, $4, $5, $4, 'yandex', $6, $7, $8, $9)
+         ON CONFLICT (user_id, platform, client_id) DO UPDATE
+           SET name = $2, api_key = $4, campaign_id = $5, api_secret = $4, active = TRUE, watermark_enabled = $6,
+               watermark_text = $7, ai_image_provider = $8, ai_image_model = $9, updated_at = now()
+         RETURNING id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
+        [req.user.id, finalName, resolvedClientId, secret, campaignId, watermarkEnabled, watermarkText, aiImageProvider, aiImageModel]
+      );
+      yandexMarketContextByStore.delete(String(result.rows[0].id));
+      invalidateYandexStoresListCache();
+      res.setHeader("Cache-Control", "no-store");
+      return res.json({ success: true, shop: serializeStoreForFrontend(result.rows[0]) });
+    }
+
+    if (!resolvedName || !resolvedClientId || !api_key) {
       return res.status(400).json({ success: false, error: "请填写完整信息" });
     }
-    await validateOzonCredentials(client_id, api_key);
+    await validateOzonCredentials(resolvedClientId, api_key);
     const result = await db.query(
-      `INSERT INTO app_stores (user_id, name, client_id, api_key, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (user_id, client_id) DO UPDATE
+      `INSERT INTO app_stores (user_id, name, client_id, api_key, platform, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
+       VALUES ($1, $2, $3, $4, 'ozon', $5, $6, $7, $8)
+       ON CONFLICT (user_id, platform, client_id) DO UPDATE
          SET name = $2, api_key = $4, active = TRUE, watermark_enabled = $5, watermark_text = $6,
              ai_image_provider = $7, ai_image_model = $8, updated_at = now()
-       RETURNING id, name, client_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
-      [req.user.id, name, client_id, api_key, watermarkEnabled, watermarkText, aiImageProvider, aiImageModel]
+       RETURNING id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
+      [req.user.id, resolvedName, resolvedClientId, api_key, watermarkEnabled, watermarkText, aiImageProvider, aiImageModel]
     );
     res.setHeader("Cache-Control", "no-store");
     res.json({ success: true, shop: serializeStoreForFrontend(result.rows[0]) });
+  } catch (error) { next(error); }
+});
+
+// 新增 Yandex 授权前的账号探测：输入 Api-Key 返回其下所有 campaign，供前端选择
+app.post("/api/yandex/campaigns-probe", requireAuth, async (req, res, next) => {
+  try {
+    const apiKey = String(req.body?.api_key || "").trim();
+    if (!apiKey) return res.status(400).json({ success: false, error: "Yandex API Key 必填" });
+    const info = await validateYandexCredentials(apiKey);
+    res.json({
+      success: true,
+      campaigns: info.campaigns.map((item) => ({
+        id: String(item.id || ""),
+        name: item.domain || item.business?.name || "",
+        businessId: String(item.business?.id || ""),
+        businessName: item.business?.name || "",
+        placementType: item.placementType || "",
+      })),
+    });
+  } catch (error) { next(error); }
+});
+
+async function validateYandexCredentials(apiKey) {
+  const secret = String(apiKey || "").trim();
+  if (!secret) {
+    const error = new Error("Yandex API Key 必填");
+    error.statusCode = 400;
+    throw error;
+  }
+  let payload;
+  try {
+    payload = await callYandexMarketAPI("/v2/campaigns", { query: { limit: 100 }, timeoutMs: 30000, apiSecret: secret });
+  } catch (error) {
+    const wrapped = new Error(`Yandex API Key 无效或无权访问：${String(error.message || "").slice(0, 200)}`);
+    wrapped.statusCode = 400;
+    throw wrapped;
+  }
+  const campaigns = Array.isArray(payload.campaigns) ? payload.campaigns : [];
+  if (!campaigns.length) {
+    const error = new Error("该 Yandex 账号下没有可用店铺(campaign)");
+    error.statusCode = 400;
+    throw error;
+  }
+  return { campaigns };
+}
+
+// ── AI 文本模型设置（LLM 抽象：dashscope / minimax / custom OpenAI 兼容）──
+const LLM_DEFAULTS = {
+  dashscope: { baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-plus" },
+  minimax: { baseUrl: "https://api.minimaxi.com/v1", model: "MiniMax-M3" },
+};
+
+async function getLlmSettings(userId) {
+  const fallback = { provider: "", baseUrl: "", model: "", apiKey: "" };
+  if (!db || !userId) return fallback;
+  try {
+    const result = await db.query("SELECT llm_provider, llm_base_url, llm_model, llm_api_key FROM app_settings WHERE user_id = $1", [userId]);
+    const row = result.rows[0];
+    if (row && row.llm_provider) {
+      return {
+        provider: row.llm_provider || "",
+        baseUrl: row.llm_base_url || "",
+        model: row.llm_model || "",
+        apiKey: row.llm_api_key || "",
+      };
+    }
+  } catch (error) {
+    console.error("[llm-settings] 读取失败:", error.message);
+  }
+  // 未在 ERP 内配置时，回退环境变量 MINIMAX_API_KEY（systemd drop-in 注入）
+  const envKey = String(process.env.MINIMAX_API_KEY || "").trim();
+  if (envKey) {
+    return { provider: "minimax", baseUrl: MINIMAX_BASE_URL, model: MINIMAX_MODEL, apiKey: envKey };
+  }
+  return fallback;
+}
+
+async function callAIText(userId, { system = "", user = "", temperature = 0.3, maxTokens = 1400 } = {}) {
+  const settings = await getLlmSettings(userId);
+  const provider = settings.provider || "";
+  const defaultConfig = LLM_DEFAULTS[provider] || {};
+  const baseUrl = String(settings.baseUrl || defaultConfig.baseUrl || "").replace(/\/$/, "");
+  const model = String(settings.model || defaultConfig.model || "").trim();
+  const apiKey = String(settings.apiKey || "").trim();
+  if (!provider || !apiKey || !model) {
+    const error = new Error("未配置 AI 文本模型。请到「店铺管理」页面底部 AI 设置中配置（通义 DashScope / MiniMax 均可）。");
+    error.statusCode = 503;
+    throw error;
+  }
+  if (!baseUrl) {
+    const error = new Error("AI 模型 Base URL 未配置。");
+    error.statusCode = 503;
+    throw error;
+  }
+  let response;
+  const requestBody = {
+    model,
+    messages: [
+      ...(system ? [{ role: "system", content: system }] : []),
+      { role: "user", content: user },
+    ],
+    temperature,
+    max_tokens: maxTokens,
+  };
+  if (provider === "minimax") {
+    // MiniMax-M3 默认开启思考，会吞掉全部 token 且把 <think> 放进 content；
+    // 关闭思考 + 强制 JSON 输出，否则解析失败
+    requestBody.thinking = { type: "disabled" };
+    requestBody.response_format = { type: "json_object" };
+  }
+  try {
+    response = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(120000),
+    });
+  } catch (error) {
+    const wrapped = new Error(`AI 模型调用失败：${String(error.message || "").slice(0, 200)}`);
+    wrapped.statusCode = 504;
+    throw wrapped;
+  }
+  const raw = await response.text();
+  if (!response.ok) {
+    const error = new Error(`AI 模型 ${response.status}：${raw.slice(0, 300)}`);
+    error.statusCode = 502;
+    throw error;
+  }
+  let payload;
+  try {
+    payload = JSON.parse(raw);
+  } catch {
+    payload = {};
+  }
+  const content = payload?.choices?.[0]?.message?.content || "";
+  if (!content) {
+    const error = new Error("AI 模型返回为空");
+    error.statusCode = 502;
+    throw error;
+  }
+  return content;
+}
+
+app.get("/api/settings/llm", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const settings = await getLlmSettings(req.user.id);
+    res.json({
+      success: true,
+      provider: settings.provider,
+      baseUrl: settings.baseUrl,
+      model: settings.model,
+      configured: Boolean(settings.provider && settings.apiKey && settings.model),
+      apiKeyLast4: settings.apiKey ? settings.apiKey.slice(-4) : "",
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/settings/llm", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const provider = String(req.body?.provider || "").trim().toLowerCase();
+    const allowed = ["dashscope", "minimax", "custom"];
+    if (!allowed.includes(provider)) return res.status(400).json({ success: false, error: "provider 仅支持 dashscope / minimax / custom" });
+    const apiKey = String(req.body?.apiKey || "").trim();
+    if (!apiKey) return res.status(400).json({ success: false, error: "API Key 必填" });
+    const baseUrl = String(req.body?.baseUrl || "").trim();
+    const model = String(req.body?.model || "").trim();
+    if (provider === "custom" && (!baseUrl || !model)) {
+      return res.status(400).json({ success: false, error: "自定义模式需填写 Base URL 与模型名" });
+    }
+    await db.query(
+      `INSERT INTO app_settings (user_id, llm_provider, llm_base_url, llm_model, llm_api_key, updated_at)
+       VALUES ($1, $2, $3, $4, $5, now())
+       ON CONFLICT (user_id) DO UPDATE
+         SET llm_provider = EXCLUDED.llm_provider, llm_base_url = EXCLUDED.llm_base_url,
+             llm_model = EXCLUDED.llm_model, llm_api_key = EXCLUDED.llm_api_key, updated_at = now()`,
+      [req.user.id, provider, baseUrl, model, apiKey]
+    );
+    res.json({ success: true });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/settings/llm/test", requireAuth, async (req, res, next) => {
+  try {
+    // 用当前已存配置做一次最小调用验证
+    const content = await callAIText(req.user.id, { system: "只回复 OK", user: "ping", maxTokens: 8 });
+    res.json({ success: true, replied: String(content || "").slice(0, 80) });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+// ── Yandex 商品卡片 AI 优化（试点）：预览生成 → 确认后批量提交 ──
+function parseJsonFromLLM(text) {
+  let cleaned = String(text || "")
+    .replace(/```json|```/g, "")
+    // MiniMax-M3 等思考型模型会输出 <think>…</think> 推理块，先剥掉再找 JSON
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .trim();
+  const start = cleaned.indexOf("{");
+  const end = cleaned.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    try { return JSON.parse(cleaned.slice(start, end + 1)); } catch { /* fallthrough */ }
+  }
+  return null;
+}
+
+app.post("/api/yandex/ai-optimize-preview", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id }); // 校验店铺归属 + 取 apiSecret
+    const items = Array.isArray(req.body?.items) ? req.body.items.slice(0, 10) : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "请先选择商品" });
+    const systemPrompt = [
+      "你是 Yandex Market（俄罗斯市场）商品卡片优化专家。用户会给你商品现状（货号/标题/描述/类目/空缺属性），你要给出可直接提交的优化内容——【只补缺失，不重写已完整内容】。",
+      "硬性规则：",
+      "1) 输出语言必须是俄语（标题、描述都用俄语，品牌/型号专名可保留原文）。",
+      "2) 标题：30-120 字符，包含核心卖点与关键词，禁止感叹号、连续大写、促销词（скидка/лучший/дешево/бесплатно/🔥等）。标题已合规且完整时原样返回。",
+      "3) 描述：200-800 字符，俄语，结构化（简短引言 + 特点要点），无 HTML、无营销夸大，不虚构规格。描述已存在且 ≥200 字符时可只润色或原样。",
+      "4) 类目属性：仅对 missingRequiredAttributes 中给出的属性逐项补值；value 必须从 options 原样挑选（不新增选项），无 options 的文本型属性填简短真实值；严禁填写被明确禁止的属性与虚构测量值。已有属性不要重复给出。",
+      "5) 不改变商品类目、品牌、货号；不新增原商品没有的功能。",
+      "6) 只输出 JSON，不要 Markdown：{\"name\":\"标题(俄语)\",\"description\":\"描述(俄语)\",\"attributes\":[{\"name\":\"属性名\",\"value\":\"值\"}],\"changes\":[\"改动点中文简述\",...]}",
+    ].join("\n");
+    const rows = [];
+    for (const it of items) {
+      const offerId = String(it.offerId || it.offer_id || "").trim();
+      try {
+        const currentName = String(it.name || "").trim();
+        const currentDesc = String(it.description || "").trim();
+        const issues = Array.isArray(it.issues) ? it.issues : [];
+        const currentAttrs = (it.attributes && typeof it.attributes === "object") ? it.attributes : {};
+        // 拉类目模板找空缺属性（只补必填+推荐，测量类跳过）
+        let template = [];
+        let pending = [];
+        let skippedNames = [];
+        if (it.category_id) {
+          try { template = await getYandexCategoryParameters(it.category_id, context.apiSecret); } catch (_e) { template = []; }
+          const collected = collectPendingAttributes(template, currentAttrs);
+          pending = collected.pending;
+          skippedNames = collected.skipped;
+        }
+        const userPrompt = JSON.stringify({
+          offerId,
+          currentName: currentName.slice(0, 500),
+          currentDescription: currentDesc ? currentDesc.slice(0, 2000) : "(空)",
+          category: String(it.category_name || it.category_id || ""),
+          qualityIssues: issues,
+          existingAttributes: currentAttrs,
+          missingRequiredAttributes: pending,
+          noteForSkippedMeasurements: skippedNames.length ? `以下测量类属性不要猜测也不要出现在 attributes 中（需卖家实测后手填）：${skippedNames.join("、")}` : "",
+        });
+        const content = await callAIText(userId, { system: systemPrompt, user: userPrompt, temperature: 0.4, maxTokens: 1800 });
+        const parsed = parseJsonFromLLM(content);
+        if (!parsed || (!parsed.name && !parsed.description && !Array.isArray(parsed.attributes))) {
+          rows.push({ offerId, ok: false, error: "AI 返回格式无法解析" });
+          continue;
+        }
+        const suggestedAttrs = (Array.isArray(parsed.attributes) ? parsed.attributes.slice(0, 30) : [])
+          .filter((a) => a && String(a.name || "").trim() && String(a.value ?? "").trim())
+          .map((a) => {
+            const tpl = template.find((t) => t.name === a.name);
+            return { name: a.name, name_zh: yandexAttrZh(a.name), value: String(a.value).trim(), unit: a.unit || (tpl && tpl.unit) || "" };
+          });
+        rows.push({
+          offerId,
+          ok: true,
+          origin: { name: currentName, description: currentDesc },
+          suggested: {
+            name: String(parsed.name || currentName).slice(0, 200),
+            description: String(parsed.description || currentDesc).slice(0, 4000),
+          },
+          attributes: suggestedAttrs,
+          changes: Array.isArray(parsed.changes) ? parsed.changes.slice(0, 8) : [],
+        });
+      } catch (error) {
+        rows.push({ offerId, ok: false, error: error.message });
+        if (error.statusCode === 503) break; // 未配置模型：停止后续
+      }
+    }
+    res.json({ success: true, rows });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/yandex/ai-optimize-apply", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "没有要提交的优化项" });
+    const results = [];
+    for (const it of items) {
+      const offerId = String(it.offerId || "").trim();
+      if (!offerId) { results.push({ offerId: "", ok: false, error: "缺货号" }); continue; }
+      const offer = { offerId };
+      const newName = String(it.name || "").trim();
+      const newDesc = String(it.description || "").trim();
+      if (newName) offer.name = newName;
+      if (newDesc) offer.description = newDesc;
+      const newAttrs = (Array.isArray(it.attributes) ? it.attributes : [])
+        .filter((a) => a && String(a.name || "").trim() && String(a.value ?? "").trim())
+        .slice(0, 30)
+        .map((a) => ({ name: String(a.name).trim(), value: String(a.value).trim() }));
+      if (newAttrs.length) offer.params = newAttrs; // 只补新增（此前为空）的属性，避免覆盖已有
+      try {
+        await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings/update`, {
+          method: "POST",
+          query: { language: "RU" },
+          body: { offerMappings: [{ offer }] },
+          timeoutMs: 60000,
+          apiSecret: context.apiSecret,
+        });
+        results.push({ offerId, ok: true });
+        insertAiRecord({ userId, storeId, offerId, action: "optimize", titleChanged: !!newName, descChanged: !!newDesc, attrCount: newAttrs.length, status: "applied" });
+      } catch (error) {
+        results.push({ offerId, ok: false, error: error.message });
+        insertAiRecord({ userId, storeId, offerId, action: "optimize", titleChanged: !!newName, descChanged: !!newDesc, attrCount: newAttrs.length, status: "failed", detail: String(error.message || "").slice(0, 400) });
+      }
+    }
+    invalidateYandexStatusCounts(storeId);
+    if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
+    res.json({ success: true, results });
+  } catch (error) { next(error); }
+});
+
+// ── Yandex 类目参数模板（编辑弹窗渲染属性表单 + AI 填充合法值用）──
+const yandexCategoryParamsCache = new Map(); // catId -> {at, data}
+const YANDEX_CATEGORY_PARAMS_TTL_MS = 3600000;
+// 俄→中属性名词典：让卖家无需看懂俄文即可编辑属性
+let YANDEX_ATTR_ZH_DICT = null;
+function yandexAttrZh(name) {
+  if (!YANDEX_ATTR_ZH_DICT) {
+    try {
+      YANDEX_ATTR_ZH_DICT = JSON.parse(readFileSync(path.join(__dirname, "data", "yandex_attr_zh.json"), "utf8"));
+      console.log(`[yandex-attr-zh] 词典加载成功: ${Object.keys(YANDEX_ATTR_ZH_DICT).length} 条`);
+    } catch (e) { console.error("[yandex-attr-zh] 词典加载失败:", e.message); YANDEX_ATTR_ZH_DICT = {}; }
+  }
+  const zh = YANDEX_ATTR_ZH_DICT[String(name || "")];
+  return zh ? String(zh) : "";
+}
+
+async function getYandexCategoryParameters(categoryId, apiSecret) {
+  const key = String(categoryId || "");
+  const cached = yandexCategoryParamsCache.get(key);
+  if (cached && Date.now() - cached.at < YANDEX_CATEGORY_PARAMS_TTL_MS) return cached.data;
+  // callYandexMarketAPI 对 POST body 处理不稳定，改用 requestJsonOverHttps 直连
+  const url = `${YANDEX_MARKET_BASE_URL}/v2/category/${encodeURIComponent(key)}/parameters?language=RU`;
+  const r = await requestJsonOverHttps(url, {
+    method: "POST",
+    headers: { "Api-Key": apiSecret, "Content-Type": "application/json" },
+    body: "{}",
+    timeoutMs: 60000,
+  });
+  const payload = r.ok ? JSON.parse(r.text || "{}") : {};
+  const parameters = (payload?.result && Array.isArray(payload.result.parameters)) ? payload.result.parameters : [];
+  yandexCategoryParamsCache.set(key, { at: Date.now(), data: parameters });
+  return parameters;
+}
+
+// 当前页商品的 AI 优化统计（次数/最近时间）
+async function getAiStatsForOffers(storeKey, offerIds) {
+  const out = {};
+  if (!db || !offerIds.length) return out;
+  try {
+    const result = await db.query(
+      "SELECT offer_id, count(*)::int AS cnt, max(created_at) AS last_at, count(*) FILTER (WHERE status = 'failed')::int AS failed_cnt FROM yandex_ai_records WHERE store_id IS NOT DISTINCT FROM $1 AND offer_id = ANY($2) GROUP BY offer_id",
+      [storeKey, offerIds]
+    );
+    for (const r of result.rows) out[r.offer_id] = { count: r.cnt, lastAt: r.last_at, failedCount: r.failed_cnt };
+  } catch (_e) { /* 统计失败不阻塞列表 */ }
+  return out;
+}
+
+// 全店有 AI 优化记录的 offer 集合（缓存 60s，供列表"已优化/未优化"过滤）
+const aiOfferSetCache = new Map();
+async function getStoreAiOfferSet(storeKey) {
+  if (!db) return new Set();
+  const key = storeKey || "__env__";
+  const cached = aiOfferSetCache.get(key);
+  if (cached && Date.now() - cached.at < 60000) return cached.set;
+  try {
+    const result = await db.query("SELECT DISTINCT offer_id FROM yandex_ai_records WHERE store_id IS NOT DISTINCT FROM $1", [key === "__env__" ? null : key]);
+    const set = new Set(result.rows.map((r) => r.offer_id));
+    aiOfferSetCache.set(key, { at: Date.now(), set });
+    return set;
+  } catch (_e) { return new Set(); }
+}
+
+// 记录一次 AI 优化提交（列表批量 apply / 编辑抽屉 AI 填充保存）
+async function insertAiRecord({ userId, storeId, offerId, action, titleChanged, descChanged, attrCount, status, detail }) {
+  if (!db || !offerId) return;
+  try {
+    await db.query(
+      `INSERT INTO yandex_ai_records (user_id, store_id, offer_id, action, title_changed, desc_changed, attr_count, status, detail)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [userId || null, storeId || null, String(offerId).slice(0, 120), action || "optimize", !!titleChanged, !!descChanged,
+       Number(attrCount) || 0, status || "applied", String(detail || "").slice(0, 500)]
+    );
+  } catch (_e) { /* 记录失败不影响主流程 */ }
+}
+
+// 从类目模板筛出"空着的必填/推荐属性"（测量类数值属性禁止 AI 猜测，留给卖家实测手填）
+function collectPendingAttributes(template, currentAttrs) {
+  const MEASURE = /(длин|ширин|высот|глубин|вес|масса|диаметр|объем|толщин|length|width|height|weight|diametr)/i;
+  const pending = [];
+  const skipped = [];
+  for (const p of template) {
+    const existing = String((currentAttrs && currentAttrs[p.name]) ?? "").trim();
+    if (existing) continue;
+    const required = p.required === true;
+    const recommended = Array.isArray(p.recommendationTypes) && p.recommendationTypes.some((r) => String(r).toUpperCase() !== "ADDITIONAL");
+    if (!required && !recommended) continue;
+    if ((p.type === "NUMERIC" || p.type === "NUMERIC_INTEGER") && MEASURE.test(p.name)) {
+      skipped.push(p.name);
+      continue;
+    }
+    pending.push({
+      name: p.name, name_zh: yandexAttrZh(p.name), type: p.type || "STRING", unit: p.unit || "", required,
+      options: Array.isArray(p.values) ? p.values.map((v) => v.value).slice(0, 60) : [],
+    });
+  }
+  return { pending, skipped };
+}
+
+app.get("/api/yandex/category/:catId/parameters", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const catId = String(req.params.catId || "").trim();
+    if (!catId) return res.status(400).json({ success: false, error: "缺少类目 ID" });
+    const parameters = await getYandexCategoryParameters(catId, context.apiSecret);
+    const summary = parameters.map((p) => ({
+      id: p.id, name: p.name, name_zh: yandexAttrZh(p.name), type: p.type || "STRING", unit: p.unit || "",
+      required: p.required === true,
+      recommendation: Array.isArray(p.recommendationTypes) ? p.recommendationTypes : [],
+      values: Array.isArray(p.values) ? p.values.map((v) => ({ id: v.id, value: v.value })).slice(0, 200) : [],
+    }));
+    res.json({ success: true, category_id: catId, parameters: summary });
+  } catch (error) { next(error); }
+});
+
+// ── AI 智能填充（熊猫式：只补空缺字段/属性，AI 按模板给合法值，就地回填表单）──
+app.post("/api/yandex/ai-fill", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const { name, description, category_id: categoryId, category_name: categoryName, attributes } = req.body || {};
+    const currentAttrs = (attributes && typeof attributes === "object") ? attributes : {}; // name -> value
+    if (!String(name || "").trim()) return res.status(400).json({ success: false, error: "请先填写商品标题" });
+
+    // 拉类目模板，找出空着的必填/推荐属性作为待补清单
+    let template = [];
+    if (categoryId) {
+      try { template = await getYandexCategoryParameters(categoryId, context.apiSecret); }
+      catch (_e) { /* 模板不可用时仅做文本级填充 */ }
+    }
+    const { pending, skipped: skipNames } = collectPendingAttributes(template, currentAttrs);
+
+    const systemPrompt = [
+      "你是 Yandex Market（俄罗斯市场）商品卡片补全专家。你的任务是【只补空缺内容】，绝不重写已有的完整内容。",
+      "硬性规则：",
+      "1) 标题/描述为空或过短(描述<200字符)时给出优化版本；已有且完整则原样返回。",
+      "2) 输出语言俄语（品牌/型号专名除外）。",
+      "3) 类目属性 value 必须从给定 options 中挑选原文（不新增选项），数值类属性(如光通量)填合理数字，值必须真实、不虚构规格。",
+      "4) 只输出 JSON：{\"name\":\"标题(可不改时与输入一致)\",\"description\":\"描述\",\"attributes\":[{\"name\":\"属性名\",\"value\":\"值\"}],\"tags\":[\"可选标签\"],\"notes\":[\"改动说明\"]}",
+    ].join("\n");
+    const userPrompt = JSON.stringify({
+      title: String(name || "").slice(0, 300),
+      description: String(description || "").slice(0, 1500) || "(空)",
+      category: String(categoryName || categoryId || ""),
+      existingAttributes: currentAttrs,
+      missingRequiredAttributes: pending,
+      noteForSkippedMeasurements: skipNames.length ? `以下测量类属性不要猜测也不要出现在 attributes 中（需卖家实测后手填）：${skipNames.join("、")}` : "",
+    });
+    const content = await callAIText(userId, { system: systemPrompt, user: userPrompt, temperature: 0.3, maxTokens: 1600 });
+    const parsed = parseJsonFromLLM(content);
+    if (!parsed) return res.status(502).json({ success: false, error: "AI 返回格式无法解析，请重试" });
+    const filledAttributes = (Array.isArray(parsed.attributes) ? parsed.attributes.slice(0, 40) : []).map((a) => {
+      const tpl = template.find((t) => t.name === a.name);
+      return { name: a.name, name_zh: (tpl && yandexAttrZh(tpl.name)) || a.name_zh || "", value: a.value, unit: a.unit || (tpl && tpl.unit) || "" };
+    });
+    res.json({
+      success: true,
+      name: String(parsed.name || name || "").slice(0, 200),
+      description: String(parsed.description || description || "").slice(0, 6000),
+      attributes: filledAttributes,
+      tags: Array.isArray(parsed.tags) ? parsed.tags.slice(0, 10) : [],
+      notes: Array.isArray(parsed.notes) ? parsed.notes.slice(0, 8) : [],
+    });
   } catch (error) { next(error); }
 });
 
@@ -1624,6 +2154,48 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
+
+      CREATE TABLE IF NOT EXISTS yandex_price_candidates (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        offer_id TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        purchase_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        supplier TEXT NOT NULL DEFAULT '',
+        source_url_1688 TEXT NOT NULL DEFAULT '',
+        score NUMERIC(6,4) NOT NULL DEFAULT 0,
+        weight_kg NUMERIC(10,4) NOT NULL DEFAULT 0,
+        len_cm NUMERIC(10,2) NOT NULL DEFAULT 0,
+        wid_cm NUMERIC(10,2) NOT NULL DEFAULT 0,
+        hei_cm NUMERIC(10,2) NOT NULL DEFAULT 0,
+        pkg_qty INTEGER NOT NULL DEFAULT 1,
+        suggest_price_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        zone TEXT NOT NULL DEFAULT '',
+        cel_fee_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        source TEXT NOT NULL DEFAULT 'prematch',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(user_id, offer_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS yandex_price_records (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        offer_id TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        purchase_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        old_price_cny NUMERIC(12,2),
+        new_price_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        zone TEXT NOT NULL DEFAULT '',
+        cel_fee_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        params_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status TEXT NOT NULL DEFAULT 'applied',
+        error TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_ypr_user_offer ON yandex_price_records(user_id, offer_id);
+      CREATE INDEX IF NOT EXISTS idx_ypc_user_status ON yandex_price_candidates(user_id, status);
     `);
 
     // 4. store_id 全面隔离迁移
@@ -1692,10 +2264,85 @@ async function initDatabase() {
       CREATE INDEX IF NOT EXISTS idx_app_worker_heartbeats_store_seen ON app_worker_heartbeats(user_id, store_id, last_seen_at DESC);
     `);
 
+    // Yandex 多店铺：app_stores 平台化 + yandex 业务表 store 归属
+    await db.query(`
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'ozon';
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS campaign_id TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS api_secret TEXT NOT NULL DEFAULT '';
+      ALTER TABLE yandex_price_candidates ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
+      ALTER TABLE yandex_price_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
+      ALTER TABLE app_stores DROP CONSTRAINT IF EXISTS app_stores_user_id_client_id_key;
+    `);
+    await db.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'app_stores_user_platform_client_unique') THEN
+          ALTER TABLE app_stores ADD CONSTRAINT app_stores_user_platform_client_unique UNIQUE(user_id, platform, client_id);
+        END IF;
+      END $$;
+      ALTER TABLE yandex_price_candidates DROP CONSTRAINT IF EXISTS yandex_price_candidates_user_id_offer_id_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS yandex_price_candidates_store_offer_unique
+        ON yandex_price_candidates(store_id, offer_id) WHERE store_id IS NOT NULL;
+    `);
+    // AI 优化记录（商品维度：次数/最近时间/明细，供列表展示与审计）
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS yandex_ai_records (
+        id BIGSERIAL PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE,
+        offer_id TEXT NOT NULL,
+        action TEXT NOT NULL DEFAULT 'optimize',
+        title_changed BOOLEAN DEFAULT FALSE,
+        desc_changed BOOLEAN DEFAULT FALSE,
+        attr_count INTEGER DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'applied',
+        detail TEXT DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_yai_store_offer ON yandex_ai_records(store_id, offer_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_yai_created ON yandex_ai_records(created_at DESC);
+    `);
+    // AI 文本模型设置（按用户；供 Yandex AI 优化等功能使用）
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        user_id UUID PRIMARY KEY REFERENCES app_users(id) ON DELETE CASCADE,
+        llm_provider TEXT NOT NULL DEFAULT '',
+        llm_base_url TEXT NOT NULL DEFAULT '',
+        llm_model TEXT NOT NULL DEFAULT '',
+        llm_api_key TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+    `);
+
     await seedInitialUsers();
   } catch (e) {
     console.error("[initDatabase] ERROR:", e);
     // 不退出，尝试继续运行，某些 DDL 报错不影响基本功能
+  }
+}
+
+async function migrateYandexEnvToStores() {
+  // 环境变量店铺（ThreeLatte）首次启动自动迁入 app_stores(platform='yandex')，幂等
+  if (!db || !YANDEX_MARKET_API_SECRET) return;
+  try {
+    const user = await db.query("SELECT id FROM app_users ORDER BY created_at LIMIT 1");
+    if (!user.rows[0]) return;
+    const existing = await db.query("SELECT id FROM app_stores WHERE platform = 'yandex' AND active = TRUE LIMIT 1");
+    if (existing.rows[0]) return;
+    const context = await getYandexMarketContext({ refresh: true });
+    const insertResult = await db.query(
+      `INSERT INTO app_stores (user_id, name, client_id, api_key, campaign_id, api_secret, platform)
+       VALUES ($1, $2, $3, $4, $5, $4, 'yandex')
+       ON CONFLICT (user_id, platform, client_id) DO UPDATE SET active = TRUE, updated_at = now()
+       RETURNING id`,
+      [user.rows[0].id, context.campaignName, context.businessId, YANDEX_MARKET_API_SECRET, context.campaignId]
+    );
+    const storeId = insertResult.rows[0].id;
+    await db.query("UPDATE yandex_price_candidates SET store_id = $1 WHERE store_id IS NULL", [storeId]);
+    await db.query("UPDATE yandex_price_records SET store_id = $1 WHERE store_id IS NULL", [storeId]);
+    invalidateYandexStoresListCache();
+    console.log(`[yandex-env] 环境店铺已迁入 app_stores: ${context.campaignName} (${storeId})`);
+  } catch (error) {
+    console.error("[yandex-env] 环境店铺迁移失败:", error.message);
   }
 }
 
@@ -2005,6 +2652,115 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
 }
 
 let yandexMarketContextCache = null;
+const yandexMarketContextByStore = new Map(); // storeId('__env__') -> {campaignId,businessId,apiSecret,...}
+// Yandex 无独立状态计数接口，计数需全量分页扫描（每页约 1.5-2.5s）。
+// 加缓存+单飞，避免每次打开商品列表都重扫整店商品导致页面极慢。
+const YANDEX_STATUS_COUNTS_TTL_MS = 120000;
+const yandexStatusCountsCacheByStore = new Map(); // storeKey -> {at,data,inflight}
+// ── Yandex 多店铺商品缓存（active + archived）────────────────────────
+// 每个 Yandex 店铺独立缓存（key = app_stores.id；env 模式用 '__env__'），
+// 后台定时全量拉取进内存，前端翻页/搜索/过滤全部走本地内存（毫秒级）。
+const YANDEX_OFFERS_TTL_MS = 300000; // 5 分钟
+const yandexAllOffersCacheByStore = new Map(); // storeId -> {at,active,archived,inflight,campaignId}
+let yandexOffersLoopStarted = false;
+let yandexStoresListCache = { at: 0, rows: [] };
+
+function yandexOfferCacheObj(storeId) {
+  const key = storeId || "__env__";
+  if (!yandexAllOffersCacheByStore.has(key)) {
+    yandexAllOffersCacheByStore.set(key, { at: 0, active: [], archived: [], inflight: false, campaignId: "" });
+  }
+  return yandexAllOffersCacheByStore.get(key);
+}
+
+async function listActiveYandexStores() {
+  if (!db) return [];
+  const now = Date.now();
+  if (yandexStoresListCache.rows.length && now - yandexStoresListCache.at < 60000) return yandexStoresListCache.rows;
+  const result = await db.query(
+    "SELECT id, name, client_id, api_key, campaign_id FROM app_stores WHERE platform = 'yandex' AND active = TRUE"
+  );
+  yandexStoresListCache = { at: now, rows: result.rows };
+  return result.rows;
+}
+
+function invalidateYandexStoresListCache() {
+  yandexStoresListCache = { at: 0, rows: [] };
+}
+
+async function fetchAllYandexOffers(context, { archived = false, maxItems = 100000 } = {}) {
+  const items = [];
+  let pageToken = "";
+  for (let scanned = 0; scanned < maxItems;) {
+    const page = await fetchYandexOfferMappingsPage(context, { pageToken, limit: 100, archived });
+    if (!page.items.length) break;
+    for (const raw of page.items) {
+      const item = normalizeYandexProductMapping(raw, context);
+      if (archived) item.status = "archived";
+      items.push(item);
+    }
+    scanned += page.items.length;
+    if (!page.nextPageToken) break;
+    pageToken = page.nextPageToken;
+  }
+  return items;
+}
+
+async function refreshYandexStoreCache(storeId) {
+  const cache = yandexOfferCacheObj(storeId);
+  if (cache.inflight) return;
+  cache.inflight = true;
+  try {
+    const context = await getYandexMarketContext({ storeId: storeId === "__env__" ? null : storeId, refresh: false });
+    const [active, archived] = await Promise.all([
+      fetchAllYandexOffers(context, { archived: false }),
+      fetchAllYandexOffers(context, { archived: true }),
+    ]);
+    cache.at = Date.now();
+    cache.active = active;
+    cache.archived = archived;
+    cache.campaignId = context.campaignId;
+    console.log(`[yandex-offers] 店铺${storeId || "(env)"} 全量缓存刷新完成 active=${active.length} archived=${archived.length}`);
+  } catch (error) {
+    console.error(`[yandex-offers] 店铺${storeId || "(env)"} 全量缓存刷新失败:`, error.message);
+  } finally {
+    cache.inflight = false;
+  }
+}
+
+async function refreshAllYandexStores() {
+  let stores = [];
+  try {
+    stores = await listActiveYandexStores();
+  } catch (error) {
+    console.error("[yandex-offers] 查询 Yandex 店铺列表失败:", error.message);
+  }
+  if (!stores.length && YANDEX_MARKET_API_SECRET) stores = [{ id: "__env__" }];
+  await Promise.allSettled(stores.map((store) => refreshYandexStoreCache(store.id)));
+}
+
+function startYandexOffersCacheLoop() {
+  if (yandexOffersLoopStarted) return;
+  yandexOffersLoopStarted = true;
+  const tick = async () => {
+    await refreshAllYandexStores();
+    setTimeout(tick, YANDEX_OFFERS_TTL_MS);
+  };
+  setTimeout(tick, 3000); // 启动 3s 后预热，避免与首屏请求争抢
+}
+
+function invalidateYandexAllOffersCache(storeId) {
+  // 改价等写操作后让最新价格尽快可见：保留旧数据继续服务，同时后台立即重拉
+  if (storeId) {
+    yandexOfferCacheObj(storeId).inflight = false;
+    setTimeout(() => { refreshYandexStoreCache(storeId); }, 500);
+  } else {
+    for (const key of yandexAllOffersCacheByStore.keys()) {
+      yandexAllOffersCacheByStore.get(key).inflight = false;
+    }
+    setTimeout(() => { refreshAllYandexStores(); }, 500);
+  }
+}
 
 function yandexQueryString(query = {}) {
   const params = new URLSearchParams();
@@ -2057,9 +2813,10 @@ function requestJsonOverHttps(url, { method = "GET", headers = {}, body, timeout
   });
 }
 
-async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, timeoutMs = 60000 } = {}) {
-  if (!YANDEX_MARKET_API_SECRET) {
-    const error = new Error("Yandex Market API Secret 未配置。");
+async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, timeoutMs = 60000, apiSecret = "" } = {}) {
+  const secret = String(apiSecret || YANDEX_MARKET_API_SECRET || "").trim();
+  if (!secret) {
+    const error = new Error("Yandex Market API Secret 未配置。请在店铺管理中设置。");
     error.statusCode = 503;
     throw error;
   }
@@ -2069,7 +2826,7 @@ async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, 
     response = await requestJsonOverHttps(`${YANDEX_MARKET_BASE_URL}${apiPath}${yandexQueryString(query)}`, {
       method,
       headers: {
-        "Api-Key": YANDEX_MARKET_API_SECRET,
+        "Api-Key": secret,
         "Content-Type": "application/json",
         Accept: "application/json",
       },
@@ -2106,11 +2863,33 @@ async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, 
   return payload || {};
 }
 
-async function getYandexMarketContext({ refresh = false } = {}) {
-  if (!refresh && yandexMarketContextCache) return yandexMarketContextCache;
-  const configuredBusinessId = YANDEX_MARKET_BUSINESS_ID || YANDEX_MARKET_CLIENT_ID;
-  const configuredCampaignId = YANDEX_MARKET_CAMPAIGN_ID;
-  const payload = await callYandexMarketAPI("/v2/campaigns", { query: { limit: 100 }, timeoutMs: 30000 });
+async function getYandexMarketContext({ storeId = null, userId = null, refresh = false } = {}) {
+  const cacheKey = storeId || "__env__";
+  const cached = yandexMarketContextByStore.get(cacheKey);
+  if (!refresh && cached) return cached;
+
+  let configuredBusinessId = YANDEX_MARKET_BUSINESS_ID || YANDEX_MARKET_CLIENT_ID;
+  let configuredCampaignId = YANDEX_MARKET_CAMPAIGN_ID;
+  let apiSecret = YANDEX_MARKET_API_SECRET;
+  let storeRow = null;
+
+  if (storeId && db) {
+    const sql = "SELECT id, name, client_id, api_key, campaign_id FROM app_stores WHERE id = $1 AND platform = 'yandex' AND active = TRUE"
+      + (userId ? " AND user_id = $2" : "");
+    const params = userId ? [storeId, userId] : [storeId];
+    const result = await db.query(sql, params);
+    storeRow = result.rows[0];
+    if (!storeRow) {
+      const error = new Error("未找到该 Yandex 店铺或无权限，请重新选择目标店铺。");
+      error.statusCode = 404;
+      throw error;
+    }
+    configuredBusinessId = String(storeRow.client_id || "");
+    configuredCampaignId = String(storeRow.campaign_id || "");
+    apiSecret = String(storeRow.api_secret || storeRow.api_key || "").trim() || apiSecret;
+  }
+
+  const payload = await callYandexMarketAPI("/v2/campaigns", { query: { limit: 100 }, timeoutMs: 30000, apiSecret });
   const campaigns = Array.isArray(payload.campaigns) ? payload.campaigns : [];
   const selected = campaigns.find((item) => configuredCampaignId && String(item.id) === configuredCampaignId)
     || campaigns.find((item) => configuredBusinessId && String(item.business?.id || "") === configuredBusinessId)
@@ -2120,15 +2899,26 @@ async function getYandexMarketContext({ refresh = false } = {}) {
     error.statusCode = 404;
     throw error;
   }
-  yandexMarketContextCache = {
+  const context = {
+    storeId: storeRow ? storeRow.id : (cacheKey === "__env__" ? "" : cacheKey),
     campaignId: String(selected.id),
     businessId: String(selected.business.id),
     campaignName: selected.domain || selected.business.name || "Yandex 店铺",
     placementType: selected.placementType || "",
     apiAvailability: selected.apiAvailability || "",
+    apiSecret,
     campaigns,
   };
-  return yandexMarketContextCache;
+  if (storeRow && !configuredCampaignId) {
+    // 授权时未指定 campaign：回填首个发现的 campaign，后续请求不再动态切换
+    await db.query(
+      "UPDATE app_stores SET campaign_id = $1, name = $2, updated_at = now() WHERE id = $3",
+      [context.campaignId, context.campaignName, storeRow.id]
+    );
+    invalidateYandexStoresListCache();
+  }
+  yandexMarketContextByStore.set(cacheKey, context);
+  return context;
 }
 
 function normalizeYandexProductMapping(item = {}, context = {}) {
@@ -2149,6 +2939,12 @@ function normalizeYandexProductMapping(item = {}, context = {}) {
   const pictures = Array.isArray(offer.pictures) ? offer.pictures : [];
   const mediaPictures = Array.isArray(offer.mediaFiles?.pictures) ? offer.mediaFiles.pictures.map((pic) => pic.url || pic) : [];
   const price = offer.basicPrice || offer.price || {};
+  // 尺寸重量：Yandex Market offer 的 weightDimensions { length,width,height (cm), weight (kg) }
+  const wd = offer.weightDimensions || {};
+  const lenCm = Number(wd.length || 0);
+  const widCm = Number(wd.width || 0);
+  const heiCm = Number(wd.height || 0);
+  const weightKg = Number(wd.weight || 0) > 0 ? Number(wd.weight) : 0;
   return {
     platform: "yandex",
     store_name: context.campaignName,
@@ -2169,10 +2965,44 @@ function normalizeYandexProductMapping(item = {}, context = {}) {
     stock: Number(offer.stock || offer.stocks || 0),
     brand: offer.vendor || "",
     category_name: mapping.marketCategoryName || offer.category || "",
+    category_leaf: offer.category || "",
     category_id: mapping.marketCategoryId || offer.marketCategoryId || "",
     updated_at: price.updatedAt || offer.updatedAt || "",
+    weightKg, lenCm, widCm, heiCm,
+    description: offer.description || "",
+    attributes: Array.isArray(offer.params) ? offer.params : [],
     raw: item,
   };
+}
+
+// Yandex 卡片质量评分（0-100，本地估算模型，用于优化前后对比与低分筛选）
+// 维度对齐 Yandex「Качество карточки」主要构成：标题/图片/描述/属性/类目/价格/平台状态。
+function computeYandexCardScore(item = {}) {
+  const issues = [];
+  let score = 100;
+  const name = String(item.name || item.title || "").trim();
+  if (!name) { issues.push("缺少标题"); score -= 20; }
+  else if (name.length < 10) { issues.push("标题过短(建议10-200字符)"); score -= 12; }
+  else if (name.length > 220) { issues.push("标题过长(建议≤200字符)"); score -= 6; }
+  else if (/[A-ZА-Я]{4,}/.test(name)) { issues.push("标题含连续大写(营销嫌疑)"); score -= 8; }
+  else if (/!+/.test(name)) { issues.push("标题含感叹号"); score -= 6; }
+  const pictures = Array.isArray(item.images) && item.images.length ? item.images : (item.image ? [item.image] : []);
+  if (!pictures.length) { issues.push("缺少主图"); score -= 25; }
+  else if (pictures.length < 3) { issues.push(`图片仅 ${pictures.length} 张(建议≥3)`); score -= 14; }
+  else if (pictures.length < 5) { issues.push(`图片 ${pictures.length} 张(建议≥5)`); score -= 5; }
+  const description = String(item.description || "").trim();
+  if (!description) { issues.push("缺少商品描述"); score -= 15; }
+  else if (description.length < 200) { issues.push("描述过短(建议≥200字符)"); score -= 8; }
+  const attributes = Array.isArray(item.attributes) ? item.attributes : [];
+  if (!attributes.length) { issues.push("未填属性"); score -= 12; }
+  else if (attributes.length < 5) { issues.push(`属性仅 ${attributes.length} 项(建议≥5)`); score -= Math.min(10, (5 - attributes.length) * 2); }
+  if (!item.category_name) { issues.push("缺少类目"); score -= 10; }
+  if (!Number(item.price) || Number(item.price) <= 0) { issues.push("价格无效"); score -= 10; }
+  if (item.status === "need_attention") { issues.push("平台标记「待修改」"); score -= 10; }
+  else if (item.status === "hidden") { issues.push("已下架(无库存或停售)"); score -= 5; }
+  score = Math.max(0, Math.min(100, Math.round(score)));
+  const grade = score >= 80 ? "high" : score >= 60 ? "medium" : "low";
+  return { score, grade, issues: issues.slice(0, 8) };
 }
 
 function normalizeYandexOrder(order = {}, context = {}) {
@@ -2226,6 +3056,7 @@ async function fetchYandexOfferMappingsPage(context, { pageToken = "", limit = 1
     query: { limit, pageToken, language: "RU" },
     body: { archived },
     timeoutMs: 60000,
+    apiSecret: context.apiSecret,
   });
   const result = payload.result || {};
   return {
@@ -2254,6 +3085,43 @@ async function getYandexProductStatusCounts(context, { maxItems = 10000 } = {}) 
   }
   counts.all += counts.archived;
   return counts;
+}
+
+async function getYandexProductStatusCountsCached(context) {
+  const key = String(context.storeId || context.businessId || "default");
+  let cache = yandexStatusCountsCacheByStore.get(key);
+  if (!cache) {
+    cache = { at: 0, data: null };
+    yandexStatusCountsCacheByStore.set(key, cache);
+  }
+  const now = Date.now();
+  if (cache.data && now - cache.at < YANDEX_STATUS_COUNTS_TTL_MS) {
+    return cache.data;
+  }
+  if (cache.inflight) return cache.inflight;
+  const task = getYandexProductStatusCounts(context)
+    .then((counts) => {
+      cache.at = Date.now();
+      cache.data = counts;
+      return counts;
+    })
+    .catch((error) => {
+      cache.at = 0;
+      cache.data = null;
+      throw error;
+    });
+  cache.inflight = task;
+  try {
+    return await task;
+  } finally {
+    if (cache.inflight === task) delete cache.inflight;
+  }
+}
+
+function invalidateYandexStatusCounts(storeId) {
+  const key = String(storeId || "");
+  if (key && yandexStatusCountsCacheByStore.has(key)) yandexStatusCountsCacheByStore.delete(key);
+  else yandexStatusCountsCacheByStore.clear();
 }
 
 function sellerConfiguredResponse(_req, res) {
@@ -3067,7 +3935,7 @@ app.post("/api/seller/products/sync-global", requireAuth, async (req, res) => {
   try {
     const userId = req.user.id;
     const storesRes = await db.query(
-      "SELECT id, name FROM app_stores WHERE user_id = $1 AND active = TRUE ORDER BY updated_at DESC",
+      "SELECT id, name FROM app_stores WHERE user_id = $1 AND active = TRUE AND (platform IS NULL OR platform = 'ozon') ORDER BY updated_at DESC",
       [userId],
     );
     const stores = storesRes.rows;
@@ -3333,45 +4201,101 @@ app.get("/api/inventory", requireAuth, async (req, res, next) => {
 
 app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
   try {
-    const context = await getYandexMarketContext();
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
     const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.min(100, Math.max(1, Number(req.query.page_size || req.query.limit || 50)));
     const status = String(req.query.status || "all").trim().toLowerCase();
     const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
+    const quality = String(req.query.quality || "all").trim().toLowerCase(); // all|high|medium|low
+    const aiFilter = String(req.query.ai || "all").trim().toLowerCase(); // all|yes|no
     const archived = status === "archived";
-    const maxPages = q ? 10 : page;
-    let pageToken = "";
+    const cache = yandexOfferCacheObj(storeId);
+
+    let cacheReady = cache.at > 0;
+    // 缓存数据可能来自旧的 campaign（店铺 campaign 变化后失效重建）
+    if (cacheReady && cache.campaignId && cache.campaignId !== context.campaignId) {
+      yandexAllOffersCacheByStore.set(storeId || "__env__", {
+        at: 0, active: [], archived: [], inflight: false, campaignId: context.campaignId,
+      });
+      cacheReady = false;
+    }
+    const pool = archived ? cache.archived : cache.active;
+
+    const decorate = (list) => list.map((item) => {
+      const qualityInfo = computeYandexCardScore(item);
+      return { ...item, qscore: qualityInfo.score, qgrade: qualityInfo.grade, qissues: qualityInfo.issues };
+    });
+
     let items = [];
-    let nextPageToken = "";
+    let total = 0;
+    let hasNext = false;
+    let syncing = false;
 
-    for (let currentPage = 1; currentPage <= maxPages; currentPage++) {
-      const pageData = await fetchYandexOfferMappingsPage(context, { pageToken, limit: pageSize, archived });
-      const pageItems = pageData.items.map((item) => normalizeYandexProductMapping(item, context));
-      nextPageToken = pageData.nextPageToken;
+    if (cacheReady) {
+      // 全量缓存已就绪：搜索/状态/质量过滤全店，分页走本地内存
+      items = pool;
       if (q) {
-        items.push(...pageItems.filter((item) => [
-          item.offer_id, item.sku, item.name, item.category_name, item.brand,
-        ].some((value) => String(value || "").toLowerCase().includes(q))));
-      } else if (currentPage === page) {
-        items = pageItems;
+        items = items.filter((item) => [item.offer_id, item.sku, item.name, item.category_name, item.brand]
+          .some((value) => String(value || "").toLowerCase().includes(q)));
       }
-      if (!nextPageToken) break;
-      pageToken = nextPageToken;
+      if (status !== "all" && status !== "archived") {
+        items = items.filter((item) => item.status === status);
+      }
+      if (quality !== "all") {
+        items = items.filter((item) => computeYandexCardScore(item).grade === quality);
+      }
+      if (aiFilter !== "all") {
+        const aiSet = await getStoreAiOfferSet(storeId);
+        items = items.filter((item) => (aiFilter === "yes") === aiSet.has(item.offer_id || item.offerId));
+      }
+      total = items.length;
+      const start = (page - 1) * pageSize;
+      hasNext = start + pageSize < total;
+      items = decorate(items.slice(start, start + pageSize));
+    } else if (archived) {
+      // archived 缓存未就绪：临时实时拉（少用），并触发后台预热
+      syncing = true;
+      const pageData = await fetchYandexOfferMappingsPage(context, { pageToken: "", limit: pageSize, archived: true });
+      items = decorate(pageData.items.map((item) => normalizeYandexProductMapping(item, context)));
+      if (quality !== "all") items = items.filter((item) => item.qgrade === quality);
+      if (aiFilter !== "all") {
+        const aiSet = await getStoreAiOfferSet(storeId);
+        items = items.filter((item) => (aiFilter === "yes") === aiSet.has(item.offer_id || item.offerId));
+      }
+      hasNext = Boolean(pageData.nextPageToken);
+      total = items.length + (hasNext ? pageSize : 0);
+    } else {
+      // active 缓存未就绪（服务刚启动）: 先实时返回当前页，后台 3s 后自动全量就绪
+      syncing = true;
+      const pageData = await fetchYandexOfferMappingsPage(context, { pageToken: "", limit: pageSize, archived: false });
+      items = decorate(pageData.items.map((item) => normalizeYandexProductMapping(item, context)));
+      if (q || (status !== "all" && status !== "archived") || quality !== "all" || aiFilter !== "all") {
+        const liveAiSet = await getStoreAiOfferSet(storeId);
+        items = items.filter((item) => !q || [item.offer_id, item.sku, item.name, item.category_name, item.brand]
+          .some((value) => String(value || "").toLowerCase().includes(q)))
+          .filter((item) => status === "all" || status === "archived" || item.status === status)
+          .filter((item) => quality === "all" || item.qgrade === quality)
+          .filter((item) => aiFilter === "all" || (aiFilter === "yes") === liveAiSet.has(item.offer_id || item.offerId));
+      }
+      hasNext = Boolean(pageData.nextPageToken);
+      total = items.length + (hasNext ? pageSize : 0);
     }
 
-    if (status !== "all" && status !== "archived") {
-      items = items.filter((item) => item.status === status);
+    // 状态计数走缓存+单飞；扫描失败只降级计数，不阻塞商品列表返回
+    let statusCounts = null;
+    try {
+      statusCounts = await getYandexProductStatusCountsCached(context);
+    } catch (countError) {
+      console.error("yandex 状态计数扫描失败，降级返回商品列表:", countError.message);
     }
-    const hasNext = Boolean(nextPageToken);
-    const statusCounts = await getYandexProductStatusCounts(context);
-    const total = q || status !== "all"
-      ? items.length
-      : Number(statusCounts[status] || statusCounts.all || (((page - 1) * pageSize) + items.length + (hasNext ? pageSize : 0)));
     res.json({
       success: true,
       api_ready: true,
       platform: "yandex",
+      syncing,
       context: {
+        store_id: context.storeId || storeId || "",
         campaign_id: context.campaignId,
         business_id: context.businessId,
         store_name: context.campaignName,
@@ -3381,6 +4305,7 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       total,
       status_counts: statusCounts,
       has_next: hasNext,
+      ai_stats: (await getAiStatsForOffers(storeId, items.map((it) => it.offer_id || it.offerId).filter(Boolean))) || {},
     });
   } catch (error) {
     next(error);
@@ -3389,7 +4314,8 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
 
 app.patch("/api/yandex/products/:offerId", requireAuth, async (req, res, next) => {
   try {
-    const context = await getYandexMarketContext();
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
     const offerId = String(req.params.offerId || "").trim();
     if (!offerId) return res.status(400).json({ success: false, error: "缺少 Yandex 货号" });
 
@@ -3410,6 +4336,13 @@ app.patch("/api/yandex/products/:offerId", requireAuth, async (req, res, next) =
     if (description) offer.description = description;
     if (categoryId && /^\d+$/.test(categoryId)) offer.marketCategoryId = Number(categoryId);
     if (pictures.length) offer.pictures = pictures.slice(0, 30);
+    // 类目属性：表单以 {name, value} 提交（与 Yandex offer.params 读取结构一致）
+    if (Array.isArray(body.attributes) && body.attributes.length) {
+      const params = body.attributes
+        .filter((item) => item && String(item.name || "").trim() && String(item.value ?? "").trim())
+        .map((item) => ({ name: String(item.name).trim(), value: String(item.value).trim() }));
+      if (params.length) offer.params = params;
+    }
 
     const updates = {};
     if (Object.keys(offer).length > 1) {
@@ -3418,6 +4351,7 @@ app.patch("/api/yandex/products/:offerId", requireAuth, async (req, res, next) =
         query: { language: "RU" },
         body: { offerMappings: [{ offer }] },
         timeoutMs: 60000,
+        apiSecret: context.apiSecret,
       });
     }
     if (priceValue > 0) {
@@ -3425,19 +4359,176 @@ app.patch("/api/yandex/products/:offerId", requireAuth, async (req, res, next) =
         method: "POST",
         body: { offers: [{ offerId, price: { value: priceValue, currencyId: currency } }] },
         timeoutMs: 60000,
+        apiSecret: context.apiSecret,
       });
     }
 
-    yandexMarketContextCache = null;
+    if (req.body && req.body.ai_filled === true) {
+      // 本次保存来自"AI 智能填充"产物 → 记入 AI 优化记录
+      const patchAttrs = Array.isArray(req.body.attributes) ? req.body.attributes.filter((a) => a && String(a.name || "").trim() && String(a.value ?? "").trim()) : [];
+      insertAiRecord({ userId: req.user.id, storeId, offerId, action: "fill", titleChanged: !!name, descChanged: !!description, attrCount: patchAttrs.length, status: "applied" });
+    }
+    yandexMarketContextByStore.delete(storeId || "__env__");
+    invalidateYandexStatusCounts(storeId);
+    if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
     res.json({ success: true, platform: "yandex", offer_id: offerId, updates });
   } catch (error) {
     next(error);
   }
 });
 
+app.get("/api/yandex/ai-records", requireAuth, async (req, res, next) => {
+  try {
+    const offerId = String(req.query.offer_id || "").trim();
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    if (!db || !offerId) return res.json({ success: true, records: [] });
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit || 20)));
+    const result = await db.query(
+      "SELECT id, offer_id, action, title_changed, desc_changed, attr_count, status, detail, created_at FROM yandex_ai_records WHERE store_id IS NOT DISTINCT FROM $1 AND offer_id = $2 ORDER BY created_at DESC LIMIT $3",
+      [storeId, offerId, limit]
+    );
+    res.json({ success: true, records: result.rows });
+  } catch (error) { next(error); }
+});
+
+// ── Yandex 库存管理（多店铺，实时打 API，无本地表；缓存 60s）──
+const yandexStocksCache = new Map(); // storeKey -> {at, warehouses, offers}
+const YANDEX_STOCKS_TTL_MS = 60000;
+
+async function fetchYandexStocksRaw(context) {
+  const storeKey = String(context.storeId || context.businessId || "default");
+  console.log("[yandex-stocks] 开始预取", storeKey, "campaign=", context.campaignId);
+  // 仓库列表
+  const whResp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/warehouses`, {
+    query: { language: "RU" }, timeoutMs: 30000, apiSecret: context.apiSecret,
+  });
+  const warehouses = Array.isArray(whResp?.result?.warehouses) ? whResp.result.warehouses : [];
+  // 库存分页：直接 fetch（callYandexMarketAPI 对 POST body 处理不稳定）
+  const offers = []; let pageToken = ""; let pageNum = 0; let prevOffersCount = 0;
+  const stocksUrl = `https://api.partner.market.yandex.ru/v2/campaigns/${encodeURIComponent(context.campaignId)}/offers/stocks?language=RU`;
+  do {
+    pageNum++;
+    if (pageNum > 300) { console.warn("[yandex-stocks] 页数超 300 强制中断"); break; }
+    const bodyStr = pageToken ? JSON.stringify({ pageToken }) : "{}";
+    const r = await requestJsonOverHttps(stocksUrl, {
+      method: "POST",
+      headers: { "Api-Key": context.apiSecret, "Content-Type": "application/json" },
+      body: bodyStr,
+      timeoutMs: 60000,
+    });
+    const rj = r.ok ? JSON.parse(r.text || "{}") : {};
+    const result = rj?.result || {};
+    for (const wh of (result.warehouses || [])) {
+      const wid = wh.warehouseId;
+      for (const o of (wh.offers || [])) {
+        const fit = (o.stocks || []).find((s) => s.type === "FIT");
+        const avail = (o.stocks || []).find((s) => s.type === "AVAILABLE");
+        offers.push({ offerId: o.offerId, warehouseId: wid, fit: Number(fit?.count || 0), available: Number(avail?.count || 0), updatedAt: o.updatedAt || "" });
+      }
+    }
+    const prevToken = pageToken;
+    pageToken = result.paging?.nextPageToken || "";
+    const pageOffers = (result.warehouses || []).reduce((a, w) => a + (w.offers || []).length, 0);
+    console.log(`[yandex-stocks] p${pageNum} +${pageOffers} 累计 ${offers.length} 条${pageToken ? "，继续..." : "，完成"}`);
+    // 死循环保护：本页 0 条 或 token 重复且累计未增长 → 终止
+    if (pageOffers === 0 || (pageToken && pageToken === prevToken && offers.length === prevOffersCount)) { console.warn("[yandex-stocks] 无新数据，终止"); break; }
+    prevOffersCount = offers.length;
+  } while (pageToken && offers.length < 50000);
+  const data = { at: Date.now(), warehouses, offers, inflight: false };
+  yandexStocksCache.set(storeKey, data);
+  console.log(`[yandex-stocks] 预取完成 ${storeKey}: ${offers.length} 条库存, ${warehouses.length} 个仓库`);
+  return data;
+}
+
+app.get("/api/yandex/warehouses", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const data = await fetchYandexStocksRaw(context);
+    res.json({ success: true, warehouses: data.warehouses });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/yandex/stocks", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const storeKey = String(context.storeId || context.businessId || "default");
+    const cached = yandexStocksCache.get(storeKey);
+    // 缓存就绪 → 直接分页
+    if (cached && cached.at && Date.now() - cached.at < YANDEX_STOCKS_TTL_MS) {
+      // fallthrough to serve from cache
+    } else if (!cached || (!cached.inflight && !cached.at)) {
+      // 无缓存 or 旧缓存已失效且无在途预取 → 启动后台预取
+      // 启动后台预取（不 await，立即返回 warming）
+      yandexStocksCache.set(storeKey, { at: 0, warehouses: [], offers: [], inflight: true });
+      (async () => {
+        try {
+          const data = await fetchYandexStocksRaw(context);
+          yandexStocksCache.set(storeKey, { ...data, inflight: false });
+        } catch (e) {
+          console.error("[yandex-stocks] 预取失败:", e.message);
+          yandexStocksCache.set(storeKey, { at: 0, warehouses: [], offers: [], inflight: false, error: e.message });
+        }
+      })();
+      return res.json({ success: true, warming: true, items: [], total: 0, warehouses: [] });
+    } else {
+      // inflight 中
+      return res.json({ success: true, warming: true, items: [], total: 0, warehouses: [], error: cached.error });
+    }
+    const data = cached;
+    const q = String(req.query.search || "").trim().toLowerCase();
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(200, Math.max(1, Number(req.query.page_size || req.query.limit || 50)));
+    const map = new Map();
+    for (const o of data.offers) {
+      let item = map.get(o.offerId);
+      if (!item) { item = { offerId: o.offerId, totalFit: 0, totalAvail: 0, perWarehouse: [], whSeen: new Set() }; map.set(o.offerId, item); }
+      const key = `${o.warehouseId}`;
+      // 同一 offer+warehouse 可能重复返回（Yandex stocks API 分页已知行为），去重
+      if (item.whSeen.has(key)) continue;
+      item.whSeen.add(key);
+      item.totalFit += o.fit; item.totalAvail += o.available;
+      item.perWarehouse.push({ warehouseId: o.warehouseId, fit: o.fit, available: o.available, updatedAt: o.updatedAt });
+    }
+    let items = Array.from(map.values());
+    if (q) items = items.filter((it) => it.offerId.toLowerCase().includes(q));
+    const total = items.length;
+    const start = (page - 1) * pageSize;
+    const pageItems = items.slice(start, start + pageSize);
+    const whNameMap = {};
+    for (const w of data.warehouses) whNameMap[w.id] = w.name;
+    for (const it of pageItems) {
+      it.perWarehouse = it.perWarehouse.map((p) => ({ ...p, warehouseName: whNameMap[p.warehouseId] || String(p.warehouseId) }));
+    }
+    res.json({ success: true, items: pageItems, total, warehouses: data.warehouses });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/yandex/stocks/update", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "items 不能为空" });
+    const skus = items.filter((it) => it.offerId && it.warehouseId).map((it) => ({
+      warehouseId: Number(it.warehouseId),
+      offerId: String(it.offerId),
+      items: [{ type: "FIT", count: Math.max(0, Math.floor(Number(it.stock) || 0)) }],
+    }));
+    if (!skus.length) return res.status(400).json({ success: false, error: "无有效行（缺少 offerId/warehouseId）" });
+    const resp = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/offers/stocks/update`, {
+      method: "POST", query: { language: "RU" }, body: { skus }, timeoutMs: 60000, apiSecret: context.apiSecret,
+    });
+    yandexStocksCache.delete(String(context.storeId || context.businessId || "default"));
+    res.json({ success: true, response: resp?.result || resp });
+  } catch (error) { next(error); }
+});
+
 app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
   try {
-    const context = await getYandexMarketContext();
+    const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
     const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.min(50, Math.max(1, Number(req.query.page_size || req.query.limit || 20)));
     const activeStatus = String(req.query.status || "all").trim().toLowerCase();
@@ -3465,6 +4556,7 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       method: "GET",
       query,
       timeoutMs: 60000,
+      apiSecret: context.apiSecret,
     });
     let items = (payload.orders || []).map((order) => normalizeYandexOrder(order, context));
     if (activeStatus === "awaiting_delivery") items = items.filter((item) => String(item.substatus || "").toUpperCase() === "READY_TO_SHIP");
@@ -3492,6 +4584,416 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+// 插件模式核价：把 Yandex 商品图集派给本机采集端（插件），用 1688 官方以图找货返同款。
+// 领取/进度/完成复用 worker job 体系（kind=yandex-research），结果留在 job.results 供前端轮询。
+app.post("/api/yandex/research-job", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const rawItems = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+    if (!rawItems.length) return res.status(400).json({ success: false, error: "items 不能为空" });
+    const items = rawItems.slice(0, 20).map((it) => ({
+      offerId: String(it.offerId || it.offer_id || "").trim(),
+      name: String(it.name || it.title || "").trim().slice(0, 200),
+      images: Array.isArray(it.images)
+        ? it.images.map((s) => String(s).trim()).filter(Boolean).slice(0, 3)
+        : (String(it.imgUrl || "").trim() ? [String(it.imgUrl).trim()] : []),
+    })).filter((it) => it.offerId && it.images.length);
+    if (!items.length) return res.status(400).json({ success: false, error: "至少一项商品需要提供图片（images）" });
+    const rawStoreId = String((req.body && (req.body.store_id || req.body.storeId))
+      || (req.query && (req.query.store_id || req.query.storeId)) || "").trim();
+    const storeId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawStoreId) ? rawStoreId : null;
+    const activeJob = await findActiveDbJobForUser(req.user, { kind: "yandex-research" });
+    if (activeJob) {
+      return res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, status: activeJob.status });
+    }
+    const queued = await createQueuedDbJob(req.user, {
+      id: crypto.randomUUID(),
+      kind: "yandex-research",
+      storeId,
+      total: items.length,
+    }, { items, storeId });
+    res.json({ success: true, jobId: queued.id, queued: true, status: "queued" });
+  } catch (error) { next(error); }
+});
+
+// ===== Yandex 商品 1688 货源研究 API（AlphaShop MCP 直连）=====
+// POST /api/yandex/price-research  { items: [{ offerId, imgUrl, title }] }
+// 服务器侧: 图搜同款 -> 选 best(价格5-100) -> productDetail 核价 -> CEL 定价 -> 返回候选
+// 图搜/词搜命中 → 归一化候选。AlphaShop 返回即按相关度排序（无相似度分字段），
+// 因此保留原始顺序、勿按价格重排；无图候选无法人工核对，直接丢弃。
+function alphaTopCandidates(matches, limit = 3) {
+  if (!Array.isArray(matches) || !matches.length) return [];
+  const list = [];
+  for (const it of matches) {
+    const price = Number(it.price || it.currentPrice || it.minPrice || 0);
+    const img = it.originImageUrl || it.aiImageUrl || it.imageUrl || '';
+    if (!(price >= 3 && price <= 300)) continue;
+    if (!img) continue; // 无图候选丢弃（避免“有链接没图”无法核对）
+    list.push({ offerId: it.offerId || it.itemId || '',
+                title: (it.originTitle || it.aiTitle || it.title || '').slice(0, 120),
+                price: Math.round(price * 100) / 100, sold: Number(it.soldOut || 0),
+                img, detailUrl: it.detailUrl || '' });
+  }
+  return list.slice(0, limit);
+}
+
+app.post("/api/yandex/price-research", requireAuth, async (req, res, next) => {
+  if (!alphaCreds()) return res.status(400).json({ success: false, error: "AlphaShop 凭据未配置" });
+  try {
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items.slice(0, 20) : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "items 不能为空" });
+    const results = [];
+    for (const it of items) {
+      const offerId = String(it.offerId || "").trim();
+      const imgUrl = String(it.imgUrl || "").trim();
+      const imgs = Array.isArray(it.images)
+        ? it.images.map((s) => String(s).trim()).filter(Boolean).slice(0, 3)
+        : (imgUrl ? [imgUrl] : []);
+      const kw = String(it.title || it.keyword || "").trim().slice(0, 40);
+      let matches = [];
+      let matchSource = "none";
+      // 1) 图搜优先：多图（商品前 3 张）+ 首图查 2 页，合并去重、按首次命中顺序保留
+      if (imgs.length) {
+        const seen = new Set();
+        const unique = [];
+        const pushItems = (arr) => {
+          for (const item of (Array.isArray(arr) ? arr : [])) {
+            const oid = String(item.offerId || item.itemId || "");
+            if (!oid || seen.has(oid)) continue;
+            seen.add(oid);
+            unique.push(item);
+          }
+        };
+        let calls = 0;
+        const maxCalls = 4;
+        for (let i = 0; i < imgs.length && calls < maxCalls; i++) {
+          const pageCount = i === 0 ? 2 : 1;
+          for (let p = 1; p <= pageCount && calls < maxCalls; p++) {
+            calls++;
+            try {
+              const r = await alphaShopMcpCall('imageSearchProduct', { imgUrl: imgs[i], beginPage: p }, 45000);
+              pushItems(Array.isArray(r) ? r : (r && (r.result || r.data)));
+            } catch (_e) { /* 单次图搜失败跳过 */ }
+          }
+          if (unique.length >= 3) break;
+        }
+        matches = unique;
+        if (matches.length) matchSource = "image";
+      }
+      // 2) 词搜兜底（仅中文关键词有意义；俄文/其他语言标题直接跳过，避免搜出无关低价品）
+      if (!matches.length && kw && /[\u4e00-\u9fff]/.test(kw)) {
+        try {
+          const r2 = await alphaShopMcpCall('keywordSearchProduct', { keyword: kw, beginPage: 1 }, 45000);
+          const arr = Array.isArray(r2) ? r2 : (r2 && (r2.result || r2.data));
+          matches = Array.isArray(arr) ? arr : [];
+          if (matches.length && matchSource === "none") matchSource = "text";
+        } catch (_e) { matches = []; }
+      }
+      // Top-N 候选（best = 首选，缺省选中第一个）
+      const candidates = alphaTopCandidates(matches, 3).map((c) => ({
+        offerId1688: c.offerId, title: c.title, price: c.price, sold: c.sold, img: c.img, detailUrl: c.detailUrl,
+      }));
+      const best = candidates[0] || null;
+      let purchaseCny = best ? best.price : 0;
+      let product = null;
+      if (best) {
+        // 仅对首选做详情核价（数量/重量），候选间保留搜索价
+        try {
+          const detail = await alphaShopMcpCall('productDetailQuery', { productId: String(best.offerId1688) }, 45000);
+          product = detail && (detail.result || detail);
+          if (product && typeof product === 'object' && !Array.isArray(product)) {
+            // 有些返回里价格在 sku 列表，取最低
+            const skus = product.skus || product.skuList || product.skuInfoList || [];
+            if (Array.isArray(skus) && skus.length && !product.price) {
+              let min = 1e9;
+              for (const s of skus) { const p = Number(s.price || s.salePrice || 0); if (p > 0 && p < min) min = p; }
+              if (min < 1e9) purchaseCny = min;
+            }
+          }
+        } catch (_e) { product = null; }
+      }
+      results.push({ offerId, ok: candidates.length > 0, purchaseCny: Math.round(purchaseCny * 100) / 100,
+                     source: matchSource, matchSource, candidates, best, product });
+      // 每商品间隔 0.8s 防限流
+      await new Promise((r) => setTimeout(r, 800));
+    }
+    res.json({ success: true, results });
+  } catch (error) { next(error); }
+});
+
+// ===== Yandex 商品调价 API (定价服务端化) =====
+function yandexCelEconomy(priceCny, opt = {}) {
+  const weightKg = Math.max(0, Number(opt.weightKg || 0));
+  const dims = opt.dims || [];
+  const lenCm = Math.max(0, Number(dims[0] || 0));
+  const widCm = Math.max(0, Number(dims[1] || 0));
+  const heiCm = Math.max(0, Number(dims[2] || 0));
+  const rate = Math.max(0, Number(opt.exchangeRate || 0)) || 12.8205;
+  const priceRub = Math.max(0, Number(priceCny || 0)) * rate;
+  const volumeKg = lenCm > 0 && widCm > 0 && heiCm > 0 ? (lenCm * widCm * heiCm) / 12000 : 0;
+  let zone = 'Extra Small', chargeKg = weightKg, fee = weightKg * 28.1 + 3.37;
+  if (priceRub <= 1500) {
+    if (weightKg <= 0.5) { zone = 'Extra Small'; chargeKg = weightKg; fee = chargeKg * 28.1 + 3.37; }
+    else { zone = 'Budget'; chargeKg = weightKg; fee = chargeKg * 19.1 + 25.83; }
+  } else if (priceRub <= 7000) {
+    if (weightKg <= 2) { zone = 'Small'; chargeKg = weightKg; fee = chargeKg * 28.1 + 17.97; }
+    else { zone = 'Big'; chargeKg = Math.max(weightKg, volumeKg); fee = chargeKg * 19.1 + 40.44; }
+  } else if (weightKg <= 5) { zone = 'Premium Small'; chargeKg = weightKg; fee = chargeKg * 28.1 + 24.71; }
+  else { zone = 'Premium Big'; chargeKg = Math.max(weightKg, volumeKg); fee = chargeKg * 25.8 + 69.64; }
+  return { zone, chargeKg: Math.round(chargeKg * 1000) / 1000, feeCny: Math.round(fee * 100) / 100, priceRub: Math.round(priceRub), volumeKg: Math.round(volumeKg * 1000) / 1000 };
+}
+
+// 店铺类目 -> Yandex FBS 官方佣金% 人工精确映射（data/yandex_fbs_shop_map.json，2026-07-01 生效费率）
+// 精确键匹配；未收录类目回退全品类 26%。新增商品类目需在映射文件补录（避免词干模糊匹配误配档位）。
+const __yandexFbsShopMap = (() => {
+  try {
+    const fsMod = require("fs");
+    const p = require("path");
+    const file = p.join(__dirname, "data", "yandex_fbs_shop_map.json");
+    if (!fsMod.existsSync(file)) return {};
+    return JSON.parse(fsMod.readFileSync(file, "utf8"));
+  } catch (_e) {
+    return {};
+  }
+})();
+function yandexMatchFbsCommission(categoryName, categoryLeaf) {
+  const map = __yandexFbsShopMap;
+  const key = String(categoryName || "").trim();
+  if (map[key] > 0) return map[key];
+  const leaf = String(categoryLeaf || "").trim();
+  if (leaf && map[leaf] > 0) return map[leaf];
+  return 26;
+}
+
+function yandexSuggestPrice(input = {}) {
+  const purchaseCny = Math.max(0, Number(input.purchaseCny || 0));
+  const weightKg = Math.max(0, Number(input.weightKg || 0.2));
+  const dims = Array.isArray(input.dims) && input.dims.length === 3 ? input.dims.map(Number) : [0, 0, 0];
+  const params = input.params || {};
+  const domestic = Math.max(0, Number(params.domesticShippingCny || 4));
+  const service = Math.max(0, Number(params.serviceFeeCny || 3));
+  const lastMile = Math.max(0, Number(params.lastMileCny || 4.68));
+  const manualCommission = Math.max(0, Number(params.commissionPct || 0));
+  const commission = manualCommission > 0 ? manualCommission : yandexMatchFbsCommission(input.categoryName, input.categoryLeaf);
+  const acquiring = Math.max(0, Number(params.acquiringPct || 3.8));
+  const withdrawal = Math.max(0, Number(params.withdrawalPct || 1.2));
+  const returnLoss = Math.max(0, Number(params.returnLossPct || 0));
+  const ad = Math.max(0, Number(params.adPct || 10));
+  const targetMargin = Math.max(0, Number(params.targetMarginPct || 35));
+  const rate = Math.max(0, Number(params.exchangeRate || 0)) || 12.8205;
+  const vrate = (commission + acquiring + withdrawal + returnLoss + ad) / 100;
+  const denom = 1 - vrate - targetMargin / 100;
+  if (purchaseCny <= 0 || denom <= 0.02) return { ok: false };
+  const base = purchaseCny + domestic + service + lastMile;
+  let price = (base + yandexCelEconomy(base, { weightKg, dims, exchangeRate: rate }).feeCny) / denom;
+  let cel = yandexCelEconomy(price, { weightKg, dims, exchangeRate: rate });
+  for (let i = 0; i < 5; i += 1) {
+    price = (base + cel.feeCny) / denom;
+    cel = yandexCelEconomy(price, { weightKg, dims, exchangeRate: rate });
+  }
+  const priceInt = Math.ceil(price); // Yandex 价格取整
+  const strikeDiscountPct = Math.max(1, Number(params.strikeDiscountPct || 0)) || 50;
+  const strikePriceCny = Math.ceil(priceInt * 100 / strikeDiscountPct); // 划线价 = 售价 ÷ 折扣率 × 100
+  const profitCny = Math.round(price * (1 - vrate) - base - cel.feeCny); // 扣除平台费率后的利润
+  return { ok: true, priceCny: priceInt, zone: cel.zone, chargeKg: cel.chargeKg, celFeeCny: cel.feeCny, rubValue: Math.round(priceInt * rate), strikePriceCny, profitCny, marginPct: targetMargin, commissionUsed: commission, commissionSource: manualCommission > 0 ? "manual" : "auto" };
+}
+
+// 预匹配候选 upsert（供 Agent 本机 1688 匹配后写入）
+app.post("/api/yandex/price-candidates", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "items 不能为空" });
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    let inserted = 0;
+    for (const it of items) {
+      const offerId = String(it.offerId || it.offer_id || "").trim();
+      if (!offerId) continue;
+      await db.query(
+        `INSERT INTO yandex_price_candidates (user_id, store_id, offer_id, name, purchase_cny, supplier, source_url_1688, score, weight_kg, len_cm, wid_cm, hei_cm, pkg_qty, suggest_price_cny, zone, cel_fee_cny, status, source)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17)
+         ON CONFLICT (store_id, offer_id)
+         DO UPDATE SET name=EXCLUDED.name, purchase_cny=EXCLUDED.purchase_cny, supplier=EXCLUDED.supplier,
+           source_url_1688=EXCLUDED.source_url_1688, score=EXCLUDED.score, weight_kg=EXCLUDED.weight_kg,
+           len_cm=EXCLUDED.len_cm, wid_cm=EXCLUDED.wid_cm, hei_cm=EXCLUDED.hei_cm, pkg_qty=EXCLUDED.pkg_qty,
+           suggest_price_cny=EXCLUDED.suggest_price_cny, zone=EXCLUDED.zone, cel_fee_cny=EXCLUDED.cel_fee_cny,
+           status=EXCLUDED.status, source=EXCLUDED.source, updated_at=now()`,
+        [userId, storeId, offerId, String(it.name || "").slice(0, 500), Number(it.purchaseCny || 0), String(it.supplier || "").slice(0, 200),
+         String(it.sourceUrl1688 || "").slice(0, 500), Number(it.score || 0), Number(it.weightKg || 0), Number(it.lenCm || 0),
+         Number(it.widCm || 0), Number(it.heiCm || 0), Number(it.pkgQty || 1), Number(it.suggestPriceCny || 0),
+         String(it.zone || ""), Number(it.celFeeCny || 0), String(it.source || "prematch")]);
+      inserted += 1;
+    }
+    res.json({ success: true, inserted });
+  } catch (error) { next(error); }
+});
+
+// 查询某批 offer 的调价状态（候选 + 最近调价记录）
+app.get("/api/yandex/price-state", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const offerIds = String(req.query.offerIds || "").split(",").map((s) => s.trim()).filter(Boolean);
+    if (!offerIds.length) return res.json({ success: true, items: [] });
+    const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
+    const [candRows, recRows] = await Promise.all([
+      db.query(`SELECT offer_id, purchase_cny, supplier, score, weight_kg, len_cm, wid_cm, hei_cm, pkg_qty, suggest_price_cny, zone, cel_fee_cny, status, source, updated_at
+                FROM yandex_price_candidates WHERE user_id=$1 AND offer_id = ANY($2) AND store_id IS NOT DISTINCT FROM $3`, [userId, offerIds, storeId]),
+      db.query(`SELECT offer_id, purchase_cny, new_price_cny, old_price_cny, zone, status, error, created_at
+                FROM yandex_price_records WHERE user_id=$1 AND offer_id = ANY($2) AND store_id IS NOT DISTINCT FROM $3
+                ORDER BY created_at DESC`, [userId, offerIds, storeId]),
+    ]);
+    const byOffer = {};
+    for (const o of offerIds) byOffer[o] = { candidate: null, records: [] };
+    for (const c of candRows.rows) { if (byOffer[c.offer_id]) byOffer[c.offer_id].candidate = c; }
+    for (const r of recRows.rows) { if (byOffer[r.offer_id] && byOffer[r.offer_id].records.length < 5) byOffer[r.offer_id].records.push(r); }
+    res.json({ success: true, items: offerIds.map((o) => ({ offerId: o, ...byOffer[o] })) });
+  } catch (error) { next(error); }
+});
+
+// 批量预览建议售价（只计算，不写回；与 price-apply 共用 yandexSuggestPrice 公式）
+const YANDEX_OZON_CAT_RATES = (() => {
+  try { return JSON.parse(require("fs").readFileSync(require("path").join(__dirname, "data", "yandex_ozon_cat_rates.json"), "utf8")); } catch (_e) { return null; }
+})();
+async function defaultYandexStoreId() {
+  // 请求未显式带 store_id 时的兜底：当前账号第一个 active Yandex 店铺
+  try {
+    const result = await db.query("SELECT id FROM app_stores WHERE platform = 'yandex' AND active = TRUE ORDER BY created_at LIMIT 1");
+    return result.rows[0] ? result.rows[0].id : null;
+  } catch (_e) { return null; }
+}
+
+app.post("/api/yandex/ozon-reverse", requireAuth, async (req, res, next) => {
+  // Ozon 售价(CNY 合同) 反推采购价 E：E = P×(1-comm-margin-0.04) - 国内运费 - 3 - 跨境头程
+  // comm 按 desc_cat(经 yandex_ozon_matches) 查 rFBS 三档 [<=1500, 1501-5000, >5000₽]
+  try {
+    const { vendorCode, ozonPriceCny, weightKg, lenCm, widCm, heiCm, marginPct, domesticCny, rubRate } = req.body || {};
+    let storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    if (!storeId) storeId = await defaultYandexStoreId(); // 匹配表已按店铺归属，多店后兜底首个 Yandex 店
+    let ozonPrice = Math.max(0, Number(ozonPriceCny || 0));
+    let descCat = null;
+    if (vendorCode) {
+      try {
+        const { rows } = await db.query(
+          "SELECT price, desc_cat FROM yandex_ozon_matches WHERE yid = $1 AND yandex_store_id IS NOT DISTINCT FROM $2 LIMIT 1",
+          [String(vendorCode), storeId]
+        );
+        if (rows && rows.length && Number(rows[0].price) > 0) {
+          ozonPrice = Number(rows[0].price);
+          descCat = rows[0].desc_cat ? String(rows[0].desc_cat) : null;
+        }
+      } catch (_e) { /* 表不存在等情形降级手动价 */ }
+    }
+    if (!(ozonPrice > 0)) return res.json({ ok: false, error: "未找到 Ozon 同款售价（yandex_ozon_matches 无记录且未传 ozonPriceCny）" });
+    const weight = Math.max(0, Number(weightKg || 0)) || 0.2;
+    const rate = Math.max(0, Number(rubRate || 0)) || 13;
+    const margin = Math.max(0, Number(marginPct || 0)) || 10;
+    const domestic = Math.max(0, Number(domesticCny || 0)) || 0;
+    const priceRub = Math.round(ozonPrice * rate);
+    const ratesMap = YANDEX_OZON_CAT_RATES || {};
+    const catRates = (descCat && ratesMap[descCat]) || ratesMap._default || [12, 14, 18];
+    const tier = !(priceRub > 0) ? 0 : (priceRub <= 1500 ? 0 : (priceRub <= 5000 ? 1 : 2));
+    const commission = Number(catRates[tier] || catRates[0]);
+    // CEL 经济渠道价卡（与精铺技能一致）
+    const volW = (Number(lenCm || 0) * Number(widCm || 0) * Number(heiCm || 0)) / 12000;
+    let cross = 0;
+    if (priceRub <= 1500) cross = weight <= 0.5 ? weight * 28.1 + 3.37 : weight * 19.1 + 25.83;
+    else if (priceRub <= 7000) {
+      const q = (weight <= 2) ? weight : Math.max(weight, volW);
+      cross = weight <= 2 ? weight * 28.1 + 17.97 : q * 19.1 + 40.44;
+    } else {
+      const q = (weight <= 5) ? weight : Math.max(weight, volW);
+      cross = weight <= 5 ? weight * 28.1 + 24.71 : q * 25.8 + 69.64;
+    }
+    const denom = 1 - commission / 100 - margin / 100 - 0.02 - 0.02;
+    const E = ozonPrice * denom - domestic - 3 - cross;
+    if (!(E > 0)) return res.json({ ok: false, error: `反推采购价为负（售价 ${ozonPrice} CNY 不足以覆盖佣金 ${commission}%+费率+头程 ${cross.toFixed(1)}），请核对 Ozon 售价或佣金档` });
+    return res.json({
+      ok: true, purchaseCny: Math.round(E * 100) / 100,
+      ozonPriceCny: ozonPrice, priceRub, commission, tier, descCat,
+      crossCny: Math.round(cross * 100) / 100, marginPct: margin, denom: Math.round(denom * 10000) / 10000,
+    });
+  } catch (e) {
+    return res.json({ ok: false, error: "反推失败: " + (e && e.message ? e.message : String(e)) });
+  }
+});
+
+app.post("/api/yandex/price-suggest", requireAuth, async (req, res, next) => {
+  try {
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "items 不能为空" });
+    const results = [];
+    for (const it of items) {
+      const offerId = String(it.offerId || it.offer_id || "").trim();
+      const dims = Array.isArray(it.dims) && it.dims.length === 3
+        ? it.dims.map(Number)
+        : [Number(it.lenCm || it.len_cm || 0), Number(it.widCm || it.wid_cm || 0), Number(it.heiCm || it.hei_cm || 0)];
+      const calc = yandexSuggestPrice({ purchaseCny: it.purchaseCny, weightKg: it.weightKg, dims, categoryName: it.categoryName, categoryLeaf: it.categoryLeaf, params: it.params || {} });
+      if (calc.ok) {
+        results.push({ offerId, ok: true, priceCny: calc.priceCny, zone: calc.zone, chargeKg: calc.chargeKg, celFeeCny: calc.celFeeCny, rubValue: calc.rubValue, strikePriceCny: calc.strikePriceCny, profitCny: calc.profitCny, marginPct: calc.marginPct, commissionUsed: calc.commissionUsed, commissionSource: calc.commissionSource });
+      } else {
+        results.push({ offerId, ok: false, error: "成本参数无效" });
+      }
+    }
+    res.json({ success: true, results });
+  } catch (error) { next(error); }
+});
+
+// 批量执行调价（写回 Yandex + 记录历史 + 更新候选状态）
+app.post("/api/yandex/price-apply", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const items = Array.isArray(req.body && req.body.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "items 不能为空" });
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const results = [];
+    for (const it of items) {
+      const offerId = String(it.offerId || it.offer_id || "").trim();
+      if (!offerId) { results.push({ offerId: "", ok: false, error: "缺货号" }); continue; }
+      let oldPriceCny = null;
+      try {
+        const priceResp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices`, {
+          method: "POST", body: { offerIds: [offerId] }, timeoutMs: 60000, apiSecret: context.apiSecret });
+        oldPriceCny = Number(priceResp && priceResp.result && priceResp.result.offers && priceResp.result.offers[0] && priceResp.result.offers[0].price && priceResp.result.offers[0].price.value || 0) || null;
+      } catch (_e) { /* 忽略读价失败 */ }
+      let targetPrice = Number(it.price || 0);
+      let zone = "", celFee = 0, purchaseCny = Number(it.purchaseCny || 0);
+      if (!(targetPrice > 0)) {
+        const calc = yandexSuggestPrice({ purchaseCny: it.purchaseCny, weightKg: it.weightKg, dims: it.dims, params: it.params });
+        if (!calc.ok) { results.push({ offerId, ok: false, error: "成本参数无效" }); continue; }
+        targetPrice = calc.priceCny; zone = calc.zone; celFee = calc.celFeeCny;
+      }
+      try {
+        const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices/updates`, {
+          method: "POST", body: { offers: [{ offerId, price: { value: targetPrice, currencyId: String(it.currency || "CNY").toUpperCase() } }] },
+          timeoutMs: 60000, apiSecret: context.apiSecret });
+        await db.query(
+          `INSERT INTO yandex_price_records (user_id, store_id, offer_id, name, purchase_cny, old_price_cny, new_price_cny, zone, cel_fee_cny, params_json, status)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'applied')`,
+          [userId, storeId, offerId, String(it.name || "").slice(0, 500), purchaseCny, oldPriceCny, targetPrice, zone, celFee,
+           JSON.stringify({ apiStatus: resp && resp.status, request: { price: targetPrice, currency: it.currency || "CNY" } })]);
+        await db.query(`UPDATE yandex_price_candidates SET status='applied', updated_at=now() WHERE user_id=$1 AND offer_id=$2 AND store_id IS NOT DISTINCT FROM $3`, [userId, offerId, storeId]);
+        results.push({ offerId, ok: true, newPrice: targetPrice, oldPrice: oldPriceCny, apiStatus: resp && resp.status });
+      } catch (err) {
+        await db.query(
+          `INSERT INTO yandex_price_records (user_id, store_id, offer_id, name, purchase_cny, old_price_cny, new_price_cny, zone, cel_fee_cny, params_json, status, error)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'failed',$11)`,
+          [userId, storeId, offerId, String(it.name || "").slice(0, 500), purchaseCny, oldPriceCny, targetPrice, zone, celFee, "{}", String(err.message || "").slice(0, 1000)]);
+        results.push({ offerId, ok: false, error: err.message });
+      }
+    }
+    yandexMarketContextByStore.delete(storeId || "__env__");
+    invalidateYandexStatusCounts(storeId);
+    if (results.some((r) => r.ok)) { // 改价成功后让全量缓存尽快反映新价
+      if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
+    }
+    res.json({ success: true, results });
+  } catch (error) { next(error); }
 });
 
 app.get("/api/seller/stocks/drafts", requireAuth, async (req, res, next) => {
@@ -6757,11 +8259,11 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const yesterdayStartISO = yesterdayStart.toISOString();
     const nowISO = now.toISOString();
 
-    // 1. 查所有 active 店铺
+    // 1. 查所有 active 店铺（业绩对比为 Ozon 维度；Yandex 店铺不走 Ozon 订单聚合）
     const storesRes = await db.query(
-      `SELECT id, name, client_id, api_key
+      `SELECT id, name, client_id, api_key, platform
          FROM app_stores
-        WHERE active = TRUE AND user_id = $1`,
+        WHERE active = TRUE AND user_id = $1 AND (platform IS NULL OR platform = 'ozon')`,
       [userId],
     );
     const stores = storesRes.rows;
@@ -7001,6 +8503,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       return {
         store_id: store.id,
         store_name: store.name,
+        platform: "ozon",
         // 7 大核心指标 (对齐 MyERP)
         active_products: activeProducts,
         today_orders: todayOrders.length,
@@ -12460,7 +13963,9 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       return;
     }
     await rescueStaleDbJobsForUser(req.user, { kinds });
+    console.log("[jobs/next] user=", req.user?.username || req.user?.id || "?", "worker=", workerName, "ver=", workerVersion, "kinds=", JSON.stringify(kinds));
     const job = await claimNextDbJob(req.user, workerName, { kinds });
+    if (job) console.log("[jobs/next] CLAIMED kind=", job.kind, "status=", job.status);
     if (job) {
       await upsertWorkerHeartbeat(req.user, workerName, {
         version: req.body?.version,
@@ -12488,7 +13993,7 @@ app.get("/api/worker/status", async (req, res, next) => {
     if (requestedStoreId) {
       await assertActiveStoreAccess(requestedStoreId, req.user.id, "id");
     }
-    await rescueStaleDbJobsForUser(req.user, { kinds: ["run"] });
+    await rescueStaleDbJobsForUser(req.user, { kinds: ["run", "yandex-research"] });
     const workersResult = await db.query(
       `SELECT h.worker_name, h.store_id, h.version, h.platform, h.hostname, h.profile_dir,
               CASE WHEN j.status IN ('queued','claimed','running','exporting') THEN h.current_job_id ELSE NULL END AS current_job_id,
@@ -12632,7 +14137,7 @@ app.post("/api/worker/heartbeat", async (req, res, next) => {
       currentPhase: req.body?.currentPhase || "本机采集端在线",
       currentJobId: req.body?.currentJobId,
     });
-    await rescueStaleDbJobsForUser(req.user, { kinds: ["run"] });
+    await rescueStaleDbJobsForUser(req.user, { kinds: ["run", "yandex-research"] });
     const queueResult = await db.query(
       `SELECT
          count(*) FILTER (WHERE status = 'queued')::int AS queued,
@@ -12695,7 +14200,11 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       return;
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};
-    const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon" ? "batch-ozon" : "run";
+    const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon"
+      ? "batch-ozon"
+      : (existing.kind === "yandex-research" || job.kind === "yandex-research")
+        ? "yandex-research"
+        : "run";
     if (["done", "error"].includes(existing.status)) {
       await clearWorkerCurrentJobRefs(req.params.id);
       res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl || "", terminal: true });
@@ -17611,12 +19120,12 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
        FROM app_jobs j
        WHERE j.user_id = $1
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
-         AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
-         AND (
-           j.status = 'queued'
-           OR (
-             j.kind = 'run'
-             AND j.status IN ('claimed','running')
+          AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind = 'yandex-research')
+          AND (
+            j.status = 'queued'
+            OR (
+              j.kind IN ('run','yandex-research')
+              AND j.status IN ('claimed','running')
              AND COALESCE(j.processed, 0) < COALESCE(j.total, 0)
              AND j.updated_at < now() - ($4::int * interval '1 millisecond')
              AND NOT (j.phase LIKE '服务器%' OR j.phase LIKE '%生成 Excel%')
@@ -17723,7 +19232,7 @@ async function saveWorkerArtifacts(id, kind, job, excelBase64) {
   if (shouldUseWorkerExcel) {
     const excelName = kind === "batch-ozon" ? "ozon-batch-results.xlsx" : "ozon-1688-results.xlsx";
     await fs.writeFile(path.join(dir, excelName), Buffer.from(String(excelBase64), "base64"));
-  } else if (kind !== "batch-ozon" && Array.isArray(jobJson.results)) {
+  } else if (kind !== "batch-ozon" && kind !== "yandex-research" && Array.isArray(jobJson.results)) {
     const artifactJob = {
       id,
       kind,
@@ -18946,6 +20455,7 @@ try {
   console.warn(`[uploads] 目录不可写，图片上传/水印会失败: ${e.message}`);
 }
 await initDatabase();
+await migrateYandexEnvToStores();
 if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
   setTimeout(() => maybeRefreshOzonOpportunityPool("startup"), 12000).unref?.();
   setInterval(() => maybeRefreshOzonOpportunityPool("interval"), OZON_OPPORTUNITY_REFRESH_INTERVAL_MS).unref?.();
@@ -18954,13 +20464,14 @@ if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
 // SPA catch-all
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/")) return next();
-  res.sendFile(path.join(PUBLIC_DIR, "index.html"));
+  res.sendFile(path.join(PUBLIC_DIR, "index.html"), { cacheControl: false, headers: { "Cache-Control": "no-cache, no-store, must-revalidate" } });
 });
 
 if (process.argv[1] === __filename) {
   const finalPort = parseInt(process.env.PORT || "5177");
   app.listen(finalPort, "0.0.0.0", () => {
     console.log(`Ozon to 1688 tool running at http://0.0.0.0:${finalPort}`);
+    startYandexOffersCacheLoop();
   });
 }
 

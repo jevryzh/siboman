@@ -70,3 +70,16 @@ cp .env.example .env
 ```
 
 不要提交 `.env`。
+
+## Yandex 多店铺管理（2026-09 起）
+
+系统在 Ozon 店铺之外新增 **Yandex Market 店铺体系**（`app_stores.platform = 'yandex'`），支持多 Yandex 店铺并存、切换与隔离管理：
+
+- **店铺授权**：店铺管理页可新增 Yandex 授权（平台切换 → 填 API Key → 探测并选择 campaign）；环境变量配置的旧店铺（Three Latte）启动时自动迁入。
+- **Yandex 商品页 / 订单页 / 库存页**：顶栏按路由自动切换到 Yandex 店铺体系，全部接口按 `store_id` 隔离（含改价记录、调价候选、AI 优化记录）。
+- **Yandex 库存管理页**（`#/yandex-inventory`）：实时拉取平台仓库与库存（FIT/AVAILABLE），支持分仓修改、批量设值、低库存统计；首次全量拉取异步预热，前端轮询展示。
+- **卡片质量评分**（本地估算 0-100，≥80 绿）：按标题/图片/描述/属性/类目完整性计分，随列表展示并支持质量、AI 状态、调价状态多维筛选。
+- **AI 优化（对标"熊猫上架"补全模式）**：列表行内 / 批量「AI 优化」与编辑抽屉「AI 智能填充」——只补空缺字段：俄语标题改写、描述生成、**空缺类目属性自动选合法值**（枚举从 Yandex 类目参数模板取值，测量类属性禁止 AI 猜测）；每次提交计入 `yandex_ai_records`（时间/改动维度/状态），列表可查次数与明细。
+- **属性名中文化**：`data/yandex_attr_zh.json` 提供俄→中属性名词典（169 条高频属性），编辑弹窗与 AI 结果均显示中文名。
+
+详细变更说明见 [docs/2026-09-yandex-multistore-ai-update.md](docs/2026-09-yandex-multistore-ai-update.md)。

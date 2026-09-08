@@ -1,5 +1,6 @@
 node_modules/
 data/*
+!data/yandex_attr_zh.json
 !data/templates/
 !data/templates/logistics-template.xlsx
 .env

@@ -22,8 +22,15 @@ window.YandexProductListView = {
         price: 0,
         currency_code: 'RUB',
         imagesText: '',
+        attributes: {},     // 属性名 -> 值（含 AI 填充）
       },
+      attrTemplate: [],     // 类目参数模板
+      dirtyAttrs: {},       // 本次改动/新增的属性名
+      aiFillBusy: false,
+      aiFilled: false,      // 本表单是否含"AI 智能填充"产物（保存时记入 AI 优化记录）
+      aiNotes: [],
     });
+    const editDrawerMode = Vue.ref('manual'); // manual|aiFill
     const profitDialog = Vue.reactive({
       visible: false,
       cost: {
@@ -35,13 +42,14 @@ window.YandexProductListView = {
         widthCm: 0,
         heightCm: 0,
         lastMileCny: 4.68,
-        commissionPct: 22,
+        commissionPct: 0, // 0 = 按 Yandex 官方费率表自动匹配类目佣金（手动填数则优先手动）
         acquiringPct: 3.8,
         withdrawalPct: 1.2,
         returnLossPct: 0,
         adPct: 10,
         targetMarginPct: 35,
         strikeDiscountPct: 50,
+        ozonMarginPct: 10, // Ozon 反推采购价用的目标利润率
         exchangeRate: 12.8205,
       },
     });
@@ -162,12 +170,57 @@ window.YandexProductListView = {
       for (const tab of statusTabs) statusCounts[tab.value] = Number(counts[tab.value] || 0);
     };
 
+    // 卡片质量筛选：all | high(≥80) | medium(60-79) | low(<60)
+    const qualityFilter = Vue.ref('all');
+    const qualityOptions = [
+      { label: '全部质量', value: 'all' },
+      { label: '优秀(≥80 绿)', value: 'high' },
+      { label: '一般(60-79 橙)', value: 'medium' },
+      { label: '待优化(<60 红)', value: 'low' },
+    ];
+    // AI 优化状态：是否做过 AI 优化 + 次数/最近时间（来自 ai_stats）
+    const aiFilter = Vue.ref('all');
+    const aiOptions = [
+      { label: '全部 AI 状态', value: 'all' },
+      { label: '已 AI 优化', value: 'yes' },
+      { label: '未 AI 优化', value: 'no' },
+    ];
+    // 调价状态：all | priced（已调价） | unpriced（未调价）
+    const priceFilter = Vue.ref('all');
+    const priceOptions = [
+      { label: '全部调价状态', value: 'all' },
+      { label: '已调价', value: 'priced' },
+      { label: '未调价', value: 'unpriced' },
+    ];
+    const isPriced = (row) => {
+      const st = priceState[row.offer_id];
+      return !!(st && Array.isArray(st.records) && st.records.some((r) => r.status === 'applied'));
+    };
+    const aiStats = Vue.ref({});
+    const aiRecordsDialog = Vue.reactive({ visible: false, offerId: '', name: '', rows: [], busy: false });
+    const openAiRecords = async (row) => {
+      aiRecordsDialog.offerId = row.offer_id || row.offerId || '';
+      aiRecordsDialog.name = row.name || row.title || '';
+      aiRecordsDialog.rows = [];
+      aiRecordsDialog.visible = true;
+      aiRecordsDialog.busy = true;
+      try {
+        const res = await axios.get('/api/yandex/ai-records', { params: { offer_id: aiRecordsDialog.offerId, limit: 30 } });
+        aiRecordsDialog.rows = res.data?.records || [];
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '读取优化记录失败');
+      } finally {
+        aiRecordsDialog.busy = false;
+      }
+    };
+
     const fetchProducts = async () => {
       loading.value = true;
       try {
         const res = await axios.get('/api/yandex/products', {
           params: {
             status: activeTab.value,
+            quality: qualityFilter.value,
             q: search.value,
             page: pagination.currentPage,
             page_size: pagination.pageSize,
@@ -178,6 +231,9 @@ window.YandexProductListView = {
         apiReady.value = res.data?.api_ready !== false;
         context.value = res.data?.context || null;
         applyCounts(res.data?.status_counts || {});
+        aiStats.value = res.data?.ai_stats || {};
+        const stateIds = (res.data?.items || []).map((it) => it.offer_id).filter(Boolean);
+        if (stateIds.length) refreshPriceState(stateIds);
       } catch (error) {
         if (error.response?.status === 404) {
           apiReady.value = false;
@@ -193,6 +249,12 @@ window.YandexProductListView = {
       }
     };
 
+    // 调价筛选依赖 priceState（异步加载），用 computed 实时过滤显示列表
+    const displayProducts = Vue.computed(() => {
+      if (priceFilter.value === 'all') return products.value;
+      return products.value.filter((row) => priceFilter.value === 'priced' ? isPriced(row) : !isPriced(row));
+    });
+
     const selectStatusTab = (value) => {
       activeTab.value = value;
       pagination.currentPage = 1;
@@ -202,12 +264,21 @@ window.YandexProductListView = {
     const resetFilters = () => {
       search.value = '';
       activeTab.value = 'all';
+      qualityFilter.value = 'all';
+      aiFilter.value = 'all';
+      priceFilter.value = 'all';
       pagination.currentPage = 1;
       fetchProducts();
     };
 
     const openEdit = (row) => {
       const images = Array.isArray(row.images) ? row.images : [row.image];
+      const attrMap = {};
+      if (Array.isArray(row.attributes)) {
+        for (const a of row.attributes) {
+          if (a && a.name) attrMap[a.name] = String(a.value ?? '');
+        }
+      }
       Object.assign(drawer.form, {
         offer_id: row.offer_id || '',
         name: row.name || row.title || '',
@@ -218,9 +289,88 @@ window.YandexProductListView = {
         price: Number(row.price || 0),
         currency_code: row.currency_code || 'RUB',
         imagesText: images.filter(Boolean).join('\n'),
+        attributes: attrMap,
       });
+      drawer.attrTemplate = [];
+      drawer.dirtyAttrs = {};
+      drawer.aiFilled = false;
       drawer.visible = true;
+      fetchCategoryTemplate(row.category_id || '');
     };
+
+    // 拉取类目参数模板，用于渲染"空属性补齐"表单
+    const fetchCategoryTemplate = async (categoryId) => {
+      if (!categoryId) return;
+      drawer.attrTemplate = [];
+      try {
+        const res = await axios.get(`/api/yandex/category/${encodeURIComponent(categoryId)}/parameters`);
+        drawer.attrTemplate = (res.data && res.data.parameters) || [];
+      } catch (e) {
+        if (!(e.response && e.response.status === 404)) {
+          notify.warning('属性模板加载失败：' + (e.response?.data?.error || e.message || ''));
+        }
+      }
+    };
+
+    // 熊猫式「AI 智能填充」：只补空缺（标题/描述/必填与推荐属性）
+    const aiFillProduct = async () => {
+      if (!drawer.form.name || !drawer.form.name.trim()) return notify.warning('请先填写商品标题');
+      if (drawer.aiFillBusy) return;
+      drawer.aiFillBusy = true;
+      try {
+        const res = await axios.post('/api/yandex/ai-fill', {
+          name: drawer.form.name,
+          description: drawer.form.description,
+          category_id: drawer.form.category_id,
+          category_name: drawer.form.category_name,
+          attributes: drawer.form.attributes,
+        }, { timeout: 180000 });
+        const data = res.data || {};
+        if (data.name) drawer.form.name = data.name;
+        if (data.description) drawer.form.description = data.description;
+        if (Array.isArray(data.attributes)) {
+          let filled = 0;
+          const filledZh = [];
+          for (const a of data.attributes) {
+            if (!a || !a.name || !a.value) continue;
+            if (String(a.value).trim()) {
+              drawer.form.attributes[a.name] = String(a.value).trim();
+              drawer.dirtyAttrs[a.name] = true;
+              filled += 1;
+              const tpl = attrTemplateOf(a.name);
+              filledZh.push((tpl && tpl.name_zh) || a.name_zh || a.name);
+            }
+          }
+          drawer.aiFilled = true;
+          notify.success('AI 填充完成：' + filled + ' 个属性已补全（' + filledZh.slice(0, 6).join('、') + (filledZh.length > 6 ? ' 等' : '') + '），请核对后点「保存并更新到 Yandex」');
+        } else {
+          notify.success('AI 填充完成');
+        }
+        drawer.aiNotes = data.notes || [];
+        if (drawer.aiNotes.length) {
+          const mb = window.ElementPlus && window.ElementPlus.ElMessageBox;
+          if (mb) mb.alert(drawer.aiNotes.join('<br/>'), 'AI 改动说明', { dangerouslyUseHTMLString: true });
+        }
+      } catch (e) {
+        notify.error((e.response?.data?.error) || e.message || 'AI 填充失败');
+      } finally {
+        drawer.aiFillBusy = false;
+      }
+    };
+
+    const setAttrValue = (name, value) => {
+      drawer.form.attributes[name] = String(value ?? '');
+      drawer.dirtyAttrs[name] = true;
+    };
+    const attrTemplateOf = (name) => (drawer.attrTemplate || []).find((t) => t.name === name);
+    const drawerMissingAttrs = Vue.computed(() => {
+      const tpl = drawer.attrTemplate || [];
+      return tpl.filter((t) => {
+        const cur = String(drawer.form.attributes[t.name] ?? '').trim();
+        const recommended = Array.isArray(t.recommendation) ? t.recommendation.some((r) => String(r).toUpperCase() !== 'ADDITIONAL') : false;
+        return !cur && (t.required === true || recommended);
+      });
+    });
 
     const openProfitDialog = () => {
       profitDialog.visible = true;
@@ -297,7 +447,11 @@ window.YandexProductListView = {
       if (!drawer.form.offer_id) return notify.error('缺少 Yandex 货号');
       saveLoading.value = true;
       try {
+        const dirtyAttributes = Object.keys(drawer.dirtyAttrs || {})
+          .filter((n) => drawer.form.attributes[n] && String(drawer.form.attributes[n]).trim())
+          .map((n) => ({ name: n, value: drawer.form.attributes[n] }));
         const payload = {
+          ai_filled: drawer.aiFilled === true,
           name: drawer.form.name,
           brand: drawer.form.brand,
           description: drawer.form.description,
@@ -305,6 +459,7 @@ window.YandexProductListView = {
           price: drawer.form.price,
           currency_code: drawer.form.currency_code,
           images: String(drawer.form.imagesText || '').split(/\n|,/).map((item) => item.trim()).filter(Boolean),
+          attributes: dirtyAttributes,
         };
         await axios.patch(`/api/yandex/products/${encodeURIComponent(drawer.form.offer_id)}`, payload, { timeout: 120000 });
         notify.success('Yandex 商品已提交更新，平台生效可能需要几分钟');
@@ -317,14 +472,832 @@ window.YandexProductListView = {
       }
     };
 
-    Vue.onMounted(fetchProducts);
+    // ===== Task #41: 核价 / 调价（1688 候选 + 批量写回）=====
+    const selectedRows = Vue.ref([]);
+    const reverseDialog = Vue.reactive({ visible: false, rows: [], busy: false, applying: false });
+    const hoverImg = Vue.reactive({ show: false, url: '', x: 0, y: 0, left: 0, top: 0 });
+    const priceState = Vue.reactive({}); // offerId -> { candidate, records }
+    const researchDialog = Vue.reactive({ visible: false, busy: false, error: '', rows: [], jobId: '', jobText: '', pluginDisabled: false, stopRequested: false, stopping: false, pluginPhase: false });
+    const stateDrawer = Vue.reactive({
+      visible: false, offerId: '', name: '', image: '',
+      candidate: null, records: [], suggest: null,
+      saving: false, applying: false, suggestBusy: false,
+    });
+    const applyDialog = Vue.reactive({ visible: false, busy: false, rows: [], results: [] });
+
+    const confirmBox = (message, title) => {
+      const mb = window.ElementPlus && window.ElementPlus.ElMessageBox;
+      if (!mb) return Promise.reject(new Error('ElementPlus MessageBox 未加载'));
+      return mb.confirm(message, title || '请确认', { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' });
+    };
+
+    const handleSelectionChange = (val) => { selectedRows.value = val || []; };
+
+    // 缩略图悬停大图预览
+    const onImgEnter = (ev, row) => {
+      hoverImg.url = row.image || row.primary_image || (Array.isArray(row.images) ? (row.images[0] || '') : '') || '';
+      hoverImg.show = Boolean(hoverImg.url);
+      onImgMove(ev);
+    };
+    const onImgMove = (ev) => {
+      hoverImg.x = ev.clientX;
+      hoverImg.y = ev.clientY;
+      const vw = window.innerWidth || 1600;
+      const vh = window.innerHeight || 900;
+      hoverImg.left = Math.max(8, Math.min(hoverImg.x + 18, vw - 336));
+      hoverImg.top = Math.max(8, Math.min(hoverImg.y + 18, vh - 420));
+    };
+    const onImgLeave = () => { hoverImg.show = false; hoverImg.url = ''; };
+
+    const mapCandidate = (c) => {
+      if (!c) return null;
+      return {
+        offerId: c.offer_id, purchaseCny: Number(c.purchase_cny || 0),
+        supplier: c.supplier || '', sourceUrl1688: c.source_url_1688 || '',
+        score: Number(c.score || 0), weightKg: Number(c.weight_kg || 0),
+        lenCm: Number(c.len_cm || 0), widCm: Number(c.wid_cm || 0), heiCm: Number(c.hei_cm || 0),
+        pkgQty: Number(c.pkg_qty || 1), suggestPriceCny: Number(c.suggest_price_cny || 0),
+        zone: c.zone || '', celFeeCny: Number(c.cel_fee_cny || 0),
+        status: c.status || 'pending', source: c.source || '', updatedAt: c.updated_at || '',
+      };
+    };
+
+    const mapRecord = (r) => ({
+      offerId: r.offer_id, purchaseCny: Number(r.purchase_cny || 0),
+      oldPriceCny: Number(r.old_price_cny || 0), newPriceCny: Number(r.new_price_cny || 0),
+      zone: r.zone || '', status: r.status || '', error: r.error || '', createdAt: r.created_at || '',
+    });
+
+    const rowFirstImage = (row) => (Array.isArray(row.images) && row.images.length ? row.images[0] : (row.image || ''));
+
+    const pricingParams = () => {
+      const c = profitDialog.cost;
+      return {
+        domesticShippingCny: Number(c.domesticShippingCny || 0),
+        serviceFeeCny: Number(c.serviceFeeCny || 0),
+        lastMileCny: Number(c.lastMileCny || 0),
+        commissionPct: Number(c.commissionPct || 0),
+        acquiringPct: Number(c.acquiringPct || 0),
+        withdrawalPct: Number(c.withdrawalPct || 0),
+        returnLossPct: Number(c.returnLossPct || 0),
+        adPct: Number(c.adPct || 0),
+        targetMarginPct: Number(c.targetMarginPct || 0),
+        strikeDiscountPct: Number(c.strikeDiscountPct || 0) || 50,
+        exchangeRate: Number(c.exchangeRate || 0) || 12.8205,
+      };
+    };
+
+    const refreshPriceState = async (offerIds) => {
+      const ids = (offerIds || []).map((v) => String(v)).filter(Boolean);
+      if (!ids.length) return;
+      try {
+        const res = await axios.get('/api/yandex/price-state', { params: { offerIds: ids.join(',') }, timeout: 30000 });
+        const items = (res.data && res.data.items) || [];
+        for (const it of items) {
+          priceState[it.offerId] = { candidate: mapCandidate(it.candidate), records: (it.records || []).map(mapRecord) };
+        }
+      } catch (_e) { /* 状态查询失败不阻塞列表 */ }
+    };
+
+    const buildResearchRow = (row) => ({
+      offerId: row.offer_id || row.offerId || '',
+      name: row.name || row.title || '',
+      categoryName: row.category_name || row.category || '',
+      categoryLeaf: row.category_leaf || '',
+      imgUrl: rowFirstImage(row),
+      images: (Array.isArray(row.images) ? row.images : []).filter(Boolean).slice(0, 3),
+      status: 'queued', message: '', result: null, chosen: -1,
+      // 尺寸重量优先预填平台(店铺/Ozon)已同步值，1688 候选有值才覆盖；平台无则回落默认待手动确认
+      cand: {
+        purchaseCny: 0, supplier: '', sourceUrl1688: '', score: 0,
+        weightKg: Number(row.weightKg) > 0 ? Number(row.weightKg) : 0.2,
+        lenCm: Number(row.lenCm || 0), widCm: Number(row.widCm || 0), heiCm: Number(row.heiCm || 0),
+        pkgQty: 1,
+      },
+      suggest: null, suggestBusy: false,
+    });
+
+    // ===== 插件模式核价（1688 官方同款）编排 =====
+    const parseDimCm = (text) => {
+      const raw = String(text || '').replace(/[（(]?[长宽高厚]*[）)]?/g, ' ').trim();
+      const nums = (raw.match(/\d+(?:\.\d+)?/g) || []).map(Number).filter((n) => n > 0 && n < 100000);
+      return nums.length ? { lenCm: nums[0], widCm: nums[1] || 0, heiCm: nums[2] || 0 } : null;
+    };
+    const parseWeightKg = (c) => {
+      const direct = Number(c.weightKg || c.weight_kg || 0);
+      if (direct > 0) return direct;
+      const grams = Number(c.weightGrams || 0);
+      if (grams > 0) return Math.round((grams / 1000) * 1000) / 1000;
+      const text = String(c.weightText || '');
+      const m = text.match(/(\d+(?:\.\d+)?)\s*(kg|千克|公斤)/i);
+      if (m) return Number(m[1]);
+      const g = text.match(/(\d+(?:\.\d+)?)\s*g(?:ram)?s?\b/i);
+      if (g) return Math.round((Number(g[1]) / 1000) * 1000) / 1000;
+      return 0;
+    };
+    const normPluginCand = (c) => {
+      if (!c) return null;
+      const img = c.img || c.image || c.imageUrl || c.originImageUrl || (Array.isArray(c.images) ? c.images[0] : '') || '';
+      const price = Number(c.price || c.salePrice || c.minPrice || 0);
+      // 插件候选价格来自 1688 阶梯最低档，可能为 ¥1 引流价：只要 >0 就展示，由用户核对/手动改价
+      if (!img || !(price > 0)) return null;
+      const detailUrl = c.detailUrl || c.link || c.url || '';
+      const dimsText = String(c.dimensionsText || '').trim();
+      const weightText = String(c.weightText || '').trim();
+      const dims = parseDimCm(dimsText);
+      const weightKg = parseWeightKg(c);
+      return {
+        offerId1688: String(c.offerId || c.id || c.itemId || c.offerId1688 || ''),
+        title: String(c.title || c.originTitle || '').slice(0, 120),
+        price: Math.round(price * 100) / 100,
+        sold: Number(c.sold || c.sales || c.volume || c.soldOut || 0),
+        img,
+        detailUrl,
+        trafficBaitRisk: !!c.trafficBaitRisk,
+        dimsText, weightText,
+        lenCm: dims ? dims.lenCm : 0,
+        widCm: dims ? dims.widCm : 0,
+        heiCm: dims ? dims.heiCm : 0,
+        weightKg,
+      };
+    };
+
+    const applyPluginResults = (rows, results) => {
+      for (const row of rows) {
+        const item = (results || []).find((x) => String(x.offerId) === String(row.offerId));
+        if (!item) { row.status = 'queued'; row.message = ''; continue; }
+        const candidates = (Array.isArray(item.candidates) ? item.candidates : []).map(normPluginCand).filter(Boolean);
+        if (candidates.length) {
+          row.status = 'ok';
+          row.message = '';
+          row.result = { ok: true, matchSource: 'plugin', source: 'plugin-1688', candidates, best: candidates[0] };
+          applyCandidateFields(row, 0, { silent: true });
+        } else {
+          row.status = 'queued';
+          row.message = '';
+        }
+      }
+      calcAllSuggest();
+    };
+
+    const tryPluginResearch = async (targets) => {
+      if (researchDialog.pluginDisabled) return false;
+      if (researchDialog.stopRequested) return 'aborted';
+      researchDialog.jobText = '正在提交给本机插件做 1688 官方同款搜索…';
+      let jobId = '';
+      try {
+        const created = await axios.post('/api/yandex/research-job', {
+          items: targets.map((t) => ({ offerId: t.offerId, name: t.name, images: ((t.images && t.images.length ? t.images : [t.imgUrl]).filter(Boolean)).slice(0, 3) })),
+        }, { timeout: 20000 });
+        jobId = created.data && created.data.jobId;
+        if (!jobId) throw new Error('服务端未返回任务号');
+        researchDialog.jobId = jobId;
+        researchDialog.pluginPhase = true;
+      } catch (_e) {
+        researchDialog.pluginDisabled = true;
+        researchDialog.jobText = '插件任务不可用，回落 AlphaShop 搜索';
+        return false;
+      }
+      let queuedAt = 0;
+      try {
+        const deadline = Date.now() + 300000;
+      while (Date.now() < deadline) {
+        if (researchDialog.stopRequested) {
+          researchDialog.jobText = '正在停止插件核价…';
+          try { await axios.post('/api/jobs/' + encodeURIComponent(jobId) + '/cancel', {}, { timeout: 15000 }); } catch (_e3) { /* 任务可能已结束 */ }
+          researchDialog.jobText = '已请求停止，未完成商品不再自动回落搜索';
+          return 'aborted';
+        }
+        await new Promise((r) => setTimeout(r, 2500));
+        let job = null;
+        try { const g = await axios.get('/api/jobs/' + encodeURIComponent(jobId), { timeout: 15000 }); job = g.data && (g.data.job || g.data); } catch (_e2) { job = null; }
+        if (!job) continue;
+        const st = job.status || '';
+        if (job.phase && !/完成|收尾/.test(String(job.phase))) researchDialog.jobText = String(job.phase).slice(0, 60);
+        if (st === 'queued') {
+          if (!queuedAt) queuedAt = Date.now();
+          if (Date.now() - queuedAt > 45000) {
+            researchDialog.jobText = '插件 45s 内未认领（可能离线或未开启），回落 AlphaShop 搜索';
+            return false;
+          }
+          if (!researchDialog.jobText.startsWith('等待')) researchDialog.jobText = '等待本机插件认领（插件每 30 秒轮询一次，可点下方「停止」取消）…';
+          continue;
+        }
+        if (st === 'claimed' || st === 'running' || st === 'processing') continue;
+        if (st === 'done' || st === 'error' || st === 'canceled') {
+          applyPluginResults(researchDialog.rows, (job.results || []));
+          researchDialog.jobText = st === 'done' ? '插件核价完成' : '插件未匹配，回落 AlphaShop 搜索';
+          return st === 'done';
+        }
+      }
+      researchDialog.jobText = '插件核价超时，回落 AlphaShop 搜索';
+      return false;
+      } finally {
+        researchDialog.pluginPhase = false;
+      }
+    };
+
+    const runResearch = async () => {
+      const targets = researchDialog.rows.filter((r) => r.status === 'queued');
+      if (!targets.length) return;
+      const pluginResult = await tryPluginResearch(targets);
+      if (pluginResult === true || pluginResult === 'aborted') return;
+      const remain = researchDialog.rows.filter((r) => r.status === 'queued');
+      if (remain.length) await runAlphaResearch();
+    };
+
+    const stopPluginJob = async () => {
+      const jobId = researchDialog.jobId;
+      if (!jobId || researchDialog.stopping) return;
+      researchDialog.stopping = true;
+      researchDialog.stopRequested = true;
+      researchDialog.jobText = '正在请求停止插件核价…';
+      try {
+        await axios.post('/api/jobs/' + encodeURIComponent(jobId) + '/cancel', {}, { timeout: 15000 });
+        researchDialog.jobText = '已请求停止插件核价（插件端会尽快中止，未完成商品不再自动回落搜索）';
+      } catch (_e) {
+        researchDialog.jobText = '停止请求发送失败，任务可能刚好完成';
+      }
+      researchDialog.stopping = false;
+    };
+
+    const runAlphaResearch = async () => {
+      const targets = researchDialog.rows.filter((r) => r.status === 'queued');
+      if (!targets.length) return;
+      researchDialog.busy = true;
+      researchDialog.error = '';
+      targets.forEach((t) => { t.status = 'running'; t.message = '正在搜索 1688 同款…'; });
+      try {
+        const chunks = [];
+        for (let i = 0; i < targets.length; i += 10) chunks.push(targets.slice(i, i + 10));
+        for (const chunk of chunks) {
+          let res;
+          try {
+            res = await axios.post('/api/yandex/price-research', {
+              items: chunk.map((t) => ({ offerId: t.offerId, imgUrl: t.imgUrl, images: (t.images && t.images.length ? t.images : undefined), title: t.name })),
+            }, { timeout: 240000 });
+          } catch (chunkError) {
+            const msg = (chunkError.response && chunkError.response.data && chunkError.response.data.error) || chunkError.message || '核价失败';
+            if (chunkError.response && chunkError.response.status === 400 && /AlphaShop|凭据/i.test(msg)) {
+              researchDialog.error = 'AlphaShop 凭据未配置，自动核价不可用；可手动填写采购信息后保存候选。';
+              chunk.forEach((t) => { t.status = 'empty'; t.message = '手动填写候选'; });
+            } else {
+              chunk.forEach((t) => { if (t.status === 'running') { t.status = 'fail'; t.message = msg; } });
+              notify.error(msg);
+            }
+            continue;
+          }
+          const results = (res.data && res.data.results) || [];
+          for (const t of chunk) {
+            const r = results.find((x) => String(x.offerId) === String(t.offerId));
+            if (!r) { t.status = 'fail'; t.message = '服务端未返回该项结果'; continue; }
+            t.result = r;
+            if (r.ok) {
+              // 仅图搜命中才标“已匹配”；词搜兜底命中标记为疑似，需人工核对
+              t.status = r.matchSource === 'image' ? 'ok' : 'suspect';
+              t.message = r.matchSource === 'text' ? '仅按标题词搜到疑似同款，请核对是否同一商品（可点下方“纯手动填写”）' : '';
+              if (Array.isArray(r.candidates) && r.candidates.length) applyCandidateFields(t, 0, { silent: true });
+            } else {
+              t.status = 'empty';
+              t.message = '未找到可核对的 1688 同款（图搜无结果或候选缺图），可手动填写候选';
+            }
+          }
+        }
+        await calcAllSuggest();
+      } finally {
+        researchDialog.busy = false;
+      }
+    };
+
+    const calcSuggestRows = async (rows) => {
+      const ready = rows.filter((r) => Number(r.cand.purchaseCny || 0) > 0);
+      if (!ready.length) return;
+      ready.forEach((r) => { r.suggestBusy = true; });
+      try {
+        const res = await axios.post('/api/yandex/price-suggest', {
+          items: ready.map((r) => ({
+            offerId: r.offerId, purchaseCny: r.cand.purchaseCny, weightKg: r.cand.weightKg,
+            lenCm: r.cand.lenCm, widCm: r.cand.widCm, heiCm: r.cand.heiCm,
+            categoryName: r.categoryName || '', categoryLeaf: r.categoryLeaf || '',
+            params: pricingParams(),
+          })),
+        }, { timeout: 60000 });
+        const results = (res.data && res.data.results) || [];
+        for (const r of results) {
+          const row = ready.find((x) => String(x.offerId) === String(r.offerId));
+          if (row) row.suggest = r && r.ok ? r : null;
+        }
+      } catch (_e) { /* 预览失败保持为空 */ } finally {
+        ready.forEach((r) => { r.suggestBusy = false; });
+      }
+    };
+
+    const calcAllSuggest = () => calcSuggestRows(researchDialog.rows);
+    const calcRowSuggest = (row) => calcSuggestRows([row]);
+
+    const openReversePricing = () => {
+      const rows = (selectedRows.value || []).filter((r) => r && (r.offer_id || r.offerId));
+      if (!rows.length) return notify.warning('请先勾选要反推定价的商品');
+      reverseDialog.rows = rows.map((r) => ({
+        offerId: r.offer_id || r.offerId || '',
+        name: r.name || r.title || '',
+        img: rowFirstImage(r),
+        weightKg: Number(r.weightKg || 0) || 0.2,
+        lenCm: Number(r.lenCm || 0), widCm: Number(r.widCm || 0), heiCm: Number(r.heiCm || 0),
+        categoryName: r.category_name || r.category || '',
+        categoryLeaf: r.category_leaf || '',
+        ozonPriceCny: Number(r.ozon_price_cny || 0) || null,
+        rev: null, err: '',
+      }));
+      reverseDialog.busy = false;
+      reverseDialog.visible = true;
+    };
+
+    const reverseOneRow = async (row) => {
+      row.err = ''; row.rev = null;
+      try {
+        const r = await axios.post('/api/yandex/ozon-reverse', {
+          vendorCode: row.offerId, ozonPriceCny: Number(row.ozonPriceCny || 0),
+          weightKg: row.weightKg, lenCm: row.lenCm, widCm: row.widCm, heiCm: row.heiCm,
+          marginPct: Number(profitDialog.cost.ozonMarginPct || 0) || 10,
+          domesticCny: Number(profitDialog.cost.domesticShippingCny || 0) || 5,
+          rubRate: Number(profitDialog.cost.exchangeRate || 0) || 13,
+        }, { timeout: 30000 });
+        const d = r.data || {};
+        if (!d.ok) { row.err = d.error || '反推失败'; return; }
+        row.rev = d;
+        if (Number(d.ozonPriceCny || 0) > 0) row.ozonPriceCny = Number(d.ozonPriceCny);
+        const s = await axios.post('/api/yandex/price-suggest', { items: [{
+          offerId: row.offerId, purchaseCny: Number(d.purchaseCny), weightKg: row.weightKg,
+          lenCm: row.lenCm, widCm: row.widCm, heiCm: row.heiCm,
+          categoryName: row.categoryName || '', categoryLeaf: row.categoryLeaf || '',
+          params: pricingParams(),
+        }] }, { timeout: 30000 });
+        const sd = ((s.data && s.data.results) || []).find((x) => String(x.offerId) === String(row.offerId)) || {};
+        if (sd.ok) row.rev.ys = sd;
+      } catch (_e) { row.err = '反推失败（网络/服务异常）'; }
+    };
+
+    const reverseAllRows = async () => {
+      if (!reverseDialog.rows.length || reverseDialog.busy) return;
+      reverseDialog.busy = true;
+      await Promise.all(reverseDialog.rows.map((row) => reverseOneRow(row)));
+      reverseDialog.busy = false;
+      const okN = reverseDialog.rows.filter((r) => r.rev).length;
+      notify.success(okN + '/' + reverseDialog.rows.length + ' 反推完成（含 Yandex 建议售价），未成功的见各行提示');
+    };
+
+    const applyReverseToYandex = async () => {
+      // 保存为价格候选（调价队列），随后由列表「批量应用候选调价」统一提交 Yandex 平台
+      const okRows = reverseDialog.rows.filter((r) => r.rev && r.rev.ys);
+      if (!okRows.length) return notify.warning('没有成功反推的行可保存');
+      if (reverseDialog.applying) return;
+      reverseDialog.applying = true;
+      try {
+        const items = okRows.map((r) => ({
+          offerId: r.offerId, name: r.name,
+          purchaseCny: Number(r.rev.purchaseCny || 0),
+          supplier: '', sourceUrl1688: '', score: 0,
+          weightKg: Number(r.weightKg || 0),
+          lenCm: Number(r.lenCm || 0), widCm: Number(r.widCm || 0), heiCm: Number(r.heiCm || 0),
+          pkgQty: 1,
+          suggestPriceCny: Number((r.rev.ys && r.rev.ys.priceCny) || 0),
+          zone: (r.rev.ys && r.rev.ys.zone) || '',
+          celFeeCny: Number((r.rev.ys && r.rev.ys.celFeeCny) || 0),
+          source: 'ozon-reverse',
+        }));
+        const res = await axios.post('/api/yandex/price-candidates', { items }, { timeout: 120000 });
+        const n = res.data && res.data.inserted != null ? res.data.inserted : items.length;
+        for (const r of okRows) r.applyResult = '✓ 已保存候选（采购 ¥' + Number(r.rev.purchaseCny).toFixed(2) + ' / 建议 ¥' + r.rev.ys.priceCny + '）';
+        notify.success('候选已保存 ' + n + ' 条：关掉本窗后，在列表勾选这些商品，点「批量应用候选调价」统一提交 Yandex');
+        fetchProducts();
+      } catch (e) {
+        notify.error((e.response && e.response.data && e.response.data.error) || e.message || '保存候选失败');
+      }
+      reverseDialog.applying = false;
+    };
+
+    const ozonReverse = async (row) => {
+      if (!row || !row.offerId || row.ozonBusy) return;
+      row.ozonBusy = true;
+      row.ozonMsg = '';
+      try {
+        const r = await axios.post('/api/yandex/ozon-reverse', {
+          vendorCode: row.offerId,
+          weightKg: Number(row.cand.weightKg || 0),
+          lenCm: Number(row.cand.lenCm || 0),
+          widCm: Number(row.cand.widCm || 0),
+          heiCm: Number(row.cand.heiCm || 0),
+          marginPct: Number(profitDialog.cost.ozonMarginPct || 0) || 10,
+          domesticCny: Number(profitDialog.cost.domesticShippingCny || 0) || 5,
+          rubRate: Number(profitDialog.cost.exchangeRate || 0) || 13,
+        }, { timeout: 30000 });
+        const d = r.data || {};
+        if (d.ok) {
+          row.cand.purchaseCny = Number(d.purchaseCny || 0);
+          row.ozonMsg = `Ozon 同款 ¥${Number(d.ozonPriceCny || 0).toFixed(0)}（≈₽${d.priceRub}）→ 反推采购 ¥${Number(d.purchaseCny).toFixed(2)}（佣金 ${d.commission}%${d.descCat ? '·按Ozon类目' : '·默认档'} · 头程 ¥${Number(d.crossCny || 0).toFixed(1)} · 利润率 ${d.marginPct}%）`;
+          await calcSuggestRows([row]);
+        } else {
+          row.ozonMsg = '反推失败：' + (d.error || '未知原因');
+        }
+      } catch (_e) {
+        row.ozonMsg = '反推失败（网络/服务异常）';
+      }
+      row.ozonBusy = false;
+    };
+
+    // 选用某个 1688 候选（idx>=0）→ 回填采购价/链接/销量；idx=-1 → 纯手动
+    const applyCandidateFields = (row, idx, { silent = false } = {}) => {
+      row.chosen = idx;
+      const list = (row.result && Array.isArray(row.result.candidates)) ? row.result.candidates : [];
+      const cand = (typeof idx === 'number' && idx >= 0) ? list[idx] : null;
+      if (cand) {
+        const candFields = {
+          purchaseCny: Number(cand.price || 0),
+          sourceUrl1688: cand.detailUrl || '',
+          score: Number(cand.sold || 0),
+        };
+        // v2.2.9: 1688 详情有尺寸/重量时一并回写（无数据则保留默认值，供手动确认）
+        if (Number(cand.weightKg || 0) > 0) candFields.weightKg = cand.weightKg;
+        if (Number(cand.lenCm || 0) > 0) candFields.lenCm = cand.lenCm;
+        if (Number(cand.widCm || 0) > 0) candFields.widCm = cand.widCm;
+        if (Number(cand.heiCm || 0) > 0) candFields.heiCm = cand.heiCm;
+        Object.assign(row.cand, candFields);
+      } else {
+        Object.assign(row.cand, { purchaseCny: 0, sourceUrl1688: '', score: 0 });
+      }
+      if (!silent && Number(row.cand.purchaseCny || 0) > 0) calcRowSuggest(row);
+    };
+
+    const candRowStyle = (row, idx) => ({
+      display: 'flex', alignItems: 'center', gap: '10px', borderRadius: '8px', padding: '8px 10px',
+      marginBottom: '6px', cursor: 'pointer',
+      border: `1px solid ${row.chosen === idx ? '#3b82f6' : '#eef2f7'}`,
+      background: row.chosen === idx ? '#eff6ff' : '#f8fafc',
+    });
+
+    const openResearch = (rows) => {
+      const valid = (rows || []).filter((r) => r && r.offer_id);
+      if (!valid.length) return notify.warning('请先勾选要核价的商品');
+      researchDialog.rows = valid.map((r) => {
+        const row = buildResearchRow(r);
+        // 历史已保存候选（含之前核对过的尺寸重量）作为兜底，1688 候选无值时不丢
+        const st = priceState[r.offer_id] || {};
+        const pc = st.candidate;
+        if (pc) {
+          if (Number(pc.weightKg || 0) > 0) row.cand.weightKg = Number(pc.weightKg);
+          if (Number(pc.lenCm || 0) > 0) row.cand.lenCm = Number(pc.lenCm);
+          if (Number(pc.widCm || 0) > 0) row.cand.widCm = Number(pc.widCm);
+          if (Number(pc.heiCm || 0) > 0) row.cand.heiCm = Number(pc.heiCm);
+          if (Number(pc.pkgQty || 0) > 0) row.cand.pkgQty = Number(pc.pkgQty);
+        }
+        return row;
+      });
+      researchDialog.error = '';
+      researchDialog.jobText = '';
+      researchDialog.jobId = '';
+      researchDialog.pluginDisabled = false;
+      researchDialog.stopRequested = false;
+      researchDialog.stopping = false;
+      researchDialog.visible = true;
+      runResearch();
+    };
+    const openResearchBatch = () => openResearch(selectedRows.value);
+    const openResearchRow = (row) => openResearch([row]);
+
+    const retryFailedResearch = () => {
+      researchDialog.rows.forEach((r) => {
+        if (r.status === 'empty' || r.status === 'fail') { r.status = 'queued'; r.result = null; r.message = ''; }
+      });
+      runResearch();
+    };
+
+    const saveCandidates = async () => {
+      const ready = researchDialog.rows.filter((r) => Number(r.cand.purchaseCny || 0) > 0);
+      if (!ready.length) return notify.warning('请至少为一项商品填写采购价后再保存候选');
+      researchDialog.busy = true;
+      try {
+        const items = ready.map((r) => ({
+          offerId: r.offerId, name: r.name,
+          purchaseCny: Number(r.cand.purchaseCny || 0),
+          supplier: r.cand.supplier || '',
+          sourceUrl1688: r.cand.sourceUrl1688 || '',
+          score: Number(r.cand.score || 0),
+          weightKg: Number(r.cand.weightKg || 0),
+          lenCm: Number(r.cand.lenCm || 0), widCm: Number(r.cand.widCm || 0), heiCm: Number(r.cand.heiCm || 0),
+          pkgQty: Number(r.cand.pkgQty || 1),
+          suggestPriceCny: (r.suggest && r.suggest.priceCny) || 0,
+          zone: (r.suggest && r.suggest.zone) || '',
+          celFeeCny: (r.suggest && r.suggest.celFeeCny) || 0,
+          source: (r.result && r.result.ok && ['image', 'text', 'plugin'].indexOf(r.result.matchSource) !== -1) ? r.result.matchSource : 'manual',
+        }));
+        const res = await axios.post('/api/yandex/price-candidates', { items }, { timeout: 60000 });
+        notify.success('候选已保存 ' + (res.data && res.data.inserted != null ? res.data.inserted : items.length) + ' 条：回列表勾选后点「批量应用候选调价」');
+        await refreshPriceState(ready.map((r) => r.offerId));
+        researchDialog.visible = false;
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '保存候选失败');
+      } finally {
+        researchDialog.busy = false;
+      }
+    };
+
+    const emptyCandidate = (offerId) => ({
+      offerId, purchaseCny: 0, supplier: '', sourceUrl1688: '', score: 0,
+      weightKg: 0.2, lenCm: 0, widCm: 0, heiCm: 0, pkgQty: 1,
+      suggestPriceCny: 0, zone: '', celFeeCny: 0, status: 'pending', source: '', updatedAt: '',
+    });
+
+    const openStateDrawer = (row) => {
+      const st = priceState[row.offer_id] || {};
+      stateDrawer.offerId = row.offer_id;
+      stateDrawer.name = row.name || row.title || '';
+      stateDrawer.image = rowFirstImage(row);
+      stateDrawer.candidate = st.candidate ? Object.assign({}, st.candidate) : emptyCandidate(row.offer_id);
+      stateDrawer.records = st.records || [];
+      stateDrawer.suggest = null;
+      stateDrawer.visible = true;
+    };
+
+    const calcDrawerSuggest = async () => {
+      const c = stateDrawer.candidate;
+      if (!c || !(Number(c.purchaseCny || 0) > 0)) return notify.warning('请先填写采购成本');
+      stateDrawer.suggestBusy = true;
+      try {
+        const res = await axios.post('/api/yandex/price-suggest', {
+          items: [{
+            offerId: stateDrawer.offerId, purchaseCny: c.purchaseCny, weightKg: c.weightKg,
+            lenCm: c.lenCm, widCm: c.widCm, heiCm: c.heiCm, params: pricingParams(),
+          }],
+        }, { timeout: 30000 });
+        const r = res.data && res.data.results && res.data.results[0];
+        if (r && r.ok) { stateDrawer.suggest = r; notify.success('建议价已更新'); }
+        else notify.warning((r && r.error) || '计算失败：请检查采购价/参数');
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '计算建议价失败');
+      } finally {
+        stateDrawer.suggestBusy = false;
+      }
+    };
+
+    const saveDrawerCandidate = async () => {
+      const c = stateDrawer.candidate;
+      if (!c || !(Number(c.purchaseCny || 0) > 0)) return notify.warning('请先填写采购成本');
+      stateDrawer.saving = true;
+      try {
+        const s = stateDrawer.suggest;
+        const items = [{
+          offerId: stateDrawer.offerId, name: stateDrawer.name,
+          purchaseCny: Number(c.purchaseCny || 0), supplier: c.supplier || '',
+          sourceUrl1688: c.sourceUrl1688 || '', score: Number(c.score || 0),
+          weightKg: Number(c.weightKg || 0), lenCm: Number(c.lenCm || 0),
+          widCm: Number(c.widCm || 0), heiCm: Number(c.heiCm || 0), pkgQty: Number(c.pkgQty || 1),
+          suggestPriceCny: (s && s.priceCny) || Number(c.suggestPriceCny || 0),
+          zone: (s && s.zone) || c.zone || '',
+          celFeeCny: (s && s.celFeeCny) || Number(c.celFeeCny || 0),
+          source: c.source || 'manual',
+        }];
+        await axios.post('/api/yandex/price-candidates', { items }, { timeout: 30000 });
+        notify.success('候选已保存（状态置为待应用）');
+        await refreshPriceState([stateDrawer.offerId]);
+        const st = priceState[stateDrawer.offerId];
+        if (st) { stateDrawer.candidate = st.candidate ? Object.assign({}, st.candidate) : stateDrawer.candidate; stateDrawer.records = st.records || []; }
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '保存候选失败');
+      } finally {
+        stateDrawer.saving = false;
+      }
+    };
+
+    const applyOnePrice = async () => {
+      const c = stateDrawer.candidate;
+      const target = (stateDrawer.suggest && stateDrawer.suggest.priceCny) || Number(c.suggestPriceCny || 0);
+      if (!(Number(c.purchaseCny || 0) > 0) || !(target > 0)) return notify.warning('请先填写采购价并点击「计算建议价」');
+      try {
+        await confirmBox('将把「' + stateDrawer.name + '」售价写为 CNY ' + target + '（服务端按采购成本/重量/尺寸重算）？', '确认调价');
+      } catch (_e) { return; }
+      stateDrawer.applying = true;
+      try {
+        const res = await axios.post('/api/yandex/price-apply', {
+          items: [{
+            offerId: stateDrawer.offerId, name: stateDrawer.name,
+            purchaseCny: c.purchaseCny, weightKg: c.weightKg,
+            dims: [Number(c.lenCm || 0), Number(c.widCm || 0), Number(c.heiCm || 0)],
+            params: pricingParams(),
+          }],
+        }, { timeout: 120000 });
+        const r = res.data && res.data.results && res.data.results[0];
+        if (r && r.ok) notify.success('调价成功：CNY ' + r.newPrice + (r.oldPrice ? '（原 ' + r.oldPrice + '）' : ''));
+        else notify.error((r && r.error) || '调价失败');
+        await refreshPriceState([stateDrawer.offerId]);
+        const st = priceState[stateDrawer.offerId];
+        if (st) {
+          stateDrawer.records = st.records || [];
+          stateDrawer.candidate = st.candidate ? Object.assign({}, st.candidate) : stateDrawer.candidate;
+        }
+        fetchProducts();
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '调价失败');
+      } finally {
+        stateDrawer.applying = false;
+      }
+    };
+
+    const openApplyBatch = async () => {
+      const rows = (selectedRows.value || []).filter((row) => priceState[row.offer_id] && priceState[row.offer_id].candidate);
+      if (!rows.length) return notify.warning('所选商品还没有候选：先「批量核价」并保存候选，或通过状态「详情」手工补录');
+      applyDialog.rows = rows.map((row) => {
+        const c = priceState[row.offer_id].candidate;
+        return {
+          offerId: row.offer_id, name: row.name || row.title || '',
+          image: rowFirstImage(row),
+          oldPrice: Number(row.price || 0), oldCurrency: row.currency_code || 'RUB',
+          cand: Object.assign({}, c), preview: null, result: null,
+        };
+      });
+      applyDialog.results = [];
+      applyDialog.visible = true;
+      applyDialog.busy = true;
+      try {
+        const res = await axios.post('/api/yandex/price-suggest', {
+          items: applyDialog.rows.map((r) => ({
+            offerId: r.offerId, purchaseCny: r.cand.purchaseCny, weightKg: r.cand.weightKg,
+            lenCm: r.cand.lenCm, widCm: r.cand.widCm, heiCm: r.cand.heiCm, params: pricingParams(),
+          })),
+        }, { timeout: 60000 });
+        const results = (res.data && res.data.results) || [];
+        for (const r of results) {
+          const row = applyDialog.rows.find((x) => String(x.offerId) === String(r.offerId));
+          if (row) row.preview = r && r.ok ? r : null;
+        }
+        const missing = applyDialog.rows.filter((r) => !r.preview);
+        if (missing.length) notify.warning(missing.length + ' 项预览失败（多为采购价/参数问题），将被跳过');
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '预览计算失败');
+      } finally {
+        applyDialog.busy = false;
+      }
+    };
+
+    const confirmApplyBatch = async () => {
+      const targets = applyDialog.rows.filter((r) => r.preview);
+      if (!targets.length) return notify.warning('没有可执行的调价项（需要成功的建议价预览）');
+      applyDialog.busy = true;
+      applyDialog.results = [];
+      try {
+        const res = await axios.post('/api/yandex/price-apply', {
+          items: targets.map((r) => ({
+            offerId: r.offerId, name: r.name,
+            purchaseCny: r.cand.purchaseCny, weightKg: r.cand.weightKg,
+            dims: [Number(r.cand.lenCm || 0), Number(r.cand.widCm || 0), Number(r.cand.heiCm || 0)],
+            params: pricingParams(),
+          })),
+        }, { timeout: 600000 });
+        const results = (res.data && res.data.results) || [];
+        applyDialog.results = results;
+        for (const r of results) {
+          const row = applyDialog.rows.find((x) => String(x.offerId) === String(r.offerId));
+          if (row) row.result = r;
+        }
+        const okN = results.filter((r) => r.ok).length;
+        if (okN === results.length) notify.success('批量调价完成：' + okN + '/' + results.length + ' 已写回 Yandex（平台处理中）');
+        else notify.warning('批量调价：成功 ' + okN + '/' + results.length + '，失败项见列表');
+        await refreshPriceState(applyDialog.rows.map((r) => r.offerId));
+        fetchProducts();
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '批量调价失败');
+      } finally {
+        applyDialog.busy = false;
+      }
+    };
+
+    // ===== Yandex 卡片质量：评分列展示 + AI 优化（试点，预览→确认→提交）=====
+    const qgradeInfo = (row) => {
+      const score = Number(row?.qscore);
+      if (!Number.isFinite(score)) return { color: '#94a3b8', text: '-' };
+      const color = score >= 80 ? '#16a34a' : score >= 60 ? '#f59e0b' : '#dc2626';
+      return { color, text: String(score) };
+    };
+    const qualityTagType = (grade) => (grade === 'high' ? 'success' : grade === 'medium' ? 'warning' : 'danger');
+
+    const aiDialog = Vue.reactive({ visible: false, busy: false, rows: [], applying: false });
+    const aiChecked = Vue.reactive({}); // offerId -> bool
+
+    // 熊猫式：把类目与现有属性一并带上，让 AI 只补空缺（标题/描述/属性）
+    const attrMapFromRow = (row) => {
+      const map = {};
+      if (Array.isArray(row.attributes)) {
+        for (const a of row.attributes) {
+          if (a && a.name) map[a.name] = String(a.value ?? '');
+        }
+      }
+      return map;
+    };
+    const buildAiItems = (rows) => rows.map((row) => ({
+      offerId: row.offer_id || row.offerId || '',
+      name: row.name || row.title || '',
+      description: row.description || (row.raw && row.raw.offer && row.raw.offer.description) || '',
+      category_id: row.category_id || '',
+      category_name: row.category_name || '',
+      attributes: attrMapFromRow(row),
+      issues: Array.isArray(row.qissues) ? row.qissues : [],
+    })).filter((it) => it.offerId);
+
+    const openAiOptimize = async (sourceRows) => {
+      const rows = (sourceRows && sourceRows.length ? sourceRows : selectedRows.value).slice(0, 10);
+      if (!rows.length) return notify.warning('请先勾选要优化的商品（单次最多 10 个）');
+      aiDialog.rows = rows.map((row) => ({
+        offerId: row.offer_id || row.offerId || '',
+        name: row.name || '',
+        status: 'queued', message: '', suggested: null, changes: [], error: '',
+      }));
+      aiDialog.busy = true;
+      aiDialog.visible = true;
+      for (const key of Object.keys(aiChecked)) delete aiChecked[key];
+      try {
+        const res = await axios.post('/api/yandex/ai-optimize-preview', { items: buildAiItems(rows) }, { timeout: 300000 });
+        const results = (res.data && res.data.rows) || [];
+        for (const rr of results) {
+          const target = aiDialog.rows.find((r) => r.offerId === rr.offerId);
+          if (!target) continue;
+          if (rr.ok) {
+            target.status = 'ok';
+            target.suggested = rr.suggested;
+            target.changes = rr.changes || [];
+            target.attributes = rr.attributes || [];
+            target.originName = rr.origin && rr.origin.name;
+            aiChecked[rr.offerId] = true;
+          } else {
+            target.status = 'error';
+            target.error = rr.error || '生成失败';
+          }
+        }
+        const failed = results.filter((r) => !r.ok);
+        if (failed.length) notify.warning(failed.length + ' 个商品生成失败（含未配置 AI 模型的情况）');
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || 'AI 优化失败');
+      } finally {
+        aiDialog.busy = false;
+      }
+    };
+
+    const applyAiOptimize = async () => {
+      const okItems = aiDialog.rows.filter((r) => r.status === 'ok' && aiChecked[r.offerId] && r.suggested);
+      if (!okItems.length) return notify.warning('没有勾选可提交的优化项');
+      aiDialog.applying = true;
+      try {
+        const res = await axios.post('/api/yandex/ai-optimize-apply', {
+          items: okItems.map((r) => ({
+            offerId: r.offerId,
+            name: r.suggested.name,
+            description: r.suggested.description,
+            attributes: (r.attributes || []).filter((a) => a && a.name && String(a.value).trim()),
+          })),
+        }, { timeout: 300000 });
+        const results = (res.data && res.data.results) || [];
+        const okN = results.filter((x) => x.ok).length;
+        if (okN === results.length) notify.success('AI 优化已提交 Yandex：' + okN + '/' + results.length);
+        else notify.warning('AI 优化提交：成功 ' + okN + '/' + results.length + '，失败项见下方提示');
+        for (const rr of results) {
+          const target = aiDialog.rows.find((r) => r.offerId === rr.offerId);
+          if (target) target.message = rr.ok ? '✓ 已提交 Yandex，等待平台审核' : ('✗ ' + (rr.error || '失败'));
+        }
+        fetchProducts();
+      } catch (error) {
+        notify.error((error.response && error.response.data && error.response.data.error) || error.message || '提交失败');
+      } finally {
+        aiDialog.applying = false;
+      }
+    };
+
+    const onShopChanged = () => {
+      pagination.currentPage = 1;
+      hasFetched.value = false;
+      fetchProducts();
+    };
+
+    Vue.onMounted(() => {
+      fetchProducts();
+      window.addEventListener('shop-changed', onShopChanged);
+    });
+    Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
     return {
-      products, loading, saveLoading, hasFetched, activeTab, search, pagination, apiReady, statusTabItems,
+      products, loading, saveLoading, hasFetched, activeTab, search, qualityFilter, qualityOptions, pagination, apiReady, statusTabItems,
       context, drawer, statusText, statusTagType, moneyText, fetchProducts, selectStatusTab, resetFilters,
       profitDialog, fixedCostCny, currentPriceCny, currentProfitPreview, suggestedPriceDisplay, strikePriceDisplay,
       currentCrossBorder, suggestedCrossBorder,
-      openEdit, saveProduct, openProfitDialog, applySuggestedPrice,
+      openEdit, saveProduct, openProfitDialog, applySuggestedPrice, applyCandidateFields, candRowStyle,
+      hoverImg, onImgEnter, onImgMove, onImgLeave,
+      selectedRows, priceState, researchDialog, stateDrawer, applyDialog,
+      handleSelectionChange, openResearchBatch, openResearchRow, openStateDrawer,
+      retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
+      reverseDialog, openReversePricing, reverseAllRows, applyReverseToYandex,
+      calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
+      qgradeInfo, qualityTagType, aiDialog, aiChecked, openAiOptimize, applyAiOptimize,
+      drawer, saveLoading, editDrawerMode, aiFillProduct, setAttrValue, attrTemplateOf, drawerMissingAttrs,
+      aiFilter, aiOptions, aiStats, aiRecordsDialog, openAiRecords,
+      priceFilter, priceOptions, displayProducts,
     };
   },
   template: `
@@ -369,12 +1342,30 @@ window.YandexProductListView = {
 
       <div class="erp-filter-row">
         <el-input v-model="search" size="large" clearable placeholder="搜索商品 / 货号 / SKU" style="width:360px" @keyup.enter="fetchProducts" />
+        <el-select v-model="qualityFilter" size="large" style="width:160px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
+          <el-option v-for="opt in qualityOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
+        <el-select v-model="aiFilter" size="large" style="width:150px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
+          <el-option v-for="opt in aiOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
+        <el-select v-model="priceFilter" size="large" style="width:150px">
+          <el-option v-for="opt in priceOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
         <el-button size="large" type="primary" @click="fetchProducts">查询</el-button>
         <el-button size="large" @click="resetFilters">重置</el-button>
       </div>
 
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap">
+        <el-button type="primary" @click="openReversePricing">Ozon 反推定价</el-button>
+        <el-button type="primary" plain @click="openResearchBatch">批量核价（1688 找货）</el-button>
+        <el-button type="warning" plain @click="openApplyBatch">批量应用候选调价</el-button>
+        <el-button type="danger" plain @click="openAiOptimize(selectedRows)">AI 优化（预览确认）</el-button>
+        <span style="font-size:13px; color:#94a3b8">已选 {{ selectedRows.length }} 项 · 调价按候选的采购成本/重量/尺寸以 CNY 写回 Yandex</span>
+      </div>
+
       <el-table
-        :data="products"
+        :data="displayProducts"
+        @selection-change="handleSelectionChange"
         v-loading="loading"
         element-loading-text="正在读取 Yandex 商品..."
         border
@@ -385,7 +1376,8 @@ window.YandexProductListView = {
         <el-table-column label="商品" min-width="360" fixed="left">
           <template #default="{ row }">
             <div style="display:flex; gap:12px; align-items:center; min-width:0">
-              <el-image :src="row.image || row.primary_image" style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; flex-shrink:0" fit="cover" preview-teleported>
+              <el-image :src="row.image || row.primary_image" lazy style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; flex-shrink:0; cursor:zoom-in" fit="cover" preview-teleported
+                        @mouseenter="onImgEnter($event, row)" @mousemove="onImgMove" @mouseleave="onImgLeave">
                 <template #error><div style="height:58px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:12px">无图</div></template>
               </el-image>
               <div style="min-width:0">
@@ -402,6 +1394,29 @@ window.YandexProductListView = {
             </el-tooltip>
           </template>
         </el-table-column>
+        <el-table-column label="卡片质量" width="130">
+          <template #default="{ row }">
+            <el-tooltip v-if="Array.isArray(row.qissues) && row.qissues.length" :content="row.qissues.join('；')" placement="top">
+              <el-tag :type="qualityTagType(row.qgrade)" effect="light" style="cursor:help">
+                {{ qgradeInfo(row).text }} · {{ row.qgrade === 'high' ? '优' : row.qgrade === 'medium' ? '中' : '低' }}
+              </el-tag>
+            </el-tooltip>
+            <el-tag v-else :type="qualityTagType(row.qgrade)" effect="light">{{ qgradeInfo(row).text }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="AI 优化" width="130" align="center">
+          <template #default="{ row }">
+            <template v-if="aiStats[row.offer_id] && aiStats[row.offer_id].count > 0">
+              <el-tooltip :content="'最近优化：' + String(aiStats[row.offer_id].lastAt || '').slice(0, 16)" placement="top">
+                <el-button link type="success" @click="openAiRecords(row)">
+                  <el-tag size="small" type="success" effect="light" style="cursor:pointer">{{ aiStats[row.offer_id].count }} 次</el-tag>
+                </el-button>
+              </el-tooltip>
+              <div style="font-size:11px; color:#94a3b8">点击查看记录</div>
+            </template>
+            <span v-else style="color:#cbd5e1; font-size:12px">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="售价" width="130" align="right">
           <template #default="{ row }">{{ moneyText(row.price, row.currency_code || 'RUB') }}</template>
         </el-table-column>
@@ -410,12 +1425,40 @@ window.YandexProductListView = {
         <el-table-column label="类目" min-width="190" show-overflow-tooltip>
           <template #default="{ row }">{{ row.category_name || row.category || '-' }}</template>
         </el-table-column>
+        <el-table-column label="核价 / 调价" min-width="250">
+          <template #default="{ row }">
+            <div v-if="priceState[row.offer_id]" style="display:flex; flex-direction:column; gap:4px; min-width:0">
+              <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap">
+                <el-tag v-if="priceState[row.offer_id].records[0] && priceState[row.offer_id].records[0].status === 'failed'" type="danger" size="small">上次失败</el-tag>
+                <el-tag v-else-if="!priceState[row.offer_id].candidate" type="info" size="small">未核价</el-tag>
+                <el-tag v-else-if="priceState[row.offer_id].candidate.status === 'pending'" type="warning" size="small">候选待应用</el-tag>
+                <el-tag v-else type="success" size="small">已调价</el-tag>
+                <el-link type="primary" :underline="false" @click="openStateDrawer(row)">详情</el-link>
+              </div>
+              <template v-if="priceState[row.offer_id].candidate">
+                <div style="font-size:12px; color:#475569">
+                  采购 ¥{{ Number(priceState[row.offer_id].candidate.purchaseCny || 0).toFixed(2) }}
+                  <template v-if="Number(priceState[row.offer_id].candidate.suggestPriceCny || 0) > 0">
+                    → 建议 ¥{{ Number(priceState[row.offer_id].candidate.suggestPriceCny || 0).toFixed(0) }}
+                  </template>
+                  <span v-if="priceState[row.offer_id].candidate.zone" style="color:#94a3b8"> · {{ priceState[row.offer_id].candidate.zone }}</span>
+                </div>
+              </template>
+              <div v-if="priceState[row.offer_id].records[0] && priceState[row.offer_id].records[0].status === 'failed' && priceState[row.offer_id].records[0].error"
+                   class="text-ellipsis" style="font-size:12px; color:#dc2626; max-width:230px"
+                   :title="priceState[row.offer_id].records[0].error">{{ priceState[row.offer_id].records[0].error }}</div>
+            </div>
+            <el-button v-else link type="primary" @click="openStateDrawer(row)">核价 / 调价</el-button>
+          </template>
+        </el-table-column>
         <el-table-column label="更新时间" width="180">
           <template #default="{ row }">{{ (row.updated_at || row.updatedAt || '').replace('T',' ').slice(0,19) || '-' }}</template>
         </el-table-column>
-        <el-table-column label="操作" width="120" fixed="right">
+        <el-table-column label="操作" width="190" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" @click="openEdit(row)">编辑</el-button>
+            <el-button link type="primary" @click="openResearchRow(row)">核价</el-button>
+            <el-button link type="danger" @click="openAiOptimize([row])">AI 优化</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -465,10 +1508,62 @@ window.YandexProductListView = {
             <el-input v-model="drawer.form.description" type="textarea" :rows="8" />
           </el-form-item>
         </el-form>
+
+        <!-- AI 智能填充：只补空缺，熊猫式 -->
+        <div style="display:flex; align-items:center; gap:10px; margin: 4px 0 14px 0; flex-wrap:wrap">
+          <el-button type="warning" plain :loading="drawer.aiFillBusy" @click="aiFillProduct">
+            <el-icon><MagicStick /></el-icon>&nbsp;AI 智能填充（补标题/描述/空属性）
+          </el-button>
+          <span style="font-size:12px; color:#94a3b8">
+            缺 {{ drawerMissingAttrs.length }} 项必填/推荐属性{{ drawerMissingAttrs.length ? '：' + drawerMissingAttrs.slice(0,5).map(t => t.name).join('、') + (drawerMissingAttrs.length > 5 ? ' 等' : '') : '' }}
+          </span>
+        </div>
+
+        <!-- 类目属性区 -->
+        <div v-if="drawer.attrTemplate && drawer.attrTemplate.length" style="margin-bottom:14px; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden">
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:10px 14px; background:#f8fafc; font-weight:700; color:#334155; font-size:14px">
+            <span>类目属性（{{ drawer.form.category_name || ('类目 ' + drawer.form.category_id) }}）</span>
+            <span style="font-size:12px; color:#94a3b8">AI 填充后请核对；保存仅提交改动项</span>
+          </div>
+          <div style="padding:6px 14px; max-height:340px; overflow:auto">
+            <div v-for="t in drawerMissingAttrs" :key="t.name"
+              style="display:flex; gap:8px; align-items:center; padding:7px 0; border-bottom:1px dashed #eef2f7">
+              <el-tag size="small" :type="t.required ? 'danger' : 'warning'" style="flex-shrink:0">{{ t.required ? '必填' : '推荐' }}</el-tag>
+              <div style="flex:1; min-width:0">
+                <div class="text-ellipsis" style="font-size:13px; color:#334155" :title="t.name_zh ? t.name : '俄文原名（暂无中文对照，可反馈添加）：' + t.name">
+                  {{ t.name_zh || t.name }}<span v-if="t.name_zh" style="color:#94a3b8; font-size:12px">（{{ t.name }}）</span><span v-if="t.unit" style="color:#94a3b8"> ({{ t.unit }})</span>
+                </div>
+              </div>
+              <el-select v-if="t.type === 'ENUM' && t.options && t.options.length" v-model="drawer.form.attributes[t.name]" filterable size="small" style="width:220px"
+                placeholder="选择或输入" allow-create default-first-option @change="setAttrValue(t.name, $event)">
+                <el-option v-for="opt in t.options" :key="opt" :label="opt" :value="opt" />
+              </el-select>
+              <el-input v-else size="small" v-model="drawer.form.attributes[t.name]" style="width:220px"
+                :placeholder="t.type === 'NUMERIC' && t.unit ? '填数值(' + t.unit + ')' : '填值'" @change="setAttrValue(t.name, $event)" />
+            </div>
+            <div v-if="!drawerMissingAttrs.length" style="padding:8px 0; font-size:13px; color:#16a34a">✓ 必填与推荐属性已齐全</div>
+            <el-collapse style="margin-top:6px">
+              <el-collapse-item :title="'已填属性 ' + Object.keys(drawer.form.attributes).filter(n => String(drawer.form.attributes[n] || '').trim()).length + ' 项（查看/修改，改动会随保存提交）'">
+                <div v-for="t in drawer.attrTemplate.filter((x) => String(drawer.form.attributes[x.name] || '').trim())" :key="t.name"
+                  style="display:flex; gap:8px; align-items:center; padding:5px 0">
+                  <div style="flex:1; min-width:0; font-size:13px; color:#475569">
+                    {{ t.name_zh || t.name }}<span v-if="t.name_zh" style="color:#94a3b8; font-size:11px">（{{ t.name }}）</span>
+                    <span style="color:#16a34a"> = {{ drawer.form.attributes[t.name] }}</span>
+                  </div>
+                  <el-select v-if="t.type === 'ENUM' && t.values && t.values.length" v-model="drawer.form.attributes[t.name]" filterable size="small" style="width:200px" allow-create default-first-option @change="setAttrValue(t.name, $event)">
+                    <el-option v-for="opt in t.values" :key="opt.value" :label="opt.value" :value="opt.value" />
+                  </el-select>
+                  <el-input v-else size="small" v-model="drawer.form.attributes[t.name]" style="width:200px" @change="setAttrValue(t.name, $event)" />
+                </div>
+              </el-collapse-item>
+            </el-collapse>
+          </div>
+        </div>
+
         <el-alert type="info" :closable="false" show-icon title="Yandex 更新不是即时生效，提交后平台可能需要几分钟处理。" />
         <template #footer>
           <el-button @click="drawer.visible=false">取消</el-button>
-          <el-button type="primary" :loading="saveLoading" @click="saveProduct">保存到 Yandex</el-button>
+          <el-button type="success" :loading="saveLoading" @click="saveProduct">保存并更新到 Yandex</el-button>
         </template>
       </el-drawer>
 
@@ -586,6 +1681,352 @@ window.YandexProductListView = {
           <el-button type="primary" @click="applySuggestedPrice">应用建议售价</el-button>
         </template>
       </el-dialog>
+
+      <!-- 批量应用候选调价：预览 → 确认提交 Yandex -->
+      <!-- 核价（1688 同款候选搜索/选择/保存） -->
+      <el-dialog v-model="researchDialog.visible" title="1688 核价 → 保存候选" width="1200px" append-to-body destroy-on-close :close-on-click-modal="false">
+        <el-alert v-if="researchDialog.jobText" type="info" :closable="false" style="margin-bottom:10px" :title="researchDialog.jobText" />
+        <el-alert v-if="researchDialog.error" type="error" :closable="false" style="margin-bottom:10px" :title="researchDialog.error" />
+        <el-alert v-if="researchDialog.pluginDisabled" type="warning" :closable="false" style="margin-bottom:10px"
+          title="本机核价插件不可用（插件未连接/版本过旧），候选将为空，可手动在下方填写采购成本后保存。" />
+        <el-table :data="researchDialog.rows" v-loading="researchDialog.busy" element-loading-text="正在核价..." border size="large" max-height="520">
+          <el-table-column type="expand">
+            <template #default="{ row }">
+              <div v-if="row.result && row.result.ok && row.result.candidates && row.result.candidates.length" style="padding:6px 14px 10px 14px">
+                <div style="font-size:12px; color:#64748b; margin:4px 0 8px 0; font-weight:700">1688 同款候选（点选一项回填采购信息）</div>
+                <div v-for="(c, i) in row.result.candidates" :key="i" :style="candRowStyle(row, i)" @click="applyCandidateFields(row, i)">
+                  <el-image :src="c.img" lazy fit="cover" style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; flex-shrink:0" />
+                  <div style="flex:1; min-width:0">
+                    <div class="text-ellipsis" style="font-size:13px; color:#0f172a; max-width:520px" :title="c.title">{{ c.title }}</div>
+                    <div style="font-size:12px; color:#94a3b8">1688 货号 {{ c.offerId1688 || '-' }} · 销量 {{ c.sold || 0 }}</div>
+                    <div v-if="c.dimsText || c.weightText" style="font-size:12px; color:#64748b">{{ c.dimsText }} {{ c.weightText }}</div>
+                  </div>
+                  <div style="flex-shrink:0; text-align:right">
+                    <div style="font-size:15px; font-weight:800; color:#dc2626">¥{{ c.price }}</div>
+                    <el-tag v-if="row.chosen === i" size="small" type="primary">已选用</el-tag>
+                    <el-tag v-else size="small" effect="plain">选用</el-tag>
+                  </div>
+                </div>
+              </div>
+              <div v-else style="padding:10px 14px; font-size:13px; color:#94a3b8">暂无 1688 候选，可在下方填写采购成本与尺寸重量后点「计算建议价」，再「保存候选」。</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="商品" min-width="230">
+            <template #default="{ row }">
+              <div style="display:flex; align-items:center; gap:10px">
+                <el-image :src="row.imgUrl" lazy style="width:48px; height:48px; border-radius:6px; background:#f1f5f9; flex-shrink:0" fit="cover" />
+                <div>
+                  <div class="text-ellipsis" style="font-size:13px; font-weight:600; color:#111827; max-width:300px">{{ row.name }}</div>
+                  <div style="font-size:12px; color:#94a3b8">{{ row.offerId }} · {{ row.categoryName || '-' }}</div>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="采购成本 ¥" width="150" align="center">
+            <template #default="{ row }">
+              <el-input-number v-model="row.cand.purchaseCny" :min="0" :precision="2" :controls="false" size="small" style="width:110px" />
+              <div v-if="row.cand.supplier" class="text-ellipsis" style="font-size:11px; color:#64748b; max-width:140px">{{ row.cand.supplier }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="单重/数量" width="170" align="center">
+            <template #default="{ row }">
+              <div style="display:flex; gap:6px; justify-content:center">
+                <el-tooltip content="重量 kg" placement="top"><el-input-number v-model="row.cand.weightKg" :min="0" :precision="3" :controls="false" size="small" style="width:86px" /></el-tooltip>
+                <el-tooltip content="每包件数" placement="top"><el-input-number v-model="row.cand.pkgQty" :min="1" :controls="false" size="small" style="width:70px" /></el-tooltip>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="尺寸 cm (长×宽×高)" width="240" align="center">
+            <template #default="{ row }">
+              <div style="display:flex; gap:6px; justify-content:center">
+                <el-input-number v-model="row.cand.lenCm" :min="0" :precision="1" :controls="false" size="small" style="width:72px" />
+                <el-input-number v-model="row.cand.widCm" :min="0" :precision="1" :controls="false" size="small" style="width:72px" />
+                <el-input-number v-model="row.cand.heiCm" :min="0" :precision="1" :controls="false" size="small" style="width:72px" />
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="建议售价" width="190" align="center">
+            <template #default="{ row }">
+              <div v-if="row.suggest" style="font-weight:800; color:#16a34a">¥{{ row.suggest.priceCny }}<span style="font-weight:400;color:#64748b"> ≈₽{{ row.suggest.rubValue }}</span>
+                <div style="font-size:12px; font-weight:400; color:#64748b">毛利 {{ row.suggest.marginPct }}%</div>
+              </div>
+              <div v-else style="color:#94a3b8; font-size:12px">未计算</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" min-width="150">
+            <template #default="{ row }">
+              <span v-if="row.status === 'ok'" style="color:#16a34a; font-size:12px">✓ 已核价{{ row.result && row.result.candidates ? '（' + row.result.candidates.length + ' 候选）' : '' }}</span>
+              <span v-else-if="row.status === 'empty'" style="color:#f59e0b; font-size:12px">无候选，可手动填成本</span>
+              <span v-else-if="row.status === 'fail'" style="color:#dc2626; font-size:12px">{{ row.message || '核价失败' }}</span>
+              <span v-else-if="row.status === 'queued'" style="color:#94a3b8; font-size:12px">{{ row.message || '排队中...' }}</span>
+              <el-button v-if="row.suggestBusy || row.status === 'queued'" link type="primary" loading>计算</el-button>
+              <el-button v-else link type="primary" @click="calcRowSuggest(row)">计算建议价</el-button>
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button v-if="researchDialog.jobId && !researchDialog.stopping" :loading="researchDialog.stopping" @click="stopPluginJob">停止核价</el-button>
+          <el-button @click="retryFailedResearch">重试失败项</el-button>
+          <el-button type="primary" :loading="researchDialog.busy" @click="saveCandidates">保存全部候选</el-button>
+          <el-button @click="researchDialog.visible = false">关闭</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- 核价详情 / 单商品候选维护 -->
+      <el-drawer v-model="stateDrawer.visible" size="640px" title="候选详情与调价（Yandex）" destroy-on-close>
+        <div style="display:flex; gap:12px; align-items:flex-start; margin-bottom:14px">
+          <el-image :src="stateDrawer.image" style="width:64px; height:64px; border-radius:8px; background:#f1f5f9" fit="cover" />
+          <div>
+            <div style="font-size:14px; font-weight:700; color:#111827">{{ stateDrawer.name }}</div>
+            <div style="font-size:12px; color:#94a3b8; margin-top:2px">{{ stateDrawer.offerId }}</div>
+          </div>
+        </div>
+        <el-form :model="stateDrawer.candidate" label-position="top" size="small">
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:0 14px">
+            <el-form-item label="采购成本 (CNY)">
+              <el-input-number v-model="stateDrawer.candidate.purchaseCny" :min="0" :precision="2" :controls="false" style="width:100%" />
+            </el-form-item>
+            <el-form-item label="每包件数">
+              <el-input-number v-model="stateDrawer.candidate.pkgQty" :min="1" :controls="false" style="width:100%" />
+            </el-form-item>
+          </div>
+          <el-form-item label="供应商">
+            <el-input v-model="stateDrawer.candidate.supplier" placeholder="供应商名称" />
+          </el-form-item>
+          <el-form-item label="1688 链接">
+            <el-input v-model="stateDrawer.candidate.sourceUrl1688" placeholder="https://detail.1688.com/..." />
+          </el-form-item>
+          <div style="display:grid; grid-template-columns:repeat(4, 1fr); gap:0 12px">
+            <el-form-item label="重量 kg"><el-input-number v-model="stateDrawer.candidate.weightKg" :min="0" :precision="3" :controls="false" style="width:100%" /></el-form-item>
+            <el-form-item label="长 cm"><el-input-number v-model="stateDrawer.candidate.lenCm" :min="0" :precision="1" :controls="false" style="width:100%" /></el-form-item>
+            <el-form-item label="宽 cm"><el-input-number v-model="stateDrawer.candidate.widCm" :min="0" :precision="1" :controls="false" style="width:100%" /></el-form-item>
+            <el-form-item label="高 cm"><el-input-number v-model="stateDrawer.candidate.heiCm" :min="0" :precision="1" :controls="false" style="width:100%" /></el-form-item>
+          </div>
+        </el-form>
+        <div v-if="stateDrawer.suggest" style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:8px; padding:10px 14px; margin-bottom:14px">
+          <div style="display:flex; gap:18px; flex-wrap:wrap; align-items:baseline">
+            <span style="font-size:20px; font-weight:900; color:#16a34a">建议售价 ¥{{ stateDrawer.suggest.priceCny }}</span>
+            <span style="color:#64748b">≈₽{{ stateDrawer.suggest.rubValue }}</span>
+            <span style="font-size:12px; color:#64748b">毛利 {{ stateDrawer.suggest.marginPct }}% · 佣金区 {{ stateDrawer.suggest.zone || '-' }}</span>
+            <span v-if="stateDrawer.suggest.strikePriceCny" style="font-size:12px; color:#94a3b8">划线 {{ stateDrawer.suggest.strikePriceCny }}</span>
+          </div>
+        </div>
+        <div style="display:flex; gap:10px; margin-bottom:18px; flex-wrap:wrap">
+          <el-button type="primary" :loading="stateDrawer.suggestBusy" @click="calcDrawerSuggest">计算建议价</el-button>
+          <el-button :loading="stateDrawer.saving" @click="saveDrawerCandidate">保存候选（待应用）</el-button>
+          <el-button type="warning" :loading="stateDrawer.applying" @click="applyOnePrice">应用调价到 Yandex</el-button>
+        </div>
+        <div style="font-size:13px; font-weight:700; color:#334155; margin:6px 0 8px 0">调价历史</div>
+        <el-table :data="stateDrawer.records" size="small" border max-height="260" empty-text="暂无调价记录">
+          <el-table-column label="时间" width="150">
+            <template #default="{ row }">{{ String(row.createdAt || '').slice(0, 16) || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="原价 ¥" width="90" align="right"><template #default="{ row }">{{ row.oldPriceCny || '-' }}</template></el-table-column>
+          <el-table-column label="新价 ¥" width="90" align="right"><template #default="{ row }">{{ row.newPriceCny || '-' }}</template></el-table-column>
+          <el-table-column label="状态" width="90">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.status === 'applied' ? 'success' : row.status === 'failed' ? 'danger' : 'info'">{{ row.status === 'applied' ? '已应用' : row.status === 'failed' ? '失败' : row.status }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="错误" min-width="140"><template #default="{ row }"><span style="font-size:12px; color:#dc2626">{{ row.error || '' }}</span></template></el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button @click="stateDrawer.visible = false">关闭</el-button>
+        </template>
+      </el-drawer>
+
+      <el-dialog v-model="applyDialog.visible" title="批量应用候选调价 → Yandex" width="1120px" append-to-body destroy-on-close :close-on-click-modal="false">
+        <el-alert type="info" :closable="false" style="margin-bottom:10px"
+          title="流程：按候选的采购成本/尺寸/重量 + 当前定价参数重算 Yandex 售价并提交平台（写调价记录）。提交即真实改价，建议先小批量核对。" />
+        <el-table :data="applyDialog.rows" v-loading="applyDialog.busy" element-loading-text="正在预览 / 提交..." border size="large" max-height="460">
+          <el-table-column label="商品" min-width="230">
+            <template #default="{ row }">
+              <div style="display:flex; align-items:center; gap:10px">
+                <el-image :src="row.image" lazy style="width:44px; height:44px; border-radius:6px; background:#f1f5f9" fit="cover" />
+                <div style="min-width:0">
+                  <div class="text-ellipsis" style="font-size:13px; color:#111827; font-weight:600">{{ row.name }}</div>
+                  <div style="font-size:12px; color:#94a3b8">{{ row.offerId }}</div>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="现价" width="100" align="right">
+            <template #default="{ row }">
+              <span style="color:#64748b">{{ row.oldPrice ? row.oldPrice + ' ' + row.oldCurrency : '-' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="采购 ¥" width="90" align="right">
+            <template #default="{ row }">¥{{ row.cand ? Number(row.cand.purchaseCny || 0).toFixed(2) : '-' }}</template>
+          </el-table-column>
+          <el-table-column label="建议售价" width="140" align="center">
+            <template #default="{ row }">
+              <span v-if="row.preview" style="color:#2563eb; font-weight:700">CNY {{ row.preview.priceCny }}<br /><span style="font-weight:400;color:#64748b">≈₽{{ row.preview.rubValue }}</span></span>
+              <span v-else style="color:#b91c1c; font-size:12px">{{ row.result ? '' : '预览失败/跳过' }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="利润" width="120" align="center">
+            <template #default="{ row }">
+              <span v-if="row.preview" :style="{ color: row.preview.profitCny >= 0 ? '#16a34a' : '#dc2626' }">¥{{ row.preview.profitCny }}<br /><span style="font-size:12px;color:#64748b">毛利 {{ row.preview.marginPct }}%</span></span>
+              <span v-else style="color:#94a3b8">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="提交结果" min-width="170">
+            <template #default="{ row }">
+              <span v-if="row.result" :style="{ color: row.result.ok ? '#16a34a' : '#dc2626', fontSize: '12px' }">
+                {{ row.result.ok ? '✓ 已提交 Yandex' : '✗ ' + (row.result.error || '失败') }}
+              </span>
+              <span v-else-if="row.preview" style="color:#94a3b8; font-size:12px">待确认</span>
+              <span v-else style="color:#94a3b8; font-size:12px">-</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button :disabled="applyDialog.busy" @click="applyDialog.visible = false">关闭</el-button>
+          <el-button type="warning" :loading="applyDialog.busy" :disabled="!applyDialog.rows.some((r) => r.preview && !r.result)" @click="confirmApplyBatch">
+            确认批量应用（{{ applyDialog.rows.filter((r) => r.preview && !r.result).length }} 项）
+          </el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog v-model="reverseDialog.visible" title="Ozon 反推定价 → Yandex 售价（免 1688 核价）" width="1080px" append-to-body destroy-on-close :close-on-click-modal="false">
+        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:10px">
+          <span style="font-size:12px; color:#64748b">Ozon 售价自动匹配同款；匹配不到的行请手填 Ozon 在售价(CNY)。利润率为 Ozon 侧目标。</span>
+          <el-form-item label="Ozon 利润率 %" style="margin:0"><el-input-number v-model="profitDialog.cost.ozonMarginPct" :min="0" :max="80" :precision="1" :step="1" size="small" style="width:110px" /></el-form-item>
+          <el-form-item label="国内运费 ¥" style="margin:0"><el-input-number v-model="profitDialog.cost.domesticShippingCny" :min="0" :precision="2" :step="0.5" size="small" style="width:100px" /></el-form-item>
+          <el-form-item label="汇率 CNY/RUB" style="margin:0"><el-input-number v-model="profitDialog.cost.exchangeRate" :min="1" :precision="4" :step="0.5" size="small" style="width:120px" /></el-form-item>
+        </div>
+        <el-table :data="reverseDialog.rows" height="420" size="small" border>
+          <el-table-column label="商品" min-width="220">
+            <template #default="{ row }">
+              <div style="display:flex; gap:8px; align-items:center">
+                <img :src="row.img" referrerpolicy="no-referrer" style="width:38px;height:38px;border-radius:4px;object-fit:cover;background:#f1f5f9" @error="$event.target.style.visibility='hidden'" />
+                <div style="min-width:0">
+                  <div style="font-size:12px; color:#334155; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:170px">{{ row.name }}</div>
+                  <div style="font-size:11px; color:#94a3b8">{{ row.offerId }}</div>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="Ozon 在售价 CNY（可改）" width="150">
+            <template #default="{ row }">
+              <el-input-number v-model="row.ozonPriceCny" :min="0" :precision="2" size="small" style="width:120px" :placeholder="row.rev ? '' : '自动匹配或手填'" />
+            </template>
+          </el-table-column>
+          <el-table-column label="佣金 %" width="80" align="center">
+            <template #default="{ row }">{{ row.rev ? row.rev.commission : '-' }}</template>
+          </el-table-column>
+          <el-table-column label="头程 ¥" width="90" align="center">
+            <template #default="{ row }">{{ row.rev ? row.rev.crossCny : '-' }}</template>
+          </el-table-column>
+          <el-table-column label="反推采购 ¥" width="110" align="center">
+            <template #default="{ row }"><b v-if="row.rev" style="color:#0f172a">{{ Number(row.rev.purchaseCny).toFixed(2) }}</b><span v-else>-</span></template>
+          </el-table-column>
+          <el-table-column label="Yandex 建议售价" width="130" align="center">
+            <template #default="{ row }">
+              <span v-if="row.rev && row.rev.ys" style="color:#2563eb; font-weight:700">CNY {{ row.rev.ys.priceCny }}<br /><span style="font-weight:400;color:#64748b">≈₽{{ row.rev.ys.rubValue }}</span></span>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="划线价 / 利润 ¥" width="150" align="center">
+            <template #default="{ row }">
+              <span v-if="row.rev && row.rev.ys" style="font-size:12px; color:#64748b">划线 CNY {{ row.rev.ys.strikePriceCny }}<br />利润 ¥{{ row.rev.ys.profitCny }}</span>
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态 / 应用结果" min-width="170">
+            <template #default="{ row }">
+              <div>
+                <div v-if="row.err" style="color:#dc2626; font-size:12px">{{ row.err }}</div>
+                <div v-else-if="row.rev" style="color:#16a34a; font-size:12px">✓ 已反推（佣金 {{ row.rev.commission }}% · {{ row.rev.descCat ? '按类目' : '默认档' }}）</div>
+                <div v-else style="color:#94a3b8; font-size:12px">待反推</div>
+                <div v-if="row.applyResult" style="font-size:12px; color:#0ea5e9; margin-top:2px">{{ row.applyResult }}</div>
+              </div>
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button @click="reverseDialog.visible = false">关闭</el-button>
+          <el-popconfirm :title="'将把 ' + reverseDialog.rows.filter((r) => r.rev && r.rev.ys).length + ' 个反推结果保存为价格候选（调价队列），之后到列表用「批量应用候选调价」统一提交 Yandex，确认？'" @confirm="applyReverseToYandex">
+            <template #reference>
+              <el-button type="success" plain :loading="reverseDialog.applying" :disabled="!reverseDialog.rows.some((r) => r.rev && r.rev.ys)">保存为候选（待批量应用调价）</el-button>
+              </template>
+            </template>
+          </el-table>
+        </template>
+      </el-dialog>
+
+      <el-dialog v-model="aiDialog.visible" title="AI 优化（Yandex 商品卡片：生成俄语标题/描述 → 勾选后提交平台）" width="1200px" append-to-body destroy-on-close :close-on-click-modal="false" :close-on-press-escape="!aiDialog.busy">
+        <el-alert type="info" :closable="false" style="margin-bottom:12px"
+          title="试点说明"
+          description="AI 依据商品现状与质量问题生成优化标题与描述（俄语）。提交后 Yandex 会重新审核商品卡片，审核通过质量分会提升。AI 模型在「店铺管理 → AI 设置」配置（支持通义 DashScope / MiniMax）。" />
+        <el-table :data="aiDialog.rows" v-loading="aiDialog.busy" element-loading-text="AI 正在逐个生成优化内容..." border size="large" max-height="520">
+          <el-table-column label="提交" width="64" align="center">
+            <template #default="{ row }">
+              <el-checkbox :model-value="Boolean(aiChecked[row.offerId])" :disabled="row.status !== 'ok'"
+                @change="(v) => { aiChecked[row.offerId] = Boolean(v); }" />
+            </template>
+          </el-table-column>
+          <el-table-column label="商品（现状）" min-width="230">
+            <template #default="{ row }">
+              <div class="text-ellipsis" style="font-weight:700; color:#0f172a; max-width:220px" :title="row.originName || row.name">{{ row.originName || row.name }}</div>
+              <div style="font-size:12px; color:#94a3b8; margin-top:4px">货号 {{ row.offerId }}</div>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态 / 生成结果" min-width="260">
+            <template #default="{ row }">
+              <div v-if="row.status === 'queued'" style="color:#94a3b8">生成中...</div>
+              <div v-else-if="row.status === 'error'" style="color:#dc2626; font-size:12px">{{ row.error }}</div>
+              <div v-else-if="row.status === 'ok' && row.suggested">
+                <div style="color:#16a34a; font-weight:800; margin-bottom:4px">✓ 建议标题（俄语）</div>
+                <div class="text-ellipsis" style="font-size:13px; color:#0f172a; max-width:520px" :title="row.suggested.name">{{ row.suggested.name }}</div>
+                <el-tooltip :content="row.suggested.description" placement="top">
+                  <div class="text-ellipsis" style="font-size:12px; color:#64748b; margin-top:4px; max-width:520px">{{ row.suggested.description }}</div>
+                </el-tooltip>
+                <div v-if="row.attributes && row.attributes.length" style="margin-top:6px">
+                  <div style="font-size:12px; color:#2563eb; font-weight:700; margin-bottom:3px">补全属性（{{ row.attributes.length }} 项，随提交写入 Yandex）</div>
+                  <div style="display:flex; flex-wrap:wrap; gap:4px">
+                    <el-tag v-for="(a, i) in row.attributes" :key="i" size="small" type="primary" effect="plain"
+                      :title="a.name">{{ a.name_zh || a.name }}<span style="color:#94a3b8"> = </span>{{ a.value }}{{ a.unit ? ' ' + a.unit : '' }}</el-tag>
+                  </div>
+                </div>
+                <div v-if="row.changes.length" style="margin-top:6px; display:flex; flex-wrap:wrap; gap:4px">
+                  <el-tag v-for="(c, i) in row.changes" :key="i" size="small" type="warning" effect="plain">{{ c }}</el-tag>
+                </div>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="提交结果" width="200">
+            <template #default="{ row }">
+              <span style="font-size:12px">{{ row.message || '' }}</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button @click="aiDialog.visible = false" :disabled="aiDialog.busy || aiDialog.applying">关闭</el-button>
+          <el-button type="success" :loading="aiDialog.applying" :disabled="aiDialog.busy || !aiDialog.rows.some((r) => r.status === 'ok')" @click="applyAiOptimize">
+            提交勾选项到 Yandex（真实改商品卡片）
+          </el-button>
+        </template>
+      </el-dialog>
+
+      <el-dialog v-model="aiRecordsDialog.visible" title="AI 优化记录" width="820px" append-to-body destroy-on-close>
+        <div style="font-size:13px; color:#334155; margin-bottom:10px; font-weight:700">{{ aiRecordsDialog.name }} <span style="color:#94a3b8; font-weight:400">{{ aiRecordsDialog.offerId }}</span></div>
+        <el-table :data="aiRecordsDialog.rows" v-loading="aiRecordsDialog.busy" size="large" border max-height="440" empty-text="暂无 AI 优化记录（做过优化并提交后会出现在这里）">
+          <el-table-column label="时间" width="170"><template #default="{ row }">{{ String(row.created_at || '').slice(0, 16) }}</template></el-table-column>
+          <el-table-column label="方式" width="110"><template #default="{ row }"><el-tag size="small" :type="row.action === 'fill' ? 'warning' : 'primary'">{{ row.action === 'fill' ? '智能填充' : 'AI 优化' }}</el-tag></template></el-table-column>
+          <el-table-column label="改动内容" min-width="220">
+            <template #default="{ row }">
+              <div style="display:flex; gap:4px; flex-wrap:wrap">
+                <el-tag v-if="row.title_changed" size="small" type="info" effect="plain">标题</el-tag>
+                <el-tag v-if="row.desc_changed" size="small" type="info" effect="plain">描述</el-tag>
+                <el-tag v-if="row.attr_count > 0" size="small" type="info" effect="plain">属性 {{ row.attr_count }} 项</el-tag>
+              </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="状态" width="90"><template #default="{ row }"><el-tag size="small" :type="row.status === 'applied' ? 'success' : 'danger'">{{ row.status === 'applied' ? '已提交' : '失败' }}</el-tag></template></el-table-column>
+          <el-table-column label="说明" min-width="160"><template #default="{ row }"><span style="font-size:12px; color:#94a3b8">{{ row.detail || '' }}</span></template></el-table-column>
+        </el-table>
+      </el-dialog>
     </div>
-  `,
+  `
 };
