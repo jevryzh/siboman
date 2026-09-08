@@ -268,7 +268,7 @@ window.YandexInventoryManagementView = {
         notify.success(msg);
         bulkDialog.visible = false;
         selectedRows.value = [];
-        pagination.currentPage = 1;
+        // 保留当前页码与筛选，批量后只刷新数据不跳回第一页（方便定位刚才操作的位置）
         refreshAfterWrite();
       } catch (e) {
         notify.error('批量更新失败: ' + (e.response?.data?.error || e.message));
