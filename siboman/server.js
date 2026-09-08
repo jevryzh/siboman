@@ -4475,15 +4475,16 @@ async function fetchYandexStocksRaw(context) {
   const offers = [];
   for (const campaignId of campaignIds) {
     let pageToken = ""; let pageNum = 0;
-    const stocksUrl = `https://api.partner.market.yandex.ru/v2/campaigns/${encodeURIComponent(campaignId)}/offers/stocks?language=RU&limit=100`;
+    const stockUrlBase = `https://api.partner.market.yandex.ru/v2/campaigns/${encodeURIComponent(campaignId)}/offers/stocks?language=RU&limit=100`;
     do {
       pageNum++;
       if (pageNum > 500) { console.warn(`[yandex-stocks] campaign ${campaignId} 页数超 500 强制中断`); break; }
-      const bodyStr = pageToken ? JSON.stringify({ pageToken }) : "{}";
+      // 注意：Yandex 要求 pageToken 作为 URL query 参数（放 body 会无效并无限重复首页）
+      const stocksUrl = pageToken ? `${stockUrlBase}&pageToken=${encodeURIComponent(pageToken)}` : stockUrlBase;
       const r = await requestJsonOverHttps(stocksUrl, {
         method: "POST",
         headers: { "Api-Key": context.apiSecret, "Content-Type": "application/json" },
-        body: bodyStr,
+        body: "{}",
         timeoutMs: 90000,
       });
       const rj = r.ok ? JSON.parse(r.text || "{}") : {};
@@ -4507,9 +4508,12 @@ async function fetchYandexStocksRaw(context) {
       pageToken = result.paging?.nextPageToken || "";
       const pageOffers = (result.warehouses || []).reduce((a, w) => a + (w.offers || []).length, 0);
       console.log(`[yandex-stocks] campaign ${campaignId} p${pageNum} +${pageOffers} 累计 ${offers.length} 条${pageToken ? "，继续..." : "，完成"}`);
-      // 死循环保护：本页 0 条 或 pageToken 原地重复 → 终止
-      if (pageOffers === 0) break;
-      if (pageToken && pageToken === prevToken) { console.warn(`[yandex-stocks] campaign ${campaignId} pageToken 重复，终止`); break; }
+      // 终止条件：本页无新增行（正常翻完）或已无下一页。
+      // 注意：Yandex 下一页 token 可能在多页内重复回显，但每页仍带新行，因此以 pageOffers 为准。
+      if (pageOffers === 0) { console.warn(`[yandex-stocks] campaign ${campaignId} 本页无数据，终止`); break; }
+      if (!pageToken) break;
+      // 兜底：token 原地重复且连续 2 页都没有新增行，才判为死循环
+      if (pageToken === prevToken && pageOffers === 0) break;
     } while (pageToken && offers.length < 200000);
   }
   // 合并商品元数据（名称/图片/类目/价格）——来自 offer-mappings 全量缓存，保证列表能像商品页一样展示
