@@ -11,7 +11,7 @@ window.YandexInventoryManagementView = {
     const stale = Vue.ref(false);
     const syncError = Vue.ref('');
     const stockDialog = Vue.reactive({ visible: false, loading: false, row: null, stocks: [], submitting: false });
-    const bulkDialog = Vue.reactive({ visible: false, submitting: false, warehouseMode: 'all', warehouseId: '', targetStock: 0, selectedRows: [], preview: [] });
+    const bulkDialog = Vue.reactive({ visible: false, submitting: false, scopeMode: 'filtered', warehouseMode: 'all', warehouseId: '', targetStock: 0, selectedRows: [], preview: [] });
     const selectedRows = Vue.ref([]);
     const threshold = Vue.ref(Math.max(1, Number(localStorage.getItem('yandexInvLowStockThreshold') || 5)));
     const storeName = Vue.ref('');
@@ -197,10 +197,12 @@ window.YandexInventoryManagementView = {
       return Array.from(map.values());
     });
 
-    // 批量：跨页勾选（reserve-selection）+ 可对全筛选结果批量
+    // 批量：支持两种作用范围 ——
+    //   scopeMode='selected'：只处理跨页勾选的行（reserve-selection 跨页保留勾选）
+    //   scopeMode='filtered'：直接对"当前搜索/筛选结果的全部"批量（服务端按条件展开所有 offer，不依赖逐页勾选）
     const openBulkDialog = () => {
       const rows = selectedRows.value;
-      if (!rows.length) return notify.warning('请先勾选商品（可跨页勾选）');
+      bulkDialog.scopeMode = rows.length ? 'selected' : 'filtered';
       bulkDialog.selectedRows = rows;
       bulkDialog.warehouseMode = 'all';
       bulkDialog.warehouseId = bulkWarehouseOptions.value[0]?.warehouseId || '';
@@ -210,10 +212,15 @@ window.YandexInventoryManagementView = {
     };
 
     const refreshBulkPreview = () => {
-      const rows = bulkDialog.selectedRows || [];
       const target = Math.max(0, Math.floor(Number(bulkDialog.targetStock) || 0));
-      const preview = [];
       const whId = bulkDialog.warehouseMode === 'specific' ? bulkDialog.warehouseId : '';
+      if (bulkDialog.scopeMode === 'filtered') {
+        // 不枚举行：预览只统计"将影响的商品数（当前筛选总数）"，提交时后端按条件展开
+        bulkDialog.preview = [{ _scope: true, offerId: '', name: `当前筛选结果全部商品（${pagination.total} 个）`, warehouseId: whId, warehouseName: whId ? '' : '全部仓库', current: 0, target }];
+        return;
+      }
+      const rows = bulkDialog.selectedRows || [];
+      const preview = [];
       for (const r of rows) {
         const whs = (r.perWarehouse || []).filter((w) => !whId || String(w.warehouseId) === String(whId));
         for (const w of whs) {
@@ -232,16 +239,33 @@ window.YandexInventoryManagementView = {
     };
 
     const submitBulkStock = async () => {
-      const rows = bulkDialog.preview;
-      if (!rows.length) return notify.warning('所选商品在当前仓库下无库存行');
       bulkDialog.submitting = true;
       try {
         const sid = getStoreId();
-        const res = await axios.post('/api/yandex/stocks/update', {
-          store_id: sid,
-          items: rows.map((r) => ({ offerId: r.offerId, warehouseId: r.warehouseId, stock: r.target })),
-        });
-        notify.success(`已批量提交 ${rows.length} 条库存更新到 Yandex（${res.data.chunks || 1} 批）`);
+        let payload;
+        if (bulkDialog.scopeMode === 'filtered') {
+          payload = {
+            store_id: sid,
+            scope: {
+              search: search.value,
+              stock: Math.max(0, Math.floor(Number(bulkDialog.targetStock) || 0)),
+              ...(bulkDialog.warehouseMode === 'specific' && bulkDialog.warehouseId ? { warehouseId: bulkDialog.warehouseId } : {}),
+            },
+          };
+        } else {
+          const rows = bulkDialog.preview.filter((r) => !r._scope);
+          if (!rows.length) return notify.warning('所选商品在当前仓库下无库存行');
+          payload = {
+            store_id: sid,
+            items: rows.map((r) => ({ offerId: r.offerId, warehouseId: r.warehouseId, stock: r.target })),
+          };
+        }
+        const res = await axios.post('/api/yandex/stocks/update', payload);
+        const updatedRows = Number(res.data?.updated_rows || 0);
+        const msg = bulkDialog.scopeMode === 'filtered'
+          ? `已对当前筛选的全部商品提交库存更新（${updatedRows} 条行，${res.data.chunks || 1} 批）`
+          : `已批量提交 ${bulkDialog.preview.length} 条库存更新到 Yandex（${res.data.chunks || 1} 批）`;
+        notify.success(msg);
         bulkDialog.visible = false;
         selectedRows.value = [];
         pagination.currentPage = 1;
@@ -342,12 +366,14 @@ window.YandexInventoryManagementView = {
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap">
-          <div style="font-size:13px; color:#475569" v-if="selectedRows.length">
-            已选择 <b style="color:#2563eb">{{ selectedRows.length }}</b> 个商品（跨页勾选有效）
+          <div style="font-size:13px; color:#475569">
+            <template v-if="selectedRows.length">已勾选 <b style="color:#2563eb">{{ selectedRows.length }}</b> 个商品（跨页勾选有效） · </template>
+            当前筛选共 <b style="color:#111827">{{ pagination.total }}</b> 个商品
+            <el-button v-if="!selectedRows.length" link type="primary" size="small" style="margin-left:8px" @click="fetchInventory">刷新统计</el-button>
           </div>
           <div style="flex:1"></div>
-          <el-button size="large" type="warning" plain :disabled="!selectedRows.length" @click="openBulkDialog">
-            批量设置库存 ({{ selectedRows.length }})
+          <el-button size="large" type="warning" plain :disabled="!pagination.total" @click="openBulkDialog">
+            批量设置库存
           </el-button>
         </div>
 
@@ -441,14 +467,15 @@ window.YandexInventoryManagementView = {
       </el-dialog>
 
       <!-- 批量设置库存弹窗 -->
-      <el-dialog v-model="bulkDialog.visible" title="批量设置库存" width="680px" destroy-on-close>
-        <el-alert type="info" :closable="false" show-icon style="margin-bottom:14px" title="将对勾选的商品批量写入库存（FIT）。可跨页勾选，一次最多处理当前勾选的所有商品。"></el-alert>
+      <el-dialog v-model="bulkDialog.visible" title="批量设置库存" width="760px" destroy-on-close>
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom:14px"
+          :title="bulkDialog.scopeMode === 'filtered' ? '将对「当前搜索/筛选结果」的全部商品批量写入库存（FIT），不依赖逐页勾选，可一次处理整店几千个商品。' : '将对勾选的商品批量写入库存（FIT），勾选可跨页保留。'" />
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px">
           <div>
-            <div style="font-size:13px; font-weight:700; margin-bottom:8px; color:#475569">作用范围</div>
-            <el-radio-group v-model="bulkDialog.warehouseMode" @change="refreshBulkPreview">
-              <el-radio-button label="all">勾选商品全部仓库</el-radio-button>
-              <el-radio-button label="specific">指定同一仓库</el-radio-button>
+            <div style="font-size:13px; font-weight:700; margin-bottom:8px; color:#475569">处理对象</div>
+            <el-radio-group v-model="bulkDialog.scopeMode" @change="refreshBulkPreview">
+              <el-radio-button :label="'filtered'" :disabled="!pagination.total">当前筛选全部 ({{ pagination.total }})</el-radio-button>
+              <el-radio-button :label="'selected'" :disabled="!selectedRows.length">已勾选 ({{ selectedRows.length }})</el-radio-button>
             </el-radio-group>
           </div>
           <div>
@@ -456,23 +483,42 @@ window.YandexInventoryManagementView = {
             <el-input-number v-model="bulkDialog.targetStock" :min="0" :precision="0" :step="1" controls-position="right" style="width:180px" @change="refreshBulkPreview" />
           </div>
         </div>
-        <div v-if="bulkDialog.warehouseMode === 'specific'" style="margin-bottom:14px">
-          <el-select v-model="bulkDialog.warehouseId" filterable placeholder="选择仓库" style="width:100%" @change="refreshBulkPreview">
-            <el-option v-for="w in bulkWarehouseOptions" :key="w.warehouseId" :label="w.warehouseName" :value="w.warehouseId" />
-          </el-select>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-bottom:14px">
+          <div>
+            <div style="font-size:13px; font-weight:700; margin-bottom:8px; color:#475569">仓库</div>
+            <el-radio-group v-model="bulkDialog.warehouseMode" @change="refreshBulkPreview">
+              <el-radio-button label="all">全部仓库</el-radio-button>
+              <el-radio-button label="specific">指定同一仓库</el-radio-button>
+            </el-radio-group>
+          </div>
+          <div v-if="bulkDialog.warehouseMode === 'specific'">
+            <div style="font-size:13px; font-weight:700; margin-bottom:8px; color:#475569">选择仓库</div>
+            <el-select v-model="bulkDialog.warehouseId" filterable placeholder="选择仓库" style="width:100%" @change="refreshBulkPreview">
+              <el-option v-for="w in bulkWarehouseOptions" :key="w.warehouseId" :label="w.warehouseName" :value="w.warehouseId" />
+            </el-select>
+          </div>
         </div>
         <div style="display:flex; justify-content:space-between; color:#64748b; font-size:12px; margin-bottom:8px">
-          <span>将生成 {{ bulkDialog.preview.length }} 条库存更新</span>
-          <span>覆盖 {{ bulkDialog.selectedRows.length }} 个勾选商品</span>
+          <template v-if="bulkDialog.scopeMode === 'filtered'">
+            <span>将按当前搜索条件{{ search ? '（"' + search + '"）' : '' }}批量设置：{{ pagination.total }} 个商品</span>
+            <span>每个商品写入选中的每个仓库（FIT）</span>
+          </template>
+          <template v-else>
+            <span>将生成 {{ bulkDialog.preview.filter(r => !r._scope).length }} 条库存更新</span>
+            <span>覆盖 {{ bulkDialog.selectedRows.length }} 个勾选商品</span>
+          </template>
         </div>
-        <el-table :data="bulkDialog.preview.slice(0, 8)" size="small" border max-height="240">
+        <el-table v-if="bulkDialog.scopeMode === 'selected'" :data="bulkDialog.preview.slice(0, 8)" size="small" border max-height="240">
           <el-table-column label="图片" width="60"><template #default="{ row }"><el-image v-if="row.image" :src="row.image" style="width:40px;height:40px;border-radius:4px" fit="cover" /><div v-else style="width:40px;height:40px;background:#f1f5f9"></div></template></el-table-column>
           <el-table-column prop="offerId" label="货号" min-width="150" show-overflow-tooltip />
           <el-table-column prop="warehouseName" label="仓库" min-width="110" />
           <el-table-column prop="current" label="当前" width="80" align="right" />
           <el-table-column prop="target" label="目标" width="80" align="right" />
         </el-table>
-        <div v-if="bulkDialog.preview.length > 8" style="font-size:12px; color:#94a3b8; margin-top:6px">仅预览前 8 条，其余会一起提交。</div>
+        <div v-else style="border:1px dashed #cbd5e1; border-radius:6px; padding:18px; text-align:center; color:#64748b; background:#f8fafc">
+          当前筛选 {{ pagination.total }} 个商品将在提交时由服务端全部展开处理（数量多时自动分批提交，无需逐页勾选）。
+        </div>
+        <div v-if="bulkDialog.scopeMode === 'selected' && bulkDialog.preview.filter(r => !r._scope).length > 8" style="font-size:12px; color:#94a3b8; margin-top:6px">仅预览前 8 条，其余会一起提交。</div>
         <template #footer>
           <el-button @click="bulkDialog.visible = false">取消</el-button>
           <el-button type="primary" :loading="bulkDialog.submitting" @click="submitBulkStock">提交到 Yandex</el-button>

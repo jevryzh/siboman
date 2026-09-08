@@ -4706,13 +4706,6 @@ app.post("/api/yandex/stocks/update", requireAuth, async (req, res, next) => {
   try {
     const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
     const context = await getYandexMarketContext({ storeId, userId: req.user.id });
-    const items = Array.isArray(req.body?.items) ? req.body.items : [];
-    if (!items.length) return res.status(400).json({ success: false, error: "items 不能为空" });
-    // Yandex 官方：更新库存用 PUT /v2/campaigns/{campaignId}/offers/stocks，
-    // body: { skus: [{ warehouseId, sku, items: [{ type:"FIT", count }] }] }
-    // 旧实现用了不存在的 POST .../offers/stocks/update → 一直 404，批量改库存不可用。
-    // 仓库可能分属多个 campaign（店铺下多个可用仓库）→ 按 warehouseId→campaignId 分组，
-    // 每组单独 PUT 到对应 campaign，保证跨仓库批量都能写进去。
     const storeKey = String(context.storeId || context.businessId || "default");
     const cached = yandexStocksCache.get(storeKey);
     const cachedWh = (cached?.warehouses || []);
@@ -4727,20 +4720,68 @@ app.post("/api/yandex/stocks/update", requireAuth, async (req, res, next) => {
         for (const w of (whResp?.result?.warehouses || [])) campaignByWarehouse.set(String(w.id), String(w.campaignId || ""));
       } catch (e) { console.warn("[yandex-stocks] update 读取仓库映射失败:", e.message); }
     }
-    // 分组：campaignId -> [{warehouseId, sku, items}]
+    // Yandex 官方：更新库存用 PUT /v2/campaigns/{campaignId}/offers/stocks，
+    // body: { skus: [{ warehouseId, sku, items: [{ type:"FIT", count }] }] }
+    // 旧实现用了不存在的 POST .../offers/stocks/update → 一直 404，批量改库存不可用。
+    // 仓库可能分属多个 campaign（店铺下多个可用仓库）→ 按 warehouseId→campaignId 分组，
+    // 每组单独 PUT 到对应 campaign，保证跨仓库批量都能写进去。
+
+    // 两种模式：
+    //   A) items: 显式行 [{offerId, warehouseId, stock}]（勾选模式，支持跨页累计）
+    //   B) scope:  { search?, warehouseId?, stock } —— 对"当前筛选结果全部"批量，
+    //      由服务端在缓存快照里按 search 匹配所有 offer 并展开到其各仓库行（避免前端只选得到一页）。
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    const scope = req.body?.scope && typeof req.body.scope === "object" ? req.body.scope : null;
+    const targetStock = Math.max(0, Math.floor(Number(scope?.stock ?? req.body?.stock ?? -1)) || 0);
+
+    if (!items.length && !scope) return res.status(400).json({ success: false, error: "items 或 scope 至少提供一个" });
+
+    // 组装目标行：[{offerId, warehouseId}]
+    let targetRows = [];
+    if (scope) {
+      const q = String(scope.search || "").trim().toLowerCase();
+      const onlyWh = String(scope.warehouseId || "").trim();
+      const grouped = new Map(); // offerId -> row meta
+      if (!cached || !cached.offers?.length) {
+        return res.status(409).json({ success: false, error: "库存快照尚未就绪，请先同步 Yandex 全量后再执行按条件批量" });
+      }
+      for (const o of cached.offers) {
+        const offerId = String(o.offerId || "");
+        if (!offerId) continue;
+        if (q && !offerId.toLowerCase().includes(q)) continue;
+        if (onlyWh && String(o.warehouseId) !== onlyWh) continue;
+        if (!grouped.has(offerId)) grouped.set(offerId, { offerId, warehouses: new Map() });
+        const row = grouped.get(offerId);
+        const key = String(o.warehouseId);
+        if (!row.warehouses.has(key)) row.warehouses.set(key, o.warehouseId);
+      }
+      for (const entry of grouped.values()) {
+        for (const warehouseId of entry.warehouses.values()) {
+          targetRows.push({ offerId: entry.offerId, warehouseId });
+        }
+      }
+      if (!targetRows.length) return res.status(404).json({ success: false, error: "当前筛选条件下没有可批量设置的库存行" });
+    } else {
+      for (const it of items) {
+        if (!it.offerId || !it.warehouseId) continue;
+        targetRows.push({ offerId: String(it.offerId), warehouseId: it.warehouseId, stock: Number(it.stock) });
+      }
+    }
+    if (!targetRows.length) return res.status(400).json({ success: false, error: "无有效行（缺少 offerId/warehouseId）" });
+
+    // 按 campaignId 分组构造 skus
     const groups = new Map();
-    for (const it of items) {
-      if (!it.offerId || !it.warehouseId) continue;
-      const cid = campaignByWarehouse.get(String(it.warehouseId)) || String(context.campaignId || "");
+    for (const row of targetRows) {
+      const cid = campaignByWarehouse.get(String(row.warehouseId)) || String(context.campaignId || "");
+      const stock = Number.isFinite(Number(row.stock)) ? Math.max(0, Math.floor(Number(row.stock))) : targetStock;
       const skuItem = {
-        warehouseId: Number(it.warehouseId),
-        sku: String(it.offerId),
-        items: [{ type: "FIT", count: Math.max(0, Math.floor(Number(it.stock) || 0)) }],
+        warehouseId: Number(row.warehouseId),
+        sku: String(row.offerId),
+        items: [{ type: "FIT", count: stock }],
       };
       if (!groups.has(cid)) groups.set(cid, []);
       groups.get(cid).push(skuItem);
     }
-    if (!groups.size) return res.status(400).json({ success: false, error: "无有效行（缺少 offerId/warehouseId）" });
     // 单次请求过大时分批（Yandex 建议单批 ≤500），避免超时/被拒
     const CHUNK = 500;
     const results = [];
@@ -4756,7 +4797,7 @@ app.post("/api/yandex/stocks/update", requireAuth, async (req, res, next) => {
     // 让下次读取尽快看到新库存：保留旧数据服务，同时后台刷新
     yandexStocksCache.delete(storeKey);
     setTimeout(() => { refreshYandexStocksStore(context.storeId || "__env__").catch(() => {}); }, 500);
-    res.json({ success: true, chunks: results.length, response: results });
+    res.json({ success: true, chunks: results.length, updated_rows: targetRows.length, response: results });
   } catch (error) { next(error); }
 });
 
