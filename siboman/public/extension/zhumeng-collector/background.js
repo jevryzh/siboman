@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.103";
+const VERSION = "2.2.9.108";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -951,6 +951,89 @@ async function runQueuedSourcingJob(remoteJob) {
   await completeSourcingJob(job);
 }
 
+// Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
+async function runQueuedYandexResearchJob(remoteJob) {
+  const payload = remoteJob.payload || {};
+  const rawItems = Array.isArray(payload.items) ? payload.items : [];
+  const declaredTotal = Math.max(0, Number(remoteJob.total || rawItems.length || 0));
+  const items = declaredTotal > 0 ? rawItems.slice(0, declaredTotal) : rawItems;
+  const job = {
+    id: remoteJob.id,
+    status: "running",
+    phase: "插件已领取，开始 Yandex 核价（1688 官方同款）",
+    total: items.length,
+    processed: Math.min(Math.max(0, Number(remoteJob.processed || 0)), items.length),
+    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
+    results: [],
+    error: "",
+    cancelRequested: false,
+    abortController: typeof AbortController === "function" ? new AbortController() : null,
+  };
+  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取 Yandex 核价任务（${items.length} 项）。`));
+  await setActiveSourcingJob(job);
+  await reportSourcingProgress(job);
+  const stopCancelMonitor = startSourcingCancelMonitor(job);
+  try {
+    for (let index = job.processed; index < items.length; index += 1) {
+      if (job.cancelRequested) break;
+      const item = items[index] || {};
+      const offerId = String(item.offerId || "");
+      const images = Array.isArray(item.images) ? item.images.filter(Boolean) : [];
+      const result = { offerId, name: item.name || "", candidates: [], searchError: "" };
+      job.phase = `1688 搜图 ${index + 1}/${items.length}`;
+      job.logs.push(makeLog(`为货号 ${offerId} 搜索 1688 同款（${images.length} 张图）`));
+      await reportSourcingProgress(job);
+      try {
+        if (!offerId) throw new Error("缺少 offerId");
+        if (!images.length) throw new Error("无商品图");
+        const seen = new Set();
+        let imgIndex = 0;
+        for (const img of images) {
+          if (job.cancelRequested) break;
+          imgIndex += 1;
+          const stepStarted = Date.now();
+          const step = await withSourcingStepTimeout(job, `1688 核价搜图 ${offerId}`, 120_000,
+            () => search1688ByImageInPlugin(img, 3, job, { lightMode: true }));
+          const stepMs = Date.now() - stepStarted;
+          const stepOk = !!(step && step.success === true && Array.isArray(step.candidates));
+          const stepErr = String((step && (step.error || step.message)) || (step ? "" : "搜图步骤无返回（可能被超时中断）")).slice(0, 200);
+          if (stepOk) {
+            for (const c of step.candidates) {
+              const oid = String(c?.offerId || c?.id || c?.itemId || "");
+              if (!oid || seen.has(oid)) continue;
+              seen.add(oid);
+              result.candidates.push({ source: "plugin-1688", ...c });
+            }
+            job.logs.push(makeLog(`货号 ${offerId} 第 ${imgIndex}/${images.length} 张图搜 OK：接口返回 ${step.candidates.length} 个原始候选（${stepMs}ms）` + (step.candidates[0]
+              ? `；首候选 keys=[${Object.keys(step.candidates[0]).join(",")}] oid="${String(step.candidates[0]?.offerId || step.candidates[0]?.id || step.candidates[0]?.itemId || step.candidates[0]?.offerId1688 || "")}" img="${String((step.candidates[0]?.image || step.candidates[0]?.img || "").slice(0, 60))}"`
+              : "；候选对象为空"), "info"));
+          } else {
+            if (!result.candidates.length) result.searchError = stepErr || "1688 搜图无结果";
+            job.logs.push(makeLog(`货号 ${offerId} 第 ${imgIndex}/${images.length} 张图未命中：${stepErr || "接口返回空结果"}（${stepMs}ms）。`, "warn"));
+          }
+          if (result.candidates.length) break; // 首张命中即不再搜后续图
+        }
+        job.logs.push(makeLog(result.candidates.length
+          ? `货号 ${offerId} 找到 ${result.candidates.length} 个 1688 同款候选。`
+          : `货号 ${offerId} 未找到同款：${result.searchError || "无候选"}`, result.candidates.length ? "info" : "warn"));
+      } catch (e) {
+        result.searchError = (e?.message || String(e)).slice(0, 300);
+        job.logs.push(makeLog(`货号 ${offerId} 搜图失败：${result.searchError}`, "error"));
+      }
+      job.results.push(result);
+      job.processed = Math.min(index + 1, job.total);
+      job.phase = `已完成 ${job.processed}/${job.total}`;
+      await reportSourcingProgress(job);
+    }
+  } finally {
+    stopCancelMonitor();
+  }
+  job.status = job.cancelRequested ? "canceled" : (job.results.some((r) => r.candidates.length) ? "done" : "error");
+  job.error = job.status === "error" ? "全部未找到 1688 同款" : "";
+  job.phase = job.status === "done" ? "已完成，正在收尾" : (job.status === "canceled" ? "已停止" : "全部未匹配");
+  await completeSourcingJob(job);
+}
+
 async function pollSourcingQueueOnce() {
   if (sourcingBusy) return;
   sourcingBusy = true;
@@ -961,11 +1044,12 @@ async function pollSourcingQueueOnce() {
       : "逐梦插件在线，可领取单品找货任务";
     const data = await erpApi("/api/worker/jobs/next", {
       method: "POST",
-      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run"] },
+      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research"] },
     });
     if (data.job) {
-      console.log(`[SW ${VERSION}] 领取单品找货任务: ${data.job.id}`);
-      await runQueuedSourcingJob(data.job);
+      console.log(`[SW ${VERSION}] 领取任务: ${data.job.id} kind=${data.job.kind}`);
+      if (data.job.kind === "yandex-research") await runQueuedYandexResearchJob(data.job);
+      else await runQueuedSourcingJob(data.job);
     }
   } catch (e) {
     const msg = e.message || String(e);
@@ -1422,6 +1506,7 @@ function normalize1688OfferItemInPlugin(item, index) {
   const moqText = moqItem?.text || data.minOrderQuantity || data.moq || data.quantityBegin || data.beginAmount || "";
   return {
     rank: index + 1,
+    offerId,
     title,
     price: data.priceInfo?.price || data.price || data.discountPrice || data.salePrice || "",
     image: normalizeUrlInPlugin(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || data.imageUrl || data.imgUrl || ""),
@@ -1640,6 +1725,7 @@ async function searchOffersByImageIdInPlugin(imageId, cookieState, job = null) {
     const moqText = moqItem?.text || data.minOrderQuantity || data.moq || "";
     return {
       rank: index + 1,
+      offerId,
       title,
       price: data.priceInfo?.price || data.price || "",
       image: normalizeUrlInPlugin(data.offerPicUrl || data.odPicUrl || data.mainImage || data.picUrl || ""),
@@ -2312,13 +2398,16 @@ function rank1688CandidatesForOzonInPlugin(candidates) {
 }
 
 function addTrafficBaitAssessmentInPlugin(candidate) {
-  const unitPriceRmb = extract1688MinimumTierUnitPriceInPlugin(candidate.priceDetails || candidate.price);
-  const values = extractRmbValuesInPlugin([candidate.price, candidate.priceDetails, candidate.minOrderQuantity, candidate.moq].join(" "));
-  const positive = values.filter(v => v > 0).sort((a, b) => a - b);
-  const minPriceRmb = positive[0] ?? null;
-  const maxPriceRmb = positive[positive.length - 1] ?? null;
-  const trafficBaitRisk = (minPriceRmb !== null && minPriceRmb < 1) ||
-    (minPriceRmb !== null && maxPriceRmb !== null && maxPriceRmb >= 10 && maxPriceRmb / Math.max(minPriceRmb, 0.01) >= 10);
+  const rawValues = extractRmbValuesInPlugin([candidate.price, candidate.priceDetails, candidate.minOrderQuantity, candidate.moq].join(" "))
+    .filter(v => v > 0).sort((a, b) => a - b);
+  const rawMin = rawValues[0] ?? null;
+  const maxPriceRmb = rawValues[rawValues.length - 1] ?? null;
+  // v2.2.9.108: 1688 常见 ¥1 引流档——展示价取排除 <2 元引流档后的最低实际档，避免候选价全为 1 元
+  const meaningful = rawValues.filter(v => v >= 2);
+  const minPriceRmb = meaningful[0] ?? rawMin;
+  const unitPriceRmb = minPriceRmb;
+  const trafficBaitRisk = (rawMin !== null && rawMin < 1) ||
+    (rawMin !== null && maxPriceRmb !== null && maxPriceRmb >= 10 && maxPriceRmb / Math.max(rawMin, 0.01) >= 10);
   return {
     ...candidate,
     price: unitPriceRmb !== null ? formatPriceNumberInPlugin(unitPriceRmb) : normalize1688PriceOnlyInPlugin(candidate.price || candidate.priceDetails),
