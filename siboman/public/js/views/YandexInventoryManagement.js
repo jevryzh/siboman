@@ -13,7 +13,7 @@ window.YandexInventoryManagementView = {
     const stockDialog = Vue.reactive({ visible: false, loading: false, row: null, stocks: [], submitting: false });
     const bulkDialog = Vue.reactive({ visible: false, submitting: false, scopeMode: 'filtered', warehouseMode: 'all', warehouseId: '', targetStock: 0, selectedRows: [], preview: [] });
     const selectedRows = Vue.ref([]);
-    const threshold = Vue.ref(Math.max(1, Number(localStorage.getItem('yandexInvLowStockThreshold') || 5)));
+    const onlyOutOfStock = Vue.ref(false); // 只看缺货（库存=0）
     const storeName = Vue.ref('');
     let warmTimer = null;
 
@@ -36,6 +36,7 @@ window.YandexInventoryManagementView = {
           params: {
             store_id: sid,
             search: search.value,
+            stock_state: onlyOutOfStock.value ? 'out' : 'all',
             page: pagination.currentPage,
             page_size: pagination.pageSize,
             ...(opts.refresh ? { refresh: 1 } : {}),
@@ -69,7 +70,6 @@ window.YandexInventoryManagementView = {
       return {
         total: pagination.total,
         outOfStock: rows.filter((r) => totalStock(r) === 0).length,
-        lowStock: rows.filter((r) => totalStock(r) > 0 && totalStock(r) < threshold.value).length,
       };
     });
 
@@ -92,7 +92,13 @@ window.YandexInventoryManagementView = {
         const poll = setInterval(async () => {
           try {
             const r = await axios.get('/api/yandex/stocks', {
-              params: { store_id: sid, page: pagination.currentPage, page_size: pagination.pageSize },
+              params: {
+                store_id: sid,
+                search: search.value,
+                stock_state: onlyOutOfStock.value ? 'out' : 'all',
+                page: pagination.currentPage,
+                page_size: pagination.pageSize,
+              },
             });
             if (!r.data.warming && r.data.cached_at > 0) {
               clearInterval(poll);
@@ -125,7 +131,7 @@ window.YandexInventoryManagementView = {
       stockDialog.visible = true;
     };
 
-    // 写操作后等待后端重建快照（update 接口已触发后台重拉），再刷新列表
+    // 写操作后等待后端重建快照（update 接口已触发后台重拉），再刷新列表（保留当前筛选与页码）
     const refreshAfterWrite = async () => {
       const sid = getStoreId();
       const targetAt = Date.now();
@@ -134,7 +140,13 @@ window.YandexInventoryManagementView = {
         await new Promise((resolve) => setTimeout(resolve, 4000));
         try {
           const r = await axios.get('/api/yandex/stocks', {
-            params: { store_id: sid, page: pagination.currentPage, page_size: pagination.pageSize },
+            params: {
+              store_id: sid,
+              search: search.value,
+              stock_state: onlyOutOfStock.value ? 'out' : 'all',
+              page: pagination.currentPage,
+              page_size: pagination.pageSize,
+            },
           });
           if (r.data.warming) continue;
           if (r.data.cached_at > 0 && r.data.cached_at >= targetAt - 3000) {
@@ -278,9 +290,18 @@ window.YandexInventoryManagementView = {
     };
 
     const onSelectionChange = (val) => { selectedRows.value = val || []; };
-    const onThresholdChange = (v) => { threshold.value = Math.max(1, Number(v || 5)); localStorage.setItem('yandexInvLowStockThreshold', String(threshold.value)); };
+    const onOutOfStockChange = (v) => {
+      onlyOutOfStock.value = Boolean(v);
+      pagination.currentPage = 1;
+      fetchInventory();
+    };
     const onSearch = () => { pagination.currentPage = 1; fetchInventory(); };
-    const resetSearch = () => { search.value = ''; pagination.currentPage = 1; fetchInventory(); };
+    const resetSearch = () => {
+      search.value = '';
+      onlyOutOfStock.value = false;
+      pagination.currentPage = 1;
+      fetchInventory();
+    };
     const onPageChange = () => fetchInventory();
     const onSizeChange = () => { pagination.currentPage = 1; fetchInventory(); };
 
@@ -312,10 +333,10 @@ window.YandexInventoryManagementView = {
     };
 
     return {
-      inventory, loading, syncing, search, pagination, warehouses, warming, stale, syncError, stats, threshold, storeName,
+      inventory, loading, syncing, search, pagination, warehouses, warming, stale, syncError, stats, onlyOutOfStock, storeName,
       stockDialog, bulkDialog, bulkWarehouseOptions, selectedRows, cachedAt, fmtCachedAt,
       fetchInventory, handleSyncAll, refreshAfterWrite, openStockEditor, submitStockChanges, openBulkDialog, refreshBulkPreview, submitBulkStock,
-      onSelectionChange, onThresholdChange, onSearch, resetSearch, onPageChange, onSizeChange, totalStock, totalAvail,
+      onSelectionChange, onOutOfStockChange, onSearch, resetSearch, onPageChange, onSizeChange, totalStock, totalAvail,
     };
   },
   template: `
@@ -334,8 +355,8 @@ window.YandexInventoryManagementView = {
 
         <div style="display:grid; grid-template-columns:repeat(3,minmax(150px,1fr)); border:1px solid #dfe7f1; border-radius:8px; overflow:hidden; background:#fff; margin-bottom:16px">
           <div style="padding:20px 24px; border-right:1px solid #dfe7f1"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:10px">Yandex 商品数</div><strong style="font-size:28px;line-height:1;color:#111827;font-weight:900">{{ stats.total }}</strong></div>
-          <div style="padding:20px 24px; border-right:1px solid #dfe7f1"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:10px">当前页缺货</div><strong style="font-size:28px;line-height:1;color:#dc2626;font-weight:900">{{ stats.outOfStock }}</strong></div>
-          <div style="padding:20px 24px"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:10px">当前页低库存</div><strong style="font-size:28px;line-height:1;color:#d97706;font-weight:900">{{ stats.lowStock }}</strong></div>
+          <div style="padding:20px 24px; border-right:1px solid #dfe7f1"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:10px">当前结果缺货</div><strong style="font-size:28px;line-height:1;color:#dc2626;font-weight:900">{{ stats.outOfStock }}</strong></div>
+          <div style="padding:20px 24px"><div style="font-size:13px;color:#7c8798;font-weight:800;margin-bottom:10px">筛选状态</div><strong style="font-size:18px;line-height:1.2;color:#475569;font-weight:700">{{ onlyOutOfStock ? '仅看缺货' : '全部库存' }}</strong></div>
         </div>
 
         <div v-if="warming" class="el-alert el-alert--info" style="margin-bottom:12px">
@@ -359,10 +380,10 @@ window.YandexInventoryManagementView = {
           <el-button size="large" type="primary" @click="onSearch">查询</el-button>
           <el-button size="large" @click="resetSearch">重置</el-button>
           <div style="flex:1"></div>
-          <div style="display:flex; align-items:center; gap:6px">
-            <span style="font-size:13px; color:#64748b; white-space:nowrap">低库存阈值</span>
-            <el-input-number v-model="threshold" :min="1" :max="999" size="large" style="width:110px" @change="onThresholdChange" />
-          </div>
+          <el-button :type="onlyOutOfStock ? 'danger' : 'default'" size="large" :plain="!onlyOutOfStock" @click="onOutOfStockChange(!onlyOutOfStock)">
+            <el-icon v-if="onlyOutOfStock"><CircleCloseFilled /></el-icon><el-icon v-else><WarningFilled /></el-icon>
+            <span>{{ onlyOutOfStock ? '缺货筛选已开启' : '只看缺货' }}</span>
+          </el-button>
         </div>
 
         <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap">
@@ -399,7 +420,7 @@ window.YandexInventoryManagementView = {
             <template #default="{ row }">
               <el-popover placement="top" :width="360" trigger="hover">
                 <template #reference>
-                  <span :style="{ cursor:'pointer', fontWeight:800, fontSize:'16px', color: totalStock(row) === 0 ? '#dc2626' : totalStock(row) < threshold ? '#d97706' : '#16a34a' }">{{ totalStock(row) }}</span>
+                  <span :style="{ cursor:'pointer', fontWeight:800, fontSize:'16px', color: totalStock(row) === 0 ? '#dc2626' : '#16a34a' }">{{ totalStock(row) }}</span>
                 </template>
                 <div>
                   <div style="font-size:13px; font-weight:bold; margin-bottom:8px; padding-bottom:6px; border-bottom:1px solid #eee">分仓库存明细</div>
@@ -416,11 +437,10 @@ window.YandexInventoryManagementView = {
           <el-table-column label="可预留 AVAILABLE" width="150" align="right">
             <template #default="{ row }"><span style="color:#64748b; font-weight:700">{{ totalAvail(row) }}</span></template>
           </el-table-column>
-          <el-table-column label="预警" width="90" align="center">
+          <el-table-column label="状态" width="90" align="center">
             <template #default="{ row }">
               <el-tag size="small" v-if="totalStock(row) === 0" type="danger">缺货</el-tag>
-              <el-tag size="small" v-else-if="totalStock(row) < threshold" type="warning">低库存</el-tag>
-              <el-tag size="small" v-else type="success">充足</el-tag>
+              <el-tag size="small" v-else type="success">有货</el-tag>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="130" fixed="right" align="center">

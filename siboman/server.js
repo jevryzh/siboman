@@ -4677,6 +4677,13 @@ function serveYandexStocksPage(cache, query = {}, res) {
     item.perWarehouse.push({ warehouseId: o.warehouseId, campaignId: o.campaignId || "", fit: o.fit, available: o.available, updatedAt: o.updatedAt });
   }
   let items = Array.from(map.values());
+  // 库存状态过滤：out_of_stock=1 → 只看缺货(全部仓库 FIT 合计 = 0)
+  const stockState = String(query.stock_state || query.out_of_stock || "").trim().toLowerCase();
+  if (stockState === "out" || stockState === "1" || stockState === "true") {
+    items = items.filter((it) => Number(it.totalFit || 0) === 0);
+  } else if (stockState === "in" || stockState === "0" || stockState === "false") {
+    items = items.filter((it) => Number(it.totalFit || 0) > 0);
+  }
   if (q) {
     items = items.filter((it) =>
       it.offerId.toLowerCase().includes(q) || String(it.name || "").toLowerCase().includes(q)
