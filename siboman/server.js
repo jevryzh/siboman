@@ -850,11 +850,20 @@ app.post("/api/yandex/ai-optimize-preview", requireAuth, async (req, res, next) 
           rows.push({ offerId, ok: false, error: "AI 返回格式无法解析" });
           continue;
         }
+        // 属性白名单加固：只接受「待补必填/推荐」清单（pending）内的属性，枚举值必须取自模板 options；
+        // 丢弃 AI 自创、已存在、或测量/规格类属性（后者已由 collectPendingAttributes 移出 pending）
+        const pendingByName = new Map(pending.map((p) => [p.name, p]));
         const suggestedAttrs = (Array.isArray(parsed.attributes) ? parsed.attributes.slice(0, 30) : [])
           .filter((a) => a && String(a.name || "").trim() && String(a.value ?? "").trim())
           .map((a) => {
             const tpl = template.find((t) => t.name === a.name);
-            return { name: a.name, name_zh: yandexAttrZh(a.name), value: String(a.value).trim(), unit: a.unit || (tpl && tpl.unit) || "" };
+            return { name: String(a.name).trim(), name_zh: yandexAttrZh(a.name), value: String(a.value).trim(), unit: a.unit || (tpl && tpl.unit) || "" };
+          })
+          .filter((a) => {
+            const meta = pendingByName.get(a.name);
+            if (!meta) return false; // 不在待补清单（已存在/测量规格类/AI 自创）→ 丢弃
+            if (meta.options && meta.options.length && !meta.options.includes(a.value)) return false; // 枚举值不在选项内 → 丢弃
+            return true;
           });
         rows.push({
           offerId,
@@ -994,9 +1003,9 @@ async function insertAiRecord({ userId, storeId, offerId, action, titleChanged, 
   } catch (_e) { /* 记录失败不影响主流程 */ }
 }
 
-// 从类目模板筛出"空着的必填/推荐属性"（测量类数值属性禁止 AI 猜测，留给卖家实测手填）
+// 从类目模板筛出"空着的必填/推荐属性"（测量/规格类属性禁止 AI 猜测，留给卖家实测手填）
 function collectPendingAttributes(template, currentAttrs) {
-  const MEASURE = /(длин|ширин|высот|глубин|вес|масса|диаметр|объем|толщин|length|width|height|weight|diametr)/i;
+  const MEASURE = /(длин|ширин|высот|глубин|вес|масса|диаметр|объем|толщин|length|width|height|weight|diametr|разрешени|обзор|скорост|мощност|частот|емкост|напряжени|диагонал|дальност|capacity|resolution|speed|power|frequency|voltage|angle)/i;
   const pending = [];
   const skipped = [];
   for (const p of template) {
@@ -1005,7 +1014,8 @@ function collectPendingAttributes(template, currentAttrs) {
     const required = p.required === true;
     const recommended = Array.isArray(p.recommendationTypes) && p.recommendationTypes.some((r) => String(r).toUpperCase() !== "ADDITIONAL");
     if (!required && !recommended) continue;
-    if ((p.type === "NUMERIC" || p.type === "NUMERIC_INTEGER") && MEASURE.test(p.name)) {
+    // 测量/规格词对非枚举类型一律跳过（数值或自由文本 AI 都可能虚构）；枚举类属性交由预览端 options 校验兜底
+    if (p.type !== "ENUM" && MEASURE.test(p.name)) {
       skipped.push(p.name);
       continue;
     }
