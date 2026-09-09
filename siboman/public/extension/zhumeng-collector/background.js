@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.108";
+const VERSION = "2.2.9.109";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -21,6 +21,8 @@ const MTOP_URL = "https://h5api.m.1688.com/h5/mtop.relationrecommend.wirelessrec
 const MTOP_APP_KEY = "12574478";
 const WORKER_NAME = `zhumeng-plugin-${chrome.runtime.id.slice(0, 8)}`;
 let sourcingBusy = false;
+let sourcingQueueLoopStarted = false;
+let quickPollToken = 0;
 let workerAuthToken = "";
 let imageSearchQueue = Promise.resolve();
 let last1688SearchAt = 0;
@@ -1060,8 +1062,36 @@ async function pollSourcingQueueOnce() {
 }
 
 function startSourcingQueueLoop() {
+  if (sourcingQueueLoopStarted) {
+    // 已启动：仅重置一次快速轮询（取消旧链再开新链，避免多条并行）
+    quickPollToken += 1;
+    const myToken = quickPollToken;
+    const quickPollAgain = () => {
+      if (myToken !== quickPollToken) return;
+      pollSourcingQueueOnce().catch((e) => {
+        console.warn(`[SW ${VERSION}] 快速领取轮询失败: ${e.message || e}`);
+      }).finally(() => {
+        if (myToken === quickPollToken) setTimeout(quickPollAgain, 4000);
+      });
+    };
+    setTimeout(quickPollAgain, 400);
+    return;
+  }
+  sourcingQueueLoopStarted = true;
   chrome.alarms.create("zhumeng-single-sourcing", { periodInMinutes: 0.5 });
-  setTimeout(() => pollSourcingQueueOnce(), 1500);
+  // 领取提速：SW 存活期间每 4s 快速轮询几次（alarm 0.5min 是 MV3 下限，单靠它领取最坏等 30s）。
+  // 链式 setTimeout 在 SW 休眠后自动停止，由 alarm 再次唤醒兜底，不影响 MV3 生命周期约束。
+  quickPollToken += 1;
+  const myToken = quickPollToken;
+  const quickPoll = () => {
+    if (myToken !== quickPollToken) return;
+    pollSourcingQueueOnce().catch((e) => {
+      console.warn(`[SW ${VERSION}] 快速领取轮询失败: ${e.message || e}`);
+    }).finally(() => {
+      if (myToken === quickPollToken) setTimeout(quickPoll, 4000);
+    });
+  };
+  setTimeout(() => quickPoll(), 800);
 }
 
 async function run1688ImageSearchQueued(fn) {
@@ -1460,7 +1490,8 @@ async function collect1688CandidatesInPlugin(base64Image, cookieState, maxCandid
   assertSourcingNotCanceled(job);
   const imageId = await uploadImageTo1688InPlugin(base64Image, cookieState, job);
   assertSourcingNotCanceled(job);
-  await sleep(randomInt(1200, 2800));
+  // v2.2.9.108: 找货轻量模式缩短上传后的等待，核价任务不再每次等 1.2-2.8s
+  await sleep(opts.lightMode === true ? randomInt(500, 1100) : randomInt(1200, 2800));
   assertSourcingNotCanceled(job);
   const candidates = (await searchOffersByImageIdInPlugin(imageId, cookieState, job)).slice(0, maxCandidates);
   assertSourcingNotCanceled(job);
@@ -1476,6 +1507,12 @@ async function enrich1688CandidatesInPlugin(candidates, job = null, opts = {}) {
       await sleep(opts.lightMode === true ? randomInt(1200, 3800) : randomInt(2500, 6500));
     }
     assertSourcingNotCanceled(job);
+    // v2.2.9.108: 找货轻量模式只为第 1 个候选开详情页补 MOQ/运费，
+    //   其余候选直接用搜索接口返回字段（详情 tab 逐个开关是核价慢的主因，报价场景不需要）。
+    if (opts.lightMode === true && index > 0) {
+      enriched.push(addTrafficBaitAssessmentInPlugin(candidate));
+      continue;
+    }
     const details = await scrape1688CandidateDetailsInPlugin(candidate, job, opts);
     enriched.push(addTrafficBaitAssessmentInPlugin(merge1688CandidateDetailsInPlugin(candidate, details)));
   }
