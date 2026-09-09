@@ -5130,7 +5130,7 @@ function alphaTopCandidates(matches, limit = 3) {
   for (const it of matches) {
     const price = Number(it.price || it.currentPrice || it.minPrice || 0);
     const img = it.originImageUrl || it.aiImageUrl || it.imageUrl || '';
-    if (!(price >= 3 && price <= 300)) continue;
+    if (!(price >= 1 && price <= 500)) continue;
     if (!img) continue; // 无图候选丢弃（避免“有链接没图”无法核对）
     list.push({ offerId: it.offerId || it.itemId || '',
                 title: (it.originTitle || it.aiTitle || it.title || '').slice(0, 120),
@@ -5230,13 +5230,61 @@ app.post("/api/yandex/price-research", requireAuth, async (req, res, next) => {
 // 图搜无结果或商品无重量 → 记 need_weight / no_match 待人工，不自动定价（避免按错误成本亏钱）。
 const yandexBulkPricingRunning = new Map(); // jobId -> true
 
+// 转存图片到本服务 public/uploads，返回公网 URL 供 AlphaShop 图搜抓取。
+// 若已是公网可抓域名则原样返回；下载失败返回空串（调用方跳过该图）。
+function medianOf(nums) {
+  const sorted = [...nums].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+function bulkPricingPublicBase() {
+  return String(process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "https://test.renwz.cn").replace(/\/+$/, "");
+}
+async function proxyImageToPublicUrl(imgUrl) {
+  const url = String(imgUrl || "").trim();
+  if (!/^https?:\/\//i.test(url)) return "";
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    // 已确认可被 AlphaShop 抓取的域名直接放行（1688 CDN + 本服务）。其余一律转存（含 Ozon CDN ir.ozone.ru，实测其直连图搜为 0 结果）。
+    if (/(alicdn\.com|renwz\.cn)$/.test(host)) return url;
+  } catch { return ""; }
+  // 其余域名：下载 → 存 uploads → 公网 URL
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const resp = await fetch(url, { signal: controller.signal, headers: { Referer: "https://www.1688.com/" } });
+    if (!resp.ok) return "";
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length || buf.length > 8 * 1024 * 1024) return "";
+    const uploadDir = path.join(PUBLIC_DIR, "uploads");
+    await fs.mkdir(uploadDir, { recursive: true });
+    const name = `bulk-${crypto.randomBytes(10).toString("hex")}.jpg`;
+    await fs.writeFile(path.join(uploadDir, name), buf);
+    return `${bulkPricingPublicBase()}/uploads/${name}`;
+  } catch { return ""; } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function researchOfferViaAlpha(offer, context, userId, storeId) {
   const offerId = String(offer?.offer_id || offer?.offerId || "");
-  const images = Array.isArray(offer?.images) && offer.images.length
+  const rawImages = Array.isArray(offer?.images) && offer.images.length
     ? offer.images.filter(Boolean).slice(0, 3)
     : (offer?.image ? [offer.image] : []);
   const title = String(offer?.name || offer?.title || "").trim();
-  if (!offerId || !images.length) return { offerId, ok: false, reason: "no_image", candidates: [] };
+  if (!offerId || !rawImages.length) return { offerId, ok: false, reason: "no_image", candidates: [] };
+  // AlphaShop 图搜只能抓取公网可达域名（alicdn/test.renwz.cn/uploads 等）。
+  // Ozon/Yandex 原图常落在卖家 CDN（xiongmaoshangjia.cn 等）导致图搜 0 结果 → 下载后转存本服务 /uploads 再搜。
+  const images = [];
+  for (const imgUrl of rawImages) {
+    const proxied = await proxyImageToPublicUrl(imgUrl).catch((e) => {
+      console.warn(`[yandex-bulk] 转存商品图失败 ${String(imgUrl).slice(0, 70)}: ${e.message || e}`);
+      return "";
+    });
+    if (proxied) images.push(proxied);
+  }
+  if (!images.length) return { offerId, ok: false, reason: "no_image", candidates: [] };
   let matches = [];
   let matchSource = "none";
   const seen = new Set();
@@ -5277,9 +5325,9 @@ async function researchOfferViaAlpha(offer, context, userId, storeId) {
   };
   if (!best) return { ...base, ok: false, reason: "no_match" };
   if (!(weightKg > 0)) return { ...base, ok: false, reason: "need_weight", best };
-  // 采购价取候选最低可买档（过滤引流低价）
-  const prices = candidates.map((c) => Number(c.price || 0)).filter((p) => p >= 3 && p <= 300);
-  const purchaseCny = prices.length ? Math.min(...prices) : Number(best.price || 0);
+  // 采购价：候选有效价（≥1，过滤 0.x 引流/异常高）取中位数，避免最低价可能是凑单引流档
+  const prices = candidates.map((c) => Number(c.price || 0)).filter((p) => p >= 1 && p <= 500);
+  const purchaseCny = prices.length ? medianOf(prices) : Number(best.price || 0);
   if (!(purchaseCny > 0)) return { ...base, ok: false, reason: "bad_price", best };
   const suggest = yandexSuggestPrice({
     purchaseCny, weightKg,
@@ -5313,10 +5361,11 @@ async function researchOfferViaAlpha(offer, context, userId, storeId) {
   return { ...base, ok: true, reason: "priced", best, purchaseCny, suggestPriceCny: suggest.priceCny, suggest };
 }
 
-async function runYandexBulkPricingJob(jobId, userId, storeId, offerIds) {
+async function runYandexBulkPricingJob(jobId, userId, storeId, offerIds, opts = {}) {
   if (yandexBulkPricingRunning.get(jobId)) return;
   yandexBulkPricingRunning.set(jobId, true);
-  const results = [];
+  const resumeFrom = Math.max(0, Number(opts.resumeFrom || 0));
+  const results = Array.isArray(opts.existingResults) ? opts.existingResults.slice() : [];
   try {
     const context = await getYandexMarketContext({ storeId: storeId || null, userId, refresh: false }).catch(() => null);
     const offerCache = yandexOfferCacheObj(storeId || "__env__");
@@ -5325,8 +5374,9 @@ async function runYandexBulkPricingJob(jobId, userId, storeId, offerIds) {
       const oid = String(it?.offer_id || it?.offerId || "");
       if (oid) byId.set(oid, it);
     }
-    await updateDbJob(jobId, { status: "running", phase: "正在批量核价…", logs: [{ at: new Date().toISOString(), level: "info", message: `服务端开始批量 AlphaShop 核价，共 ${offerIds.length} 条。` }] });
-    for (let i = 0; i < offerIds.length; i += 1) {
+    const phaseText = resumeFrom > 0 ? `断点续跑（${resumeFrom} 条已完成），从 ${resumeFrom + 1}/${offerIds.length} 继续` : "正在批量核价…";
+    await updateDbJob(jobId, { status: "running", phase: phaseText, logs: [{ at: new Date().toISOString(), level: "info", message: phaseText }] });
+    for (let i = resumeFrom; i < offerIds.length; i += 1) {
       const oid = String(offerIds[i] || "");
       if (!oid) continue;
       const offer = byId.get(oid) || {};
@@ -5355,6 +5405,35 @@ async function runYandexBulkPricingJob(jobId, userId, storeId, offerIds) {
   }
 }
 
+// 服务启动后扫描“进程重启前遗留的 running bulk 任务”并断点续跑
+async function resumeStaleBulkPricingJobs() {
+  if (!db) return;
+  try {
+    const result = await db.query(
+      `SELECT id, user_id, store_id, processed, results, payload
+       FROM app_jobs
+       WHERE kind='yandex-bulk-pricing' AND status IN ('queued','running')
+       ORDER BY created_at DESC LIMIT 3`
+    );
+    for (const row of result.rows || []) {
+      const offerIds = (row.payload && Array.isArray(row.payload.offerIds) ? row.payload.offerIds : []).map(String);
+      if (!offerIds.length) { await updateDbJob(row.id, { status: "error", phase: "任务缺少 offer 列表" }); continue; }
+      const processed = Math.min(Math.max(0, Number(row.processed || 0)), offerIds.length);
+      const existingResults = Array.isArray(row.results) ? row.results : [];
+      if (processed >= offerIds.length) {
+        await updateDbJob(row.id, { status: "done", phase: "批量核价完成（进程重启前已完成全部）" });
+        continue;
+      }
+      console.log(`[yandex-bulk-pricing] 续跑遗留任务 ${row.id} 从 ${processed + 1}/${offerIds.length}`);
+      setTimeout(() => {
+        runYandexBulkPricingJob(row.id, row.user_id, row.store_id, offerIds, { resumeFrom: processed, existingResults }).catch(() => {});
+      }, 1500);
+    }
+  } catch (e) {
+    console.error("[yandex-bulk-pricing] 续跑遗留任务失败:", e.message);
+  }
+}
+
 app.post("/api/yandex/bulk-pricing", requireAuth, async (req, res, next) => {
   try {
     if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
@@ -5369,6 +5448,35 @@ app.post("/api/yandex/bulk-pricing", requireAuth, async (req, res, next) => {
     const job = await createQueuedDbJob(req.user, { id: crypto.randomUUID(), kind: "yandex-bulk-pricing", storeId, total: offerIds.length, phase: "排队开始批量核价" }, { offerIds, storeId });
     setTimeout(() => { runYandexBulkPricingJob(job.id, userId, storeId, offerIds).catch(() => {}); }, 100);
     res.json({ success: true, jobId: job.id, total: offerIds.length });
+  } catch (error) { next(error); }
+});
+
+// 最近的后台核价任务（页面加载/点按钮时判断是否已有 running，避免重复发起）
+app.get("/api/yandex/bulk-pricing", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.json({ success: true, jobs: [] });
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
+    const result = await db.query(
+      `SELECT id, status, phase, processed, total, error, created_at, updated_at
+       FROM app_jobs
+       WHERE user_id = $1 AND kind = 'yandex-bulk-pricing'
+         AND ($2::uuid IS NULL OR store_id = $2::uuid)
+       ORDER BY created_at DESC
+       LIMIT 5`,
+      [userId, storeId || null],
+    );
+    const jobs = (result.rows || []).map((r) => ({
+      id: r.id,
+      status: r.status,
+      phase: r.phase,
+      processed: Number(r.processed || 0),
+      total: Number(r.total || 0),
+      error: r.error || "",
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+    }));
+    res.json({ success: true, jobs });
   } catch (error) { next(error); }
 });
 
@@ -21130,6 +21238,7 @@ if (process.argv[1] === __filename) {
     console.log(`Ozon to 1688 tool running at http://0.0.0.0:${finalPort}`);
     startYandexOffersCacheLoop();
     startYandexStocksCacheLoop();
+    setTimeout(() => { resumeStaleBulkPricingJobs().catch(() => {}); }, 20000);
   });
 }
 
