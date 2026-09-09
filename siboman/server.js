@@ -2955,7 +2955,7 @@ function normalizeYandexProductMapping(item = {}, context = {}) {
   const widCm = Number(wd.width || 0);
   const heiCm = Number(wd.height || 0);
   const weightKg = Number(wd.weight || 0) > 0 ? Number(wd.weight) : 0;
-  return {
+  const normalized = {
     platform: "yandex",
     store_name: context.campaignName,
     offer_id: offer.offerId || "",
@@ -2982,6 +2982,58 @@ function normalizeYandexProductMapping(item = {}, context = {}) {
     description: offer.description || "",
     attributes: Array.isArray(offer.params) ? offer.params : [],
     raw: item,
+  };
+  normalized.yandex_diagnostic = buildYandexOfferDiagnostic(normalized, item, context);
+  return normalized;
+}
+
+function buildYandexOfferDiagnostic(item = {}, rawItem = {}, context = {}) {
+  const rawOffer = rawItem.offer || {};
+  const mapping = rawItem.mapping || {};
+  const campaign = (rawOffer.campaigns || []).find((entry) => String(entry.campaignId || "") === String(context.campaignId))
+    || (rawOffer.campaigns || [])[0]
+    || {};
+  const marketCategory = String(item.category_name || mapping.marketCategoryName || "").trim();
+  const sellerCategory = String(item.category_leaf || rawOffer.category || "").trim();
+  const title = String(item.name || rawOffer.name || "").trim();
+  const combinedProductText = `${title} ${sellerCategory}`.toLowerCase();
+  const combinedMarketText = `${marketCategory} ${mapping.marketCategoryId || ""}`.toLowerCase();
+  const productLooksToy = /(скричер|трансформ|волчок|battle|игруш|robot|робот|auldey|игров)/i.test(combinedProductText);
+  const marketLooksNotToy = /(тренаж|кресл|коньк|спорт|велосипед|самокат|мебел|компьютерн)/i.test(combinedMarketText);
+  const marketLooksToy = /(игруш|трансформ|робот|фигур|набор игров)/i.test(combinedMarketText);
+  const issues = [];
+  const tips = [];
+  let severity = "ok";
+
+  if (productLooksToy && marketLooksNotToy && !marketLooksToy) {
+    severity = "danger";
+    issues.push("疑似 Yandex 类目错配");
+    tips.push("商品看起来是玩具，但平台映射类目像健身器材/家具/运动品；这会触发发货点不支持该类目的错误。");
+    tips.push("优先在 Yandex 商品卡片把类目改到玩具类目，再补齐该类目的必填属性。");
+  }
+
+  if (String(campaign.status || "").toUpperCase() === "DISABLED_BY_PARTNER") {
+    if (severity === "ok") severity = "warning";
+    issues.push("当前 campaign 未启用销售");
+    tips.push("该商品在当前 campaign 被商家禁售，需确认是否同步到了正确店铺。");
+  }
+
+  if (item.status === "need_attention") {
+    if (severity === "ok") severity = "warning";
+    issues.push("平台要求修改");
+  }
+
+  return {
+    severity,
+    issues,
+    tips,
+    product_category: sellerCategory,
+    market_category: marketCategory,
+    market_category_id: String(item.category_id || mapping.marketCategoryId || ""),
+    campaign_status: campaign.status || "",
+    campaign_id: campaign.campaignId || context.campaignId || "",
+    product_looks_toy: productLooksToy,
+    market_category_suspect: productLooksToy && marketLooksNotToy && !marketLooksToy,
   };
 }
 
@@ -4219,6 +4271,7 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
     const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
     const quality = String(req.query.quality || "all").trim().toLowerCase(); // all|high|medium|low
     const aiFilter = String(req.query.ai || "all").trim().toLowerCase(); // all|yes|no
+    const diagnostic = String(req.query.diagnostic || "all").trim().toLowerCase(); // all|category_mismatch|warning|ok
     const archived = status === "archived";
     const cache = yandexOfferCacheObj(storeId);
 
@@ -4232,9 +4285,36 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
     }
     const pool = archived ? cache.archived : cache.active;
 
+    const stockCache = yandexStocksCache.get(String(context.storeId || context.businessId || "default"));
+    const stockByOffer = new Map();
+    if (stockCache?.offers?.length) {
+      const whNameMap = new Map((stockCache.warehouses || []).map((w) => [String(w.id), w.name || String(w.id)]));
+      for (const row of stockCache.offers) {
+        const offerId = String(row.offerId || "");
+        if (!offerId) continue;
+        if (!stockByOffer.has(offerId)) stockByOffer.set(offerId, { total_fit: 0, total_available: 0, warehouses: [], seen: new Set() });
+        const summary = stockByOffer.get(offerId);
+        const key = String(row.warehouseId || "");
+        if (summary.seen.has(key)) continue;
+        summary.seen.add(key);
+        summary.total_fit += Number(row.fit || 0);
+        summary.total_available += Number(row.available || 0);
+        summary.warehouses.push({
+          warehouse_id: row.warehouseId,
+          warehouse_name: whNameMap.get(String(row.warehouseId || "")) || String(row.warehouseId || ""),
+          campaign_id: row.campaignId || "",
+          fit: Number(row.fit || 0),
+          available: Number(row.available || 0),
+          updated_at: row.updatedAt || "",
+        });
+      }
+      for (const summary of stockByOffer.values()) delete summary.seen;
+    }
+
     const decorate = (list) => list.map((item) => {
       const qualityInfo = computeYandexCardScore(item);
-      return { ...item, qscore: qualityInfo.score, qgrade: qualityInfo.grade, qissues: qualityInfo.issues };
+      const stockSummary = stockByOffer.get(item.offer_id || item.offerId || "") || null;
+      return { ...item, qscore: qualityInfo.score, qgrade: qualityInfo.grade, qissues: qualityInfo.issues, yandex_stock_summary: stockSummary };
     });
 
     let items = [];
@@ -4255,6 +4335,15 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       if (quality !== "all") {
         items = items.filter((item) => computeYandexCardScore(item).grade === quality);
       }
+      if (diagnostic !== "all") {
+        items = items.filter((item) => {
+          const d = item.yandex_diagnostic || {};
+          if (diagnostic === "category_mismatch") return d.market_category_suspect === true;
+          if (diagnostic === "warning") return ["warning", "danger"].includes(String(d.severity || ""));
+          if (diagnostic === "ok") return String(d.severity || "ok") === "ok";
+          return true;
+        });
+      }
       if (aiFilter !== "all") {
         const aiSet = await getStoreAiOfferSet(storeId);
         items = items.filter((item) => (aiFilter === "yes") === aiSet.has(item.offer_id || item.offerId));
@@ -4269,6 +4358,15 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       const pageData = await fetchYandexOfferMappingsPage(context, { pageToken: "", limit: pageSize, archived: true });
       items = decorate(pageData.items.map((item) => normalizeYandexProductMapping(item, context)));
       if (quality !== "all") items = items.filter((item) => item.qgrade === quality);
+      if (diagnostic !== "all") {
+        items = items.filter((item) => {
+          const d = item.yandex_diagnostic || {};
+          if (diagnostic === "category_mismatch") return d.market_category_suspect === true;
+          if (diagnostic === "warning") return ["warning", "danger"].includes(String(d.severity || ""));
+          if (diagnostic === "ok") return String(d.severity || "ok") === "ok";
+          return true;
+        });
+      }
       if (aiFilter !== "all") {
         const aiSet = await getStoreAiOfferSet(storeId);
         items = items.filter((item) => (aiFilter === "yes") === aiSet.has(item.offer_id || item.offerId));
@@ -4280,12 +4378,20 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       syncing = true;
       const pageData = await fetchYandexOfferMappingsPage(context, { pageToken: "", limit: pageSize, archived: false });
       items = decorate(pageData.items.map((item) => normalizeYandexProductMapping(item, context)));
-      if (q || (status !== "all" && status !== "archived") || quality !== "all" || aiFilter !== "all") {
+      if (q || (status !== "all" && status !== "archived") || quality !== "all" || diagnostic !== "all" || aiFilter !== "all") {
         const liveAiSet = await getStoreAiOfferSet(storeId);
         items = items.filter((item) => !q || [item.offer_id, item.sku, item.name, item.category_name, item.brand]
           .some((value) => String(value || "").toLowerCase().includes(q)))
           .filter((item) => status === "all" || status === "archived" || item.status === status)
           .filter((item) => quality === "all" || item.qgrade === quality)
+          .filter((item) => {
+            const d = item.yandex_diagnostic || {};
+            if (diagnostic === "all") return true;
+            if (diagnostic === "category_mismatch") return d.market_category_suspect === true;
+            if (diagnostic === "warning") return ["warning", "danger"].includes(String(d.severity || ""));
+            if (diagnostic === "ok") return String(d.severity || "ok") === "ok";
+            return true;
+          })
           .filter((item) => aiFilter === "all" || (aiFilter === "yes") === liveAiSet.has(item.offer_id || item.offerId));
       }
       hasNext = Boolean(pageData.nextPageToken);
