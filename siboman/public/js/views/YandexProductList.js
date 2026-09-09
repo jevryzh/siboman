@@ -22,6 +22,8 @@ window.YandexProductListView = {
         description: '',
         category_id: '',
         category_name: '',
+        diagnostic: null,
+        stockSummary: null,
         price: 0,
         currency_code: 'RUB',
         imagesText: '',
@@ -188,13 +190,45 @@ window.YandexProductListView = {
       { label: '已 AI 优化', value: 'yes' },
       { label: '未 AI 优化', value: 'no' },
     ];
-    // 调价状态：all | priced（已调价） | unpriced（未调价）
+    // 调价状态：all | priced（已调价） | unpriced（未调价）| promo（售价≠划线价=促销中）
     const priceFilter = Vue.ref('all');
     const priceOptions = [
       { label: '全部调价状态', value: 'all' },
       { label: '已调价', value: 'priced' },
       { label: '未调价', value: 'unpriced' },
+      { label: '售价≠划线价(促销中)', value: 'promo' },
     ];
+    const diagnosticFilter = Vue.ref('all');
+    const diagnosticOptions = [
+      { label: '全部诊断', value: 'all' },
+      { label: '疑似类目错配', value: 'category_mismatch' },
+      { label: '有风险提示', value: 'warning' },
+      { label: '诊断正常', value: 'ok' },
+    ];
+    const diagnosticTagType = (row) => {
+      const severity = String(row?.yandex_diagnostic?.severity || 'ok');
+      return severity === 'danger' ? 'danger' : severity === 'warning' ? 'warning' : 'success';
+    };
+    const diagnosticText = (row) => {
+      const d = row?.yandex_diagnostic || {};
+      if (Array.isArray(d.issues) && d.issues.length) return d.issues[0];
+      return '正常';
+    };
+    const diagnosticTips = (row) => {
+      const d = row?.yandex_diagnostic || {};
+      const tips = [];
+      if (Array.isArray(d.issues)) tips.push(...d.issues);
+      if (d.product_category || d.market_category) tips.push(`商品类目：${d.product_category || '-'} / Yandex类目：${d.market_category || '-'}`);
+      if (Array.isArray(d.tips)) tips.push(...d.tips);
+      return tips.filter(Boolean).join('；');
+    };
+    const stockSummaryText = (row) => {
+      const s = row?.yandex_stock_summary;
+      if (!s || !Array.isArray(s.warehouses) || !s.warehouses.length) return '无库存快照';
+      const first = s.warehouses[0];
+      const more = s.warehouses.length > 1 ? ` 等 ${s.warehouses.length} 仓` : '';
+      return `${first.warehouse_name || first.warehouse_id}${more} · FIT ${s.total_fit || 0}`;
+    };
     const isPriced = (row) => {
       const st = priceState[row.offer_id];
       return !!(st && Array.isArray(st.records) && st.records.some((r) => r.status === 'applied'));
@@ -262,6 +296,8 @@ window.YandexProductListView = {
           params: {
             status: activeTab.value,
             quality: qualityFilter.value,
+            ai: aiFilter.value,
+            diagnostic: diagnosticFilter.value,
             q: search.value,
             page: pagination.currentPage,
             page_size: pagination.pageSize,
@@ -292,9 +328,16 @@ window.YandexProductListView = {
       }
     };
 
+    // 划线价来源：Yandex basicPrice.discountBase（normalize 后为 row.old_price）
+    const isPromoRow = (row) => {
+      const price = Number(row?.price || 0);
+      const old = Number(row?.old_price || row?.discountBase || 0);
+      return old > 0 && price > 0 && Math.abs(price - old) > 0.001;
+    };
     // 调价筛选依赖 priceState（异步加载），用 computed 实时过滤显示列表
     const displayProducts = Vue.computed(() => {
       if (priceFilter.value === 'all') return products.value;
+      if (priceFilter.value === 'promo') return products.value.filter(isPromoRow);
       return products.value.filter((row) => priceFilter.value === 'priced' ? isPriced(row) : !isPriced(row));
     });
 
@@ -310,6 +353,7 @@ window.YandexProductListView = {
       qualityFilter.value = 'all';
       aiFilter.value = 'all';
       priceFilter.value = 'all';
+      diagnosticFilter.value = 'all';
       pagination.currentPage = 1;
       fetchProducts();
     };
@@ -329,6 +373,8 @@ window.YandexProductListView = {
         description: row.raw?.offer?.description || row.description || '',
         category_id: row.category_id || '',
         category_name: row.category_name || '',
+        diagnostic: row.yandex_diagnostic || null,
+        stockSummary: row.yandex_stock_summary || null,
         price: Number(row.price || 0),
         currency_code: row.currency_code || 'RUB',
         imagesText: images.filter(Boolean).join('\n'),
@@ -1340,7 +1386,8 @@ window.YandexProductListView = {
       qgradeInfo, qualityTagType, aiDialog, aiChecked, openAiOptimize, applyAiOptimize,
       drawer, saveLoading, editDrawerMode, aiFillProduct, setAttrValue, attrTemplateOf, drawerMissingAttrs,
       aiFilter, aiOptions, aiStats, aiRecordsDialog, openAiRecords,
-      priceFilter, priceOptions, displayProducts,
+      priceFilter, priceOptions, displayProducts, isPromoRow,
+      diagnosticFilter, diagnosticOptions, diagnosticTagType, diagnosticText, diagnosticTips, stockSummaryText,
     };
   },
   template: `
@@ -1395,10 +1442,13 @@ window.YandexProductListView = {
         <el-select v-model="qualityFilter" size="large" style="width:160px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
           <el-option v-for="opt in qualityOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
+        <el-select v-model="diagnosticFilter" size="large" style="width:160px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
+          <el-option v-for="opt in diagnosticOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
         <el-select v-model="aiFilter" size="large" style="width:150px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
           <el-option v-for="opt in aiOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
-        <el-select v-model="priceFilter" size="large" style="width:150px">
+        <el-select v-model="priceFilter" size="large" style="width:210px">
           <el-option v-for="opt in priceOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
         <el-button size="large" type="primary" @click="fetchProducts">查询</el-button>
@@ -1467,10 +1517,40 @@ window.YandexProductListView = {
             <span v-else style="color:#cbd5e1; font-size:12px">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="售价" width="130" align="right">
-          <template #default="{ row }">{{ moneyText(row.price, row.currency_code || 'RUB') }}</template>
+        <el-table-column label="售价 / 划线价" width="180" align="right">
+          <template #default="{ row }">
+            <template v-if="isPromoRow(row)">
+              <div>
+                <span style="color:#dc2626; font-weight:900">{{ moneyText(row.price, row.currency_code || 'RUB') }}</span>
+                <span style="color:#94a3b8; text-decoration:line-through; margin-left:6px; font-size:12px">{{ moneyText(row.old_price, row.currency_code || 'RUB') }}</span>
+              </div>
+              <div style="font-size:11px; color:#e11d48; margin-top:2px">促销中（划线价 ≠ 售价）</div>
+            </template>
+            <span v-else>{{ moneyText(row.price, row.currency_code || 'RUB') }}</span>
+          </template>
         </el-table-column>
         <el-table-column label="库存" prop="stock" width="100" align="right" />
+        <el-table-column label="发货/类目诊断" min-width="210">
+          <template #default="{ row }">
+            <el-tooltip :content="diagnosticTips(row)" placement="top" :disabled="!diagnosticTips(row)">
+              <div style="display:flex; flex-direction:column; gap:5px; min-width:0">
+                <el-tag :type="diagnosticTagType(row)" effect="light" style="width:max-content; max-width:180px">
+                  {{ diagnosticText(row) }}
+                </el-tag>
+                <div v-if="row.yandex_diagnostic && row.yandex_diagnostic.market_category" class="text-ellipsis" style="font-size:12px; color:#64748b; max-width:190px">
+                  {{ row.yandex_diagnostic.market_category }}
+                </div>
+              </div>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="库存发货点" min-width="150">
+          <template #default="{ row }">
+            <el-tooltip :content="(row.yandex_stock_summary?.warehouses || []).map(w => (w.warehouse_name || w.warehouse_id) + ' FIT ' + w.fit + ' / 可售 ' + w.available).join('；')" placement="top" :disabled="!(row.yandex_stock_summary?.warehouses || []).length">
+              <span style="font-size:12px; color:#475569; font-weight:700">{{ stockSummaryText(row) }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
         <el-table-column label="品牌" prop="brand" width="140" show-overflow-tooltip />
         <el-table-column label="类目" min-width="190" show-overflow-tooltip>
           <template #default="{ row }">{{ row.category_name || row.category || '-' }}</template>
@@ -1525,6 +1605,22 @@ window.YandexProductListView = {
       </div>
 
       <el-drawer v-model="drawer.visible" size="620px" title="编辑 Yandex 商品" destroy-on-close>
+        <el-alert
+          v-if="drawer.form.diagnostic && drawer.form.diagnostic.severity !== 'ok'"
+          :type="drawer.form.diagnostic.severity === 'danger' ? 'error' : 'warning'"
+          :closable="false"
+          show-icon
+          style="margin-bottom:14px"
+          :title="(drawer.form.diagnostic.issues || []).join('；') || '商品需要检查'"
+          :description="diagnosticTips({ yandex_diagnostic: drawer.form.diagnostic })" />
+        <el-alert
+          v-if="drawer.form.stockSummary && drawer.form.stockSummary.warehouses && drawer.form.stockSummary.warehouses.length"
+          type="success"
+          :closable="false"
+          show-icon
+          style="margin-bottom:14px"
+          :title="'库存已写入：' + stockSummaryText({ yandex_stock_summary: drawer.form.stockSummary })"
+          :description="drawer.form.stockSummary.warehouses.map(w => (w.warehouse_name || w.warehouse_id) + ' · campaign ' + (w.campaign_id || '-') + ' · FIT ' + w.fit + ' / 可售 ' + w.available).join('；')" />
         <el-form label-width="110px" label-position="left">
           <el-form-item label="货号">
             <el-input v-model="drawer.form.offer_id" disabled />
