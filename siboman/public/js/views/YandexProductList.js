@@ -1881,7 +1881,7 @@ window.YandexProductListView = {
               <div v-if="row.result && row.result.ok && row.result.candidates && row.result.candidates.length" style="padding:6px 14px 10px 14px">
                 <div style="font-size:12px; color:#64748b; margin:4px 0 8px 0; font-weight:700">1688 同款候选（点选一项回填采购信息）</div>
                 <div v-for="(c, i) in row.result.candidates" :key="i" :style="candRowStyle(row, i)" @click="applyCandidateFields(row, i)">
-                  <el-image :src="c.img" lazy fit="cover" style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; flex-shrink:0" />
+                  <el-image :src="c.img" lazy fit="cover" referrerpolicy="no-referrer" style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; flex-shrink:0" />
                   <div style="flex:1; min-width:0">
                     <div class="text-ellipsis" style="font-size:13px; color:#0f172a; max-width:520px" :title="c.title">{{ c.title }}</div>
                     <div style="font-size:12px; color:#94a3b8">1688 货号 {{ c.offerId1688 || '-' }} · 销量 {{ c.sold || 0 }}</div>
@@ -1953,7 +1953,7 @@ window.YandexProductListView = {
             <template #default="{ row }">
               <div v-if="row.status === 'ok' && row.result && row.result.candidates && row.result.candidates.length"
                 style="display:flex; gap:6px; align-items:center; justify-content:center; cursor:pointer" title="点行展开看全部候选并选用" @click.stop>
-                <el-image v-for="(c, i) in row.result.candidates.slice(0, 3)" :key="i" :src="c.img" lazy fit="cover"
+                <el-image v-for="(c, i) in row.result.candidates.slice(0, 3)" :key="i" :src="c.img" lazy fit="cover" referrerpolicy="no-referrer"
                   style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; border:1px solid #e2e8f0"
                   preview-teleported :preview-src-list="(row.result.candidates || []).map(x => x.img).filter(Boolean)"
                   :initial-index="i" hide-on-click-modal />
