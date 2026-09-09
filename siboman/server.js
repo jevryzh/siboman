@@ -564,7 +564,7 @@ app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
       const result = await db.query(
         `INSERT INTO app_stores (user_id, name, client_id, api_key, campaign_id, api_secret, platform, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
          VALUES ($1, $2, $3, $4, $5, $4, 'yandex', $6, $7, $8, $9)
-         ON CONFLICT (user_id, platform, client_id) DO UPDATE
+         ON CONFLICT (user_id, platform, client_id, campaign_id) DO UPDATE
            SET name = $2, api_key = $4, campaign_id = $5, api_secret = $4, active = TRUE, watermark_enabled = $6,
                watermark_text = $7, ai_image_provider = $8, ai_image_model = $9, updated_at = now()
          RETURNING id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
@@ -581,9 +581,9 @@ app.post("/api/seller/shops", requireAuth, async (req, res, next) => {
     }
     await validateOzonCredentials(resolvedClientId, api_key);
     const result = await db.query(
-      `INSERT INTO app_stores (user_id, name, client_id, api_key, platform, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
-       VALUES ($1, $2, $3, $4, 'ozon', $5, $6, $7, $8)
-       ON CONFLICT (user_id, platform, client_id) DO UPDATE
+      `INSERT INTO app_stores (user_id, name, client_id, api_key, campaign_id, platform, watermark_enabled, watermark_text, ai_image_provider, ai_image_model)
+       VALUES ($1, $2, $3, $4, '', 'ozon', $5, $6, $7, $8)
+       ON CONFLICT (user_id, platform, client_id, campaign_id) DO UPDATE
          SET name = $2, api_key = $4, active = TRUE, watermark_enabled = $5, watermark_text = $6,
              ai_image_provider = $7, ai_image_model = $8, updated_at = now()
        RETURNING id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
@@ -2302,8 +2302,12 @@ async function initDatabase() {
     `);
     await db.query(`
       DO $$ BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'app_stores_user_platform_client_unique') THEN
-          ALTER TABLE app_stores ADD CONSTRAINT app_stores_user_platform_client_unique UNIQUE(user_id, platform, client_id);
+        -- 允许同一 Yandex API Key(business) 下按 campaign 登记多个店铺（1 ck / CELbudget 并存切换）
+        IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'app_stores_user_platform_client_unique') THEN
+          ALTER TABLE app_stores DROP CONSTRAINT app_stores_user_platform_client_unique;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'app_stores_user_platform_client_campaign_unique') THEN
+          ALTER TABLE app_stores ADD CONSTRAINT app_stores_user_platform_client_campaign_unique UNIQUE(user_id, platform, client_id, campaign_id);
         END IF;
       END $$;
       ALTER TABLE yandex_price_candidates DROP CONSTRAINT IF EXISTS yandex_price_candidates_user_id_offer_id_key;
@@ -2365,7 +2369,7 @@ async function migrateYandexEnvToStores() {
     const insertResult = await db.query(
       `INSERT INTO app_stores (user_id, name, client_id, api_key, campaign_id, api_secret, platform)
        VALUES ($1, $2, $3, $4, $5, $4, 'yandex')
-       ON CONFLICT (user_id, platform, client_id) DO UPDATE SET active = TRUE, updated_at = now()
+       ON CONFLICT (user_id, platform, client_id, campaign_id) DO UPDATE SET active = TRUE, updated_at = now()
        RETURNING id`,
       [user.rows[0].id, context.campaignName, context.businessId, YANDEX_MARKET_API_SECRET, context.campaignId]
     );
