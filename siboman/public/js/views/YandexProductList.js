@@ -565,6 +565,7 @@ window.YandexProductListView = {
     const hoverImg = Vue.reactive({ show: false, url: '', x: 0, y: 0, left: 0, top: 0 });
     const priceState = Vue.reactive({}); // offerId -> { candidate, records }
     const researchDialog = Vue.reactive({ visible: false, busy: false, error: '', rows: [], jobId: '', jobText: '', pluginDisabled: false, stopRequested: false, stopping: false, pluginPhase: false });
+    const researchTableRef = Vue.ref(null);
     const stateDrawer = Vue.reactive({
       visible: false, offerId: '', name: '', image: '',
       candidate: null, records: [], suggest: null,
@@ -749,10 +750,20 @@ window.YandexProductListView = {
           row.result = { ok: true, matchSource: 'plugin', source: 'plugin-1688', candidates, best: candidates[0] };
           applyCandidateFields(row, 0, { silent: true });
         } else {
-          row.status = 'queued';
-          row.message = '';
+          row.status = 'empty';
+          row.message = '插件未返回候选（可能 1688 登录态异常），可手动填成本';
         }
       }
+      // 核价完成自动展开有候选的行，方便直接看图核对同款
+      Vue.nextTick(() => {
+        const table = researchTableRef.value;
+        if (!table) return;
+        for (const row of rows) {
+          if (row.status === 'ok' && row.result?.candidates?.length) {
+            try { table.toggleRowExpansion(row, true); } catch (_e) { /* 展开失败不阻塞 */ }
+          }
+        }
+      });
       calcAllSuggest();
     };
 
@@ -1405,7 +1416,7 @@ window.YandexProductListView = {
       currentCrossBorder, suggestedCrossBorder,
       openEdit, saveProduct, openProfitDialog, applySuggestedPrice, applyCandidateFields, candRowStyle,
       hoverImg, onImgEnter, onImgMove, onImgLeave,
-      selectedRows, priceState, researchDialog, stateDrawer, applyDialog,
+      selectedRows, priceState, researchDialog, researchTableRef, stateDrawer, applyDialog,
       handleSelectionChange, changeVisibility, visBusy, openResearchBatch, openResearchRow, openStateDrawer,
       retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
       reverseDialog, openReversePricing, reverseAllRows, applyReverseToYandex,
@@ -1864,7 +1875,7 @@ window.YandexProductListView = {
         <el-alert v-if="researchDialog.error" type="error" :closable="false" style="margin-bottom:10px" :title="researchDialog.error" />
         <el-alert v-if="researchDialog.pluginDisabled" type="warning" :closable="false" style="margin-bottom:10px"
           title="本机核价插件不可用（插件未连接/版本过旧），候选将为空，可手动在下方填写采购成本后保存。" />
-        <el-table :data="researchDialog.rows" v-loading="researchDialog.busy" element-loading-text="正在核价..." border size="large" max-height="520">
+        <el-table ref="researchTableRef" :data="researchDialog.rows" v-loading="researchDialog.busy" element-loading-text="正在核价..." border size="large" max-height="520" row-key="offerId">
           <el-table-column type="expand">
             <template #default="{ row }">
               <div v-if="row.result && row.result.ok && row.result.candidates && row.result.candidates.length" style="padding:6px 14px 10px 14px">
@@ -1928,7 +1939,7 @@ window.YandexProductListView = {
               <div v-else style="color:#94a3b8; font-size:12px">未计算</div>
             </template>
           </el-table-column>
-          <el-table-column label="状态" min-width="150">
+          <el-table-column label="状态" width="130">
             <template #default="{ row }">
               <span v-if="row.status === 'ok'" style="color:#16a34a; font-size:12px">✓ 已核价{{ row.result && row.result.candidates ? '（' + row.result.candidates.length + ' 候选）' : '' }}</span>
               <span v-else-if="row.status === 'empty'" style="color:#f59e0b; font-size:12px">无候选，可手动填成本</span>
@@ -1936,6 +1947,18 @@ window.YandexProductListView = {
               <span v-else-if="row.status === 'queued'" style="color:#94a3b8; font-size:12px">{{ row.message || '排队中...' }}</span>
               <el-button v-if="row.suggestBusy || row.status === 'queued'" link type="primary" loading>计算</el-button>
               <el-button v-else link type="primary" @click="calcRowSuggest(row)">计算建议价</el-button>
+            </template>
+          </el-table-column>
+          <el-table-column label="候选同款图" width="170" align="center">
+            <template #default="{ row }">
+              <div v-if="row.status === 'ok' && row.result && row.result.candidates && row.result.candidates.length"
+                style="display:flex; gap:6px; align-items:center; justify-content:center; cursor:pointer" title="点行展开看全部候选并选用" @click.stop>
+                <el-image v-for="(c, i) in row.result.candidates.slice(0, 3)" :key="i" :src="c.img" lazy fit="cover"
+                  style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; border:1px solid #e2e8f0"
+                  preview-teleported :preview-src-list="(row.result.candidates || []).map(x => x.img).filter(Boolean)"
+                  :initial-index="i" hide-on-click-modal />
+              </div>
+              <span v-else style="color:#cbd5e1; font-size:12px">—</span>
             </template>
           </el-table-column>
         </el-table>
