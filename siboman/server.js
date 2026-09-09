@@ -2203,8 +2203,7 @@ async function initDatabase() {
         status TEXT NOT NULL DEFAULT 'pending',
         source TEXT NOT NULL DEFAULT 'prematch',
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        UNIQUE(user_id, offer_id)
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
 
       CREATE TABLE IF NOT EXISTS yandex_price_records (
@@ -2308,8 +2307,14 @@ async function initDatabase() {
         END IF;
       END $$;
       ALTER TABLE yandex_price_candidates DROP CONSTRAINT IF EXISTS yandex_price_candidates_user_id_offer_id_key;
+      -- 统一用 (store_id, offer_id) 完整唯一索引（非 partial）。
+      -- 注意：partial unique index (WHERE store_id IS NOT NULL) 无法被 ON CONFLICT (store_id, offer_id) 仲裁，
+      -- store_id 为 NULL 时会报 "no unique or exclusion constraint matching the ON CONFLICT specification"。
+      DROP INDEX IF EXISTS yandex_price_candidates_store_offer_unique;
+      DELETE FROM yandex_price_candidates a USING yandex_price_candidates b
+        WHERE a.id < b.id AND a.store_id IS NOT NULL AND a.store_id IS NOT DISTINCT FROM b.store_id AND a.offer_id = b.offer_id;
       CREATE UNIQUE INDEX IF NOT EXISTS yandex_price_candidates_store_offer_unique
-        ON yandex_price_candidates(store_id, offer_id) WHERE store_id IS NOT NULL;
+        ON yandex_price_candidates(store_id, offer_id);
     `);
     // AI 优化记录（商品维度：次数/最近时间/明细，供列表展示与审计）
     await db.query(`
