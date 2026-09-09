@@ -990,6 +990,24 @@ async function getStoreAiOfferSet(storeKey) {
   } catch (_e) { return new Set(); }
 }
 
+// 全店有成功调价记录(yandex_price_records status='applied')的 offer 集合（缓存 60s，供"已调价/未调价"过滤）
+const priceAppliedOfferSetCache = new Map();
+async function getStorePriceAppliedOfferSet(storeKey) {
+  if (!db) return new Set();
+  const key = storeKey || "__env__";
+  const cached = priceAppliedOfferSetCache.get(key);
+  if (cached && Date.now() - cached.at < 60000) return cached.set;
+  try {
+    const result = await db.query(
+      "SELECT DISTINCT offer_id FROM yandex_price_records WHERE status='applied' AND store_id IS NOT DISTINCT FROM $1",
+      [key === "__env__" ? null : key]
+    );
+    const set = new Set(result.rows.map((r) => r.offer_id));
+    priceAppliedOfferSetCache.set(key, { at: Date.now(), set });
+    return set;
+  } catch (_e) { return new Set(); }
+}
+
 // 记录一次 AI 优化提交（列表批量 apply / 编辑抽屉 AI 填充保存）
 async function insertAiRecord({ userId, storeId, offerId, action, titleChanged, descChanged, attrCount, status, detail }) {
   if (!db || !offerId) return;
@@ -4272,6 +4290,7 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
     const quality = String(req.query.quality || "all").trim().toLowerCase(); // all|high|medium|low
     const aiFilter = String(req.query.ai || "all").trim().toLowerCase(); // all|yes|no
     const diagnostic = String(req.query.diagnostic || "all").trim().toLowerCase(); // all|category_mismatch|warning|ok
+    const priceStateFilter = String(req.query.price || "all").trim().toLowerCase(); // all|priced|unpriced|promo
     const archived = status === "archived";
     const cache = yandexOfferCacheObj(storeId);
 
@@ -4316,6 +4335,19 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       const stockSummary = stockByOffer.get(item.offer_id || item.offerId || "") || null;
       return { ...item, qscore: qualityInfo.score, qgrade: qualityInfo.grade, qissues: qualityInfo.issues, yandex_stock_summary: stockSummary };
     });
+    // 促销中：Yandex 划线原价(discountBase→old_price) 存在且与当前售价不一致
+    const isPromoRow = (row) => {
+      const price = Number(row?.price || 0);
+      const old = Number(row?.old_price || row?.discountBase || 0);
+      return old > 0 && price > 0 && Math.abs(price - old) > 0.001;
+    };
+    const matchPriceFilter = (row, aiSet) => {
+      if (priceStateFilter === "all") return true;
+      if (priceStateFilter === "promo") return isPromoRow(row);
+      // priced/unpriced：是否有成功调价记录（来自 AI 调价/apply 的本地集合）
+      const has = aiSet.has(row.offer_id || row.offerId || "");
+      return priceStateFilter === "priced" ? has : !has;
+    };
 
     let items = [];
     let total = 0;
@@ -4348,6 +4380,10 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
         const aiSet = await getStoreAiOfferSet(storeId);
         items = items.filter((item) => (aiFilter === "yes") === aiSet.has(item.offer_id || item.offerId));
       }
+      if (priceStateFilter !== "all") {
+        const priceAppliedSet = await getStorePriceAppliedOfferSet(storeId);
+        items = items.filter((item) => matchPriceFilter(item, priceAppliedSet));
+      }
       total = items.length;
       const start = (page - 1) * pageSize;
       hasNext = start + pageSize < total;
@@ -4371,6 +4407,10 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
         const aiSet = await getStoreAiOfferSet(storeId);
         items = items.filter((item) => (aiFilter === "yes") === aiSet.has(item.offer_id || item.offerId));
       }
+      if (priceStateFilter !== "all") {
+        const priceAppliedSet = await getStorePriceAppliedOfferSet(storeId);
+        items = items.filter((item) => matchPriceFilter(item, priceAppliedSet));
+      }
       hasNext = Boolean(pageData.nextPageToken);
       total = items.length + (hasNext ? pageSize : 0);
     } else {
@@ -4393,6 +4433,10 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
             return true;
           })
           .filter((item) => aiFilter === "all" || (aiFilter === "yes") === liveAiSet.has(item.offer_id || item.offerId));
+        if (priceStateFilter !== "all") {
+          const priceAppliedSet = await getStorePriceAppliedOfferSet(storeId);
+          items = items.filter((item) => matchPriceFilter(item, priceAppliedSet));
+        }
       }
       hasNext = Boolean(pageData.nextPageToken);
       total = items.length + (hasNext ? pageSize : 0);

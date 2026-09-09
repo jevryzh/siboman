@@ -298,6 +298,7 @@ window.YandexProductListView = {
             quality: qualityFilter.value,
             ai: aiFilter.value,
             diagnostic: diagnosticFilter.value,
+            price: priceFilter.value,
             q: search.value,
             page: pagination.currentPage,
             page_size: pagination.pageSize,
@@ -334,12 +335,9 @@ window.YandexProductListView = {
       const old = Number(row?.old_price || row?.discountBase || 0);
       return old > 0 && price > 0 && Math.abs(price - old) > 0.001;
     };
-    // 调价筛选依赖 priceState（异步加载），用 computed 实时过滤显示列表
-    const displayProducts = Vue.computed(() => {
-      if (priceFilter.value === 'all') return products.value;
-      if (priceFilter.value === 'promo') return products.value.filter(isPromoRow);
-      return products.value.filter((row) => priceFilter.value === 'priced' ? isPriced(row) : !isPriced(row));
-    });
+    // 调价/促销筛选已由服务端整店过滤（fetchProducts 传 price 参数），此处不再二次过滤，
+    // 直接展示服务端返回结果（分页/总数随服务端一致）。
+    const displayProducts = Vue.computed(() => products.value);
 
     const selectStatusTab = (value) => {
       activeTab.value = value;
@@ -1448,7 +1446,7 @@ window.YandexProductListView = {
         <el-select v-model="aiFilter" size="large" style="width:150px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
           <el-option v-for="opt in aiOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
-        <el-select v-model="priceFilter" size="large" style="width:210px">
+        <el-select v-model="priceFilter" size="large" style="width:210px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
           <el-option v-for="opt in priceOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
         <el-button size="large" type="primary" @click="fetchProducts">查询</el-button>
