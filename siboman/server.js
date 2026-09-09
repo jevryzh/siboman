@@ -5224,6 +5224,162 @@ app.post("/api/yandex/price-research", requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// ===== Yandex 全店批量核价（服务端后台跑，AlphaShop 图搜，不经浏览器插件）=====
+// 用法：POST /api/yandex/bulk-pricing { store_id, offer_ids[], scope?: {status|search} } →
+// 创建服务端自跑 job(kind=yandex-bulk-pricing)；runner 逐条图搜，命中且商品有重量 → 写 yandex_price_candidates；
+// 图搜无结果或商品无重量 → 记 need_weight / no_match 待人工，不自动定价（避免按错误成本亏钱）。
+const yandexBulkPricingRunning = new Map(); // jobId -> true
+
+async function researchOfferViaAlpha(offer, context, userId, storeId) {
+  const offerId = String(offer?.offer_id || offer?.offerId || "");
+  const images = Array.isArray(offer?.images) && offer.images.length
+    ? offer.images.filter(Boolean).slice(0, 3)
+    : (offer?.image ? [offer.image] : []);
+  const title = String(offer?.name || offer?.title || "").trim();
+  if (!offerId || !images.length) return { offerId, ok: false, reason: "no_image", candidates: [] };
+  let matches = [];
+  let matchSource = "none";
+  const seen = new Set();
+  const pushItems = (arr) => {
+    for (const item of (Array.isArray(arr) ? arr : [])) {
+      const oid = String(item.offerId || item.itemId || "");
+      if (!oid || seen.has(oid)) continue;
+      seen.add(oid);
+      matches.push(item);
+    }
+  };
+  let calls = 0;
+  const maxCalls = 3;
+  for (const img of images) {
+    if (calls >= maxCalls || matches.length >= 5) break;
+    try {
+      const r = await alphaShopMcpCall("imageSearchProduct", { imgUrl: img, beginPage: 1 }, 45000);
+      pushItems(Array.isArray(r) ? r : (r?.result || []));
+      calls++;
+    } catch (_e) { /* 单图失败跳过 */ }
+  }
+  if (matches.length) matchSource = "image";
+  else if (/[\u4e00-\u9fff]/.test(title)) {
+    try {
+      const r2 = await alphaShopMcpCall("keywordSearchProduct", { keyword: title.slice(0, 40), beginPage: 1 }, 45000);
+      pushItems(Array.isArray(r2) ? r2 : (r2?.result || []));
+      if (matches.length) matchSource = "text";
+    } catch (_e) { /* 词搜失败 */ }
+  }
+  const candidates = alphaTopCandidates(matches, 3);
+  const weightKg = Number(offer?.weightKg || 0);
+  const lenCm = Number(offer?.lenCm || 0), widCm = Number(offer?.widCm || 0), heiCm = Number(offer?.heiCm || 0);
+  const best = candidates[0] || null;
+  const base = {
+    offerId, title: String(offer?.name || "").slice(0, 200),
+    matchSource, candidates, categoryName: offer?.category_name || offer?.category_leaf || "",
+    categoryLeaf: offer?.category_leaf || "", weightKg, lenCm, widCm, heiCm,
+  };
+  if (!best) return { ...base, ok: false, reason: "no_match" };
+  if (!(weightKg > 0)) return { ...base, ok: false, reason: "need_weight", best };
+  // 采购价取候选最低可买档（过滤引流低价）
+  const prices = candidates.map((c) => Number(c.price || 0)).filter((p) => p >= 3 && p <= 300);
+  const purchaseCny = prices.length ? Math.min(...prices) : Number(best.price || 0);
+  if (!(purchaseCny > 0)) return { ...base, ok: false, reason: "bad_price", best };
+  const suggest = yandexSuggestPrice({
+    purchaseCny, weightKg,
+    dims: [lenCm, widCm, heiCm],
+    categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
+    params: { exchangeRate: 12.8205, targetMarginPct: 35 },
+  });
+  if (!suggest?.ok) return { ...base, ok: false, reason: "calc_failed", best, purchaseCny };
+  // 写候选表：已有 applied（已提交过平台）的保留不动，避免覆盖已确认价；其余刷新
+  try {
+    const existing = await db.query(
+      "SELECT id, status FROM yandex_price_candidates WHERE store_id IS NOT DISTINCT FROM $1 AND offer_id=$2 LIMIT 1",
+      [storeId || null, offerId]
+    );
+    if (existing.rows[0]?.status === "applied") return { ...base, ok: false, reason: "already_applied", best, purchaseCny, suggestPriceCny: suggest.priceCny, suggest };
+    await db.query(
+      `INSERT INTO yandex_price_candidates (user_id, store_id, offer_id, name, purchase_cny, supplier, source_url_1688, score,
+         weight_kg, len_cm, wid_cm, hei_cm, pkg_qty, suggest_price_cny, zone, cel_fee_cny, status, source)
+       VALUES ($1,$2,$3,$4,$5,'AlphaShop',COALESCE(NULLIF($6,''),''),$7,$8,$9,$10,$11,1,$12,$13,$14,'ready','bulk-alpha')
+       ON CONFLICT (store_id, offer_id) DO UPDATE SET
+         name=EXCLUDED.name, purchase_cny=EXCLUDED.purchase_cny, supplier=EXCLUDED.supplier,
+         source_url_1688=EXCLUDED.source_url_1688, score=EXCLUDED.score, weight_kg=EXCLUDED.weight_kg,
+         len_cm=EXCLUDED.len_cm, wid_cm=EXCLUDED.wid_cm, hei_cm=EXCLUDED.hei_cm,
+         suggest_price_cny=EXCLUDED.suggest_price_cny, zone=EXCLUDED.zone, cel_fee_cny=EXCLUDED.cel_fee_cny,
+         status='ready', source='bulk-alpha', updated_at=now()`,
+      [userId, storeId || null, offerId, String(offer?.name || "").slice(0, 500), purchaseCny,
+       best?.detailUrl || "", Number(best?.sold || 0), weightKg, lenCm, widCm, heiCm,
+       suggest.priceCny, suggest.zone || "", suggest.celFeeCny || 0]
+    );
+  } catch (_e) { /* 落库失败仅影响该条 */ }
+  return { ...base, ok: true, reason: "priced", best, purchaseCny, suggestPriceCny: suggest.priceCny, suggest };
+}
+
+async function runYandexBulkPricingJob(jobId, userId, storeId, offerIds) {
+  if (yandexBulkPricingRunning.get(jobId)) return;
+  yandexBulkPricingRunning.set(jobId, true);
+  const results = [];
+  try {
+    const context = await getYandexMarketContext({ storeId: storeId || null, userId, refresh: false }).catch(() => null);
+    const offerCache = yandexOfferCacheObj(storeId || "__env__");
+    const byId = new Map();
+    for (const it of [...(offerCache?.active || []), ...(offerCache?.archived || [])]) {
+      const oid = String(it?.offer_id || it?.offerId || "");
+      if (oid) byId.set(oid, it);
+    }
+    await updateDbJob(jobId, { status: "running", phase: "正在批量核价…", logs: [{ at: new Date().toISOString(), level: "info", message: `服务端开始批量 AlphaShop 核价，共 ${offerIds.length} 条。` }] });
+    for (let i = 0; i < offerIds.length; i += 1) {
+      const oid = String(offerIds[i] || "");
+      if (!oid) continue;
+      const offer = byId.get(oid) || {};
+      let r = { offerId: oid, ok: false, reason: "not_in_cache", candidates: [] };
+      try {
+        r = await researchOfferViaAlpha(offer, context, userId, storeId);
+      } catch (e) {
+        r = { offerId: oid, ok: false, reason: "error", error: String(e?.message || e).slice(0, 200), candidates: [] };
+      }
+      results.push(r);
+      await updateDbJob(jobId, { processed: i + 1, phase: `批量核价 ${i + 1}/${offerIds.length}`, results });
+      if ((i + 1) % 5 === 0) await new Promise((res) => setTimeout(res, 400)); // 防限流
+    }
+    const priced = results.filter((r) => r.ok && r.reason === "priced").length;
+    const noMatch = results.filter((r) => r.reason === "no_match" || r.reason === "no_image").length;
+    const needWeight = results.filter((r) => r.reason === "need_weight").length;
+    await updateDbJob(jobId, {
+      status: "done", phase: `批量核价完成：已定价 ${priced} / 无同款 ${noMatch} / 待补重量 ${needWeight}`,
+      results, error: "",
+      logs: [{ at: new Date().toISOString(), level: "info", message: `批量核价完成：${results.length} 条（已定价 ${priced}，无同款 ${noMatch}，待补重量 ${needWeight}）。` }],
+    });
+  } catch (e) {
+    await updateDbJob(jobId, { status: "error", phase: "批量核价失败", error: String(e?.message || e).slice(0, 500) }).catch(() => {});
+  } finally {
+    yandexBulkPricingRunning.delete(jobId);
+  }
+}
+
+app.post("/api/yandex/bulk-pricing", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    if (!alphaCreds()) return res.status(400).json({ success: false, error: "AlphaShop 凭据未配置，无法自动核价" });
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const offerIds = Array.isArray(req.body?.offer_ids || req.body?.offerIds)
+      ? (req.body?.offer_ids || req.body?.offerIds).map((v) => String(v || "").trim()).filter(Boolean)
+      : [];
+    if (!offerIds.length) return res.status(400).json({ success: false, error: "offer_ids 不能为空" });
+    if (offerIds.length > 3000) return res.status(400).json({ success: false, error: "单次最多 3000 条，请分批或收窄筛选" });
+    const job = await createQueuedDbJob(req.user, { id: crypto.randomUUID(), kind: "yandex-bulk-pricing", storeId, total: offerIds.length, phase: "排队开始批量核价" }, { offerIds, storeId });
+    setTimeout(() => { runYandexBulkPricingJob(job.id, userId, storeId, offerIds).catch(() => {}); }, 100);
+    res.json({ success: true, jobId: job.id, total: offerIds.length });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/yandex/bulk-pricing/:id", requireAuth, async (req, res, next) => {
+  try {
+    const job = await getDbJobForUser(req.params.id, req.user);
+    if (!job) return res.status(404).json({ success: false, error: "批量核价任务不存在" });
+    res.json({ success: true, job });
+  } catch (error) { next(error); }
+});
+
 // ===== Yandex 商品调价 API (定价服务端化) =====
 function yandexCelEconomy(priceCny, opt = {}) {
   const weightKg = Math.max(0, Number(opt.weightKg || 0));

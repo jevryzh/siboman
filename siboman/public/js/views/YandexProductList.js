@@ -581,6 +581,106 @@ window.YandexProductListView = {
 
     const handleSelectionChange = (val) => { selectedRows.value = val || []; };
 
+    // ===== 全店批量核价（服务端 AlphaShop 后台任务）=====
+    const bulkPricingDialog = Vue.reactive({
+      visible: false, jobId: '', status: '', phase: '', total: 0, processed: 0,
+      priced: 0, noMatch: 0, needWeight: 0, error: '', busy: false, pollTimer: null,
+      summaryRows: [],
+    });
+    const stopBulkPoll = () => {
+      if (bulkPricingDialog.pollTimer) { clearInterval(bulkPricingDialog.pollTimer); bulkPricingDialog.pollTimer = null; }
+    };
+    // 拉取当前筛选下全部 offer（分页翻完）用于后台核价
+    const collectFilteredOfferIds = async () => {
+      const ids = [];
+      let page = 1;
+      const pageSize = 100;
+      for (let i = 0; i < 50; i += 1) {
+        const res = await axios.get('/api/yandex/products', {
+          params: { status: activeTab.value, quality: qualityFilter.value, ai: aiFilter.value, diagnostic: diagnosticFilter.value, price: priceFilter.value, q: search.value, page, page_size: pageSize },
+        });
+        const items = res.data?.items || [];
+        for (const it of items) ids.push(String(it.offer_id || it.offerId || '').trim());
+        const total = Number(res.data?.total || ids.length);
+        if (ids.length >= total || !items.length) break;
+        page += 1;
+      }
+      return ids.filter(Boolean);
+    };
+    const startBulkPricing = async (offerIds) => {
+      const ids = (offerIds && offerIds.length ? offerIds : (await collectFilteredOfferIds()));
+      const uniq = [...new Set(ids)];
+      if (!uniq.length) return notify.warning('当前筛选下没有可核价商品');
+      bulkPricingDialog.busy = true;
+      bulkPricingDialog.jobId = '';
+      bulkPricingDialog.status = '';
+      bulkPricingDialog.error = '';
+      try {
+        const res = await axios.post('/api/yandex/bulk-pricing', { offer_ids: uniq }, { timeout: 30000 });
+        bulkPricingDialog.jobId = res.data?.jobId || '';
+        bulkPricingDialog.total = Number(res.data?.total || uniq.length);
+        if (!bulkPricingDialog.jobId) throw new Error('未返回任务号');
+        notify.success(`已提交 ${uniq.length} 个商品进行后台批量核价（AlphaShop），可关弹窗稍后查看`);
+        bulkPricingDialog.visible = true;
+        pollBulkPricing();
+      } catch (e) {
+        notify.error('启动批量核价失败: ' + (e.response?.data?.error || e.message));
+      } finally {
+        bulkPricingDialog.busy = false;
+      }
+    };
+    const pollBulkPricing = async () => {
+      stopBulkPoll();
+      const doPoll = async () => {
+        if (!bulkPricingDialog.jobId) return;
+        try {
+          const res = await axios.get('/api/yandex/bulk-pricing/' + encodeURIComponent(bulkPricingDialog.jobId));
+          const job = res.data?.job || {};
+          bulkPricingDialog.status = job.status || '';
+          bulkPricingDialog.phase = job.phase || '';
+          bulkPricingDialog.total = Number(job.total || bulkPricingDialog.total || 0);
+          bulkPricingDialog.processed = Number(job.processed || 0);
+          const results = Array.isArray(job.results) ? job.results : [];
+          bulkPricingDialog.priced = results.filter((r) => r?.ok && r?.reason === 'priced').length;
+          bulkPricingDialog.noMatch = results.filter((r) => ['no_match', 'no_image'].includes(r?.reason)).length;
+          bulkPricingDialog.needWeight = results.filter((r) => r?.reason === 'need_weight').length;
+          bulkPricingDialog.error = job.error || '';
+          bulkPricingDialog.summaryRows = results.slice(-30).map((r) => ({
+            offerId: r.offerId || r.offer_id || '',
+            ok: !!r.ok, reason: r.reason || '',
+            purchaseCny: r.purchaseCny || '',
+            suggestPriceCny: r.suggestPriceCny || r.suggest?.priceCny || '',
+            title: (r.title || (r.best && r.best.title) || '').slice(0, 50),
+            img: (r.best && (r.best.img || r.best.originImageUrl)) || (r.candidates && r.candidates[0] && r.candidates[0].img) || '',
+          }));
+          if (['done', 'error', 'canceled'].includes(job.status)) {
+            stopBulkPoll();
+            if (job.status === 'done') {
+              notify.success(`批量核价完成：定价 ${bulkPricingDialog.priced} · 无同款 ${bulkPricingDialog.noMatch} · 待补重量 ${bulkPricingDialog.needWeight}`);
+              fetchProducts();
+            } else if (job.error) notify.error('批量核价失败: ' + job.error);
+          }
+        } catch (_e) { /* 轮询失败继续 */ }
+      };
+      await doPoll();
+      if (!['done', 'error', 'canceled'].includes(bulkPricingDialog.status)) {
+        bulkPricingDialog.pollTimer = setInterval(doPoll, 6000);
+      }
+    };
+    const reasonText = (reason) => ({
+      priced: '✓ 已定价', need_weight: '⚠ 待补重量', no_match: '✗ 无同款', no_image: '✗ 无图',
+      already_applied: '已应用(跳过)', bad_price: '✗ 价格异常', not_in_cache: '? 缓存缺失', error: '✗ 出错',
+    }[reason] || reason || '-');
+    const openBulkPricingCurrentTab = async () => {
+      const msg = activeTab.value === 'all'
+        ? '将对「全部」筛选下的商品发起后台批量核价（AlphaShop 图搜），数量多时需较长时间，是否继续？'
+        : `将对「${(statusTabItems.value.find(t => t.value === activeTab.value) || {}).label || activeTab.value}」筛选下的商品后台批量核价？`;
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(msg, '后台批量核价', { type: 'warning', confirmButtonText: '开始核价', cancelButtonText: '取消' });
+      } catch { return; }
+      startBulkPricing();
+    };
+
     // 上架/下架：调 /api/yandex/products/visibility（hidden-offers）。list=恢复显示，unlist=隐藏
     const visBusy = Vue.ref(false);
     const changeVisibility = async (action) => {
@@ -1420,6 +1520,7 @@ window.YandexProductListView = {
       hoverImg, onImgEnter, onImgMove, onImgLeave,
       selectedRows, priceState, researchDialog, researchTableRef, stateDrawer, applyDialog,
       handleSelectionChange, changeVisibility, visBusy, openResearchBatch, openResearchRow, openStateDrawer,
+      bulkPricingDialog, reasonText, startBulkPricing, openBulkPricingCurrentTab, stopBulkPoll, collectFilteredOfferIds,
       retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
       reverseDialog, reverseOneRow, openReversePricing, reverseAllRows, applyReverseToYandex,
       calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
@@ -1498,6 +1599,7 @@ window.YandexProductListView = {
       <div style="display:flex; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap">
         <el-button type="primary" @click="openReversePricing">Ozon 反推定价</el-button>
         <el-button type="primary" plain @click="openResearchBatch">批量核价（1688 找货）</el-button>
+        <el-button type="primary" plain :loading="bulkPricingDialog.busy" @click="openBulkPricingCurrentTab">后台全店核价（AlphaShop）</el-button>
         <el-button type="warning" plain @click="openApplyBatch">批量应用候选调价</el-button>
         <el-button type="success" plain :disabled="!selectedRows.length || visBusy" @click="changeVisibility('list')">上架</el-button>
         <el-button type="danger" plain :disabled="!selectedRows.length || visBusy" @click="changeVisibility('unlist')">下架</el-button>
@@ -1871,6 +1973,60 @@ window.YandexProductListView = {
       </el-dialog>
 
       <!-- 批量应用候选调价：预览 → 确认提交 Yandex -->
+      <!-- 后台全店核价进度 -->
+      <el-dialog v-model="bulkPricingDialog.visible" title="后台批量核价（AlphaShop 图搜）" width="980px" append-to-body destroy-on-close
+        :close-on-click-modal="false" @closed="stopBulkPoll">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px"
+          title="服务端逐条以图搜 1688 同款并定价：命中且商品有重量 → 自动写入价格候选（可在列表「批量应用候选调价」提交）；无同款/缺重量 → 标待人工，不会误定价。关掉弹窗任务继续后台跑。" />
+        <div style="display:flex; align-items:center; gap:18px; flex-wrap:wrap; margin-bottom:12px">
+          <el-tag type="info" size="large">进度 {{ bulkPricingDialog.processed }} / {{ bulkPricingDialog.total }}</el-tag>
+          <el-tag v-if="bulkPricingDialog.status==='running'" type="warning" size="large">核价中…</el-tag>
+          <el-tag v-else-if="bulkPricingDialog.status==='done'" type="success" size="large">已完成</el-tag>
+          <el-tag v-else-if="bulkPricingDialog.status==='error'" type="danger" size="large">失败</el-tag>
+          <span style="font-size:13px; color:#334155">{{ bulkPricingDialog.phase }}</span>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:12px">
+          <div style="border:1px solid #d1fae5; background:#ecfdf5; border-radius:8px; padding:12px; text-align:center">
+            <div style="font-size:12px;color:#047857;font-weight:800">已自动定价</div>
+            <strong style="font-size:24px;color:#047857">{{ bulkPricingDialog.priced }}</strong>
+          </div>
+          <div style="border:1px solid #fde68a; background:#fffbeb; border-radius:8px; padding:12px; text-align:center">
+            <div style="font-size:12px;color:#92400e;font-weight:800">待补重量（未定价）</div>
+            <strong style="font-size:24px;color:#b45309">{{ bulkPricingDialog.needWeight }}</strong>
+          </div>
+          <div style="border:1px solid #fecaca; background:#fef2f2; border-radius:8px; padding:12px; text-align:center">
+            <div style="font-size:12px;color:#991b1b;font-weight:800">无同款（未定价）</div>
+            <strong style="font-size:24px;color:#b91c1c">{{ bulkPricingDialog.noMatch }}</strong>
+          </div>
+        </div>
+        <div v-if="bulkPricingDialog.error" style="color:#dc2626; font-size:13px; margin-bottom:10px">{{ bulkPricingDialog.error }}</div>
+        <el-table :data="bulkPricingDialog.summaryRows" size="small" border max-height="300" empty-text="暂无结果">
+          <el-table-column label="货号" prop="offerId" min-width="150" show-overflow-tooltip />
+          <el-table-column label="结果" width="110" align="center">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.ok ? 'success' : (row.reason==='need_weight'?'warning':(row.reason==='already_applied'?'info':'danger'))">{{ reasonText(row.reason) }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="同款图" width="80" align="center">
+            <template #default="{ row }">
+              <img v-if="row.img" :src="row.img" referrerpolicy="no-referrer" style="width:42px;height:42px;border-radius:4px;object-fit:cover;background:#f1f5f9" @error="$event.target.style.visibility='hidden'" />
+              <span v-else>-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="候选/标题" prop="title" min-width="200" show-overflow-tooltip />
+          <el-table-column label="采购 ¥" width="80" align="right">
+            <template #default="{ row }">{{ row.purchaseCny || '-' }}</template>
+          </el-table-column>
+          <el-table-column label="建议价 ¥" width="90" align="right">
+            <template #default="{ row }"><b v-if="row.suggestPriceCny" style="color:#2563eb">{{ row.suggestPriceCny }}</b><span v-else>-</span></template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button @click="bulkPricingDialog.visible = false; stopBulkPoll()">关闭（后台继续）</el-button>
+          <el-button v-if="bulkPricingDialog.status==='running'" :loading="bulkPricingDialog.busy" @click="fetchProducts">刷新商品</el-button>
+        </template>
+      </el-dialog>
+
       <!-- 核价（1688 同款候选搜索/选择/保存） -->
       <el-dialog v-model="researchDialog.visible" title="1688 核价 → 保存候选" width="1200px" append-to-body destroy-on-close :close-on-click-modal="false">
         <el-alert v-if="researchDialog.jobText" type="info" :closable="false" style="margin-bottom:10px" :title="researchDialog.jobText" />
