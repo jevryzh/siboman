@@ -3150,7 +3150,26 @@ async function fetchYandexOfferMappingsPage(context, { pageToken = "", limit = 1
   };
 }
 
+// 状态计数：优先复用 offer 全量缓存（active/archived 内存，与商品列表完全同源），
+// 避免独立全店扫描与列表数据不同步导致标签计数不正确。
+function countYandexStatusFromCache(storeKey) {
+  const cache = yandexAllOffersCacheByStore.get(storeKey || "__env__");
+  const counts = { all: 0, published: 0, moderation: 0, need_attention: 0, hidden: 0, archived: 0, unknown: 0 };
+  if (!cache || !cache.at || !Array.isArray(cache.active)) return null;
+  // "全部"= 在售集合(active)，归档是独立 tab（与列表"全部"页 pool=active 口径一致）
+  for (const item of cache.active) {
+    counts.all += 1;
+    const st = String(item.status || "unknown").toLowerCase();
+    counts[st] = Number(counts[st] || 0) + 1;
+  }
+  counts.archived = (cache.archived || []).length;
+  return counts;
+}
+
 async function getYandexProductStatusCounts(context, { maxItems = 10000 } = {}) {
+  // 缓存命中直接返回（快、与列表一致）
+  const cached = countYandexStatusFromCache(String(context.storeId || context.businessId || "default"));
+  if (cached) return cached;
   const counts = { all: 0, published: 0, moderation: 0, need_attention: 0, hidden: 0, archived: 0, unknown: 0 };
   for (const archived of [false, true]) {
     let pageToken = "";
@@ -3159,8 +3178,8 @@ async function getYandexProductStatusCounts(context, { maxItems = 10000 } = {}) 
       if (!page.items.length) break;
       for (const raw of page.items) {
         const item = normalizeYandexProductMapping(raw, context);
-        if (archived) item.status = "archived";
-        counts.all += archived ? 0 : 1;
+        if (archived) { counts.archived += 1; continue; }
+        counts.all += 1;
         counts[item.status] = Number(counts[item.status] || 0) + 1;
       }
       scanned += page.items.length;
@@ -3168,7 +3187,6 @@ async function getYandexProductStatusCounts(context, { maxItems = 10000 } = {}) 
       pageToken = page.nextPageToken;
     }
   }
-  counts.all += counts.archived;
   return counts;
 }
 
@@ -4447,18 +4465,20 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       total = items.length + (hasNext ? pageSize : 0);
     }
 
-    // 状态计数：有缓存直接用；无缓存不阻塞列表返回（后台预热，前端下一轮拉取自动补上）
+    // 状态计数：优先复用本次商品缓存直接算（与列表同源，标签=实际数），无缓存再走独立计数缓存，均不阻塞列表
     let statusCounts = null;
     try {
       const countKey = String(context.storeId || context.businessId || "default");
-      const cc = yandexStatusCountsCacheByStore.get(countKey);
-      if (cc?.data && Date.now() - cc.at < YANDEX_STATUS_COUNTS_TTL_MS) {
-        statusCounts = cc.data;
-      } else if (!cc?.inflight) {
-        // 后台触发一次全店计数扫描（不 await），本次返回 null，前端标签计数稍后自愈
-        getYandexProductStatusCountsCached(context).catch((e) => {
-          console.error("yandex 状态计数后台扫描失败:", e.message);
-        });
+      statusCounts = countYandexStatusFromCache(countKey);
+      if (!statusCounts) {
+        const cc = yandexStatusCountsCacheByStore.get(countKey);
+        if (cc?.data && Date.now() - cc.at < YANDEX_STATUS_COUNTS_TTL_MS) {
+          statusCounts = cc.data;
+        } else if (!cc?.inflight) {
+          getYandexProductStatusCountsCached(context).catch((e) => {
+            console.error("yandex 状态计数后台扫描失败:", e.message);
+          });
+        }
       }
     } catch (countError) {
       console.error("yandex 状态计数读取失败，降级返回商品列表:", countError.message);
@@ -4514,6 +4534,45 @@ app.post("/api/yandex/products/pull", requireAuth, async (req, res, next) => {
       store_id: context.storeId || storeId || "",
       campaign_id: context.campaignId,
       cached_at: beforeAt,
+    });
+  } catch (error) { next(error); }
+});
+
+// Yandex 上架/下架（hidden-offers）：
+//   下架 = POST /v2/campaigns/{campaignId}/hidden-offers          body {hiddenOffers:[{offerId}]}
+//   上架 = POST /v2/campaigns/{campaignId}/hidden-offers/delete   body {hiddenOffers:[{offerId}]}
+// action: 'list'=上架(恢复显示) | 'unlist'=下架(隐藏)；单次 ≤500，多则自动分批。
+app.post("/api/yandex/products/visibility", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const action = String(req.body?.action || "").trim().toLowerCase(); // list | unlist
+    const offerIds = (Array.isArray(req.body?.offerIds) ? req.body.offerIds : [])
+      .map((v) => String(v || "").trim()).filter(Boolean);
+    if (!["list", "unlist"].includes(action)) return res.status(400).json({ success: false, error: "action 必须是 list(上架) 或 unlist(下架)" });
+    if (!offerIds.length) return res.status(400).json({ success: false, error: "offerIds 不能为空" });
+    const endpoint = action === "unlist" ? "/hidden-offers" : "/hidden-offers/delete";
+    const CHUNK = 500;
+    const results = [];
+    for (let i = 0; i < offerIds.length; i += CHUNK) {
+      const chunk = offerIds.slice(i, i + CHUNK);
+      const resp = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}${endpoint}`, {
+        method: "POST",
+        body: { hiddenOffers: chunk.map((offerId) => ({ offerId })) },
+        timeoutMs: 90000,
+        apiSecret: context.apiSecret,
+      });
+      results.push(resp?.result || resp || {});
+    }
+    // 让商品缓存尽快反映最新状态
+    invalidateYandexAllOffersCache(context.storeId || "__env__");
+    res.json({
+      success: true,
+      action,
+      count: offerIds.length,
+      chunks: results.length,
+      campaign_id: context.campaignId,
+      response: results,
     });
   } catch (error) { next(error); }
 });

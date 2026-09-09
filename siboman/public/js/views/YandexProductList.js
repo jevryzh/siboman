@@ -580,6 +580,35 @@ window.YandexProductListView = {
 
     const handleSelectionChange = (val) => { selectedRows.value = val || []; };
 
+    // 上架/下架：调 /api/yandex/products/visibility（hidden-offers）。list=恢复显示，unlist=隐藏
+    const visBusy = Vue.ref(false);
+    const changeVisibility = async (action) => {
+      const rows = selectedRows.value || [];
+      const ids = rows.map((r) => r.offer_id || r.offerId || '').filter(Boolean);
+      if (!ids.length) return notify.warning('请先勾选要操作的 Yandex 商品');
+      const isList = action === 'list';
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `确定对勾选的 ${ids.length} 个商品${isList ? '执行「上架」（恢复在 Yandex 前台显示）' : '执行「下架」（从 Yandex 前台隐藏）'}？\n平台数据更新需要几分钟生效。`,
+          isList ? '上架商品' : '下架商品',
+          { type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      visBusy.value = true;
+      try {
+        const res = await axios.post('/api/yandex/products/visibility', { action: isList ? 'list' : 'unlist', offerIds: ids }, { timeout: 120000 });
+        const n = Number(res.data?.count || ids.length);
+        notify.success(`${isList ? '上架' : '下架'}已提交 ${n} 个商品（${res.data?.chunks || 1} 批），平台处理中`);
+        // 稍后刷新缓存与列表
+        await fetchProducts();
+        fetchProducts();
+      } catch (e) {
+        notify.error(`${isList ? '上架' : '下架'}失败: ` + (e.response?.data?.error || e.message));
+      } finally {
+        visBusy.value = false;
+      }
+    };
+
     // 缩略图悬停大图预览
     const onImgEnter = (ev, row) => {
       hoverImg.url = row.image || row.primary_image || (Array.isArray(row.images) ? (row.images[0] || '') : '') || '';
@@ -1377,7 +1406,7 @@ window.YandexProductListView = {
       openEdit, saveProduct, openProfitDialog, applySuggestedPrice, applyCandidateFields, candRowStyle,
       hoverImg, onImgEnter, onImgMove, onImgLeave,
       selectedRows, priceState, researchDialog, stateDrawer, applyDialog,
-      handleSelectionChange, openResearchBatch, openResearchRow, openStateDrawer,
+      handleSelectionChange, changeVisibility, visBusy, openResearchBatch, openResearchRow, openStateDrawer,
       retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
       reverseDialog, openReversePricing, reverseAllRows, applyReverseToYandex,
       calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
@@ -1457,6 +1486,8 @@ window.YandexProductListView = {
         <el-button type="primary" @click="openReversePricing">Ozon 反推定价</el-button>
         <el-button type="primary" plain @click="openResearchBatch">批量核价（1688 找货）</el-button>
         <el-button type="warning" plain @click="openApplyBatch">批量应用候选调价</el-button>
+        <el-button type="success" plain :disabled="!selectedRows.length || visBusy" @click="changeVisibility('list')">上架</el-button>
+        <el-button type="danger" plain :disabled="!selectedRows.length || visBusy" @click="changeVisibility('unlist')">下架</el-button>
         <el-button type="danger" plain @click="openAiOptimize(selectedRows)">AI 优化（预览确认）</el-button>
         <span style="font-size:13px; color:#94a3b8">已选 {{ selectedRows.length }} 项 · 调价按候选的采购成本/重量/尺寸以 CNY 写回 Yandex</span>
       </div>
