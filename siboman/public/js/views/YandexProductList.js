@@ -938,6 +938,8 @@ window.YandexProductListView = {
       }));
       reverseDialog.busy = false;
       reverseDialog.visible = true;
+      // 打开后自动开始反推（不再需要手动触发；个别失败行可改 Ozon 价后点行内重试）
+      reverseAllRows();
     };
 
     const reverseOneRow = async (row) => {
@@ -1419,7 +1421,7 @@ window.YandexProductListView = {
       selectedRows, priceState, researchDialog, researchTableRef, stateDrawer, applyDialog,
       handleSelectionChange, changeVisibility, visBusy, openResearchBatch, openResearchRow, openStateDrawer,
       retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
-      reverseDialog, openReversePricing, reverseAllRows, applyReverseToYandex,
+      reverseDialog, reverseOneRow, openReversePricing, reverseAllRows, applyReverseToYandex,
       calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
       qgradeInfo, qualityTagType, aiDialog, aiChecked, openAiOptimize, applyAiOptimize,
       drawer, saveLoading, editDrawerMode, aiFillProduct, setAttrValue, attrTemplateOf, drawerMissingAttrs,
@@ -2131,12 +2133,14 @@ window.YandexProductListView = {
               <span v-else>-</span>
             </template>
           </el-table-column>
-          <el-table-column label="状态 / 应用结果" min-width="170">
+          <el-table-column label="状态 / 应用结果" min-width="180">
             <template #default="{ row }">
               <div>
-                <div v-if="row.err" style="color:#dc2626; font-size:12px">{{ row.err }}</div>
+                <div v-if="row.err" style="color:#dc2626; font-size:12px">{{ row.err }}
+                  <el-button link type="primary" size="small" style="margin-left:4px" @click="reverseOneRow(row)">重试</el-button>
+                </div>
                 <div v-else-if="row.rev" style="color:#16a34a; font-size:12px">✓ 已反推（佣金 {{ row.rev.commission }}% · {{ row.rev.descCat ? '按类目' : '默认档' }}）</div>
-                <div v-else style="color:#94a3b8; font-size:12px">待反推</div>
+                <div v-else style="color:#94a3b8; font-size:12px">反推中…</div>
                 <div v-if="row.applyResult" style="font-size:12px; color:#0ea5e9; margin-top:2px">{{ row.applyResult }}</div>
               </div>
             </template>
