@@ -191,7 +191,9 @@ window.StoreManagementView = {
       try {
         await axios.patch(`/api/seller/shops/${row.id}/settings`, {
           watermark_enabled: row.watermark_enabled === true,
-          watermark_text: row.watermark_text || row.name || '逐梦ERP'
+          watermark_text: row.watermark_text || row.name || '逐梦ERP',
+          logistics_provider: row.logistics_provider || '',
+          last_mile_cny: Number(row.last_mile_cny || 4.68) || 4.68,
         });
         ElementPlus.ElMessage.success('店铺设置已保存');
         fetchShops();
@@ -344,6 +346,18 @@ window.StoreManagementView = {
               <div style="font-size:11px; color:#909399; margin-top:4px">
                 {{ row.watermark_enabled ? '批量上架开启水印增强时会使用此文字' : '未开启店铺水印，批量上架不会自动加店铺文字水印' }}
               </div>
+            </template>
+          </el-table-column>
+          <el-table-column label="物流商 / 尾程费" min-width="240">
+            <template #default="{ row }">
+              <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap">
+                <el-input v-model="row.logistics_provider" size="small" maxlength="80" placeholder="物流商（如 CEL）"
+                  @change="saveShopSettings(row)" style="max-width:120px" />
+                <el-input-number v-model="row.last_mile_cny" size="small" :min="0" :precision="2" :step="0.5" :controls="false"
+                  @change="saveShopSettings(row)" style="width:88px" />
+                <span style="font-size:11px; color:#909399">尾程 ¥/件</span>
+              </div>
+              <div style="font-size:11px; color:#909399; margin-top:4px">该店铺定价时用此尾程费（默认 ¥4.68），代贴单费¥3/国内运费¥5/佣金24%/广告15%/毛利35% 为全局默认</div>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="120" fixed="right" align="center">

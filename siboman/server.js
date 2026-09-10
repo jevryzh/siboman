@@ -514,6 +514,8 @@ function serializeStoreForFrontend(store) {
     watermark_text: store.watermark_text || "",
     ai_image_provider: store.ai_image_provider || AI_IMAGE_PROVIDER,
     ai_image_model: store.ai_image_model || "",
+    logistics_provider: String(store.logistics_provider || ""),
+    last_mile_cny: Number(store.last_mile_cny || 4.68),
   };
 }
 
@@ -527,7 +529,7 @@ app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const platformFilter = String(req.query.platform || "").trim();
-    const sql = "SELECT id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model FROM app_stores WHERE user_id = $1"
+    const sql = "SELECT id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model, logistics_provider, last_mile_cny FROM app_stores WHERE user_id = $1"
       + (platformFilter ? " AND platform = $2" : "")
       + " ORDER BY updated_at DESC";
     const result = await db.query(sql, platformFilter ? [req.user.id, platformFilter] : [req.user.id]);
@@ -1123,18 +1125,24 @@ app.patch("/api/seller/shops/:id/settings", requireAuth, async (req, res, next) 
     const watermarkText = String(req.body?.watermark_text || "").trim().slice(0, 80);
     const aiImageProvider = normalizeStoreAiProvider(req.body?.ai_image_provider);
     const aiImageModel = String(req.body?.ai_image_model || "").trim().slice(0, 80);
+    const hasLogistics = req.body?.logistics_provider !== undefined || req.body?.last_mile_cny !== undefined;
+    const logisticsProvider = String(req.body?.logistics_provider || "").trim().slice(0, 80);
+    const lastMileCny = Math.max(0, Number(req.body?.last_mile_cny ?? 4.68) || 0);
     const result = await db.query(
       `UPDATE app_stores
           SET watermark_enabled = $1,
               watermark_text = COALESCE(NULLIF($2, ''), name),
               ai_image_provider = $5,
               ai_image_model = $6,
+              logistics_provider = CASE WHEN $7::boolean THEN $8 ELSE logistics_provider END,
+              last_mile_cny = CASE WHEN $7::boolean THEN $9 ELSE last_mile_cny END,
               updated_at = now()
         WHERE id = $3 AND user_id = $4
-        RETURNING id, name, client_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model`,
-      [watermarkEnabled, watermarkText, req.params.id, req.user.id, aiImageProvider, aiImageModel],
+        RETURNING id, name, client_id, campaign_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model, logistics_provider, last_mile_cny`,
+      [watermarkEnabled, watermarkText, req.params.id, req.user.id, aiImageProvider, aiImageModel, hasLogistics, logisticsProvider, lastMileCny],
     );
     if (!result.rows[0]) return res.status(404).json({ success: false, error: "店铺不存在" });
+    storePricingCache.delete(String(req.params.id)); // 尾程费/物流商改了 → 立刻让定价参数生效
     res.setHeader("Cache-Control", "no-store");
     res.json({ success: true, shop: serializeStoreForFrontend(result.rows[0]) });
   } catch (error) { next(error); }
@@ -2298,6 +2306,9 @@ async function initDatabase() {
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'ozon';
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS campaign_id TEXT NOT NULL DEFAULT '';
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS api_secret TEXT NOT NULL DEFAULT '';
+      -- 店铺关联物流商 + 尾程费（定价时按店铺取）
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS logistics_provider TEXT NOT NULL DEFAULT '';
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS last_mile_cny NUMERIC(10,2) NOT NULL DEFAULT 4.68;
       ALTER TABLE yandex_price_candidates ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       ALTER TABLE yandex_price_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       -- 核价证据（同款标题/图/链接/1688 价格阶梯/起批等），供人工核对采购价来源
@@ -5858,7 +5869,7 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById, p
     ? yandexSuggestPrice({
         purchaseCny: pick.price, weightKg, dims: [lenCm, widCm, heiCm],
         categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
-        params: { ...PRICING_DEFAULTS, exchangeRate: rubPerCnyNow(), domesticShippingCny: shipping.value },
+        params: { ...(await storePricingParams(storeId)), domesticShippingCny: shipping.value },
       })
     : { ok: false };
   const evidence = {
@@ -6044,7 +6055,7 @@ app.post("/api/yandex/precise-1688/:id/recompute-suggest", requireAuth, async (r
       const suggest = yandexSuggestPrice({
         purchaseCny: Number(row.purchase_cny), weightKg, dims,
         categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
-        params: { ...PRICING_DEFAULTS, exchangeRate },
+        params: { ...(await storePricingParams(storeId)), exchangeRate },
       });
       if (!suggest?.ok) { skipped += 1; continue; }
       await db.query(
@@ -6060,8 +6071,11 @@ app.post("/api/yandex/precise-1688/:id/recompute-suggest", requireAuth, async (r
 // 定价默认参数（利润计算弹窗 / 批量调价初始化）
 app.get("/api/yandex/pricing-defaults", requireAuth, async (req, res, next) => {
   try {
-    const exchangeRate = await refreshRubPerCny();
-    res.json({ success: true, exchangeRate, ...PRICING_DEFAULTS });
+    await refreshRubPerCny();
+    const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
+    const params = storeId ? await storePricingParams(storeId) : { ...PRICING_DEFAULTS, exchangeRate: rubPerCnyNow() };
+    const cached = storePricingCache.get(String(storeId || "__env__"));
+    res.json({ success: true, ...params, logisticsProvider: cached?.logisticsProvider || "" });
   } catch (error) { next(error); }
 });
 
@@ -7299,6 +7313,28 @@ async function refreshRubPerCny() {
     }
   } catch (_e) { /* 汇率取不到就用 env 值 */ }
   return rubPerCnyCache.value;
+}
+
+// 店铺级定价参数：尾程费/物流商取店铺配置，其余用默认，汇率取实际值
+const storePricingCache = new Map(); // storeId -> { at, params }
+async function storePricingParams(storeId) {
+  const key = String(storeId || "__env__");
+  const cached = storePricingCache.get(key);
+  if (cached && Date.now() - cached.at < 60 * 1000) return cached.params;
+  let lastMileCny = PRICING_DEFAULTS.lastMileCny;
+  let logisticsProvider = "";
+  try {
+    if (db && storeId) {
+      const r = await db.query("SELECT logistics_provider, last_mile_cny FROM app_stores WHERE id = $1 LIMIT 1", [storeId]);
+      const row = r.rows?.[0];
+      const v = Number(row?.last_mile_cny || 0);
+      if (v > 0) lastMileCny = v;
+      logisticsProvider = String(row?.logistics_provider || "");
+    }
+  } catch (_e) { /* 取不到就用默认 */ }
+  const params = { ...PRICING_DEFAULTS, lastMileCny, exchangeRate: rubPerCnyNow() };
+  storePricingCache.set(key, { at: Date.now(), params, logisticsProvider });
+  return params;
 }
 
 function yandexMatchFbsCommission(categoryName, categoryLeaf) {
