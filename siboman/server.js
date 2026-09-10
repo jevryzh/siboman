@@ -5288,13 +5288,15 @@ function medianOf(nums) {
 function bulkPricingPublicBase() {
   return String(process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "https://test.renwz.cn").replace(/\/+$/, "");
 }
-async function proxyImageToPublicUrl(imgUrl) {
+async function proxyImageToPublicUrl(imgUrl, opts = {}) {
   const url = String(imgUrl || "").trim();
   if (!/^https?:\/\//i.test(url)) return "";
   try {
     const host = new URL(url).hostname.toLowerCase();
     // 已确认可被 AlphaShop 抓取的域名直接放行（1688 CDN + 本服务）。其余一律转存（含 Ozon CDN ir.ozone.ru，实测其直连图搜为 0 结果）。
-    if (/(alicdn\.com|renwz\.cn)$/.test(host)) return url;
+    // force=true：强制转存到本服务（Yandex 抓不到 1688 CDN cbu01.alicdn.com 的图，会报「Нет изображения 无法开卖」）。
+    if (!opts.force && /(alicdn\.com|renwz\.cn)$/.test(host)) return url;
+    if (/renwz\.cn$/i.test(host) && !opts.force) return url;
   } catch { return ""; }
   // 其余域名：下载 → 存 uploads → 公网 URL
   const controller = new AbortController();
@@ -5584,6 +5586,50 @@ async function buildPreciseCampaignItems(storeId) {
   return { items, skipped, publishedCount: published.length, cacheReady: cache.at > 0 };
 }
 
+// 规格匹配用的度量/型号 token：
+//   ① 组合尺寸 10х14 см / 13*18cm（排序后归一，10x14 == 14x10）
+//   ② 带单位的单尺寸 10.5CM宽 / ширина 10.5 см
+//   ③ 字母+数字型号码 XH60138 / S6202（长度>=4，避免误配）
+// 只在「唯一命中」时才用来定价，命中多个或零个一律回落到人工。
+function preciseMeasureTokens(text) {
+  const s = String(text || "").toLowerCase()
+    .replace(/[×✕хxX*]/g, "x")
+    .replace(/,/g, ".")
+    .replace(/\s+/g, " ");
+  const out = new Set();
+  const unit = (u) => {
+    const v = String(u || "").toLowerCase();
+    if (v === "см" || v === "cm") return "cm";
+    if (v === "мм" || v === "mm") return "mm";
+    if (v === "寸") return "cun";
+    if (v === "码") return "ma";
+    return "";
+  };
+  for (const m of s.matchAll(/(\d+(?:\.\d+)?)\s*x\s*(\d+(?:\.\d+)?)(?:\s*x\s*(\d+(?:\.\d+)?))?\s*(cm|см|мм|mm|寸|码)?/g)) {
+    const nums = [m[1], m[2], m[3]].filter(Boolean).map(Number).filter((n) => Number.isFinite(n) && n > 0 && n <= 500);
+    if (nums.length < 2) continue;
+    const key = `${nums.slice().sort((a, b) => a - b).join("x")}${unit(m[4])}`;
+    out.add(key);
+  }
+  for (const m of s.matchAll(/(\d+(?:\.\d+)?)\s*(cm|см|мм|mm|寸|码)/g)) {
+    const n = Number(m[1]);
+    if (!Number.isFinite(n) || n <= 0 || n > 500) continue;
+    out.add(`${n}${unit(m[2])}`);
+  }
+  return out;
+}
+
+function preciseModelCodes(text) {
+  const out = new Set();
+  for (const m of String(text || "").matchAll(/\b([a-z]{1,10}\d{2,9})\b/gi)) {
+    const code = String(m[1]).toLowerCase();
+    if (code.length < 5) continue;                       // 太短容易误配
+    if (/^(cm|mm|kg|ml|pcs?)\d+$/i.test(code)) continue; // 单位+数字，不算型号
+    out.add(code);
+  }
+  return out;
+}
+
 // 取「起批首档单价」：优先用详情页价格阶梯里起批量最小的一档（小批量真实采购价）。
 // 混合配件店（同一链接卖 边刷/滤网/尘袋…，各 SKU 一个价）不能用阶梯 —— 必须按商品名把 SKU 规格对齐，
 // 否则会把 ¥1.9 边刷价当成尘袋价（用户最早质疑的就是这个）。
@@ -5619,6 +5665,35 @@ function precisePickPrice(candidate, offerName) {
   const skuTypeKeys = skus.map((s) => preciseAccessoryTypes(s.name)[0]).filter(Boolean);
   const distinctSkuTypes = new Set(skuTypeKeys);
   const mixedTypes = distinctSkuTypes.size >= 2;
+  // 多规格一链接（每个规格不同价）：先按尺寸/型号唯一命中来对齐规格
+  const variantMatch = (() => {
+    if (skus.length < 2) return null;
+    const byMeasure = (() => {
+      const wanted = preciseMeasureTokens(offerName);
+      if (!wanted.size) return null;
+      const hits = skus.filter((sku) => {
+        const has = preciseMeasureTokens(sku.name);
+        for (const key of wanted) if (has.has(key)) return true;
+        return false;
+      });
+      return hits.length === 1 ? { sku: hits[0], kind: "尺寸" } : null;
+    })();
+    if (byMeasure) return byMeasure;
+    const byCode = (() => {
+      const wanted = preciseModelCodes(offerName);
+      if (!wanted.size) return null;
+      const hits = skus.filter((sku) => {
+        const has = preciseModelCodes(sku.name);
+        for (const key of wanted) if (has.has(key)) return true;
+        return false;
+      });
+      return hits.length === 1 ? { sku: hits[0], kind: "型号" } : null;
+    })();
+    return byCode;
+  })();
+  if (variantMatch) {
+    return { price: variantMatch.sku.price, mode: "variant_match", sku: variantMatch.sku, skus, tiers, matchKind: variantMatch.kind };
+  }
   if (mixedTypes) {
     // 混合配件店：按本商品名匹配对应规格
     const wanted = preciseAccessoryTypes(offerName).filter((t) => distinctSkuTypes.has(t));
@@ -5655,6 +5730,7 @@ const PRECISE_PRICE_MODES = {
   single_price: { trusted: true, label: "统一规格价" },
   sku_match: { trusted: true, label: "按规格匹配（混合配件店）" },
   promo_adjusted: { trusted: true, label: "含促销档，已取实际规格价（保守）" },
+  variant_match: { trusted: true, label: "按尺寸/型号匹配规格" },
   tier_suspect: { trusted: false, label: "阶梯疑似含引流档，需人工确认" },
   ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
   no_evidence: { trusted: false, label: "未取到价格证据" },
@@ -6334,8 +6410,31 @@ async function getYandexDraftForUser(id, user) {
   return r.rows?.[0] ? dbRowToYandexDraft(r.rows[0]) : null;
 }
 
+// Yandex 上架图片：统一转存到本服务公网域名（Yandex 抓不到 1688 CDN 的图）
+const yandexListingImageCache = new Map(); // 原始URL -> 本服务URL
+async function publicUrlForListingImage(url) {
+  const src = String(url || "").trim();
+  if (!src) return "";
+  if (/^https?:\/\/([a-z0-9-]+\.)?(test|xm)\.renwz\.cn\//i.test(src)) return src;
+  if (yandexListingImageCache.has(src)) return yandexListingImageCache.get(src);
+  const pub = await proxyImageToPublicUrl(src, { force: true }).catch(() => "");
+  const final = pub || src;
+  yandexListingImageCache.set(src, final);
+  return final;
+}
+
+async function mapListingImages(list, limit = 30) {
+  const urls = (Array.isArray(list) ? list : []).map((u) => String(u || "").trim()).filter(Boolean).slice(0, limit);
+  const out = [];
+  for (const u2 of urls) {
+    const pub = await publicUrlForListingImage(u2);
+    if (pub && !out.includes(pub)) out.push(pub);
+  }
+  return out;
+}
+
 // 由草稿构建 Yandex offer（对齐官方 offer-mappings/update 结构）
-function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE, currencyId = YANDEX_LISTING_CURRENCY } = {}) {
+async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE, currencyId = YANDEX_LISTING_CURRENCY } = {}) {
   const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : YANDEX_LISTING_RATE;
   const currency = String(currencyId || YANDEX_LISTING_CURRENCY).toUpperCase();
   const priceOf = (sku, key) => {
@@ -6345,7 +6444,9 @@ function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE,
     return rub > 0 ? rub : Math.round(cny * rate);
   };
   const skus = Array.isArray(draft.skus) ? draft.skus.filter((s2) => s2 && (Number(s2.priceRub) > 0 || Number(s2.priceCny) > 0)) : [];
-  const groupId = skus.length > 1 ? `ZM-${String(draft.id).slice(0, 8)}` : "";
+  // 变体合并（groupId）需要配合“变体特征参数(distinctive)”才有效，否则 Yandex 报「Дубль варианта」不发布；
+  //   一期先每个 SKU 独立成卡，二期做正规变体（选特征参数 + 每 SKU 不同值）。
+  const groupId = "";
   const baseParams = (Array.isArray(draft.categoryParams) ? draft.categoryParams : []).map((p) => {
     const item = { parameterId: String(p.parameterId ?? "") };
     const valueId = p.valueId ?? (p.optionId || "");
@@ -6359,11 +6460,10 @@ function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE,
     if (p.unitId) item.unitId = /^\d+$/.test(String(p.unitId)) ? Number(p.unitId) : String(p.unitId);
     return item;
   }).filter(Boolean);
-  return skus.map((sku, index) => {
+  return await Promise.all(skus.map(async (sku, index) => {
     const priceValue = priceOf(sku, "price");
     const oldValue = Number(sku.oldPriceCny || sku.oldPriceRub || 0) > 0 ? priceOf(sku, "oldPrice") : 0;
-    const pictures = [sku.image, ...(Array.isArray(sku.images) ? sku.images : []), ...(draft.images || [])]
-      .map((u) => String(u || "").trim()).filter(Boolean).filter((u, i, arr) => arr.indexOf(u) === i).slice(0, 30);
+    const pictures = await mapListingImages([sku.image, ...(Array.isArray(sku.images) ? sku.images : []), ...(draft.images || [])], 30);
     const offer = {
       offerId: String(sku.offerId || (skus.length > 1 ? `${draft.vendorCode || String(draft.id).slice(0, 8)}-${index + 1}` : (draft.vendorCode || String(draft.id).slice(0, 8)))),
       name: String((skus.length > 1 && (sku.specRu || sku.spec)) ? `${draft.titleRu} ${sku.specRu || sku.spec}` : draft.titleRu).slice(0, 255),
@@ -6386,15 +6486,15 @@ function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE,
     if (baseParams.length) offer.parameterValues = baseParams;
     if (groupId) offer.groupId = groupId;
     return offer;
-  });
+  }));
 }
 
-function validateYandexDraftForUpload(draft) {
+async function validateYandexDraftForUpload(draft) {
   const problems = [];
   if (!draft.categoryId) problems.push("未选类目");
   if (!String(draft.titleRu || "").trim()) problems.push("缺俄文标题");
   if (!(draft.images || []).length) problems.push("缺图片");
-  const offers = buildYandexOffersFromDraft(draft);
+  const offers = await buildYandexOffersFromDraft(draft);
   if (!offers.length) problems.push("SKU 未填售价");
   for (const offer of offers) {
     if (!(offer.basicPrice.value > 0)) problems.push(`${offer.offerId}: 售价必须 > 0`);
@@ -6690,7 +6790,7 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
     for (const id of ids) {
       const draft = await getYandexDraftForUser(id, req.user);
       if (!draft) { results.push({ id, ok: false, error: "草稿不存在" }); continue; }
-      const check = validateYandexDraftForUpload(draft);
+      const check = await validateYandexDraftForUpload(draft);
       if (!check.ok) {
         await db.query(`UPDATE yandex_listing_drafts SET publish_status='failed', publish_error=$2, updated_at=now() WHERE id=$1`, [id, check.problems.join("；").slice(0, 500)]);
         results.push({ id, ok: false, error: check.problems.join("；") });
@@ -6698,7 +6798,7 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
       }
       await db.query(`UPDATE yandex_listing_drafts SET publish_status='uploading', publish_error='', updated_at=now() WHERE id=$1`, [id]);
       try {
-        const offers = buildYandexOffersFromDraft(draft, { exchangeRate, currencyId });
+        const offers = await buildYandexOffersFromDraft(draft, { exchangeRate, currencyId });
         const mapping = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings/update`, {
           method: "POST", query: { language: "RU" }, body: { offerMappings: offers.map((offer) => ({ offer })) }, timeoutMs: 90000, apiSecret: context.apiSecret,
         });
