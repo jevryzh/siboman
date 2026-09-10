@@ -51,7 +51,7 @@ window.YandexProductListView = {
         acquiringPct: 3.8,
         withdrawalPct: 1.2,
         returnLossPct: 0,
-        adPct: 10,
+        adPct: 15,
         targetMarginPct: 35,
         strikeDiscountPct: 50,
         ozonMarginPct: 10, // Ozon 反推采购价用的目标利润率
@@ -1742,8 +1742,27 @@ window.YandexProductListView = {
       fetchProducts();
     };
 
+    // 定价默认参数（服务端为唯一口径来源：代贴单¥3/国内运费¥5/佣金24%/广告15%/汇率取实际值…）
+    const loadPricingDefaults = async () => {
+      try {
+        const res = await axios.get('/api/yandex/pricing-defaults');
+        const d = res.data || {};
+        const c = profitDialog.cost;
+        if (!(Number(c.serviceFeeCny) > 0) || Number(c.serviceFeeCny) === 3) c.serviceFeeCny = Number(d.serviceFeeCny || c.serviceFeeCny);
+        if (!(Number(c.domesticShippingCny) > 0) || Number(c.domesticShippingCny) === 5) c.domesticShippingCny = Number(d.domesticShippingCny || c.domesticShippingCny);
+        if (!(Number(c.lastMileCny) > 0)) c.lastMileCny = Number(d.lastMileCny || c.lastMileCny);
+        if (!(Number(c.adPct) > 0)) c.adPct = Number(d.adPct || c.adPct);
+        if (!(Number(c.acquiringPct) > 0)) c.acquiringPct = Number(d.acquiringPct || c.acquiringPct);
+        if (!(Number(c.withdrawalPct) > 0)) c.withdrawalPct = Number(d.withdrawalPct || c.withdrawalPct);
+        if (Number.isFinite(Number(d.targetMarginPct)) && !(Number(c.targetMarginPct) > 0)) c.targetMarginPct = Number(d.targetMarginPct);
+        if (Number.isFinite(Number(d.strikeDiscountPct)) && !(Number(c.strikeDiscountPct) > 0)) c.strikeDiscountPct = Number(d.strikeDiscountPct);
+        if (Number(d.exchangeRate) > 0) c.exchangeRate = Number(d.exchangeRate); // 汇率始终取实际值
+      } catch (_e) { /* 拿不到就沿用本地默认 */ }
+    };
+
     Vue.onMounted(async () => {
       fetchProducts();
+      loadPricingDefaults();
       window.addEventListener('shop-changed', onShopChanged);
       // 若上次有未完成/刚完成的后台核价任务，进入页面自动弹进度（避免误以为要重新发起）
       const recent = await checkRecentBulkJob();

@@ -5382,7 +5382,7 @@ async function researchOfferViaAlpha(offer, context, userId, storeId) {
     purchaseCny, weightKg,
     dims: [lenCm, widCm, heiCm],
     categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
-    params: { exchangeRate: 12.8205, targetMarginPct: 35 },
+    params: { ...PRICING_DEFAULTS, exchangeRate: rubPerCnyNow() },
   });
   if (!suggest?.ok) return { ...base, ok: false, reason: "calc_failed", best, purchaseCny };
   // 写候选表：已有 applied（已提交过平台）的保留不动，避免覆盖已确认价；其余刷新
@@ -5857,7 +5857,7 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById, p
     ? yandexSuggestPrice({
         purchaseCny: pick.price, weightKg, dims: [lenCm, widCm, heiCm],
         categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
-        params: { exchangeRate: 12.8205, targetMarginPct: 35, domesticShippingCny: shipping.value },
+        params: { ...PRICING_DEFAULTS, exchangeRate: rubPerCnyNow(), domesticShippingCny: shipping.value },
       })
     : { ok: false };
   const evidence = {
@@ -6010,6 +6010,14 @@ async function sendAlertMailThrottled({ key, subject, text, minIntervalMs = 10 *
   console.log(`[alert-mail] ${result.ok ? "已发送" : "发送失败"} key=${key} ${result.error || ""}`);
   return result;
 }
+
+// 定价默认参数（利润计算弹窗 / 批量调价初始化）
+app.get("/api/yandex/pricing-defaults", requireAuth, async (req, res, next) => {
+  try {
+    const exchangeRate = await refreshRubPerCny();
+    res.json({ success: true, exchangeRate, ...PRICING_DEFAULTS });
+  } catch (error) { next(error); }
+});
 
 app.post("/api/alerts/test-email", requireAuth, async (req, res, next) => {
   try {
@@ -6468,7 +6476,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         yandexImage: yandexImages[0] || "",
         yandexImages: yandexImages.slice(0, 3),
         yandexPriceRub: Number(yandexOffer.price || 0),
-        currentPriceCny: Number(yandexOffer.price || 0) > 0 ? Math.round((Number(yandexOffer.price) / 12.8205) * 100) / 100 : 0,
+        currentPriceCny: Number(yandexOffer.price || 0) > 0 ? Math.round((Number(yandexOffer.price) / rubPerCnyNow()) * 100) / 100 : 0,
         detailUrl: String(best?.link || best?.detailUrl || ""),
         price: pick.price || (savedTrusted ? Number(saved?.purchase_cny || 0) : 0),
         priceDetails: String(best?.priceDetails || "").slice(0, 200),
@@ -6571,7 +6579,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
 const yandexListingTreeCache = new Map(); // storeKey -> { at, tree }
 const yandexListingWarehousesCache = new Map(); // storeKey -> { at, list }
 const YANDEX_LISTING_TREE_TTL_MS = 12 * 3600 * 1000;
-const YANDEX_LISTING_RATE = 12.8205; // CNY→RUB 兜底汇率（前端可覆盖）
+const YANDEX_LISTING_RATE = Math.round((1 / (Number(process.env.RUB_CNY_RATE) || 0.0862)) * 10000) / 10000; // CNY→RUB 兜底汇率（取实际汇率，前端可覆盖）
 // 店铺结算币种：跨境店为 CNY（Yandex 会拒绝非店铺币种，实测推 RUB 报 Illegal input at basicPrice.currencyId）
 const YANDEX_LISTING_CURRENCY = String(process.env.YANDEX_LISTING_CURRENCY || "CNY").toUpperCase();
 
@@ -7134,7 +7142,7 @@ function yandexCelEconomy(priceCny, opt = {}) {
   const lenCm = Math.max(0, Number(dims[0] || 0));
   const widCm = Math.max(0, Number(dims[1] || 0));
   const heiCm = Math.max(0, Number(dims[2] || 0));
-  const rate = Math.max(0, Number(opt.exchangeRate || 0)) || 12.8205;
+  const rate = Math.max(0, Number(opt.exchangeRate || 0)) || rubPerCnyNow();
   const priceRub = Math.max(0, Number(priceCny || 0)) * rate;
   const volumeKg = lenCm > 0 && widCm > 0 && heiCm > 0 ? (lenCm * widCm * heiCm) / 12000 : 0;
   let zone = 'Extra Small', chargeKg = weightKg, fee = weightKg * 28.1 + 3.37;
@@ -7162,13 +7170,50 @@ const __yandexFbsShopMap = (() => {
     return {};
   }
 })();
+// ===== 定价默认参数（对齐熊猫 ERP 的利润计算口径）=====
+// 代贴单费 ¥3 / 国内运费 ¥5 / 平台佣金默认 24%（可按类目） / 收单 3.8% / 提现 1.2% /
+// 退货亏损 0% / 广告 15% / 目标毛利 35% / 划线价折扣 50% / 尾程默认 ¥4.68（将来按店铺物流商配置）
+const PRICING_DEFAULTS = {
+  serviceFeeCny: 3,
+  domesticShippingCny: 5,
+  lastMileCny: 4.68,
+  commissionPct: 24,      // 仅在类目匹配不到时作为兜底
+  acquiringPct: 3.8,
+  withdrawalPct: 1.2,
+  returnLossPct: 0,
+  adPct: 15,
+  targetMarginPct: 35,
+  strikeDiscountPct: 50,
+};
+const DEFAULT_COMMISSION_PCT = 24;
+
+// 实际汇率（1 CNY = ? RUB）：优先 app_exchange_rates 最新一条，其次 env RUB_CNY_RATE
+let rubPerCnyCache = { value: Math.round((1 / (Number(process.env.RUB_CNY_RATE) || 0.0862)) * 10000) / 10000, at: 0 };
+function rubPerCnyNow() {
+  return rubPerCnyCache.value > 0 ? rubPerCnyCache.value : 11.601;
+}
+async function refreshRubPerCny() {
+  if (Date.now() - rubPerCnyCache.at < 10 * 60 * 1000 && rubPerCnyCache.at > 0) return rubPerCnyCache.value;
+  try {
+    if (db) {
+      const r = await db.query(
+        `SELECT rate FROM app_exchange_rates WHERE base_currency='RUB' AND quote_currency='CNY' ORDER BY effective_at DESC LIMIT 1`
+      );
+      const rubCny = Number(r.rows?.[0]?.rate || 0);
+      if (rubCny > 0) rubPerCnyCache = { value: Math.round((1 / rubCny) * 10000) / 10000, at: Date.now() };
+      else rubPerCnyCache = { ...rubPerCnyCache, at: Date.now() };
+    }
+  } catch (_e) { /* 汇率取不到就用 env 值 */ }
+  return rubPerCnyCache.value;
+}
+
 function yandexMatchFbsCommission(categoryName, categoryLeaf) {
   const map = __yandexFbsShopMap;
   const key = String(categoryName || "").trim();
   if (map[key] > 0) return map[key];
   const leaf = String(categoryLeaf || "").trim();
   if (leaf && map[leaf] > 0) return map[leaf];
-  return 26;
+  return DEFAULT_COMMISSION_PCT;
 }
 
 function yandexSuggestPrice(input = {}) {
@@ -7176,17 +7221,17 @@ function yandexSuggestPrice(input = {}) {
   const weightKg = Math.max(0, Number(input.weightKg || 0.2));
   const dims = Array.isArray(input.dims) && input.dims.length === 3 ? input.dims.map(Number) : [0, 0, 0];
   const params = input.params || {};
-  const domestic = Math.max(0, Number(params.domesticShippingCny || 4));
-  const service = Math.max(0, Number(params.serviceFeeCny || 3));
-  const lastMile = Math.max(0, Number(params.lastMileCny || 4.68));
+  const domestic = Math.max(0, Number(params.domesticShippingCny || PRICING_DEFAULTS.domesticShippingCny));
+  const service = Math.max(0, Number(params.serviceFeeCny || PRICING_DEFAULTS.serviceFeeCny));
+  const lastMile = Math.max(0, Number(params.lastMileCny || PRICING_DEFAULTS.lastMileCny));
   const manualCommission = Math.max(0, Number(params.commissionPct || 0));
   const commission = manualCommission > 0 ? manualCommission : yandexMatchFbsCommission(input.categoryName, input.categoryLeaf);
-  const acquiring = Math.max(0, Number(params.acquiringPct || 3.8));
-  const withdrawal = Math.max(0, Number(params.withdrawalPct || 1.2));
-  const returnLoss = Math.max(0, Number(params.returnLossPct || 0));
-  const ad = Math.max(0, Number(params.adPct || 10));
-  const targetMargin = Math.max(0, Number(params.targetMarginPct || 35));
-  const rate = Math.max(0, Number(params.exchangeRate || 0)) || 12.8205;
+  const acquiring = Math.max(0, Number(params.acquiringPct || PRICING_DEFAULTS.acquiringPct));
+  const withdrawal = Math.max(0, Number(params.withdrawalPct || PRICING_DEFAULTS.withdrawalPct));
+  const returnLoss = Math.max(0, Number(params.returnLossPct || PRICING_DEFAULTS.returnLossPct));
+  const ad = Math.max(0, Number(params.adPct || PRICING_DEFAULTS.adPct));
+  const targetMargin = Math.max(0, Number(params.targetMarginPct || PRICING_DEFAULTS.targetMarginPct));
+  const rate = Math.max(0, Number(params.exchangeRate || 0)) || rubPerCnyNow();
   const vrate = (commission + acquiring + withdrawal + returnLoss + ad) / 100;
   const denom = 1 - vrate - targetMargin / 100;
   if (purchaseCny <= 0 || denom <= 0.02) return { ok: false };
