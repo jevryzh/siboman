@@ -5596,9 +5596,18 @@ function precisePickPrice(candidate, offerName) {
     }
     return { price: 0, mode: "ambiguous_manual", skus, tiers, wanted: preciseAccessoryTypes(offerName) };
   }
-  if (tiers.length) return { price: tiers[0].price, mode: "tier_first", skus, tiers };
+  if (tiers.length) {
+    // 阶梯本身也可能是“引流档 + 正常档”混在一起（如页面出现 "1件起 ¥0.16; 1件起 ¥2"）：
+    //   首档低到不合理、或同一提批量出现多档且价差极大 → 不采信，标人工，避免按引流档算成本。
+    const prices = tiers.map((t) => t.price);
+    const dupBeginAmount = new Set(tiers.map((t) => t.beginAmount)).size < tiers.length;
+    const spread = Math.max(...prices) / Math.max(0.01, Math.min(...prices));
+    const suspect = tiers[0].price < 0.3 || (tiers[0].price < 1 && (dupBeginAmount || spread >= 8));
+    if (!suspect) return { price: tiers[0].price, mode: "tier_first", skus, tiers };
+    return { price: 0, mode: "tier_suspect", skus, tiers };
+  }
   const distinctPrices = new Set(skus.map((s) => s.price));
-  if (distinctPrices.size === 1) return { price: skus[0].price, mode: "single_price", skus, tiers };
+  if (distinctPrices.size === 1 && skus[0].price >= 0.3) return { price: skus[0].price, mode: "single_price", skus, tiers };
   return { price: 0, mode: "no_evidence", skus, tiers };
 }
 
@@ -5606,6 +5615,7 @@ const PRECISE_PRICE_MODES = {
   tier_first: { trusted: true, label: "起批首档价（1688 价格阶梯）" },
   single_price: { trusted: true, label: "统一规格价" },
   sku_match: { trusted: true, label: "按规格匹配（混合配件店）" },
+  tier_suspect: { trusted: false, label: "阶梯疑似含引流档，需人工确认" },
   ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
   no_evidence: { trusted: false, label: "未取到价格证据" },
 };
@@ -5681,6 +5691,74 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
   } catch (e) {
     return { offerId, status: "error", reason: String(e?.message || e).slice(0, 160), price: pick.price, evidence };
   }
+}
+
+// ===== 精核价风控告警 =====
+// 插件遇 1688 验证码/滑块只会自己暂停 5 分钟后继续，不会通知任何人 → 这里在服务端识别风控特征，
+// 把告警写进 job.payload.alert + phase + logs，前端弹窗与报告接口都能立刻看到。
+const PRECISE_RISK_PATTERN = /验证码|滑块|安全验证|人机验证|captcha|robot|punish|风控|非法请求|ILLEGAL_ACCESS|token 失效|没有拿到 1688 搜图 token|请先.*登录|store image error|图片入库失败/i;
+const preciseRiskState = new Map(); // jobId -> { alerted: boolean }
+
+async function evaluatePreciseRisk(job, results) {
+  if (!job?.id || !db) return null;
+  const rows = Array.isArray(results) ? results : [];
+  let trailing = 0;
+  let riskMessage = "";
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const ok = Array.isArray(rows[i]?.candidates) && rows[i].candidates.length > 0;
+    if (ok) break;
+    trailing += 1;
+    const err = String(rows[i]?.searchError || "");
+    if (!riskMessage && PRECISE_RISK_PATTERN.test(err)) riskMessage = err.slice(0, 160);
+  }
+  const state = preciseRiskState.get(job.id) || { alerted: false };
+  let alert = null;
+  if (riskMessage) {
+    alert = {
+      level: "danger",
+      at: new Date().toISOString(),
+      count: trailing,
+      message: `检测到 1688 风控拦截：${riskMessage}`,
+      advice: "请在装了采集插件的 Chrome 里打开 1688 完成验证码/滑块/登录；插件会暂停约 5 分钟后自动重试，无需重发任务。",
+    };
+  } else if (trailing >= 3) {
+    alert = {
+      level: "warning",
+      at: new Date().toISOString(),
+      count: trailing,
+      message: `连续 ${trailing} 个商品没核到同款（可能被 1688 风控限流或网络异常）。`,
+      advice: "建议看一眼浏览器里的 1688 是否要求验证；确认无误可让它继续跑。",
+    };
+  }
+  if (alert) {
+    state.alerted = true;
+    preciseRiskState.set(job.id, state);
+    const phaseText = (alert.level === "danger" ? "⚠ 1688 风控：" : "⚠ 连续失败：") + alert.message.slice(0, 80);
+    await db.query(
+      `UPDATE app_jobs
+          SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb,
+              phase = $3,
+              logs = (COALESCE(logs, '[]'::jsonb) || $4::jsonb),
+              updated_at = now()
+        WHERE id = $1`,
+      [job.id, JSON.stringify({ alert }), phaseText, JSON.stringify([makeLogEntry(`${alert.message} ${alert.advice}`, "warn")])]
+    ).catch(() => {});
+    return alert;
+  }
+  if (state.alerted) {
+    state.alerted = false;
+    preciseRiskState.set(job.id, state);
+    await db.query(
+      `UPDATE app_jobs
+          SET payload = COALESCE(payload, '{}'::jsonb) - 'alert',
+              phase = $2,
+              logs = (COALESCE(logs, '[]'::jsonb) || $3::jsonb),
+              updated_at = now()
+        WHERE id = $1`,
+      [job.id, "1688 核价恢复中（风控告警已解除）", JSON.stringify([makeLogEntry("已恢复正常核价：风控告警解除。", "info")])]
+    ).catch(() => {});
+  }
+  return null;
 }
 
 // 插件每回传一次进度就增量落库（插件中途掉线/续跑也不会丢已核结果；重复调用幂等）
@@ -5851,6 +5929,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         createdAt: job.createdAt, updatedAt: job.updatedAt,
         preciseTotal: Number(job.payload?.items?.length || 0),
         finalizedAt: job.payload?.finalizedAt || "",
+        alert: job.payload?.alert || null,
       },
       report: {
         total: Number(job.payload?.items?.length || job.total || 0),
@@ -15334,6 +15413,7 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
     // 插件精核价：结果一回来就增量落库（长任务跑到一半插件掉线/续跑也不丢已核结果，重复调用幂等）
     if ((job?.payload?.marker === PRECISE_JOB_MARKER || job?.payload?.precise === true) && Array.isArray(req.body?.results) && req.body.results.length) {
       await recordPreciseResults(job, req.body.results, existing.owner?.id || null, job.storeId || null).catch(() => {});
+      await evaluatePreciseRisk(job, req.body.results).catch(() => {});
     }
     res.json({ success: true, job });
   } catch (error) {

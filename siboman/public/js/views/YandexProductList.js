@@ -729,7 +729,7 @@ window.YandexProductListView = {
     // 本流程让插件以图找货 + 打开 1688 详情页读真实价格阶梯，采购价取「起批首档单价」。
     const preciseDialog = Vue.reactive({
       visible: false, jobId: '', status: '', phase: '', total: 0, processed: 0,
-      busy: false, pollTimer: null, error: '', report: null, onlyIssues: false, notice: '',
+      busy: false, pollTimer: null, error: '', report: null, onlyIssues: false, notice: '', alert: null,
     });
     const stopPrecisePoll = () => {
       if (preciseDialog.pollTimer) { clearInterval(preciseDialog.pollTimer); preciseDialog.pollTimer = null; }
@@ -759,6 +759,7 @@ window.YandexProductListView = {
           preciseDialog.processed = Number(job.processed || 0);
           preciseDialog.error = job.error || '';
           preciseDialog.report = res.data?.report || null;
+          preciseDialog.alert = (res.data?.job && res.data.job.alert) || null;
           if (!['queued', 'claimed', 'running'].includes(job.status) && !preciseDialog.status) preciseDialog.status = job.status || '';
           if (['done', 'error', 'canceled'].includes(job.status)) {
             stopPrecisePoll();
@@ -2235,6 +2236,8 @@ window.YandexProductListView = {
           <el-tag v-else-if="preciseDialog.status==='error'" type="danger" size="large">失败</el-tag>
           <span style="font-size:13px; color:#334155">{{ preciseDialog.phase }}</span>
         </div>
+        <el-alert v-if="preciseDialog.alert" :type="preciseDialog.alert.level || 'warning'" :closable="false" show-icon style="margin-bottom:10px"
+          :title="preciseDialog.alert.message" :description="preciseDialog.alert.advice" />
         <div v-if="preciseDialog.notice" style="color:#b45309; font-size:13px; margin-bottom:8px">{{ preciseDialog.notice }}</div>
         <div v-if="preciseDialog.error" style="color:#dc2626; font-size:13px; margin-bottom:10px">{{ preciseDialog.error }}</div>
         <template v-if="preciseDialog.report">
