@@ -5620,6 +5620,38 @@ function preciseMeasureTokens(text) {
   return out;
 }
 
+// offer id 里常内嵌规格编号的英文写法（如 WSJBJTWENTYFIVE = 25号），可作为规格对齐的兜底/交叉校验
+const ENGLISH_NUMBERS = {
+  one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9, ten: 10,
+  eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16, seventeen: 17,
+  eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50, sixty: 60, seventy: 70,
+  eighty: 80, ninety: 90,
+};
+function preciseNumberInOfferId(offerId) {
+  const letters = String(offerId || "").toLowerCase().replace(/[^a-z]/g, "");
+  if (letters.length < 3) return 0;
+  // 从长到短扫描：twentyfive(25) 优先于 twenty(20)/five(5)
+  const keys = Object.keys(ENGLISH_NUMBERS).sort((a, b) => b.length - a.length);
+  for (const k of keys) {
+    if (!letters.includes(k)) continue;
+    const rest = letters.split(k).join("");
+    // 组合式：twenty + five = 25
+    if (["twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"].includes(k)) {
+      for (const k2 of keys) {
+        if (ENGLISH_NUMBERS[k2] < 10 && ENGLISH_NUMBERS[k2] > 0 && rest.includes(k2)) {
+          return ENGLISH_NUMBERS[k] + ENGLISH_NUMBERS[k2];
+        }
+      }
+    }
+    return ENGLISH_NUMBERS[k];
+  }
+  return 0;
+}
+function preciseNumberInLabel(label) {
+  const m = String(label || "").match(/(\d{1,3})\s*号/) || String(label || "").match(/^(\d{1,3})\b/);
+  return m ? Number(m[1]) : 0;
+}
+
 function preciseModelCodes(text) {
   const out = new Set();
   for (const m of String(text || "").matchAll(/\b([a-z]{1,10}\d{2,9})\b/gi)) {
@@ -5655,7 +5687,7 @@ function preciseAccessoryTypes(text) {
 }
 
 // 决定一条结果的可信采购价。mode 说明取价来源，供报告标注与人工复核。
-function precisePickPrice(candidate, offerName) {
+function precisePickPrice(candidate, offerName, offerId = "") {
   const tiers = (Array.isArray(candidate?.priceTiers) ? candidate.priceTiers : [])
     .map((t) => ({ beginAmount: Math.max(1, Number(t?.beginAmount || 1) || 1), price: Number(t?.price || 0) }))
     .filter((t) => t.price > 0 && t.price <= 50000)
@@ -5690,7 +5722,14 @@ function precisePickPrice(candidate, offerName) {
       });
       return hits.length === 1 ? { sku: hits[0], kind: "型号" } : null;
     })();
-    return byCode;
+    if (byCode) return byCode;
+    // 兜底：offer id 内嵌的英文编号 ↔ 规格名里的 “N号”
+    const offerNumber = preciseNumberInOfferId(offerId);
+    if (offerNumber > 0) {
+      const hits = skus.filter((sku) => preciseNumberInLabel(sku.name) === offerNumber);
+      if (hits.length === 1) return { sku: hits[0], kind: `编号${offerNumber}` };
+    }
+    return null;
   })();
   if (variantMatch) {
     return { price: variantMatch.sku.price, mode: "variant_match", sku: variantMatch.sku, skus, tiers, matchKind: variantMatch.kind };
@@ -5792,7 +5831,7 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById, p
   const offer = cacheById?.get(offerId) || {};
   const pick = pickOverride
     ? { price: Number(pickOverride.price || 0), mode: "image_match", sku: pickOverride.sku || null, skus: pickOverride.skus || [], tiers: [] }
-    : precisePickPrice(best, result?.name || offer?.name || "");
+    : precisePickPrice(best, result?.name || offer?.name || "", result?.offerId || offerId);
   // 只在取到可信价（阶梯首档 / 统一价 / 规格匹配）时落库；取不到可信价的一律不写，避免不可信成本进候选表
   if (!(pick.price > 0) || !(PRECISE_PRICE_MODES[pick.mode] || {}).trusted) {
     return { offerId, status: "need_confirm", reason: pick.mode, mode: pick.mode, skus: pick.skus || [] };
@@ -6255,6 +6294,18 @@ app.post("/api/yandex/precise-1688/:id/resolve-variants", requireAuth, async (re
       if (oid) cacheById.set(oid, it);
     }
     const onlyOfferIds = Array.isArray(req.body?.offerIds) ? req.body.offerIds.map((v) => String(v)) : [];
+    // 已经落过可信价（含图片比对结果）的 offer 直接跳过，避免重复处理
+    const trustedSaved = new Set();
+    if (storeId) {
+      const done = await db.query(
+        `SELECT offer_id, evidence->>'priceMode' AS mode FROM yandex_price_candidates WHERE store_id = $1 AND source = 'plugin-1688'`,
+        [storeId]
+      ).catch(() => ({ rows: [] }));
+      for (const row of (done.rows || [])) {
+        const mode = String(row.mode || "");
+        if (mode && (PRECISE_PRICE_MODES[mode] || {}).trusted) trustedSaved.add(String(row.offer_id));
+      }
+    }
     const { Jimp } = await import("jimp");
     const targets = [];
     for (const r of results) {
@@ -6263,9 +6314,15 @@ app.post("/api/yandex/precise-1688/:id/resolve-variants", requireAuth, async (re
       if (onlyOfferIds.length && !onlyOfferIds.includes(offerId)) continue;
       const best = Array.isArray(r?.candidates) ? r.candidates[0] : null;
       if (!best) continue;
-      const pick = precisePickPrice(best, r?.name || "");
-      if (pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) continue; // 已能取到可信价，跳过
+      if (trustedSaved.has(offerId)) continue; // 已落可信价，跳过
+      const pick = precisePickPrice(best, r?.name || "", offerId);
+      const pickTrusted = pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted;
       const offerId1688 = String(best?.offerId || best?.offerId1688 || "").trim();
+      if (pickTrusted) {
+        // 取价规则已能给可信价（规格/编号匹配等）→ 直接落库
+        targets.push({ result: r, best, offerId, offerId1688, image: "", pick });
+        continue;
+      }
       if (!/^\d{6,}$/.test(offerId1688)) continue;
       const offer = cacheById.get(offerId) || {};
       const image = String((Array.isArray(offer.images) && offer.images[0]) || offer.image || "").trim();
@@ -6283,6 +6340,12 @@ app.post("/api/yandex/precise-1688/:id/resolve-variants", requireAuth, async (re
     let matched = 0, manual = 0;
     const rows = [];
     for (const t of targetsToRun) {
+      if (t.pick) {
+        const write = await upsertPreciseCandidateRow({ userId, storeId, result: t.result, cacheById, pickOverride: t.pick });
+        if (write.status === "ready" || write.status === "already_applied") matched += 1; else manual += 1;
+        rows.push({ offerId: t.offerId, ok: write.status === "ready", status: write.status, price: t.pick.price, mode: t.pick.mode, label: t.pick.sku ? t.pick.sku.name : "" });
+        continue;
+      }
       let outcome = { ok: false, reason: "error" };
       try {
         outcome = await resolveVariantByImage({ yandexImageUrl: t.image, offerId1688: t.offerId1688, Jimp });
@@ -6378,7 +6441,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
     const rows = results.map((r) => {
       const candidates = Array.isArray(r?.candidates) ? r.candidates : [];
       const best = candidates[0] || null;
-      const pick = precisePickPrice(best, r?.name || "");
+      const pick = precisePickPrice(best, r?.name || "", r?.offerId || "");
       const saved = persisted.get(String(r?.offerId || "")) || null;
       const savedEvidence = (saved && saved.evidence) || {};
       const savedMode = String(savedEvidence.priceMode || "");
@@ -16639,7 +16702,7 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
           const best = Array.isArray(r?.candidates) ? r.candidates[0] : null;
           if (!best) { noMatch += 1; continue; }
           matched += 1;
-          const pick = precisePickPrice(best, r?.name || "");
+          const pick = precisePickPrice(best, r?.name || "", r?.offerId || "");
           if (pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) ready += 1;
           else needConfirm += 1;
         }
