@@ -22,7 +22,8 @@ rsync -a --delete --exclude '.DS_Store' --exclude '*.map' "$SRC/" "$DEST/" || ex
 
 # 顺手重建 ERP「下载插件」用的 zip，保持各机器下载到的是同一版
 ZIP="$(dirname "$SRC")/zhumeng-collector.zip"
-if command -v zip >/dev/null 2>&1; then
+# 只在插件确实比 zip 新时才重建，避免每次提交都把 zip 弄成脏文件
+if command -v zip >/dev/null 2>&1 && { [ ! -f "$ZIP" ] || [ "$SRC/manifest.json" -nt "$ZIP" ] || [ "$SRC/background.js" -nt "$ZIP" ]; }; then
   rm -f "$ZIP" && (cd "$SRC" && zip -qr "$ZIP" . -x '.*' >/dev/null 2>&1) && echo "[sync-ext] 已重建 ${ZIP##*/}"
 fi
 VER="$(python3 -c "import json;print(json.load(open('$DEST/manifest.json'))['version'])" 2>/dev/null || echo '?')"
