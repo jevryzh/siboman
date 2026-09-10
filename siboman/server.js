@@ -6867,7 +6867,13 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
         if (skus.length === 1) return asciiBase;
         return asciiBaseHasSuffix ? `${asciiBase}${index === 0 ? "" : "-" + (index + 1)}` : `${asciiBase}-${index + 1}`;
       })(),
-      name: String((skus.length > 1 && (sku.specRu || sku.spec)) ? `${draft.titleRu} ${sku.specRu || sku.spec}` : draft.titleRu).slice(0, 255),
+      name: (() => {
+        if (skus.length <= 1) return String(draft.titleRu).slice(0, 255);
+        const specText = String(sku.specRu || "").trim();
+        const hasChinese = /[\u4e00-\u9fff]/.test(String(sku.spec || ""));
+        const suffix = specText || (hasChinese ? `Вариант ${index + 1}` : String(sku.spec || "").trim());
+        return String(suffix ? `${draft.titleRu} ${suffix}` : draft.titleRu).slice(0, 255);
+      })(),
       description: String(draft.descriptionRu || "").slice(0, 3000),
       vendor: draft.brand || "Нет бренда",
       marketCategoryId: Number(draft.categoryId),
@@ -6927,8 +6933,11 @@ async function applyYandexCollectResults(job, results, userId) {
     }
     const data = r?.data && typeof r.data === "object" ? r.data : null;
     if (!data) continue;
+    const mainImage = String((Array.isArray(data.images) && data.images[0]) || "").trim();
     const skus = (Array.isArray(data.skus) ? data.skus : []).map((sku, i) => ({
       spec: String(sku?.spec || sku?.name || "").slice(0, 80),
+      // 1688 的 SKU 常常没有自己的图 → 用商品主图兜底，保证每个规格都有首图
+      ...(String(sku?.image || "").trim() ? {} : (mainImage ? { image: mainImage } : {})),
       purchaseCny: Number(sku?.priceCny || sku?.price || 0) || 0,
       priceCny: 0, priceRub: 0, oldPriceRub: 0,
       image: String(sku?.image || ""),
@@ -7015,7 +7024,7 @@ app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) =>
 // 类目参数（含单位/选项/是否变体特征 + 中文名）
 // ===== AI 出图（Ozon 俄罗斯风格 7 图套图，走 TokenDun gpt-image-2 图生图）=====
 // 复用文件顶部已声明的 TOKENDUN_* 常量（TOKENDUN_BASE_URL 已含 /v1）
-const TOKENDUN_BASE = TOKENDUN_BASE_URL;
+const TOKENDUN_BASE = /\/v1$/.test(TOKENDUN_BASE_URL) ? TOKENDUN_BASE_URL : `${TOKENDUN_BASE_URL}/v1`;
 const TOKENDUN_KEY = TOKENDUN_API_KEY;
 const yandexImageSetRunning = new Map();
 
