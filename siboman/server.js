@@ -92,7 +92,7 @@ const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
 const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.104";
 // 全店精核价最低插件版本：v2.2.9.110 起才按「1688 价格阶梯起批首档单价」取价
-const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.110";
+const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.111";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -5549,19 +5549,68 @@ async function buildPreciseCampaignItems(storeId) {
   return { items, skipped, publishedCount: published.length, cacheReady: cache.at > 0 };
 }
 
-// 取「起批首档单价」：优先用详情页价格阶梯里起批量最小的一档（小批量真实采购价）；
-// 没有阶梯时退化为详情/SKU 价，并标记 hasTier=false（服务端据此标待人工核对）。
-function preciseTierPriceInServer(candidate) {
+// 取「起批首档单价」：优先用详情页价格阶梯里起批量最小的一档（小批量真实采购价）。
+// 混合配件店（同一链接卖 边刷/滤网/尘袋…，各 SKU 一个价）不能用阶梯 —— 必须按商品名把 SKU 规格对齐，
+// 否则会把 ¥1.9 边刷价当成尘袋价（用户最早质疑的就是这个）。
+const PRECISE_ACCESSORY_TYPES = [
+  { key: "滚刷", zh: ["滚刷", "主刷", "中刷", "毛刷"], ru: ["турбощет", "турбощёт", "валик", "основн"] },
+  { key: "边刷", zh: ["边刷", "侧刷"], ru: ["боков", "краев"] },
+  { key: "滤网", zh: ["滤网", "滤芯", "过滤", "hepa"], ru: ["фильтр", "hepa"] },
+  { key: "尘袋", zh: ["尘袋", "集尘袋", "纸袋", "垃圾袋"], ru: ["мешок", "мешк", "пылесбор", "для сбора пыли"] },
+  { key: "拖布", zh: ["拖布", "抹布", "擦布", "拖地"], ru: ["тряпк", "швабр", "влажн", "мокрая", "салфетк", "моп"] },
+  { key: "电池", zh: ["电池", "蓄电池"], ru: ["аккумулятор", "батар"] },
+  { key: "轮子", zh: ["轮子", "滚轮", "驱动轮", "万向轮"], ru: ["колес", "колёс", "ролик"] },
+  { key: "充电座", zh: ["充电座", "底座", "基站", "充电架", "充电桩"], ru: ["база", "станц", "док", "зарядн"] },
+];
+
+function preciseAccessoryTypes(text) {
+  const lower = String(text || "").toLowerCase();
+  const out = [];
+  for (const type of PRECISE_ACCESSORY_TYPES) {
+    if ([...type.zh, ...type.ru].some((kw) => lower.includes(String(kw).toLowerCase()))) out.push(type.key);
+  }
+  return out;
+}
+
+// 决定一条结果的可信采购价。mode 说明取价来源，供报告标注与人工复核。
+function precisePickPrice(candidate, offerName) {
   const tiers = (Array.isArray(candidate?.priceTiers) ? candidate.priceTiers : [])
     .map((t) => ({ beginAmount: Math.max(1, Number(t?.beginAmount || 1) || 1), price: Number(t?.price || 0) }))
     .filter((t) => t.price > 0 && t.price <= 50000)
     .sort((a, b) => a.beginAmount - b.beginAmount);
-  if (tiers.length) return { price: tiers[0].price, hasTier: true, tiers };
-  const fallback = Number(candidate?.priceFirstTier || candidate?.price || 0);
-  return { price: fallback > 0 && fallback <= 50000 ? fallback : 0, hasTier: false, tiers: [] };
+  const skus = (Array.isArray(candidate?.skuOptions) ? candidate.skuOptions : [])
+    .map((s) => ({ name: String(s?.name || "").slice(0, 40), price: Number(s?.price || 0), stock: Number(s?.stock || 0) }))
+    .filter((s) => s.price > 0 && s.price <= 50000);
+  const skuTypeKeys = skus.map((s) => preciseAccessoryTypes(s.name)[0]).filter(Boolean);
+  const distinctSkuTypes = new Set(skuTypeKeys);
+  const mixedTypes = distinctSkuTypes.size >= 2;
+  if (mixedTypes) {
+    // 混合配件店：按本商品名匹配对应规格
+    const wanted = preciseAccessoryTypes(offerName).filter((t) => distinctSkuTypes.has(t));
+    if (wanted.length === 1) {
+      const matches = skus
+        .filter((s) => preciseAccessoryTypes(s.name).includes(wanted[0]))
+        .sort((a, b) => (b.stock - a.stock) || (a.price - b.price));
+      const best = matches[0];
+      if (best) return { price: best.price, mode: "sku_match", sku: best, skus, tiers, wanted: wanted[0] };
+    }
+    return { price: 0, mode: "ambiguous_manual", skus, tiers, wanted: preciseAccessoryTypes(offerName) };
+  }
+  if (tiers.length) return { price: tiers[0].price, mode: "tier_first", skus, tiers };
+  const distinctPrices = new Set(skus.map((s) => s.price));
+  if (distinctPrices.size === 1) return { price: skus[0].price, mode: "single_price", skus, tiers };
+  return { price: 0, mode: "no_evidence", skus, tiers };
 }
 
-function preciseCandidateEvidence(result, best, tier) {
+const PRECISE_PRICE_MODES = {
+  tier_first: { trusted: true, label: "起批首档价（1688 价格阶梯）" },
+  single_price: { trusted: true, label: "统一规格价" },
+  sku_match: { trusted: true, label: "按规格匹配（混合配件店）" },
+  ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
+  no_evidence: { trusted: false, label: "未取到价格证据" },
+};
+
+function preciseCandidateEvidence(result, best, pick) {
   return {
     source: "plugin-1688",
     offerId1688: String(best?.offerId || best?.offerId1688 || ""),
@@ -5569,14 +5618,17 @@ function preciseCandidateEvidence(result, best, tier) {
     candidateImage: String(best?.image || best?.img || ""),
     detailUrl: String(best?.link || best?.detailUrl || ""),
     priceDetails: String(best?.priceDetails || "").slice(0, 300),
-    priceTiers: tier.tiers,
-    hasTier: tier.hasTier,
-    tierPrice: tier.price,
+    priceMode: pick.mode,
+    priceModeLabel: (PRECISE_PRICE_MODES[pick.mode] || {}).label || pick.mode,
+    priceTiers: pick.tiers || [],
+    skuOptions: (pick.skus || []).slice(0, 8),
+    matchedSku: pick.sku || null,
     moq: String(best?.minOrderQuantity || best?.moq || ""),
     shopName: String(best?.shopName || ""),
     weightText: String(best?.weightText || ""),
     shippingFee: String(best?.shippingFee || ""),
     trafficBaitRisk: best?.trafficBaitRisk === true,
+    domPriceText: String(best?.domPriceText || ""),
     searchError: String(result?.searchError || "").slice(0, 200),
   };
 }
@@ -5587,27 +5639,29 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
   const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
   const best = candidates[0] || null;
   if (!best) return { offerId, status: "no_match", reason: "no_candidate" };
-  const tier = preciseTierPriceInServer(best);
-  if (!(tier.price > 0)) return { offerId, status: "need_confirm", reason: "no_price" };
   const offer = cacheById?.get(offerId) || {};
+  const pick = precisePickPrice(best, result?.name || offer?.name || "");
+  // 只在取到可信价（阶梯首档 / 统一价 / 规格匹配）时落库；取不到可信价的一律不写，避免不可信成本进候选表
+  if (!(pick.price > 0) || !(PRECISE_PRICE_MODES[pick.mode] || {}).trusted) {
+    return { offerId, status: "need_confirm", reason: pick.mode, mode: pick.mode, skus: pick.skus || [] };
+  }
   const weightKg = Number(offer?.weightKg || 0);
   const lenCm = Number(offer?.lenCm || 0), widCm = Number(offer?.widCm || 0), heiCm = Number(offer?.heiCm || 0);
   const suggest = weightKg > 0
     ? yandexSuggestPrice({
-        purchaseCny: tier.price, weightKg, dims: [lenCm, widCm, heiCm],
+        purchaseCny: pick.price, weightKg, dims: [lenCm, widCm, heiCm],
         categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
         params: { exchangeRate: 12.8205, targetMarginPct: 35 },
       })
     : { ok: false };
-  const evidence = preciseCandidateEvidence(result, best, tier);
-  // 有完整阶梯 → ready（可信）；只有兜底价（无阶梯证据）→ need_confirm 待人工核对
-  const status = tier.hasTier && !evidence.trafficBaitRisk ? "ready" : "need_confirm";
+  const evidence = preciseCandidateEvidence(result, best, pick);
+  const status = "ready";
   try {
     const existing = await db.query(
       "SELECT id, status FROM yandex_price_candidates WHERE store_id IS NOT DISTINCT FROM $1 AND offer_id=$2 LIMIT 1",
       [storeId || null, offerId]
     );
-    if (existing.rows[0]?.status === "applied") return { offerId, status: "already_applied", reason: "applied", price: tier.price, evidence };
+    if (existing.rows[0]?.status === "applied") return { offerId, status: "already_applied", reason: "applied", price: pick.price, evidence };
     await db.query(
       `INSERT INTO yandex_price_candidates (user_id, store_id, offer_id, name, purchase_cny, supplier, source_url_1688, score,
          weight_kg, len_cm, wid_cm, hei_cm, pkg_qty, suggest_price_cny, zone, cel_fee_cny, status, source, evidence)
@@ -5618,14 +5672,14 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
          len_cm=EXCLUDED.len_cm, wid_cm=EXCLUDED.wid_cm, hei_cm=EXCLUDED.hei_cm,
          suggest_price_cny=EXCLUDED.suggest_price_cny, zone=EXCLUDED.zone, cel_fee_cny=EXCLUDED.cel_fee_cny,
          status=EXCLUDED.status, source='plugin-1688', evidence=EXCLUDED.evidence, updated_at=now()`,
-      [userId, storeId || null, offerId, String(result?.name || offer?.name || "").slice(0, 500), tier.price,
+      [userId, storeId || null, offerId, String(result?.name || offer?.name || "").slice(0, 500), pick.price,
        evidence.detailUrl, Number(best?.sold || 0), weightKg, lenCm, widCm, heiCm,
        suggest?.ok ? suggest.priceCny : 0, suggest?.ok ? (suggest.zone || "") : "", suggest?.ok ? (suggest.celFeeCny || 0) : 0,
        status, JSON.stringify(evidence)]
     );
-    return { offerId, status, price: tier.price, hasTier: tier.hasTier, suggestPriceCny: suggest?.ok ? suggest.priceCny : 0, evidence };
+    return { offerId, status, price: pick.price, mode: pick.mode, suggestPriceCny: suggest?.ok ? suggest.priceCny : 0, evidence };
   } catch (e) {
-    return { offerId, status: "error", reason: String(e?.message || e).slice(0, 160), price: tier.price, evidence };
+    return { offerId, status: "error", reason: String(e?.message || e).slice(0, 160), price: pick.price, evidence };
   }
 }
 
@@ -5752,19 +5806,25 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
     const rows = results.map((r) => {
       const candidates = Array.isArray(r?.candidates) ? r.candidates : [];
       const best = candidates[0] || null;
-      const tier = preciseTierPriceInServer(best);
+      const pick = precisePickPrice(best, r?.name || "");
       const saved = persisted.get(String(r?.offerId || "")) || null;
       return {
         offerId: String(r?.offerId || ""),
         name: String(r?.name || "").slice(0, 120),
         matched: Boolean(best),
-        reason: best ? (tier.price > 0 ? (tier.hasTier ? "ok" : "need_confirm") : "no_price") : "no_match",
+        reason: best
+          ? ((pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) ? "ok" : "need_confirm")
+          : "no_match",
+        priceMode: pick.mode,
+        priceModeLabel: (PRECISE_PRICE_MODES[pick.mode] || {}).label || pick.mode,
         searchError: String(r?.searchError || "").slice(0, 160),
         candidateTitle: String(best?.title || "").slice(0, 120),
         candidateImage: String(best?.image || best?.img || ""),
         detailUrl: String(best?.link || best?.detailUrl || ""),
-        price: tier.price || Number(saved?.purchase_cny || 0),
+        price: pick.price || Number(saved?.purchase_cny || 0),
         priceDetails: String(best?.priceDetails || "").slice(0, 200),
+        skuOptions: (pick.skus || []).slice(0, 12),
+        matchedSku: pick.sku || null,
         moq: String(best?.minOrderQuantity || best?.moq || ""),
         shopName: String(best?.shopName || ""),
         trafficBaitRisk: best?.trafficBaitRisk === true,
@@ -5772,11 +5832,16 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         suggestPriceCny: Number(saved?.suggest_price_cny || 0),
       };
     });
-    const priced = rows.filter((r) => r.price > 0 && r.reason !== "no_price");
+    const priced = rows.filter((r) => r.price > 0);
     const bands = [
       { label: "<¥1", min: 0, max: 1 }, { label: "¥1-3", min: 1, max: 3 }, { label: "¥3-5", min: 3, max: 5 },
       { label: "¥5-10", min: 5, max: 10 }, { label: "¥10-20", min: 10, max: 20 }, { label: "≥¥20", min: 20, max: Infinity },
     ].map((b) => ({ label: b.label, count: priced.filter((r) => r.price >= b.min && r.price < b.max).length }));
+    const modeCounts = {};
+    for (const row of rows) {
+      if (!row.matched) continue;
+      modeCounts[row.priceMode] = (modeCounts[row.priceMode] || 0) + 1;
+    }
     res.json({
       success: true,
       job: {
@@ -5792,9 +5857,10 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         processed: Number(job.processed || 0),
         matched: rows.filter((r) => r.matched).length,
         noMatch: rows.filter((r) => r.reason === "no_match").length,
-        noPrice: rows.filter((r) => r.reason === "no_price").length,
+        noPrice: 0,
         needConfirm: rows.filter((r) => r.reason === "need_confirm").length,
         ready: rows.filter((r) => r.reason === "ok").length,
+        modeCounts,
         savedCount: persisted.size,
         bands,
         rows,
@@ -15360,9 +15426,8 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
           const best = Array.isArray(r?.candidates) ? r.candidates[0] : null;
           if (!best) { noMatch += 1; continue; }
           matched += 1;
-          const tier = preciseTierPriceInServer(best);
-          if (!(tier.price > 0)) noPrice += 1;
-          else if (tier.hasTier && best?.trafficBaitRisk !== true) ready += 1;
+          const pick = precisePickPrice(best, r?.name || "");
+          if (pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) ready += 1;
           else needConfirm += 1;
         }
         const summary = { matched, noMatch, ready, needConfirm, noPrice, total: Number(updated.payload?.items?.length || updated.total || rows.length) };

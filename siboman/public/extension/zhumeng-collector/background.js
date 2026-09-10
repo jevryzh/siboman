@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.110";
+const VERSION = "2.2.9.111";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -2140,16 +2140,86 @@ function extract1688DetailData(fallback) {
   const skuPrices = Object.values(skuModel.skuInfoMap || {})
     .map((item) => item?.price ?? item?.originalPrice ?? item?.salePrice)
     .filter((value) => value !== undefined && value !== null && value !== "");
-  const priceDetails = priceRanges.length
-    ? priceRanges.map((item) => `${item.beginAmount || 1}件起 ¥${item.price}`).join("; ")
+
+  // v2.2.9.111: 1688 详情页改版后 window.__INIT_DATA 为 null，商品数据被内联进 <script> 的 JSON 里。
+  //   这里做括号配对解析，取回真实价格阶梯(skuRangePrices) 与各规格价(skuInfoMap)。
+  //   没有它就只能退化去抓页面里第一个 ¥ 数字（曾把 ¥1 引流档当成采购价）。
+  const parseInlineOfferData = () => {
+    const sliceJson = (text, startIdx) => {
+      let depth = 0;
+      let inStr = false;
+      let esc = false;
+      for (let i = startIdx; i < text.length; i += 1) {
+        const ch = text[i];
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === "\\") { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === "{" || ch === "[") depth += 1;
+        else if (ch === "}" || ch === "]") { depth -= 1; if (depth === 0) return text.slice(startIdx, i + 1); }
+      }
+      return "";
+    };
+    const extract = (text, key, wantArray) => {
+      const at = text.indexOf(`"${key}"`);
+      if (at < 0) return null;
+      const idx = wantArray ? text.indexOf("[", at) : text.indexOf("{", at);
+      if (idx < 0) return null;
+      const rawJson = sliceJson(text, idx);
+      if (!rawJson) return null;
+      try { return JSON.parse(rawJson); } catch (_e) { return null; }
+    };
+    const tiers = [];
+    const skus = [];
+    for (const node of Array.from(document.querySelectorAll("script"))) {
+      const text = node.textContent || "";
+      if (text.length < 2000 || !/"skuRangePrices"|"skuInfoMap"/.test(text)) continue;
+      if (!tiers.length) {
+        const arr = extract(text, "skuRangePrices", true);
+        if (Array.isArray(arr)) {
+          for (const item of arr) {
+            const price = Number(String(item?.price ?? item?.discountPrice ?? "").replace(/[^\d.]/g, "")) || 0;
+            if (price > 0) tiers.push({ beginAmount: Math.max(1, Number(item?.beginAmount) || 1), price });
+          }
+        }
+      }
+      if (!skus.length) {
+        const map = extract(text, "skuInfoMap", false);
+        if (map && typeof map === "object") {
+          for (const [key, value] of Object.entries(map)) {
+            const price = Number(String(value?.price ?? value?.discountPrice ?? value?.salePrice ?? "").replace(/[^\d.]/g, "")) || 0;
+            if (price <= 0) continue;
+            skus.push({
+              name: clean(value?.specAttrs || value?.name || key).slice(0, 40),
+              price,
+              stock: Number(value?.canBookCount || 0),
+            });
+          }
+        }
+      }
+      if (tiers.length && skus.length) break;
+    }
+    return { tiers, skus };
+  };
+  const inlineData = parseInlineOfferData();
+  const priceTiers = (inlineData.tiers.length
+    ? inlineData.tiers
+    : priceRanges.map((item) => ({ beginAmount: Math.max(1, Number(item.beginAmount) || 1), price: Number(String(item.price).replace(/[^\d.]/g, "")) || 0 })))
+    .filter((tier) => tier.price > 0)
+    .sort((a, b) => a.beginAmount - b.beginAmount);
+  const skuOptions = inlineData.skus.slice(0, 12);
+  const distinctSkuPrices = Array.from(new Set(skuOptions.map((sku) => sku.price)));
+  const priceDetails = priceTiers.length
+    ? priceTiers.map((tier) => `${tier.beginAmount}件起 ¥${tier.price}`).join("; ")
     : "";
-  const rangePrices = priceRanges
-    .map((item) => Number(String(item.price).replace(/[^\d.]/g, "")))
-    .filter((value) => Number.isFinite(value) && value > 0);
-  const minPrice = [...rangePrices, ...skuPrices.map(Number).filter((value) => Number.isFinite(value) && value > 0)]
-    .sort((a, b) => a - b)[0];
-  const domPrice = bodyText.match(/¥\s*(\d+(?:[.,]\d+)?)/)?.[1] || "";
-  const price = pick(minPrice ? String(minPrice) : "", domPrice, /^\s*\d+(?:\.\d+)?\s*$/.test(String(fallback.price || "")) ? fallback.price : "");
+  // 采购价 = 价格阶梯起批首档；单规格统一价的商品直接用该价；否则留空（标待人工，绝不用页面第一个 ¥ 数字兜底）
+  const price = priceTiers.length
+    ? String(priceTiers[0].price)
+    : (distinctSkuPrices.length === 1 ? String(distinctSkuPrices[0]) : "");
+  const domPriceText = bodyText.match(/¥\s*(\d+(?:[.,]\d+)?)/)?.[1] || "";
 
   const promotionLines = rawText.split(/\n+/)
     .map(clean)
@@ -2272,17 +2342,13 @@ function extract1688DetailData(fallback) {
   return {
     title,
     price,
-    // v2.2.9.110: 价格阶梯结构化输出（起批量 → 单价）。核价取「起批首档单价」，
-    //   不再用价格文本里的第一个数字（过去会把 "10件起 ¥3.2" 误读成 10）。
-    priceTiers: priceRanges
-      .map((item) => ({
-        beginAmount: Math.max(1, Number(item.beginAmount || 1) || 1),
-        price: Number(String(item.price).replace(/[^\d.]/g, "")) || 0,
-      }))
-      .filter((tier) => tier.price > 0 && tier.price <= 50000)
-      .sort((a, b) => a.beginAmount - b.beginAmount),
-    priceRangeCount: priceRanges.length,
-    priceDetails: priceDetails || (price ? `1件起 ¥${price}` : ""),
+    // v2.2.9.111: 结构化价格证据（起批量→单价 + 各规格价），核价取「起批首档单价」；
+    //   混合配件店（如 1个边刷¥1.9 / 1个尘袋¥3.2）由服务端按商品名匹配正确规格，匹配不到就标待人工。
+    priceTiers: priceTiers.filter((tier) => tier.price <= 50000),
+    skuOptions,
+    priceRangeCount: priceTiers.length,
+    domPriceText,
+    priceDetails,
     minOrderQuantity,
     moq: minOrderQuantity,
     shippingFee,
@@ -2414,15 +2480,23 @@ function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
     .filter((tier) => tier && Number(tier.price) > 0)
     .sort((a, b) => (Number(a.beginAmount) || 1) - (Number(b.beginAmount) || 1));
   const firstTier = tiers[0] || null;
-  const fallbackPrice = normalize1688PriceOnlyInPlugin(details.price || candidate.price || "");
+  const skuList = Array.isArray(details.skuOptions) ? details.skuOptions : (Array.isArray(candidate.skuOptions) ? candidate.skuOptions : []);
+  const distinctSkuPrices = new Set(skuList.map((sku) => Number(sku?.price) || 0).filter((p) => p > 0));
+  // 详情页已给出可信价（阶梯或全规格同价）才采信；否则留空，让服务端标待人工，
+  //   绝不用搜索列表价（常常是店铺最低/引流档）兜底。
+  const detailPrice = normalize1688PriceOnlyInPlugin(details.price || "");
+  const priceValue = firstTier ? String(firstTier.price)
+    : (detailPrice && distinctSkuPrices.size === 1 ? detailPrice : "");
   return {
     ...candidate,
     ...details,
     title: details.title || candidate.title,
-    price: firstTier ? String(firstTier.price) : fallbackPrice,
+    price: priceValue,
     priceFirstTier: firstTier ? String(firstTier.price) : "",
     priceTiers: tiers,
+    skuOptions: skuList.slice(0, 12),
     priceHasTier: tiers.length > 0,
+    priceEvidence: tiers.length > 0 ? "tier" : (priceValue ? "single_sku" : "none"),
     priceLadderText: details.priceDetails || candidate.priceDetails || "",
     minOrderQuantity: details.minOrderQuantity || candidate.minOrderQuantity || candidate.moq,
     moq: details.moq || details.minOrderQuantity || candidate.moq,

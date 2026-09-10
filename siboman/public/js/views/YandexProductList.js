@@ -2292,8 +2292,20 @@ window.YandexProductListView = {
             <el-table-column label="起批首档 ¥" width="100" align="right">
               <template #default="{ row }"><b v-if="row.price" :style="{color: row.reason==='ok' ? '#047857' : '#b45309'}">{{ Number(row.price).toFixed(2) }}</b><span v-else>-</span></template>
             </el-table-column>
-            <el-table-column label="1688 价格阶梯（起批量→单价）" min-width="200" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.priceDetails || '（未取到阶梯）' }}</template>
+            <el-table-column label="取价方式" width="160" show-overflow-tooltip>
+              <template #default="{ row }">
+                <el-tag v-if="row.priceModeLabel" size="small" :type="row.reason==='ok' ? 'success' : 'warning'">{{ row.priceModeLabel }}</el-tag>
+                <div v-if="row.matchedSku" style="font-size:12px;color:#047857">采用规格：{{ row.matchedSku.name }} ¥{{ row.matchedSku.price }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="1688 价格阶梯 / 各规格价" min-width="240">
+              <template #default="{ row }">
+                <div v-if="row.priceDetails">{{ row.priceDetails }}</div>
+                <div v-if="row.skuOptions && row.skuOptions.length > 1" style="font-size:12px;color:#92400e">
+                  该链接各规格：<span v-for="(s, si) in row.skuOptions.slice(0, 8)" :key="si">{{ si ? ' / ' : '' }}{{ s.name }} ¥{{ s.price }}</span>
+                </div>
+                <span v-if="!row.priceDetails && (!row.skuOptions || row.skuOptions.length <= 1)" style="color:#94a3b8">（未取到阶梯，需人工点开链接确认）</span>
+              </template>
             </el-table-column>
             <el-table-column label="起批" width="90" show-overflow-tooltip>
               <template #default="{ row }">{{ row.moq || '-' }}</template>
