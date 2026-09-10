@@ -91,6 +91,8 @@ const AGNES_IMAGE_PER_IMAGE_USD = Number(process.env.AGNES_IMAGE_PER_IMAGE_USD |
 const AI_IMAGE_PROVIDER_ORDER = ["agnes", "tokendun", "wanxiang", "minimax"];
 const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS || 15 * 60 * 1000);
 const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.104";
+// 全店精核价最低插件版本：v2.2.9.110 起才按「1688 价格阶梯起批首档单价」取价
+const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.110";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -15042,7 +15044,10 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
     }
     await rescueStaleDbJobsForUser(req.user, { kinds });
     console.log("[jobs/next] user=", req.user?.username || req.user?.id || "?", "worker=", workerName, "ver=", workerVersion, "kinds=", JSON.stringify(kinds));
-    const job = await claimNextDbJob(req.user, workerName, { kinds });
+    const job = await claimNextDbJob(req.user, workerName, {
+      kinds,
+      canClaimPrecise: compareNumericVersion(workerVersion, MIN_PRECISE_PRICING_PLUGIN_VERSION) >= 0,
+    });
     if (job) console.log("[jobs/next] CLAIMED kind=", job.kind, "status=", job.status);
     if (job) {
       await upsertWorkerHeartbeat(req.user, workerName, {
@@ -20216,6 +20221,9 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
     ? options.kinds.map((v) => String(v || "").trim()).filter(Boolean).slice(0, 8)
     : [];
   const tokenStoreId = isScopedWorkerUser(user) ? String(user.tokenStoreId || "").trim() : "";
+  // 全店精核价（marker=precise-1688）必须用新版插件：旧版会把 "10件起 ¥3.2" 读成 10，价格全错。
+  // 多台机器同时在线时，谁先轮询谁领任务 → 版本不够的采集端直接看不到这类任务，避免抢单跑错。
+  const canClaimPrecise = options.canClaimPrecise !== false;
   // 超时任务重新领取 — 插件掉线后 claimed/running 任务在 reclaim 窗口内自动被续跑（对齐生产旧版机制）。
   // 守卫：
   //   ① 排除服务器侧收尾阶段（服务器 AI 审核/生成 Excel），避免 complete 处理中被抢单重复执行；
@@ -20230,6 +20238,7 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
        WHERE j.user_id = $1
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
           AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind = 'yandex-research')
+          AND ($6::boolean OR COALESCE(j.payload->>'marker', '') <> 'precise-1688')
           AND (
             j.status = 'queued'
             OR (
@@ -20251,7 +20260,7 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
          j.created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`,
-      [user?.id || "", kinds, tokenStoreId || null, reclaimMs, heartbeatOnlineMs],
+      [user?.id || "", kinds, tokenStoreId || null, reclaimMs, heartbeatOnlineMs, canClaimPrecise],
     );
     if (!selected.rowCount) {
       await client.query("COMMIT");
