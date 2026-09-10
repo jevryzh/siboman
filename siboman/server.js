@@ -6743,6 +6743,7 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
         "你是 Yandex Market（俄罗斯电商）专业运营。根据中国 1688 商品信息，产出可直接上架的俄文内容。",
         "要求：标题不超过 200 字符、突出品类+关键规格+适用场景，禁止堆砌关键词；描述 300-900 字符，分段说明卖点/规格/包装清单；tags 为 5-10 个俄文搜索词。",
         "类目参数：只填你确有把握的（无把握的给空字符串），枚举型参数必须从给定 options 中精确选择其一。",
+        "严禁填写「变体组名」（Название группы вариантов，parameterId=200）以及标记为 distinctive 的变体特征参数 —— 这些留空。",
         "规格列表：把每个规格名翻成简短俄文（颜色/尺寸/件数），顺序与输入一致，无法判断时保留原样。",
         "只输出 JSON：{\"title_ru\":\"\",\"description_ru\":\"\",\"tags\":[\"\"],\"params\":{\"<parameterId>\":\"<值或选项文本>\"},\"specs_ru\":[\"\"]}",
       ].join("\n"),
@@ -6756,6 +6757,9 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
       if (m) { try { parsed = JSON.parse(m[0]); } catch (_e2) { parsed = {}; } }
     }
     const nextParams = (draft.categoryParams || []).map((p) => {
+      // 一期不做变体合并：绝不能填「变体组名(id 200)」或变体特征参数，
+      //   否则 Yandex 会把多个 SKU 当成同组无差异变体 →「Дубль варианта」并拒绝发布该组商品。
+      if (p.groupName === true || p.distinctive === true) return p;
       const v = parsed?.params?.[p.parameterId] ?? parsed?.params?.[p.name];
       if (v === undefined || v === null || String(v).trim() === "") return p;
       const text = String(v).trim();
