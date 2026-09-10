@@ -5776,6 +5776,7 @@ const PRECISE_PRICE_MODES = {
   promo_adjusted: { trusted: true, label: "含促销档，已取多数规格价（保守）" },
   variant_match: { trusted: true, label: "按尺寸/型号匹配规格" },
   image_match: { trusted: true, label: "按图片比对选规格" },
+  alpha_numeral: { trusted: true, label: "按编号匹配规格(规格表)" },
   tier_suspect: { trusted: false, label: "阶梯疑似含引流档，需人工确认" },
   ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
   no_evidence: { trusted: false, label: "未取到价格证据" },
@@ -5830,7 +5831,7 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById, p
   if (!best) return { offerId, status: "no_match", reason: "no_candidate" };
   const offer = cacheById?.get(offerId) || {};
   const pick = pickOverride
-    ? { price: Number(pickOverride.price || 0), mode: "image_match", sku: pickOverride.sku || null, skus: pickOverride.skus || [], tiers: [] }
+    ? { price: Number(pickOverride.price || 0), mode: pickOverride.mode || "image_match", sku: pickOverride.sku || null, skus: pickOverride.skus || [], tiers: [] }
     : precisePickPrice(best, result?.name || offer?.name || "", result?.offerId || offerId);
   // 只在取到可信价（阶梯首档 / 统一价 / 规格匹配）时落库；取不到可信价的一律不写，避免不可信成本进候选表
   if (!(pick.price > 0) || !(PRECISE_PRICE_MODES[pick.mode] || {}).trusted) {
@@ -6010,6 +6011,51 @@ async function sendAlertMailThrottled({ key, subject, text, minIntervalMs = 10 *
   console.log(`[alert-mail] ${result.ok ? "已发送" : "发送失败"} key=${key} ${result.error || ""}`);
   return result;
 }
+
+// 按最新默认参数（含实际汇率）重算本店候选的建议价并落库
+app.post("/api/yandex/precise-1688/:id/recompute-suggest", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const job = await getDbJobForUser(req.params.id, req.user);
+    if (!job) return res.status(404).json({ success: false, error: "精核价任务不存在" });
+    const storeId = job.storeId || null;
+    const exchangeRate = await refreshRubPerCny();
+    const cache = yandexOfferCacheObj(storeId || "__env__");
+    const byId = new Map();
+    for (const it of [...(cache?.active || []), ...(cache?.archived || [])]) {
+      const oid = String(it?.offer_id || it?.offerId || "");
+      if (oid) byId.set(oid, it);
+    }
+    const rows = await db.query(
+      `SELECT id, offer_id, purchase_cny, weight_kg, len_cm, wid_cm, hei_cm FROM yandex_price_candidates
+        WHERE store_id = $1 AND source = 'plugin-1688' AND purchase_cny > 0`,
+      [storeId]
+    );
+    let updated = 0, skipped = 0;
+    for (const row of rows.rows || []) {
+      const offer = byId.get(String(row.offer_id)) || {};
+      const weightKg = Number(row.weight_kg || 0) || Number(offer.weightKg || 0);
+      if (!(weightKg > 0)) { skipped += 1; continue; }
+      const dims = [
+        Number(row.len_cm || 0) || Number(offer.lenCm || 0),
+        Number(row.wid_cm || 0) || Number(offer.widCm || 0),
+        Number(row.hei_cm || 0) || Number(offer.heiCm || 0),
+      ];
+      const suggest = yandexSuggestPrice({
+        purchaseCny: Number(row.purchase_cny), weightKg, dims,
+        categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
+        params: { ...PRICING_DEFAULTS, exchangeRate },
+      });
+      if (!suggest?.ok) { skipped += 1; continue; }
+      await db.query(
+        `UPDATE yandex_price_candidates SET suggest_price_cny=$2, zone=$3, cel_fee_cny=$4, updated_at=now() WHERE id=$1`,
+        [row.id, suggest.priceCny, suggest.zone || "", suggest.celFeeCny || 0]
+      );
+      updated += 1;
+    }
+    res.json({ success: true, updated, skipped, total: (rows.rows || []).length, exchangeRate, params: PRICING_DEFAULTS });
+  } catch (error) { next(error); }
+});
 
 // 定价默认参数（利润计算弹窗 / 批量调价初始化）
 app.get("/api/yandex/pricing-defaults", requireAuth, async (req, res, next) => {
@@ -6195,6 +6241,36 @@ function hashDistance(a, b) {
   return n;
 }
 
+// 插件抓到的 skuInfoMap 可能不全（1688 页面懒加载，实测 21 个规格只抓到 12 个）→
+// 用 AlphaShop 完整规格表按编号对齐（如 offer id WSJBJELEVEN=11 ↔ 规格「11号复活女鬼」）。
+function alphaSkuNumbers(sku) {
+  const values = (sku?.productSkuAttributeInfos || [])
+    .map((a) => `${a?.value || ""} ${a?.valueTrans || ""}`).join(" ");
+  const nums = new Set();
+  for (const m of values.matchAll(/(\d{1,3})\s*号/g)) nums.add(Number(m[1]));
+  for (const m of values.matchAll(/no\.?\s*(\d{1,3})/gi)) nums.add(Number(m[1]));
+  return nums;
+}
+
+async function resolveVariantByAlphaNumeral({ offerId1688, numeral }) {
+  const detail = await alphaShopMcpCall("productDetailQuery", { productId: String(offerId1688) }, 45000).catch(() => null);
+  const product = detail && (detail.result || detail);
+  const skus = Array.isArray(product?.productSkuInfos) ? product.productSkuInfos : [];
+  if (!skus.length) return { ok: false, reason: "no_skus" };
+  const hits = skus.filter((sku) => Number(sku?.price || 0) > 0 && alphaSkuNumbers(sku).has(Number(numeral)));
+  if (hits.length !== 1) return { ok: false, reason: hits.length ? "multiple_numeral" : "no_numeral", skuCount: skus.length };
+  const sku = hits[0];
+  const attrs = sku.productSkuAttributeInfos || [];
+  return {
+    ok: true, reason: "matched", skuCount: skus.length,
+    price: Number(sku.price),
+    label: attrs.map((a) => a?.value).filter(Boolean).join(" / "),
+    labelTrans: attrs.map((a) => a?.valueTrans).filter(Boolean).join(" / "),
+    imageUrl: attrs.map((a) => a?.skuImageUrl).find(Boolean) || "",
+    stock: Number(sku?.amountOnSale || 0),
+  };
+}
+
 async function resolveVariantByImage({ yandexImageUrl, offerId1688, Jimp }) {
   const yHash = await dHashFromBuffer(Jimp, await fetchImageBufferSafe(yandexImageUrl));
   if (!yHash) return { ok: false, reason: "yandex_image_unreadable" };
@@ -6353,6 +6429,24 @@ app.post("/api/yandex/precise-1688/:id/resolve-variants", requireAuth, async (re
         if (write.status === "ready" || write.status === "already_applied") matched += 1; else manual += 1;
         rows.push({ offerId: t.offerId, ok: write.status === "ready", status: write.status, price: t.pick.price, mode: t.pick.mode, label: t.pick.sku ? t.pick.sku.name : "" });
         continue;
+      }
+      // 先用「offer id 编号 ↔ AlphaShop 完整规格表编号」对齐（最稳，且能弥补插件规格抓取不全）
+      const numeral = preciseNumberInOfferId(t.offerId);
+      if (numeral > 0) {
+        try {
+          const byNum = await resolveVariantByAlphaNumeral({ offerId1688: t.offerId1688, numeral });
+          if (byNum.ok) {
+            const write = await upsertPreciseCandidateRow({
+              userId, storeId, result: t.result, cacheById,
+              pickOverride: { price: byNum.price, mode: "alpha_numeral", sku: { name: byNum.label, price: byNum.price, stock: byNum.stock } },
+              extraEvidence: { alphaNumeralMatch: { numeral, label: byNum.label, labelTrans: byNum.labelTrans || "", price: byNum.price, skuCount: byNum.skuCount, skuImageUrl: byNum.imageUrl || "" } },
+            });
+            if (write.status === "ready" || write.status === "already_applied") matched += 1; else manual += 1;
+            rows.push({ offerId: t.offerId, ok: write.status === "ready", status: write.status, price: byNum.price, mode: "alpha_numeral", label: byNum.label });
+            await new Promise((r) => setTimeout(r, 400));
+            continue;
+          }
+        } catch (_e) { /* 落到图片比对 */ }
       }
       let outcome = { ok: false, reason: "error" };
       try {
