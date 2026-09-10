@@ -2798,6 +2798,37 @@ async function fetchAllYandexOffers(context, { archived = false, maxItems = 1000
   return items;
 }
 
+// offer-mappings 的 basicPrice 里没有 discountBase（划线价）→ 用价格接口批量补全售价/划线价
+//   否则 ERP 列表的「划线价」永远显示 0/旧值（写入是生效的，只是读错了接口）
+async function enrichYandexOffersWithPrices(context, offers) {
+  const list = Array.isArray(offers) ? offers : [];
+  if (!list.length) return 0;
+  const byId = new Map(list.map((o) => [String(o.offer_id || o.offerId || ""), o]));
+  const ids = [...byId.keys()].filter(Boolean);
+  let filled = 0;
+  for (let i = 0; i < ids.length; i += 200) {
+    const chunk = ids.slice(i, i + 200);
+    try {
+      const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices`, {
+        method: "POST", body: { offerIds: chunk }, timeoutMs: 60000, apiSecret: context.apiSecret,
+      });
+      for (const item of (resp?.result?.offers || [])) {
+        const offer = byId.get(String(item.offerId || ""));
+        if (!offer || !item.price) continue;
+        const value = Number(item.price.value || 0);
+        const base = Number(item.price.discountBase || 0);
+        if (value > 0) offer.price = value;
+        offer.old_price = base > 0 ? base : Number(offer.old_price || 0);
+        if (item.price.currencyId) offer.currency_code = item.price.currencyId;
+        filled += 1;
+      }
+    } catch (e) {
+      console.warn("[yandex-prices] 价格补全失败:", e.message);
+    }
+  }
+  return filled;
+}
+
 async function refreshYandexStoreCache(storeId) {
   const cache = yandexOfferCacheObj(storeId);
   if (cache.inflight) return;
@@ -2808,6 +2839,7 @@ async function refreshYandexStoreCache(storeId) {
       fetchAllYandexOffers(context, { archived: false }),
       fetchAllYandexOffers(context, { archived: true }),
     ]);
+    await enrichYandexOffersWithPrices(context, active).catch(() => {});
     cache.at = Date.now();
     cache.active = active;
     cache.archived = archived;
@@ -5578,7 +5610,8 @@ async function mapWithConcurrency(items, limit, worker) {
 
 // 组织本次精核价的目标：店铺「销售中」商品 + 把商品图转存成插件可抓的公网 URL
 // （Yandex 图片域名不在插件 host_permissions 内；转存到本服务 /uploads 后插件才抓得到）
-async function buildPreciseCampaignItems(storeId) {
+async function buildPreciseCampaignItems(storeId, options = {}) {
+  const onlyIds = Array.isArray(options.offerIds) ? new Set(options.offerIds.map((v) => String(v))) : null;
   const cacheKey = storeId || "__env__";
   const cache = yandexOfferCacheObj(cacheKey);
   // 缓存可能还在预热（或已有请求在跑 → refresh 会因 inflight 直接返回），这里等到就绪再取名单，
@@ -5587,10 +5620,12 @@ async function buildPreciseCampaignItems(storeId) {
     await refreshYandexStoreCache(cacheKey).catch(() => {});
     for (let i = 0; i < 30 && !cache.at; i += 1) await new Promise((resolve) => setTimeout(resolve, 2000));
   }
-  const published = (cache.active || []).filter((it) => String(it?.status || "") === "published");
+  const pool = onlyIds
+    ? [...(cache.active || []), ...(cache.archived || [])].filter((it) => onlyIds.has(String(it?.offer_id || it?.offerId || "")))
+    : (cache.active || []).filter((it) => String(it?.status || "") === "published");
   const items = [];
   const skipped = [];
-  for (const it of published) {
+  for (const it of pool) {
     const offerId = String(it?.offer_id || it?.offerId || "").trim();
     const raw = (Array.isArray(it?.images) && it.images.length ? it.images : (it?.image ? [it.image] : []))
       .map((s) => String(s || "").trim()).filter(Boolean).slice(0, 3);
@@ -5600,7 +5635,7 @@ async function buildPreciseCampaignItems(storeId) {
     if (!images.length) { skipped.push({ offerId, name: String(it?.name || "").slice(0, 80), reason: "no_image" }); continue; }
     items.push({ offerId, name: String(it?.name || it?.title || "").slice(0, 200), images });
   }
-  return { items, skipped, publishedCount: published.length, cacheReady: cache.at > 0 };
+  return { items, skipped, publishedCount: pool.length, cacheReady: cache.at > 0 };
 }
 
 // 规格匹配用的度量/型号 token：
@@ -6344,7 +6379,10 @@ app.post("/api/yandex/precise-1688", requireAuth, async (req, res, next) => {
       const r = running.rows[0];
       return res.json({ success: true, jobId: r.id, existing: true, status: r.status, phase: r.phase, processed: Number(r.processed || 0), total: Number(r.total || 0) });
     }
-    const { items, skipped, publishedCount } = await buildPreciseCampaignItems(storeId);
+    const requestOfferIds = Array.isArray(req.body?.offer_ids || req.body?.offerIds)
+      ? (req.body.offer_ids || req.body.offerIds).map((v) => String(v || "").trim()).filter(Boolean)
+      : [];
+    const { items, skipped, publishedCount } = await buildPreciseCampaignItems(storeId, { offerIds: requestOfferIds });
     // dry_run：只侦查目标清单（不建任务、不影响插件），用于上线自检
     if (req.body?.dry_run === true || req.query?.dry_run === "1") {
       return res.json({
