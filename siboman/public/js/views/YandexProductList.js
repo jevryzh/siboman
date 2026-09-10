@@ -2224,7 +2224,7 @@ window.YandexProductListView = {
       </el-dialog>
 
       <!-- 插件精核价（1688 官方真实价）：进度 + 真实成本分布 -->
-      <el-dialog v-model="preciseDialog.visible" title="插件精核价（1688 官方真实价）" width="1180px" append-to-body destroy-on-close
+      <el-dialog v-model="preciseDialog.visible" title="插件精核价（1688 官方真实价）" width="1440px" append-to-body destroy-on-close
         :close-on-click-modal="false" @closed="stopPrecisePoll">
         <el-alert type="warning" :closable="false" show-icon style="margin-bottom:12px"
           title="本机插件用 1688 官方以图找货 + 打开详情页读「真实价格阶梯」，采购价取起批首档单价（小批量真能买到的价）。可直接采用 = 有完整阶梯；待人工核对 = 阶梯缺失或疑似引流档，需要你点开链接确认。建议价里已含 1688 国内运费（抓到真实运费就用真实值，抓到「未公开/需选地区」则按默认 ¥4 并标「默认」）。需要浏览器插件在线并登录 1688。" />
@@ -2270,17 +2270,32 @@ window.YandexProductListView = {
             <span style="font-size:12px; color:#94a3b8">共 {{ preciseRows.length }} 行</span>
           </div>
           <el-table :data="preciseRows" size="small" border max-height="420" empty-text="暂无结果">
-            <el-table-column label="货号" prop="offerId" width="140" show-overflow-tooltip />
+            <el-table-column label="货号 / Yandex 商品名" min-width="200">
+              <template #default="{ row }">
+                <div>{{ row.offerId }}</div>
+                <div v-if="row.yandexName" style="font-size:12px; color:#64748b">{{ row.yandexName }}</div>
+              </template>
+            </el-table-column>
             <el-table-column label="状态" width="170" align="center">
               <template #default="{ row }">
                 <el-tag size="small" :type="preciseReasonTag(row.reason)">{{ preciseReasonText(row.reason) }}</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="1688 同款图" width="90" align="center">
+            <el-table-column label="Yandex 原图" width="100" align="center">
+              <template #default="{ row }">
+                <el-image v-if="row.yandexImage" :src="row.yandexImage" referrerpolicy="no-referrer" fit="cover"
+                  style="width:56px;height:56px;border-radius:4px;background:#f1f5f9; cursor:zoom-in"
+                  :preview-src-list="[row.yandexImage, row.candidateImage].filter(Boolean)" :initial-index="0"
+                  preview-teleported hide-on-click-modal :title="'Yandex 原图（点开可与 1688 图左右切换对比）'" />
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="1688 同款图" width="100" align="center">
               <template #default="{ row }">
                 <el-image v-if="row.candidateImage" :src="row.candidateImage" referrerpolicy="no-referrer" fit="cover"
-                  style="width:46px;height:46px;border-radius:4px;background:#f1f5f9"
-                  :preview-src-list="[row.candidateImage]" preview-teleported hide-on-click-modal />
+                  style="width:56px;height:56px;border-radius:4px;background:#f1f5f9; cursor:zoom-in"
+                  :preview-src-list="[row.yandexImage, row.candidateImage].filter(Boolean)" :initial-index="1"
+                  preview-teleported hide-on-click-modal :title="'1688 同款图（点开可与 Yandex 图左右切换对比）'" />
                 <span v-else>-</span>
               </template>
             </el-table-column>

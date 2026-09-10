@@ -6045,11 +6045,24 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
       ).catch(() => ({ rows: [] }));
       persisted = new Map((r.rows || []).map((row) => [String(row.offer_id), row]));
     }
+    // Yandex 原图/原价：从店铺缓存取（报告里要和 1688 同款图并排对比）
+    const yandexCache = yandexOfferCacheObj(storeId || "__env__");
+    const yandexById = new Map();
+    for (const it of [...(yandexCache?.active || []), ...(yandexCache?.archived || [])]) {
+      const oid = String(it?.offer_id || it?.offerId || "");
+      if (oid) yandexById.set(oid, it);
+    }
+    const payloadItems = new Map((Array.isArray(job.payload?.items) ? job.payload.items : []).map((it) => [String(it.offerId || ""), it]));
     const rows = results.map((r) => {
       const candidates = Array.isArray(r?.candidates) ? r.candidates : [];
       const best = candidates[0] || null;
       const pick = precisePickPrice(best, r?.name || "");
       const saved = persisted.get(String(r?.offerId || "")) || null;
+      const yandexOffer = yandexById.get(String(r?.offerId || "")) || {};
+      const yandexImages = (Array.isArray(yandexOffer.images) && yandexOffer.images.length
+        ? yandexOffer.images
+        : (yandexOffer.image ? [yandexOffer.image] : (payloadItems.get(String(r?.offerId || ""))?.images || [])))
+        .map((u) => String(u || "").trim()).filter(Boolean);
       return {
         offerId: String(r?.offerId || ""),
         name: String(r?.name || "").slice(0, 120),
@@ -6062,6 +6075,10 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         searchError: String(r?.searchError || "").slice(0, 160),
         candidateTitle: String(best?.title || "").slice(0, 120),
         candidateImage: String(best?.image || best?.img || ""),
+        yandexName: String(r?.name || yandexOffer.name || "").slice(0, 120),
+        yandexImage: yandexImages[0] || "",
+        yandexImages: yandexImages.slice(0, 3),
+        yandexPriceRub: Number(yandexOffer.price || 0),
         detailUrl: String(best?.link || best?.detailUrl || ""),
         price: pick.price || Number(saved?.purchase_cny || 0),
         priceDetails: String(best?.priceDetails || "").slice(0, 200),
