@@ -732,7 +732,7 @@ window.YandexProductListView = {
     // 本流程让插件以图找货 + 打开 1688 详情页读真实价格阶梯，采购价取「起批首档单价」。
     const preciseDialog = Vue.reactive({
       visible: false, jobId: '', status: '', phase: '', total: 0, processed: 0,
-      busy: false, pollTimer: null, error: '', report: null, onlyIssues: false, notice: '', alert: null,
+      busy: false, pollTimer: null, error: '', report: null, filter: 'all', notice: '', alert: null, resolving: false,
     });
     const stopPrecisePoll = () => {
       if (preciseDialog.pollTimer) { clearInterval(preciseDialog.pollTimer); preciseDialog.pollTimer = null; }
@@ -746,7 +746,10 @@ window.YandexProductListView = {
     }[reason] || 'info');
     const preciseRows = Vue.computed(() => {
       const rows = (preciseDialog.report && preciseDialog.report.rows) || [];
-      return preciseDialog.onlyIssues ? rows.filter((r) => r.reason !== 'ok') : rows;
+      if (preciseDialog.filter === 'manual') return rows.filter((r) => r.reason !== 'ok');
+      if (preciseDialog.filter === 'below') return rows.filter((r) => r.price > 0 && r.currentPriceCny > 0 && r.currentPriceCny < r.price);
+      if (preciseDialog.filter === 'ok') return rows.filter((r) => r.reason === 'ok');
+      return rows;
     });
     const preciseBands = Vue.computed(() => (preciseDialog.report && preciseDialog.report.bands) || []);
     const pollPrecise1688 = async () => {
@@ -849,6 +852,53 @@ window.YandexProductListView = {
         );
       } catch { return; }
       await startPrecise1688();
+    };
+    const resolvePreciseVariants = async () => {
+      if (!preciseDialog.jobId) return;
+      preciseDialog.resolving = true;
+      preciseDialog.notice = '正在用图片比对自动对齐多规格（每个规格需下载图片计算哈希，约 1-3 秒/条）…';
+      try {
+        const res = await axios.post('/api/yandex/precise-1688/' + encodeURIComponent(preciseDialog.jobId) + '/resolve-variants', {}, { timeout: 600000 });
+        const d = res.data || {};
+        if (!d.total) {
+          preciseDialog.notice = d.message || '没有可自动对齐的多规格行';
+          notify.info(preciseDialog.notice);
+        } else {
+          preciseDialog.notice = `图片比对完成：自动对齐 ${d.matched} 条，仍需人工 ${d.manual} 条（共 ${d.total} 条多规格）。`;
+          notify.success(preciseDialog.notice);
+        }
+        await pollPrecise1688();
+      } catch (e) {
+        const msg = e.response?.data?.error || e.message || '自动对齐失败';
+        preciseDialog.notice = '自动对齐失败：' + msg;
+        notify.error(msg);
+      } finally {
+        preciseDialog.resolving = false;
+      }
+    };
+    const exportPreciseCsv = () => {
+      const rows = preciseRows.value || [];
+      if (!rows.length) return notify.warning('当前筛选没有可导出的行');
+      const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+      const head = ['货号', 'Yandex商品名', '状态', '取价方式', '采购价CNY', '1688运费CNY', '重量kg(来源)', '现价CNY', '是否低于成本', '建议价CNY', '1688同款标题', '1688链接', '1688价格阶梯'];
+      const lines = [head.map(esc).join(',')];
+      for (const r of rows) {
+        const below = r.price > 0 && r.currentPriceCny > 0 && r.currentPriceCny < r.price;
+        lines.push([
+          r.offerId, r.yandexName || r.name, preciseReasonText(r.reason), r.priceModeLabel || r.priceMode,
+          r.price || '', r.shippingCnyUsed == null ? '' : r.shippingCnyUsed,
+          r.weightKg ? `${Number(r.weightKg).toFixed(3)}(${r.weightSource || '-'})` : '',
+          r.currentPriceCny || '', below ? '亏本' : '', r.suggestPriceCny || '',
+          r.candidateTitle || '', r.detailUrl || '', r.priceDetails || '',
+        ].map(esc).join(','));
+      }
+      const blob = new Blob(['\ufeff' + lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = `插件精核价_${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      notify.success(`已导出 ${rows.length} 行`);
     };
     const stopPreciseJob = async () => {
       if (!preciseDialog.jobId) return;
@@ -1718,7 +1768,7 @@ window.YandexProductListView = {
       selectedRows, priceState, researchDialog, researchTableRef, stateDrawer, applyDialog,
       handleSelectionChange, changeVisibility, visBusy, openResearchBatch, openResearchRow, openStateDrawer,
       bulkPricingDialog, reasonText, startBulkPricing, openBulkPricingCurrentTab, resumeBulkPricing, checkRecentBulkJob, stopBulkPoll, collectFilteredOfferIds,
-      preciseDialog, preciseRows, preciseBands, preciseReasonText, preciseReasonTag, openPreciseCurrentTab, stopPreciseJob, stopPrecisePoll,
+      preciseDialog, preciseRows, preciseBands, preciseReasonText, preciseReasonTag, openPreciseCurrentTab, stopPreciseJob, stopPrecisePoll, exportPreciseCsv, resolvePreciseVariants,
       retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
       reverseDialog, reverseOneRow, openReversePricing, reverseAllRows, applyReverseToYandex,
       calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
@@ -2269,8 +2319,17 @@ window.YandexProductListView = {
             </el-tag>
           </div>
           <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px">
-            <el-checkbox v-model="preciseDialog.onlyIssues">只看待人工/无同款</el-checkbox>
+            <el-radio-group v-model="preciseDialog.filter" size="small">
+              <el-radio-button label="all">全部</el-radio-button>
+              <el-radio-button label="ok">可直接采用</el-radio-button>
+              <el-radio-button label="manual">待人工/无同款</el-radio-button>
+              <el-radio-button label="below">低于成本（亏本 {{ preciseDialog.report.belowCost || 0 }}）</el-radio-button>
+            </el-radio-group>
             <span style="font-size:12px; color:#94a3b8">共 {{ preciseRows.length }} 行</span>
+            <el-button size="small" @click="exportPreciseCsv">导出 CSV</el-button>
+            <el-button v-if="preciseDialog.report.needConfirm > 0" size="small" type="warning" :loading="preciseDialog.resolving" @click="resolvePreciseVariants">
+              自动匹配多规格（图片比对）
+            </el-button>
           </div>
           <el-table :data="preciseRows" size="small" border max-height="420" empty-text="暂无结果">
             <el-table-column label="货号 / Yandex 商品名" min-width="200">
@@ -2283,6 +2342,7 @@ window.YandexProductListView = {
               <template #default="{ row }">
                 <el-tag size="small" :type="preciseReasonTag(row.reason)">{{ preciseReasonText(row.reason) }}</el-tag>
                 <el-tag v-if="row.trafficBaitRisk" size="small" type="danger" style="margin-left:4px">引流风险</el-tag>
+                <el-tag v-if="row.price > 0 && row.currentPriceCny > 0 && row.currentPriceCny < row.price" size="small" type="danger" effect="dark" style="margin-left:4px">亏本</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="Yandex 原图" width="84" align="center">

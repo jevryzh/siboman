@@ -52,7 +52,7 @@ window.SourcingModuleView = {
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const PLUGIN_ZIP_VERSION = "2.2.9.115";
+    const PLUGIN_ZIP_VERSION = "2.2.9.116";
     window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
 
     const handleExtensionMessage = (event) => {

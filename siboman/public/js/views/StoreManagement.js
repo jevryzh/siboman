@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.115";
-    const PLUGIN_ZIP_VERSION = "2.2.9.115";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.116";
+    const PLUGIN_ZIP_VERSION = "2.2.9.116";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -427,6 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.116 上架采集补齐包装重量/尺寸：1688 的包装信息比标题晚加载，旧逻辑只等 2-3 秒导致重量尺寸为空（上传被拦）；现在缺失时滚动触发懒加载并重试最多 3 次。</li>
             <li>✅ v2.2.9.115 修复 Yandex 上架图片地址失效：采集时误把 1688 图片 URL 的 _!!<卖家id>-0-cib.jpg 后缀一起裁掉，导致 Yandex 报「Нет изображения 无图片无法开卖」；现在只裁末尾尺寸后缀、保留原图地址。</li>
             <li>✅ v2.2.9.114 Yandex 上架采集质量修复：标题复用已验证的详情抽取（不再抓成公司名）、补齐包装重量/尺寸（如 130g、12×4×4cm）、属性过滤收紧（去掉 uiType/【说明】/SKU 规格行等噪声）、详情图容器补 #description。</li>
             <li>✅ v2.2.9.113 修复核价/采集任务续跑丢结果：重新加载扩展或断线后续跑时保留服务器上已完成的 results（旧逻辑清空，导致报告只剩续跑后的行），并从 processed 断点继续不重复跑。</li>

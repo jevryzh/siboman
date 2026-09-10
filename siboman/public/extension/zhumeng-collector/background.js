@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.115";
+const VERSION = "2.2.9.116";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1019,8 +1019,19 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
     assertSourcingNotCanceled(job);
     // v2.2.9.114: 复用已验证的 extract1688DetailData 取标题/重量/尺寸/属性（含公司名过滤），
     //   再单独抽图集/SKU，避免自己重写一套导致标题抓成公司名、重量尺寸为空。
-    const [basicsRes] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688DetailData, args: [{}] });
-    const basics = basicsRes?.result || {};
+    let basics = {};
+    // 1688 的包装重量/尺寸比标题晚加载：缺失时向下滚动触发懒加载并重试（最多 3 次）
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const [r] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688DetailData, args: [{}] });
+      basics = r?.result || {};
+      const hasWeight = Number(basics.weightGrams || 0) > 0;
+      const hasDims = /\d/.test(String(basics.dimensionsText || ""));
+      if (hasWeight && hasDims) break;
+      if (attempt < 2) {
+        await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: () => { window.scrollBy(0, 700); window.scrollBy(0, -350); } }).catch(() => {});
+        await sleep(randomInt(2200, 3200));
+      }
+    }
     const [mediaRes] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688ListingMedia });
     const media = mediaRes?.result || {};
     const dims = String(basics.dimensionsText || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
