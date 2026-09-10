@@ -18,6 +18,7 @@ window.YandexAutoListingView = {
     const currencySymbol = Vue.computed(() => (currencyId.value === 'CNY' ? '¥' : '₽'));
     const warehouses = Vue.ref([]);
     // 利润计算（对齐熊猫口径：代贴单费/国内运费/物流商/佣金/收单/提现/退货/广告/目标毛利/划线折扣/实际汇率）
+    const imageSet = Vue.reactive({ busy: false, jobId: '', phase: '', processed: 0, total: 7, timer: null });
     const profit = Vue.reactive({
       visible: true, busy: false, rows: [], applied: false,
       cost: { serviceFeeCny: 3, domesticShippingCny: 5, lastMilePct: 3, lastMileCny: 4.68,  commissionPct: 24, acquiringPct: 3.8, withdrawalPct: 1.2, returnLossPct: 0, adPct: 15, targetMarginPct: 35, strikeDiscountPct: 50, exchangeRate: 12.8205 },
@@ -49,6 +50,47 @@ window.YandexAutoListingView = {
     const publishStatusType = (s) => ({ unpublished: 'info', uploading: 'warning', published: 'success', failed: 'danger' }[s] || 'info');
     const firstImage = (d) => (Array.isArray(d.images) && d.images.length ? d.images[0] : (d.skus?.[0]?.image || ''));
 
+    const refreshDraft = async () => {
+      if (!drawer.id) return;
+      try { const res = await axios.get('/api/yandex/listing/drafts/' + encodeURIComponent(drawer.id)); if (res.data?.draft) drawer.draft = res.data.draft; } catch (_e) {}
+    };
+    const generateImageSet = async () => {
+      if (!drawer.id) return;
+      imageSet.busy = true; imageSet.phase = '正在提交出图任务…';
+      try {
+        const res = await axios.post(`/api/yandex/listing/drafts/${encodeURIComponent(drawer.id)}/generate-images`, {}, { timeout: 60000 });
+        imageSet.jobId = res.data?.jobId || '';
+        imageSet.total = Number(res.data?.total || 7); imageSet.processed = 0;
+        notify.success('AI 出图已开始（7 张约 5-8 分钟），可关闭弹窗后台跑');
+        pollImageSet();
+      } catch (e) { notify.error('出图失败: ' + (e.response?.data?.error || e.message)); }
+      finally { imageSet.busy = false; }
+    };
+    const pollImageSet = async () => {
+      if (imageSet.timer) clearInterval(imageSet.timer);
+      const tick = async () => {
+        if (!imageSet.jobId) return;
+        try {
+          const res = await axios.get('/api/jobs/' + encodeURIComponent(imageSet.jobId));
+          const job = res.data?.job || res.data || {};
+          imageSet.phase = job.phase || ''; imageSet.processed = Number(job.processed || 0);
+          await refreshDraft();
+          if (['done', 'error', 'canceled'].includes(job.status)) {
+            clearInterval(imageSet.timer); imageSet.timer = null;
+            if (job.status === 'done') notify.success('AI 套图完成，可在下方选择应用'); else notify.error('出图结束：' + (job.error || job.phase || ''));
+          }
+        } catch (_e) {}
+      };
+      await tick();
+      imageSet.timer = setInterval(tick, 8000);
+    };
+    const applyImageSet = async (mode) => {
+      try {
+        await axios.post(`/api/yandex/listing/drafts/${encodeURIComponent(drawer.id)}/apply-images`, { mode }, { timeout: 60000 });
+        await refreshDraft();
+        notify.success(mode === 'main-only' ? '已把生成主图设为商品首图' : '已把套图加入商品图片');
+      } catch (e) { notify.error('应用失败: ' + (e.response?.data?.error || e.message)); }
+    };
     const loadProfitDefaults = async () => {
       try {
         const res = await axios.get('/api/yandex/pricing-defaults', { timeout: 30000 });
@@ -385,7 +427,7 @@ window.YandexAutoListingView = {
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
-      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, profit, loadProfitDefaults, calcProfit, applyProfitPrices, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
+      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, profit, imageSet, generateImageSet, applyImageSet, loadProfitDefaults, calcProfit, applyProfitPrices, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
     };
   },
 
@@ -629,7 +671,28 @@ window.YandexAutoListingView = {
             </el-card>
 
             <el-card shadow="never" style="margin-bottom:14px">
-              <template #header><b>图片与视频</b><div style="float:right"><el-button size="small" @click="addImage">添加图片 URL</el-button></div></template>
+              <template #header>
+                <b>图片与视频</b>
+                <div style="float:right; display:flex; gap:8px; align-items:center">
+                  <span v-if="imageSet.phase" style="font-size:12px; color:#64748b">{{ imageSet.phase }} {{ imageSet.processed }}/{{ imageSet.total }}</span>
+                  <el-button size="small" type="primary" plain :loading="imageSet.busy" @click="generateImageSet">AI 出图（Ozon 风格 7 图）</el-button>
+                  <el-button size="small" @click="addImage">添加图片 URL</el-button>
+                </div>
+              </template>
+              <div v-if="(drawer.draft.imageSet || []).length" style="margin-bottom:12px">
+                <div style="font-size:13px; color:#334155; margin-bottom:6px">AI 生成套图（主图含俄文标注尺寸；可一键应用）
+                  <el-button size="small" type="success" plain style="margin-left:8px" @click="applyImageSet('main-only')">把生成主图设为首图</el-button>
+                  <el-button size="small" plain @click="applyImageSet('all')">全部加入商品图</el-button>
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:8px">
+                  <div v-for="(g, gi) in drawer.draft.imageSet" :key="gi" style="text-align:center; width:96px">
+                    <el-image v-if="g.ok" :src="g.url" referrerpolicy="no-referrer" fit="cover" style="width:96px;height:128px;border-radius:6px;background:#f1f5f9"
+                      :preview-src-list="(drawer.draft.imageSet || []).filter(x => x.ok).map(x => x.url)" :initial-index="gi" preview-teleported hide-on-click-modal />
+                    <div v-else style="width:96px;height:128px;border-radius:6px;background:#fef2f2;color:#b91c1c;font-size:11px;display:flex;align-items:center;justify-content:center">生成失败</div>
+                    <div style="font-size:11px; color:#64748b; margin-top:2px">{{ g.label }}</div>
+                  </div>
+                </div>
+              </div>
               <div style="display:flex; flex-wrap:wrap; gap:8px">
                 <div v-for="(img, i) in drawer.draft.images" :key="i" style="position:relative">
                   <el-image :src="img" referrerpolicy="no-referrer" fit="cover" style="width:76px;height:76px;border-radius:6px;background:#f1f5f9" :preview-src-list="drawer.draft.images" preview-teleported hide-on-click-modal />
