@@ -63,6 +63,9 @@ window.YandexProductListView = {
       success: (msg) => (window.ElementPlus?.ElMessage || console).success?.(msg),
       warning: (msg) => (window.ElementPlus?.ElMessage || console).warning?.(msg),
       error: (msg) => (window.ElementPlus?.ElMessage || console).error?.(msg),
+      // v23232: 本文件多处用 notify.info（后台核价/精核价进度提示）但此前没定义 → 点了按钮会抛
+      //   "notify.info is not a function"，弹窗打开但后续提示与流程被中断。
+      info: (msg) => (window.ElementPlus?.ElMessage || console).info?.(msg),
     };
 
     const statusTabs = [
