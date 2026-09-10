@@ -78,8 +78,16 @@
           </div>
           <div><label>标题（可选，影响文案）</label><input id="fTitle" placeholder="商品标题" /></div>
         </div>
-        <label>参考图 URL（必填，直接用商品原图，越清晰越好）</label>
-        <input id="fRef" placeholder="https://... 商品主图" />
+        <label>参考图：拖拽图片进来 / Ctrl+V 粘贴截图 / 点击选择文件，也可以直接粘图片链接</label>
+        <div id="drop" style="border:1.5px dashed #475569; border-radius:10px; padding:16px; text-align:center; cursor:pointer; transition:.15s">
+          <div id="dropHint" style="color:#94a3b8; font-size:13px">把商品图拖到这里 · 或 Ctrl+V 粘贴 · 或点击选择文件</div>
+          <input id="fFile" type="file" accept="image/*" style="display:none" />
+          <div id="refPreview" style="display:none; margin-top:12px">
+            <img id="refThumb" style="max-width:150px; max-height:200px; border-radius:8px; border:1px solid #334155" />
+            <div class="mono" id="refMeta" style="margin-top:6px"></div>
+          </div>
+        </div>
+        <input id="fRef" placeholder="https://... 商品主图（也可直接粘贴链接）" style="margin-top:10px" />
         <label>只生成部分图片（不勾选 = 全部 7 张）</label>
         <div class="keys" id="keysBox"></div>
         <div style="margin-top:16px"><button id="submitBtn">开始出图</button>
@@ -110,6 +118,99 @@ async function api(path, opts) {
 }
 
 function el(id) { return document.getElementById(id); }
+
+// ===== 参考图：文件选择 / 拖拽 / 粘贴 =====
+function setRefPreview(url, meta) {
+  if (!url) { el('refPreview').style.display = 'none'; el('refThumb').src = ''; return; }
+  el('refThumb').src = url;
+  el('refMeta').textContent = meta || url;
+  el('refPreview').style.display = 'block';
+}
+
+async function uploadRefFile(file) {
+  if (!file) return;
+  if (!/^image\//.test(file.type || '')) { el('fErr').textContent = '只支持图片文件（JPG / PNG / WEBP / GIF）'; return; }
+  if (file.size > 30 * 1024 * 1024) { el('fErr').textContent = '图片超过 30MB'; return; }
+  el('fErr').textContent = '';
+  el('dropHint').textContent = `上传中… ${(file.size / 1024).toFixed(0)}KB`;
+  // 先本地预览，用户立刻能看到图
+  const localUrl = URL.createObjectURL(file);
+  setRefPreview(localUrl, '上传中…');
+  try {
+    const res = await fetch('/api/image-set/upload', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+    const text = await res.text();
+    let d = null;
+    try { d = JSON.parse(text); } catch { d = null; }
+    if (!res.ok || !d || !d.ok) throw new Error((d && d.error) || ('上传失败 HTTP ' + res.status));
+    el('fRef').value = d.url;
+    setRefPreview(d.url, `${(d.bytes / 1024).toFixed(0)}KB · ${d.mime}`);
+    el('dropHint').textContent = '已上传，可继续拖拽替换';
+  } catch (e) {
+    setRefPreview('', '');
+    el('dropHint').textContent = '把商品图拖到这里 · 或 Ctrl+V 粘贴 · 或点击选择文件';
+    el('fErr').textContent = '参考图上传失败：' + (e.message || e);
+  }
+}
+
+function pickImageFromDataTransfer(dt) {
+  if (!dt) return null;
+  if (dt.files && dt.files.length) {
+    const f = Array.from(dt.files).find(x => /^image\//.test(x.type || ''));
+    if (f) return f;
+  }
+  if (dt.items) {
+    for (const it of Array.from(dt.items)) {
+      if (it.kind === 'file' && /^image\//.test(it.type || '')) return it.getAsFile();
+    }
+  }
+  return null;
+}
+
+function initRefDropzone() {
+  const drop = el('drop');
+  const file = el('fFile');
+  drop.addEventListener('click', () => file.click());
+  file.addEventListener('change', () => { if (file.files[0]) uploadRefFile(file.files[0]); file.value = ''; });
+
+  ['dragenter', 'dragover'].forEach(ev => drop.addEventListener(ev, (e) => {
+    e.preventDefault(); drop.style.borderColor = '#3b82f6'; drop.style.background = 'rgba(59,130,246,.08)';
+  }));
+  ['dragleave', 'dragend'].forEach(ev => drop.addEventListener(ev, () => {
+    drop.style.borderColor = '#475569'; drop.style.background = 'transparent';
+  }));
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault(); drop.style.borderColor = '#475569'; drop.style.background = 'transparent';
+    const f = pickImageFromDataTransfer(e.dataTransfer);
+    if (f) uploadRefFile(f);
+    else {
+      const t = e.dataTransfer?.getData?.('text') || '';
+      if (/^https?:\/\//.test(t.trim())) { el('fRef').value = t.trim(); setRefPreview(t.trim(), '来自链接'); }
+      else el('fErr').textContent = '没识别到图片，请拖拽图片文件';
+    }
+  });
+
+  // 整页粘贴：Ctrl+V 截图/复制图片；粘贴文本链接则填到输入框
+  document.addEventListener('paste', (e) => {
+    if (el('appArea').style.display === 'none') return;
+    const f = pickImageFromDataTransfer(e.clipboardData);
+    if (f) { e.preventDefault(); uploadRefFile(f); return; }
+    const t = (e.clipboardData?.getData?.('text') || '').trim();
+    if (/^https?:\/\/\S+$/.test(t)) {
+      el('fRef').value = t;
+      setRefPreview(t, '来自链接');
+    }
+  });
+
+  el('fRef').addEventListener('input', () => {
+    const v = el('fRef').value.trim();
+    if (/^https?:\/\//.test(v)) setRefPreview(v, '来自链接');
+    else if (!v) setRefPreview('', '');
+  });
+}
 
 function renderKeys() {
   el('keysBox').innerHTML = KEYS.map(([k, zh]) =>
@@ -199,6 +300,7 @@ el('logoutBtn').addEventListener('click', async () => {
   checkAuth();
 });
 renderKeys();
+initRefDropzone();
 checkAuth();
 timer = setInterval(() => { if (el('appArea').style.display !== 'none') refreshJobs(); }, 10000);
 

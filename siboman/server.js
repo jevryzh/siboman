@@ -7174,6 +7174,27 @@ app.post("/api/image-set/jobs", requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// 参考图上传：浏览器把图片原文 POST 过来，转发出图服务落盘后得到公网可抓取的 URL
+app.post("/api/image-set/upload", requireAuth, express.raw({ type: () => true, limit: "30mb" }), async (req, res, next) => {
+  try {
+    const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (!buf.length) return res.status(400).json({ success: false, error: "空文件" });
+    const resp = await fetch(`${IMAGE_SET_URL}/upload`, {
+      method: "POST",
+      headers: {
+        "Content-Type": String(req.headers["content-type"] || "application/octet-stream"),
+        ...(IMAGE_SET_KEY ? { "x-api-key": IMAGE_SET_KEY } : {}),
+      },
+      body: buf,
+      signal: AbortSignal.timeout(120000),
+    });
+    const text = await resp.text();
+    let payload = null;
+    try { payload = JSON.parse(text); } catch { payload = { ok: false, error: text.slice(0, 300) }; }
+    res.status(resp.status).json(payload);
+  } catch (error) { next(error); }
+});
+
 app.get("/api/image-set/jobs", requireAuth, async (req, res, next) => {
   try {
     const out = await callImageSetService("GET", "/jobs");

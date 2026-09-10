@@ -164,12 +164,47 @@ async function runJob(job) {
 function json(res, code, body) { const t = JSON.stringify(body); res.writeHead(code, { "Content-Type": "application/json; charset=utf-8", "Content-Length": Buffer.byteLength(t) }); res.end(t); }
 function readBody(req) { return new Promise((resolve, reject) => { const parts = []; req.on("data", (c) => parts.push(c)); req.on("end", () => { try { resolve(parts.length ? JSON.parse(Buffer.concat(parts).toString("utf8")) : {}); } catch (e) { reject(e); } }); req.on("error", reject); }); }
 
+const MAX_UPLOAD_BYTES = Number(process.env.IMAGE_SET_MAX_UPLOAD_MB || 30) * 1024 * 1024;
+function readRaw(req, limit = MAX_UPLOAD_BYTES) {
+  return new Promise((resolve, reject) => {
+    const parts = []; let size = 0;
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > limit) { reject(new Error(`图片过大，最大 ${Math.round(limit / 1048576)}MB`)); req.destroy(); return; }
+      parts.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(parts)));
+    req.on("error", reject);
+  });
+}
+// 从魔数识别图片类型（不信任客户端文件名/Content-Type）
+function sniffImageType(buf) {
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { ext: "jpg", mime: "image/jpeg" };
+  if (buf.length > 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return { ext: "png", mime: "image/png" };
+  if (buf.length > 12 && buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP") return { ext: "webp", mime: "image/webp" };
+  if (buf.length > 6 && ["GIF87a", "GIF89a"].includes(buf.subarray(0, 6).toString("ascii"))) return { ext: "gif", mime: "image/gif" };
+  return null;
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
     if (url.pathname === "/health") return json(res, 200, { ok: true, service: "image-set", tokendunConfigured: Boolean(TOKENDUN_KEY), model: TOKENDUN_MODEL, base: TOKENDUN_BASE, platforms: Object.keys(PLATFORMS), jobs: jobs.size });
     const key = String(req.headers["x-api-key"] || (req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
     if (API_KEY && key !== API_KEY) return json(res, 401, { ok: false, error: "invalid api key" });
+    if (req.method === "POST" && url.pathname === "/upload") {
+      const buf = await readRaw(req);
+      if (!buf.length) return json(res, 400, { ok: false, error: "空文件" });
+      const kind = sniffImageType(buf);
+      if (!kind) return json(res, 400, { ok: false, error: "只支持 JPG / PNG / WEBP / GIF 图片" });
+      const dir = path.join(UPLOAD_DIR, "refs");
+      fs.mkdirSync(dir, { recursive: true });
+      const name = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}.${kind.ext}`;
+      fs.writeFileSync(path.join(dir, name), buf);
+      const publicUrl = `${PUBLIC_BASE}/uploads/image-set/refs/${name}`;
+      log(`上传参考图 ${(buf.length / 1024).toFixed(0)}KB → ${publicUrl}`);
+      return json(res, 200, { ok: true, url: publicUrl, bytes: buf.length, mime: kind.mime });
+    }
     if (req.method === "POST" && url.pathname === "/jobs") {
       const body = await readBody(req);
       if (!body.refImageUrl) return json(res, 400, { ok: false, error: "refImageUrl 必填" });
