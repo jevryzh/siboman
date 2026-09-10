@@ -514,7 +514,8 @@ function serializeStoreForFrontend(store) {
     watermark_text: store.watermark_text || "",
     ai_image_provider: store.ai_image_provider || AI_IMAGE_PROVIDER,
     ai_image_model: store.ai_image_model || "",
-    logistics_provider: String(store.logistics_provider || ""),
+    logistics_provider: String(store.logistics_provider || "CEL"),
+    last_mile_pct: Number(store.last_mile_pct ?? 3),
     last_mile_cny: Number(store.last_mile_cny || 4.68),
   };
 }
@@ -529,7 +530,7 @@ app.get("/api/seller/shops", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     const platformFilter = String(req.query.platform || "").trim();
-    const sql = "SELECT id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model, logistics_provider, last_mile_cny FROM app_stores WHERE user_id = $1"
+    const sql = "SELECT id, name, client_id, campaign_id, platform, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model, logistics_provider, last_mile_pct, last_mile_cny FROM app_stores WHERE user_id = $1"
       + (platformFilter ? " AND platform = $2" : "")
       + " ORDER BY updated_at DESC";
     const result = await db.query(sql, platformFilter ? [req.user.id, platformFilter] : [req.user.id]);
@@ -1126,7 +1127,8 @@ app.patch("/api/seller/shops/:id/settings", requireAuth, async (req, res, next) 
     const aiImageProvider = normalizeStoreAiProvider(req.body?.ai_image_provider);
     const aiImageModel = String(req.body?.ai_image_model || "").trim().slice(0, 80);
     const hasLogistics = req.body?.logistics_provider !== undefined || req.body?.last_mile_cny !== undefined;
-    const logisticsProvider = String(req.body?.logistics_provider || "").trim().slice(0, 80);
+    const logisticsProvider = String(req.body?.logistics_provider || "CEL").trim().slice(0, 80) || "CEL";
+    const lastMilePct = Math.max(0, Number(req.body?.last_mile_pct ?? 3) || 0);
     const lastMileCny = Math.max(0, Number(req.body?.last_mile_cny ?? 4.68) || 0);
     const result = await db.query(
       `UPDATE app_stores
@@ -1135,11 +1137,12 @@ app.patch("/api/seller/shops/:id/settings", requireAuth, async (req, res, next) 
               ai_image_provider = $5,
               ai_image_model = $6,
               logistics_provider = CASE WHEN $7::boolean THEN $8 ELSE logistics_provider END,
-              last_mile_cny = CASE WHEN $7::boolean THEN $9 ELSE last_mile_cny END,
+              last_mile_pct = CASE WHEN $7::boolean THEN $9 ELSE last_mile_pct END,
+              last_mile_cny = CASE WHEN $7::boolean THEN $10 ELSE last_mile_cny END,
               updated_at = now()
         WHERE id = $3 AND user_id = $4
-        RETURNING id, name, client_id, campaign_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model, logistics_provider, last_mile_cny`,
-      [watermarkEnabled, watermarkText, req.params.id, req.user.id, aiImageProvider, aiImageModel, hasLogistics, logisticsProvider, lastMileCny],
+        RETURNING id, name, client_id, campaign_id, active, watermark_enabled, watermark_text, ai_image_provider, ai_image_model, logistics_provider, last_mile_pct, last_mile_cny`,
+      [watermarkEnabled, watermarkText, req.params.id, req.user.id, aiImageProvider, aiImageModel, hasLogistics, logisticsProvider, lastMilePct, lastMileCny],
     );
     if (!result.rows[0]) return res.status(404).json({ success: false, error: "店铺不存在" });
     storePricingCache.delete(String(req.params.id)); // 尾程费/物流商改了 → 立刻让定价参数生效
@@ -2309,6 +2312,7 @@ async function initDatabase() {
       -- 店铺关联物流商 + 尾程费（定价时按店铺取）
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS logistics_provider TEXT NOT NULL DEFAULT '';
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS last_mile_cny NUMERIC(10,2) NOT NULL DEFAULT 4.68;
+      ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS last_mile_pct NUMERIC(6,2) NOT NULL DEFAULT 3;
       ALTER TABLE yandex_price_candidates ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       ALTER TABLE yandex_price_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       -- 核价证据（同款标题/图/链接/1688 价格阶梯/起批等），供人工核对采购价来源
@@ -6075,7 +6079,7 @@ app.get("/api/yandex/pricing-defaults", requireAuth, async (req, res, next) => {
     const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
     const params = storeId ? await storePricingParams(storeId) : { ...PRICING_DEFAULTS, exchangeRate: rubPerCnyNow() };
     const cached = storePricingCache.get(String(storeId || "__env__"));
-    res.json({ success: true, ...params, logisticsProvider: cached?.logisticsProvider || "" });
+    res.json({ success: true, ...params, logisticsProvider: cached?.logisticsProvider || params.logisticsProvider || "CEL" });
   } catch (error) { next(error); }
 });
 
@@ -6984,6 +6988,72 @@ app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) =>
 });
 
 // 类目参数（含单位/选项/是否变体特征 + 中文名）
+// 类目中文翻译：懒加载（展开哪级翻哪级）+ 永久缓存（data/yandex_category_zh.json）
+const YANDEX_CAT_ZH_FILE = path.join(__dirname, "data", "yandex_category_zh.json");
+let yandexCatZhCache = null;
+const yandexCategoryIndexByStore = new Map(); // storeKey -> Map(id -> node)
+
+function loadYandexCatZh() {
+  if (!yandexCatZhCache) {
+    try { yandexCatZhCache = JSON.parse(readFileSync(YANDEX_CAT_ZH_FILE, "utf8")); } catch { yandexCatZhCache = {}; }
+  }
+  return yandexCatZhCache;
+}
+function saveYandexCatZh() {
+  try {
+    fs.mkdirSync(path.dirname(YANDEX_CAT_ZH_FILE), { recursive: true });
+    fs.writeFileSync(YANDEX_CAT_ZH_FILE, JSON.stringify(yandexCatZhCache, null, 0));
+  } catch (e) { console.warn("[yandex-cat-zh] 保存失败:", e.message); }
+}
+function yandexCategoryIndex(tree, storeKey) {
+  let idx = yandexCategoryIndexByStore.get(storeKey);
+  if (idx) return idx;
+  idx = new Map();
+  const walk = (node) => { for (const child of (node?.children || [])) { idx.set(String(child.id), child); walk(child); } };
+  walk(tree);
+  yandexCategoryIndexByStore.set(storeKey, idx);
+  return idx;
+}
+async function attachCategoryZh(userId, items) {
+  const cache = loadYandexCatZh();
+  const missing = items.filter((it) => it.label && !cache[String(it.value)]);
+  if (missing.length) {
+    try {
+      const out = await callAIText(userId, {
+        system: [
+          "你是电商类目翻译助手。把俄文类目名翻译成简体中文。",
+          "要求：用电商习惯用词、简短（≤12 字），不要解释、不要括号补充；不确定时按字面直译。",
+          '只输出 JSON：{"<id>":"<中文翻译>"}',
+        ].join("\n"),
+        user: JSON.stringify(missing.slice(0, 60).map((m) => ({ id: String(m.value), name: m.label }))),
+        temperature: 0.2, maxTokens: 2500,
+      });
+      let parsed = {};
+      try { parsed = JSON.parse(out); } catch (_e) { const mm = String(out).match(/\{[\s\S]*\}/); if (mm) { try { parsed = JSON.parse(mm[0]); } catch (_e2) { parsed = {}; } } }
+      let changed = false;
+      for (const [k, v] of Object.entries(parsed || {})) { const zh = String(v || "").trim(); if (zh) { cache[String(k)] = zh; changed = true; } }
+      if (changed) saveYandexCatZh();
+    } catch (e) { console.warn("[yandex-cat-zh] 翻译失败:", e?.message || e); }
+  }
+  return items.map((it) => ({ ...it, zh: cache[String(it.value)] || "" }));
+}
+
+// 懒加载类目子级（带中文）
+app.get("/api/yandex/listing/categories/children", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const parentId = String(req.query?.parent_id || req.query?.parentId || "").trim();
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const tree = await getYandexCategoryTree(context, storeId || "");
+    const idx = yandexCategoryIndex(tree, storeId || "");
+    const nodes = parentId && parentId !== "root" ? (idx.get(parentId)?.children || []) : (tree?.children || []);
+    const items = await attachCategoryZh(req.user.id, nodes.map((n) => ({
+      value: String(n.id), label: String(n.name || n.id), leaf: !(n.children || []).length,
+    })));
+    res.json({ success: true, parentId: parentId || "root", children: items });
+  } catch (error) { next(error); }
+});
+
 app.get("/api/yandex/listing/categories/:id/parameters", requireAuth, async (req, res, next) => {
   try {
     const storeId = String(req.query?.store_id || "").trim() || null;
@@ -7295,7 +7365,9 @@ const __yandexFbsShopMap = (() => {
 const PRICING_DEFAULTS = {
   serviceFeeCny: 3,
   domesticShippingCny: 5,
-  lastMileCny: 4.68,
+  lastMilePct: 3,        // 尾程费按售价 3%（与佣金/广告同口径）；填 0 才退回下面的固定 ¥
+  lastMileCny: 4.68,     // 兼容旧口径：仅当 lastMilePct=0 时按固定金额计
+  logisticsProvider: "CEL",
   commissionPct: 24,      // 仅在类目匹配不到时作为兜底
   acquiringPct: 3.8,
   withdrawalPct: 1.2,
@@ -7332,18 +7404,22 @@ async function storePricingParams(storeId) {
   const key = String(storeId || "__env__");
   const cached = storePricingCache.get(key);
   if (cached && Date.now() - cached.at < 60 * 1000) return cached.params;
+  let lastMilePct = PRICING_DEFAULTS.lastMilePct;
   let lastMileCny = PRICING_DEFAULTS.lastMileCny;
-  let logisticsProvider = "";
+  let logisticsProvider = PRICING_DEFAULTS.logisticsProvider;
   try {
     if (db && storeId) {
-      const r = await db.query("SELECT logistics_provider, last_mile_cny FROM app_stores WHERE id = $1 LIMIT 1", [storeId]);
+      const r = await db.query("SELECT logistics_provider, last_mile_pct, last_mile_cny FROM app_stores WHERE id = $1 LIMIT 1", [storeId]);
       const row = r.rows?.[0];
-      const v = Number(row?.last_mile_cny || 0);
-      if (v > 0) lastMileCny = v;
-      logisticsProvider = String(row?.logistics_provider || "");
+      if (row) {
+        lastMilePct = Math.max(0, Number(row.last_mile_pct ?? PRICING_DEFAULTS.lastMilePct) || 0);
+        const v = Number(row.last_mile_cny || 0);
+        if (v > 0) lastMileCny = v;
+        logisticsProvider = String(row.logistics_provider || "") || PRICING_DEFAULTS.logisticsProvider;
+      }
     }
   } catch (_e) { /* 取不到就用默认 */ }
-  const params = { ...PRICING_DEFAULTS, lastMileCny, exchangeRate: rubPerCnyNow() };
+  const params = { ...PRICING_DEFAULTS, lastMilePct, lastMileCny, logisticsProvider, exchangeRate: rubPerCnyNow() };
   storePricingCache.set(key, { at: Date.now(), params, logisticsProvider });
   return params;
 }
@@ -7364,6 +7440,7 @@ function yandexSuggestPrice(input = {}) {
   const params = input.params || {};
   const domestic = Math.max(0, Number(params.domesticShippingCny || PRICING_DEFAULTS.domesticShippingCny));
   const service = Math.max(0, Number(params.serviceFeeCny || PRICING_DEFAULTS.serviceFeeCny));
+  const lastMilePct = Math.max(0, Number(params.lastMilePct ?? PRICING_DEFAULTS.lastMilePct));
   const lastMile = Math.max(0, Number(params.lastMileCny || PRICING_DEFAULTS.lastMileCny));
   const manualCommission = Math.max(0, Number(params.commissionPct || 0));
   const commission = manualCommission > 0 ? manualCommission : yandexMatchFbsCommission(input.categoryName, input.categoryLeaf);
@@ -7373,10 +7450,11 @@ function yandexSuggestPrice(input = {}) {
   const ad = Math.max(0, Number(params.adPct || PRICING_DEFAULTS.adPct));
   const targetMargin = Math.max(0, Number(params.targetMarginPct || PRICING_DEFAULTS.targetMarginPct));
   const rate = Math.max(0, Number(params.exchangeRate || 0)) || rubPerCnyNow();
-  const vrate = (commission + acquiring + withdrawal + returnLoss + ad) / 100;
+  // 尾程费按售价百分比时计入变动费率（与熊猫口径一致）；填 0 才按固定金额算
+  const vrate = (commission + acquiring + withdrawal + returnLoss + ad + (lastMilePct > 0 ? lastMilePct : 0)) / 100;
   const denom = 1 - vrate - targetMargin / 100;
   if (purchaseCny <= 0 || denom <= 0.02) return { ok: false };
-  const base = purchaseCny + domestic + service + lastMile;
+  const base = purchaseCny + domestic + service + (lastMilePct > 0 ? 0 : lastMile);
   let price = (base + yandexCelEconomy(base, { weightKg, dims, exchangeRate: rate }).feeCny) / denom;
   let cel = yandexCelEconomy(price, { weightKg, dims, exchangeRate: rate });
   for (let i = 0; i < 5; i += 1) {
@@ -7388,7 +7466,7 @@ function yandexSuggestPrice(input = {}) {
   const strikeDiscountPct = Number(params.strikeDiscountPct) > 0 ? Number(params.strikeDiscountPct) : 50;
   const strikePriceCny = Math.ceil(priceInt * 100 / strikeDiscountPct); // 划线价 = 售价 ÷ 折扣率 × 100
   const profitCny = Math.round(price * (1 - vrate) - base - cel.feeCny); // 扣除平台费率后的利润
-  return { ok: true, priceCny: priceInt, zone: cel.zone, chargeKg: cel.chargeKg, celFeeCny: cel.feeCny, rubValue: Math.round(priceInt * rate), strikePriceCny, profitCny, marginPct: targetMargin, commissionUsed: commission, commissionSource: manualCommission > 0 ? "manual" : "auto" };
+  return { ok: true, priceCny: priceInt, zone: cel.zone, chargeKg: cel.chargeKg, celFeeCny: cel.feeCny, rubValue: Math.round(priceInt * rate), strikePriceCny, profitCny, marginPct: targetMargin, commissionUsed: commission, commissionSource: manualCommission > 0 ? "manual" : "auto", lastMilePctUsed: lastMilePct, vratePct: Math.round(vrate * 10000) / 100 };
 }
 
 // 预匹配候选 upsert（供 Agent 本机 1688 匹配后写入）

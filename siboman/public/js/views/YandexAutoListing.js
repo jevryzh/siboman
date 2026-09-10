@@ -20,7 +20,7 @@ window.YandexAutoListingView = {
     // 利润计算（对齐熊猫口径：代贴单费/国内运费/物流商/佣金/收单/提现/退货/广告/目标毛利/划线折扣/实际汇率）
     const profit = Vue.reactive({
       visible: true, busy: false, rows: [], applied: false,
-      cost: { serviceFeeCny: 3, domesticShippingCny: 5, lastMileCny: 4.68, commissionPct: 24, acquiringPct: 3.8, withdrawalPct: 1.2, returnLossPct: 0, adPct: 15, targetMarginPct: 35, strikeDiscountPct: 50, exchangeRate: 12.8205 },
+      cost: { serviceFeeCny: 3, domesticShippingCny: 5, lastMilePct: 3, lastMileCny: 4.68,  commissionPct: 24, acquiringPct: 3.8, withdrawalPct: 1.2, returnLossPct: 0, adPct: 15, targetMarginPct: 35, strikeDiscountPct: 50, exchangeRate: 12.8205 },
       rateText: '',
     });
     // 变体特征值编辑（每个 SKU 同一特征参数给不同值，Yandex 才允许同组发布）
@@ -119,9 +119,38 @@ window.YandexAutoListingView = {
     };
 
     // ===== 新增上架任务 =====
+    // 类目懒加载（展开哪级翻哪级，中俄对照显示）
+    const fetchCatChildren = async (parentId) => {
+      const res = await axios.get('/api/yandex/listing/categories/children', { params: { parent_id: parentId || 'root' }, timeout: 90000 });
+      return (res.data?.children || []).map((c) => ({ value: c.value, label: c.zh ? `${c.zh}（${c.label}）` : c.label, ruLabel: c.label, zh: c.zh || '', leaf: c.leaf, children: undefined }));
+    };
+    const catLazyProps = (target) => ({
+      lazy: true, value: 'value', label: 'label', leaf: 'leaf',
+      lazyLoad: async (node, resolve) => {
+        try { resolve(await fetchCatChildren(node.level === 0 ? 'root' : node.value)); }
+        catch (_e) { resolve([]); }
+      },
+    });
+    const taskCatProps = catLazyProps();
+    const drawerCatProps = catLazyProps();
+    // 打开已有草稿时，按 id 逐级拉出路径，让级联框能显示"中文（俄文）"
+    const buildCategoryLadder = async (categoryId) => {
+      if (!categoryId) return [];
+      const ladder = [];
+      let level = await fetchCatChildren('root').catch(() => []);
+      let guard = 0;
+      while (level.length && guard < 6) {
+        guard += 1;
+        const hit = level.find((n) => String(n.value) === String(categoryId));
+        ladder.push(...level);
+        if (hit) break;
+        level = [];
+      }
+      return ladder;
+    };
     const loadTaskCategories = async () => {
       if (newTaskDialog.categoryOptions.length) return;
-      try { const res = await axios.get('/api/yandex/listing/categories', { timeout: 90000 }); newTaskDialog.categoryOptions = res.data?.options || []; } catch (_e) {}
+      try { newTaskDialog.categoryOptions = await fetchCatChildren('root'); } catch (_e) {}
     };
     const taskCategoryLabel = () => {
       const labels = []; let nodes = newTaskDialog.categoryOptions;
@@ -199,7 +228,8 @@ window.YandexAutoListingView = {
         d.skus = (Array.isArray(d.skus) ? d.skus : []).map((s) => ({ ...s, images: Array.isArray(s.images) ? s.images : [] }));
         drawer.draft = d;
         drawer.tagsText = (d.tags || []).join(', ');
-        drawer.categoryPath = d.categoryId ? await findCategoryPath(d.categoryId) : [];
+        drawer.categoryOptions = d.categoryId ? await buildCategoryLadder(d.categoryId) : [];
+        drawer.categoryPath = d.categoryId ? [String(d.categoryId)] : [];
         loadWarehouses();
         loadProfitDefaults();
         await loadCategoryOptions();
@@ -351,7 +381,7 @@ window.YandexAutoListingView = {
 
     return {
       loading, saving, uploading, activeTab, drafts, total, pagination, query, notify,
-      newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories,
+      newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories, taskCatProps, drawerCatProps,
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
@@ -433,8 +463,8 @@ window.YandexAutoListingView = {
           title="先选类目（必须末级），再粘贴 1688 链接：一行一个（detail.1688.com/offer/xxx.html）。提交后由本机插件逐个采集，采集完直接按该类目处理。" />
         <el-form label-width="90px" size="small" style="margin-bottom:8px">
           <el-form-item label="Yandex 类目">
-            <el-cascader v-model="newTaskDialog.categoryPath" :options="newTaskDialog.categoryOptions" filterable clearable
-              placeholder="请选择末级类目（采集前必选）" style="width:100%" @change="onTaskCategoryChange" />
+            <el-cascader v-model="newTaskDialog.categoryPath" :props="taskCatProps" filterable clearable
+              placeholder="请选择末级类目（中文｜俄文，采集前必选）" style="width:100%" @change="onTaskCategoryChange" />
           </el-form-item>
         </el-form>
         <el-input v-model="newTaskDialog.urls" type="textarea" :rows="8" placeholder="https://detail.1688.com/offer/730322803810.html&#10;https://detail.1688.com/offer/802358394710.html" />
@@ -456,8 +486,9 @@ window.YandexAutoListingView = {
               <template #header><b>基本信息</b><span style="font-size:12px; color:#94a3b8; float:right">类目必须选末级；属性随类目变化</span></template>
               <el-form label-width="90px" size="small">
                 <el-form-item label="类目">
-                  <el-cascader v-model="drawer.categoryPath" :options="drawer.categoryOptions" filterable clearable
-                    placeholder="请选择 Yandex 末级类目" style="width:100%" @change="onCategoryChange" />
+                  <el-cascader v-model="drawer.categoryPath" :props="drawerCatProps" filterable clearable
+                    placeholder="请选择 Yandex 末级类目（中文｜俄文）" style="width:100%" @change="onCategoryChange" />
+                  <div v-if="drawer.draft.categoryName" style="font-size:12px; color:#64748b; margin-top:4px">当前：{{ drawer.draft.categoryName }}</div>
                 </el-form-item>
                 <el-form-item label="商品标题">
                   <el-input v-model="drawer.draft.titleRu" placeholder="俄文标题（可用 AI 智能填充）" maxlength="255" show-word-limit />
@@ -568,7 +599,7 @@ window.YandexAutoListingView = {
               <el-row :gutter="8">
                 <el-col :span="4"><div style="font-size:12px;color:#64748b">代贴单费 ¥</div><el-input-number v-model="profit.cost.serviceFeeCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
                 <el-col :span="4"><div style="font-size:12px;color:#64748b">国内运费 ¥</div><el-input-number v-model="profit.cost.domesticShippingCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
-                <el-col :span="4"><div style="font-size:12px;color:#64748b">尾程/物流商 ¥</div><el-input-number v-model="profit.cost.lastMileCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">尾程费率 %（物流商 CEL）</div><el-input-number v-model="profit.cost.lastMilePct" :min="0" :precision="1" :controls="false" size="small" style="width:100%" /></el-col>
                 <el-col :span="4"><div style="font-size:12px;color:#64748b">平台佣金 %</div><el-input-number v-model="profit.cost.commissionPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
                 <el-col :span="4"><div style="font-size:12px;color:#64748b">银行收单 %</div><el-input-number v-model="profit.cost.acquiringPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
                 <el-col :span="4"><div style="font-size:12px;color:#64748b">提现费率 %</div><el-input-number v-model="profit.cost.withdrawalPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
