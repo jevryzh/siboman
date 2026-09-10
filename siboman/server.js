@@ -6847,12 +6847,20 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
     for (const it of toParamItems(skuParams)) map.set(String(it.parameterId), it);
     return [...map.values()];
   };
+  // 货号/offerId 一律用 ASCII：优先用 1688 商品编号（数字），否则用草稿短码；避免中文货号写进 Yandex
+  const srcOfferId = (String(draft.sourceUrl || "").match(/offer\/(\d{6,})/) || [])[1] || "";
+  const isAscii = (v) => /^[\x20-\x7e]+$/.test(String(v || ""));
+  const asciiBase = srcOfferId || `ZM${String(draft.id || "").replace(/-/g, "").slice(0, 8)}`;
   return await Promise.all(skus.map(async (sku, index) => {
     const priceValue = priceOf(sku, "price");
     const oldValue = Number(sku.oldPriceCny || sku.oldPriceRub || 0) > 0 ? priceOf(sku, "oldPrice") : 0;
     const pictures = await mapListingImages([sku.image, ...(Array.isArray(sku.images) ? sku.images : []), ...(draft.images || [])], 30);
     const offer = {
-      offerId: String(sku.offerId || (skus.length > 1 ? `${draft.vendorCode || String(draft.id).slice(0, 8)}-${index + 1}` : (draft.vendorCode || String(draft.id).slice(0, 8)))),
+      offerId: (() => {
+        const existing = String(sku.offerId || "");
+        if (existing && isAscii(existing)) return existing;
+        return skus.length > 1 ? `${asciiBase}-${index + 1}` : asciiBase;
+      })(),
       name: String((skus.length > 1 && (sku.specRu || sku.spec)) ? `${draft.titleRu} ${sku.specRu || sku.spec}` : draft.titleRu).slice(0, 255),
       description: String(draft.descriptionRu || "").slice(0, 3000),
       vendor: draft.brand || "Нет бренда",
@@ -6866,7 +6874,10 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
         height: Number(sku.heightCm || 0),
       },
     };
-    if (draft.vendorCode) offer.vendorCode = String(draft.vendorCode);
+    // 货号同样保持 ASCII：中文货号换成 1688 编号（Yandex 侧货号显示中文很不专业，也不利于对账）
+    const vendorCode = isAscii(draft.vendorCode) ? String(draft.vendorCode) : "";
+    if (vendorCode) offer.vendorCode = vendorCode;
+    else if (srcOfferId) offer.vendorCode = srcOfferId;
     if (draft.originCountry) offer.manufacturerCountries = [String(draft.originCountry)];
     if (Array.isArray(draft.tags) && draft.tags.length) offer.tags = draft.tags.slice(0, 20).map((t) => String(t).slice(0, 40));
     if (draft.videoUrl) offer.videos = [String(draft.videoUrl)];
@@ -7281,6 +7292,10 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
           });
         } catch (pe) { pricePayload = { error: String(pe?.message || pe).slice(0, 300) }; }
         const offerIds = offers.map((o) => o.offerId);
+        try {
+          const nextSkus = (draft.skus || []).map((sku, i) => (offers[i] ? { ...sku, offerId: offers[i].offerId } : sku));
+          await db.query(`UPDATE yandex_listing_drafts SET skus=$2::jsonb, updated_at=now() WHERE id=$1`, [id, JSON.stringify(nextSkus)]);
+        } catch (_e) { /* 回写失败不影响上传结果 */ }
         // 库存：Yandex FBS 必须传库存才会从 NO_STOCKS 变可售（v3 主体级，无仓库组时使用）
         let stockResult = null;
         try {
