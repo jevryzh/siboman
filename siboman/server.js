@@ -6540,6 +6540,10 @@ app.patch("/api/yandex/listing/drafts/:id", requireAuth, async (req, res, next) 
     if (b.detailImages !== undefined) push("detail_images", JSON.stringify(Array.isArray(b.detailImages) ? b.detailImages.slice(0, 60) : []), "::jsonb");
     if (b.videoUrl !== undefined) push("video_url", String(b.videoUrl || "").slice(0, 500));
     if (b.skus !== undefined) push("skus", JSON.stringify(Array.isArray(b.skus) ? b.skus : []), "::jsonb");
+    // 支持手工导入/纠错：允许直接写入采集原始数据与采集状态（Excel 导入、人工补录也会用到）
+    if (b.sourceData !== undefined) push("source_data", JSON.stringify(b.sourceData && typeof b.sourceData === "object" ? b.sourceData : {}), "::jsonb");
+    if (b.collectStatus !== undefined) push("collect_status", String(b.collectStatus || "pending").slice(0, 20));
+    if (b.collectError !== undefined) push("collect_error", String(b.collectError || "").slice(0, 500));
     if (!sets.length) return res.json({ success: true, draft });
     const r = await db.query(`UPDATE yandex_listing_drafts SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 RETURNING ${YANDEX_DRAFT_COLUMNS}`, params);
     res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]) });
