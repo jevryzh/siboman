@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.111";
-    const PLUGIN_ZIP_VERSION = "2.2.9.111";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.112";
+    const PLUGIN_ZIP_VERSION = "2.2.9.112";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -427,6 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.112 新增 Yandex 自动上架采集能力：领取 kind=yandex-collect 任务后逐个打开 1688 商品详情页，采集标题/图集/详情图/SKU(规格+价格+库存+图)/商品属性/包装重量尺寸并回传 ERP，生成 Yandex 上架草稿（配合 ERP 新增的「Yandex 自动上架」页面使用）。</li>
             <li>✅ v2.2.9.111 修复 Yandex 精核价取不到真实价格阶梯：1688 详情页改版后 window.__INIT_DATA 已为空，商品数据被内联进页面 script 的 JSON，旧解析拿不到阶梯就退化去抓页面里第一个 ¥ 数字（曾把 ¥1 引流档当采购价）。现在解析内联 JSON 取回真实价格阶梯(skuRangePrices)与各规格价(skuInfoMap)，并输出结构化证据供「混合配件店」按规格匹配（1个边刷¥1.9 与 1个尘袋¥3.2 不再混淆）。</li>
             <li>✅ v2.2.9.110 Yandex 全店精核价（1688 官方真实价）：采购价口径改为「1688 详情页价格阶梯的起批首档单价」（小批量真正能买到的价），修掉旧逻辑把价格文本里第一个数字当价格（"10件起 ¥3.2" 被读成 10）的问题；精核价时若榜首候选没有详情证据会补开它的详情页，避免用搜索列表的引流最低价。</li>
             <li>✅ v2.2.9.109 Yandex 核价提速：任务领取轮询从最长 30s 缩短到数秒（SW 存活期间每 4s 快轮询）；核价轻量模式只为首个候选开 1688 详情页补 MOQ/运费，其余候选直接用搜索接口字段，避免逐个开关详情页导致单行 60s+。</li>

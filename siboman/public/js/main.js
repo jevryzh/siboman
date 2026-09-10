@@ -172,6 +172,7 @@ const initApp = () => {
         if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
         if (path.includes('collection')) return 'collection';
+        if (path.includes('yandex-autolist')) return 'yandex-autolist';
         if (path.includes('yandex-products')) return 'yandex-products';
         if (path.includes('yandex-inventory')) return 'yandex-inventory';
         if (path.includes('yandex-orders')) return 'yandex-orders';
@@ -191,7 +192,7 @@ const initApp = () => {
       // Yandex 多店铺：按当前路由决定顶栏切换器展示的平台，并自动对齐当前店铺
       const headerPlatform = Vue.computed(() => {
         const r = routeName.value;
-        if (r === 'yandex-products' || r === 'yandex-orders' || r === 'yandex-inventory') return 'yandex';
+        if (r === 'yandex-products' || r === 'yandex-orders' || r === 'yandex-inventory' || r === 'yandex-autolist') return 'yandex';
         if (r === 'stores') return 'all';
         return 'ozon';
       });
@@ -233,6 +234,9 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/yandex-products" @click="goTo('#/yandex-products')">
               <el-icon><GoodsFilled /></el-icon><span>Yandex 商品</span>
+            </el-menu-item>
+            <el-menu-item index="#/yandex-autolist" @click="goTo('#/yandex-autolist')">
+              <el-icon><UploadFilled /></el-icon><span>Yandex 自动上架</span>
             </el-menu-item>
             <el-menu-item index="#/yandex-inventory" @click="goTo('#/yandex-inventory')">
               <el-icon><House /></el-icon><span>Yandex 库存</span>
@@ -295,6 +299,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
             <div v-else-if="routeName === 'products'"><product-list-view /></div>
             <div v-else-if="routeName === 'yandex-products'" class="erp-route-page"><yandex-product-list-view /></div>
+            <div v-else-if="routeName === 'yandex-autolist'" class="erp-route-page"><yandex-auto-listing-view /></div>
             <div v-else-if="routeName === 'yandex-inventory'" class="erp-route-page"><yandex-inventory-view /></div>
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
             <div v-else-if="routeName === 'orders'"><order-list-view /></div>
@@ -333,6 +338,7 @@ const initApp = () => {
   register('single-sourcing-review-view', window.SingleSourcingReviewView);
   register('product-list-view', window.ProductListView);
   register('yandex-product-list-view', window.YandexProductListView);
+  register('yandex-auto-listing-view', window.YandexAutoListingView);
   register('inventory-management-view', window.InventoryManagementView);
   register('yandex-inventory-view', window.YandexInventoryManagementView);
   register('order-list-view', window.OrderListView);

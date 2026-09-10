@@ -2353,6 +2353,41 @@ async function initDatabase() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
     `);
+    // Yandex 自动上架草稿（1688 采集 → 编辑属性 → 上传 Yandex）
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS yandex_listing_drafts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE,
+        source_url TEXT NOT NULL DEFAULT '',
+        source_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+        collect_status TEXT NOT NULL DEFAULT 'pending',
+        collect_error TEXT NOT NULL DEFAULT '',
+        publish_status TEXT NOT NULL DEFAULT 'unpublished',
+        publish_error TEXT NOT NULL DEFAULT '',
+        title_ru TEXT NOT NULL DEFAULT '',
+        description_ru TEXT NOT NULL DEFAULT '',
+        brand TEXT NOT NULL DEFAULT 'Нет бренда',
+        vendor_code TEXT NOT NULL DEFAULT '',
+        origin_country TEXT NOT NULL DEFAULT 'Китай',
+        tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+        hotwords TEXT NOT NULL DEFAULT '',
+        category_id TEXT NOT NULL DEFAULT '',
+        category_name TEXT NOT NULL DEFAULT '',
+        category_params JSONB NOT NULL DEFAULT '[]'::jsonb,
+        images JSONB NOT NULL DEFAULT '[]'::jsonb,
+        detail_images JSONB NOT NULL DEFAULT '[]'::jsonb,
+        video_url TEXT NOT NULL DEFAULT '',
+        skus JSONB NOT NULL DEFAULT '[]'::jsonb,
+        ai_filled_at TIMESTAMPTZ,
+        yandex_result JSONB NOT NULL DEFAULT '{}'::jsonb,
+        uploaded_at TIMESTAMPTZ,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_yld_user_store ON yandex_listing_drafts(user_id, store_id, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_yld_publish ON yandex_listing_drafts(publish_status);
+    `);
 
     await seedInitialUsers();
   } catch (e) {
@@ -6159,6 +6194,451 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         rows,
       },
     });
+  } catch (error) { next(error); }
+});
+
+// ===== Yandex 自动上架（1688 采集 → 编辑属性 → 上传 Yandex）=====
+// 对齐熊猫 ERP「Yandex → 自动上架」：粘贴 1688 链接/Excel → 插件采集 → 选末级类目+参数 →
+// AI 俄文标题/描述 → 定价 → 一键上传（offer-mappings/update）→ 上传记录。
+const yandexListingTreeCache = new Map(); // storeKey -> { at, tree }
+const YANDEX_LISTING_TREE_TTL_MS = 12 * 3600 * 1000;
+const YANDEX_LISTING_RATE = 12.8205; // CNY→RUB 兜底汇率（前端可覆盖）
+
+async function getYandexCategoryTree(context, storeKey = "") {
+  const key = storeKey || "__env__";
+  const cached = yandexListingTreeCache.get(key);
+  if (cached && Date.now() - cached.at < YANDEX_LISTING_TREE_TTL_MS) return cached.tree;
+  const payload = await callYandexMarketAPI("/v2/categories/tree", {
+    method: "POST", query: { language: "RU" }, body: {}, timeoutMs: 90000, apiSecret: context.apiSecret,
+  });
+  const tree = payload?.result || {};
+  yandexListingTreeCache.set(key, { at: Date.now(), tree });
+  console.log(`[yandex-listing] 类目树已缓存 store=${key} root=${tree?.name || ""} children=${(tree?.children || []).length}`);
+  return tree;
+}
+
+function yandexCategoryTreeToCascader(node) {
+  const id = String(node?.id || "");
+  const children = (Array.isArray(node?.children) ? node.children : []).map(yandexCategoryTreeToCascader);
+  return { value: id, label: String(node?.name || id), children };
+}
+
+function normalizeYandexCategoryParams(parameters) {
+  return (Array.isArray(parameters) ? parameters : []).map((p) => {
+    const unit = p?.unit || null;
+    const options = (Array.isArray(p?.values) ? p.values : [])
+      .map((v) => ({ id: String(v?.id ?? ""), value: String(v?.value ?? "") }))
+      .filter((v) => v.value);
+    return {
+      parameterId: String(p?.id ?? ""),
+      name: String(p?.name || ""),
+      nameZh: yandexAttrZh(p?.name),
+      type: String(p?.type || ""),
+      required: p?.required === true,
+      distinctive: p?.distinctive === true,
+      groupName: /Название группы вариантов/i.test(String(p?.name || "")),
+      options,
+      unitId: unit?.defaultUnitId ? String(unit.defaultUnitId) : "",
+      unitName: unit ? String(unit.name || "") : "",
+      units: (Array.isArray(unit?.units) ? unit.units : []).map((u) => ({ id: String(u?.id ?? ""), name: String(u?.name || ""), fullName: String(u?.fullName || "") })),
+    };
+  });
+}
+
+function dbRowToYandexDraft(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    storeId: row.store_id || "",
+    sourceUrl: row.source_url || "",
+    sourceData: row.source_data || {},
+    collectStatus: row.collect_status || "pending",
+    collectError: row.collect_error || "",
+    publishStatus: row.publish_status || "unpublished",
+    publishError: row.publish_error || "",
+    titleRu: row.title_ru || "",
+    descriptionRu: row.description_ru || "",
+    brand: row.brand || "Нет бренда",
+    vendorCode: row.vendor_code || "",
+    originCountry: row.origin_country || "Китай",
+    tags: Array.isArray(row.tags) ? row.tags : [],
+    hotwords: row.hotwords || "",
+    categoryId: row.category_id || "",
+    categoryName: row.category_name || "",
+    categoryParams: Array.isArray(row.category_params) ? row.category_params : [],
+    images: Array.isArray(row.images) ? row.images : [],
+    detailImages: Array.isArray(row.detail_images) ? row.detail_images : [],
+    videoUrl: row.video_url || "",
+    skus: Array.isArray(row.skus) ? row.skus : [],
+    aiFilledAt: row.ai_filled_at || null,
+    yandexResult: row.yandex_result || {},
+    uploadedAt: row.uploaded_at || null,
+    createdAt: row.created_at, updatedAt: row.updated_at,
+  };
+}
+
+const YANDEX_DRAFT_COLUMNS = `id, store_id, source_url, source_data, collect_status, collect_error, publish_status, publish_error,
+  title_ru, description_ru, brand, vendor_code, origin_country, tags, hotwords, category_id, category_name, category_params,
+  images, detail_images, video_url, skus, ai_filled_at, yandex_result, uploaded_at, created_at, updated_at`;
+
+async function getYandexDraftForUser(id, user) {
+  if (!db || !id) return null;
+  const params = [id];
+  let where = "id = $1";
+  if (user?.role !== "admin") { params.push(user?.id || ""); where += " AND user_id = $2"; }
+  const r = await db.query(`SELECT ${YANDEX_DRAFT_COLUMNS} FROM yandex_listing_drafts WHERE ${where} LIMIT 1`, params);
+  return r.rows?.[0] ? dbRowToYandexDraft(r.rows[0]) : null;
+}
+
+// 由草稿构建 Yandex offer（对齐官方 offer-mappings/update 结构）
+function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE } = {}) {
+  const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : YANDEX_LISTING_RATE;
+  const skus = Array.isArray(draft.skus) ? draft.skus.filter((s2) => s2 && (Number(s2.priceRub) > 0 || Number(s2.priceCny) > 0)) : [];
+  const groupId = skus.length > 1 ? `ZM-${String(draft.id).slice(0, 8)}` : "";
+  const baseParams = (Array.isArray(draft.categoryParams) ? draft.categoryParams : []).map((p) => {
+    const item = { parameterId: String(p.parameterId ?? "") };
+    const valueId = p.valueId ?? (p.optionId || "");
+    if (valueId) {
+      item.valueId = /^\d+$/.test(String(valueId)) ? Number(valueId) : String(valueId);
+      return item;
+    }
+    const value = p.value ?? "";
+    if (value === "" || value === null || value === undefined) return null;
+    item.value = p.type === "numeric" && /^-?\d+(\.\d+)?$/.test(String(value)) ? Number(value) : String(value);
+    if (p.unitId) item.unitId = /^\d+$/.test(String(p.unitId)) ? Number(p.unitId) : String(p.unitId);
+    return item;
+  }).filter(Boolean);
+  return skus.map((sku, index) => {
+    const priceRub = Number(sku.priceRub) > 0 ? Number(sku.priceRub) : Math.round(Number(sku.priceCny || 0) * rate);
+    const oldRub = Number(sku.oldPriceRub) > 0 ? Number(sku.oldPriceRub) : 0;
+    const pictures = [sku.image, ...(Array.isArray(sku.images) ? sku.images : []), ...(draft.images || [])]
+      .map((u) => String(u || "").trim()).filter(Boolean).filter((u, i, arr) => arr.indexOf(u) === i).slice(0, 30);
+    const offer = {
+      offerId: String(sku.offerId || (skus.length > 1 ? `${draft.vendorCode || String(draft.id).slice(0, 8)}-${index + 1}` : (draft.vendorCode || String(draft.id).slice(0, 8)))),
+      name: String((skus.length > 1 && sku.spec) ? `${draft.titleRu} ${sku.spec}` : draft.titleRu).slice(0, 255),
+      description: String(draft.descriptionRu || "").slice(0, 3000),
+      vendor: draft.brand || "Нет бренда",
+      marketCategoryId: Number(draft.categoryId),
+      pictures,
+      basicPrice: { value: priceRub, currencyId: "RUB", ...(oldRub > priceRub ? { discountBase: oldRub } : {}) },
+      weightDimensions: {
+        weight: Number(sku.weightKg || 0),
+        length: Number(sku.lengthCm || 0),
+        width: Number(sku.widthCm || 0),
+        height: Number(sku.heightCm || 0),
+      },
+    };
+    if (draft.vendorCode) offer.vendorCode = String(draft.vendorCode);
+    if (draft.originCountry) offer.manufacturerCountries = [String(draft.originCountry)];
+    if (Array.isArray(draft.tags) && draft.tags.length) offer.tags = draft.tags.slice(0, 20).map((t) => String(t).slice(0, 40));
+    if (draft.videoUrl) offer.videos = [String(draft.videoUrl)];
+    if (baseParams.length) offer.parameterValues = baseParams;
+    if (groupId) offer.groupId = groupId;
+    return offer;
+  });
+}
+
+function validateYandexDraftForUpload(draft) {
+  const problems = [];
+  if (!draft.categoryId) problems.push("未选类目");
+  if (!String(draft.titleRu || "").trim()) problems.push("缺俄文标题");
+  if (!(draft.images || []).length) problems.push("缺图片");
+  const offers = buildYandexOffersFromDraft(draft);
+  if (!offers.length) problems.push("SKU 未填售价");
+  for (const offer of offers) {
+    if (!(offer.basicPrice.value > 0)) problems.push(`${offer.offerId}: 售价必须 > 0`);
+    const wd = offer.weightDimensions;
+    if (!(wd.weight > 0 && wd.length > 0 && wd.width > 0 && wd.height > 0)) problems.push(`${offer.offerId}: 重量/长宽高必须都 > 0`);
+    if (!offer.pictures.length) problems.push(`${offer.offerId}: 缺图片`);
+  }
+  return { ok: problems.length === 0, problems };
+}
+
+// 采集结果回填草稿（插件 yandex-collect job 回传）
+async function applyYandexCollectResults(job, results, userId) {
+  if (!db) return 0;
+  const rows = Array.isArray(results) ? results : [];
+  let applied = 0;
+  for (const r of rows) {
+    const draftId = String(r?.draftId || "").trim();
+    if (!draftId) continue;
+    if (r?.ok === false) {
+      await db.query(
+        `UPDATE yandex_listing_drafts SET collect_status='failed', collect_error=$2, updated_at=now() WHERE id=$1`,
+        [draftId, String(r?.error || "采集失败").slice(0, 500)]
+      ).catch(() => {});
+      continue;
+    }
+    const data = r?.data && typeof r.data === "object" ? r.data : null;
+    if (!data) continue;
+    const skus = (Array.isArray(data.skus) ? data.skus : []).map((sku, i) => ({
+      spec: String(sku?.spec || sku?.name || "").slice(0, 80),
+      purchaseCny: Number(sku?.priceCny || sku?.price || 0) || 0,
+      priceCny: 0, priceRub: 0, oldPriceRub: 0,
+      image: String(sku?.image || ""),
+      images: Array.isArray(sku?.images) ? sku.images.slice(0, 10) : [],
+      stock: Number(sku?.stock || 0) || 0,
+      weightKg: Number(data.weightKg || 0) || 0,
+      lengthCm: Number(data.lengthCm || 0) || 0,
+      widthCm: Number(data.widthCm || 0) || 0,
+      heightCm: Number(data.heightCm || 0) || 0,
+      _i: i,
+    }));
+    await db.query(
+      `UPDATE yandex_listing_drafts SET
+         collect_status='collected', collect_error='',
+         source_data=$2::jsonb,
+         images=$3::jsonb, detail_images=$4::jsonb,
+         skus=$5::jsonb,
+         vendor_code=COALESCE(NULLIF(vendor_code,''), $6),
+         updated_at=now()
+       WHERE id=$1`,
+      [draftId, JSON.stringify(data), JSON.stringify((data.images || []).slice(0, 30)), JSON.stringify((data.detailImages || []).slice(0, 60)),
+       JSON.stringify(skus), String(data.vendorCode || "").slice(0, 120)]
+    ).catch((e) => console.warn("[yandex-listing] 回填草稿失败:", e.message));
+    applied += 1;
+  }
+  return applied;
+}
+
+// 类目树
+app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const tree = await getYandexCategoryTree(context, storeId || "");
+    res.json({ success: true, root: String(tree?.name || ""), options: (tree?.children || []).map(yandexCategoryTreeToCascader) });
+  } catch (error) { next(error); }
+});
+
+// 类目参数（含单位/选项/是否变体特征 + 中文名）
+app.get("/api/yandex/listing/categories/:id/parameters", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const parameters = await getYandexCategoryParameters(req.params.id, context.apiSecret);
+    res.json({ success: true, categoryId: String(req.params.id), parameters: normalizeYandexCategoryParams(parameters) });
+  } catch (error) { next(error); }
+});
+
+// 草稿列表（自动上架任务表 + 上传记录共用）
+app.get("/api/yandex/listing/drafts", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const q = String(req.query?.q || "").trim();
+    const collectStatus = String(req.query?.collect_status || "").trim();
+    const publishStatus = String(req.query?.publish_status || "").trim();
+    const page = Math.max(1, Number(req.query?.page || 1));
+    const pageSize = Math.min(100, Math.max(1, Number(req.query?.page_size || 20)));
+    const where = ["user_id = $1"]; const params = [userId];
+    if (storeId) { params.push(storeId); where.push(`store_id = $${params.length}`); }
+    if (q) { params.push(`%${q.toLowerCase()}%`); where.push(`(lower(source_url) LIKE $${params.length} OR lower(title_ru) LIKE $${params.length})`); }
+    if (collectStatus) { params.push(collectStatus); where.push(`collect_status = $${params.length}`); }
+    if (publishStatus) { params.push(publishStatus); where.push(`publish_status = $${params.length}`); }
+    const countR = await db.query(`SELECT count(*)::int AS cnt FROM yandex_listing_drafts WHERE ${where.join(" AND ")}`, params);
+    params.push(pageSize, (page - 1) * pageSize);
+    const rows = await db.query(
+      `SELECT ${YANDEX_DRAFT_COLUMNS} FROM yandex_listing_drafts WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
+      params
+    );
+    res.json({ success: true, total: countR.rows[0]?.cnt || 0, items: (rows.rows || []).map(dbRowToYandexDraft) });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/yandex/listing/drafts/:id", requireAuth, async (req, res, next) => {
+  try {
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    res.json({ success: true, draft });
+  } catch (error) { next(error); }
+});
+
+// 新增上架任务（粘贴 1688 链接批量 → 建草稿 + 派插件采集）
+app.post("/api/yandex/listing/tasks", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const storeId = String(req.body?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId });
+    let urls = Array.isArray(req.body?.urls) ? req.body.urls.map((u) => String(u || "").trim()).filter(Boolean) : [];
+    urls = urls.filter((u) => /^https?:\/\/([a-z0-9-]+\.)?1688\.com\//i.test(u));
+    if (!urls.length) return res.status(400).json({ success: false, error: "请至少填一个 1688 商品链接" });
+    urls = [...new Set(urls)].slice(0, 200);
+    const created = [];
+    for (const url of urls) {
+      const r = await db.query(
+        `INSERT INTO yandex_listing_drafts (user_id, store_id, source_url, collect_status) VALUES ($1,$2,$3,'pending') RETURNING id`,
+        [userId, storeId, url]
+      );
+      created.push({ draftId: r.rows[0].id, url });
+    }
+    const job = await createQueuedDbJob(req.user, {
+      id: crypto.randomUUID(), kind: "yandex-collect", storeId, total: created.length,
+      phase: `已排队 ${created.length} 个商品，等待本机插件采集 1688`,
+    }, { items: created, storeId });
+    res.json({ success: true, jobId: job.id, total: created.length, draftIds: created.map((c) => c.draftId) });
+  } catch (error) { next(error); }
+});
+
+// 保存编辑（属性/标题/SKU/图片/类目）
+app.patch("/api/yandex/listing/drafts/:id", requireAuth, async (req, res, next) => {
+  try {
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const b = req.body || {};
+    const sets = []; const params = [draft.id];
+    const push = (col, value, cast = "") => { params.push(value); sets.push(`${col} = $${params.length}${cast}`); };
+    if (b.titleRu !== undefined) push("title_ru", String(b.titleRu || "").slice(0, 500));
+    if (b.descriptionRu !== undefined) push("description_ru", String(b.descriptionRu || "").slice(0, 6000));
+    if (b.brand !== undefined) push("brand", String(b.brand || "").slice(0, 200));
+    if (b.vendorCode !== undefined) push("vendor_code", String(b.vendorCode || "").slice(0, 120));
+    if (b.originCountry !== undefined) push("origin_country", String(b.originCountry || "").slice(0, 80));
+    if (b.tags !== undefined) push("tags", JSON.stringify(Array.isArray(b.tags) ? b.tags.slice(0, 30) : []), "::jsonb");
+    if (b.hotwords !== undefined) push("hotwords", String(b.hotwords || "").slice(0, 500));
+    if (b.categoryId !== undefined) push("category_id", String(b.categoryId || "").slice(0, 40));
+    if (b.categoryName !== undefined) push("category_name", String(b.categoryName || "").slice(0, 300));
+    if (b.categoryParams !== undefined) push("category_params", JSON.stringify(Array.isArray(b.categoryParams) ? b.categoryParams : []), "::jsonb");
+    if (b.images !== undefined) push("images", JSON.stringify(Array.isArray(b.images) ? b.images.slice(0, 30) : []), "::jsonb");
+    if (b.detailImages !== undefined) push("detail_images", JSON.stringify(Array.isArray(b.detailImages) ? b.detailImages.slice(0, 60) : []), "::jsonb");
+    if (b.videoUrl !== undefined) push("video_url", String(b.videoUrl || "").slice(0, 500));
+    if (b.skus !== undefined) push("skus", JSON.stringify(Array.isArray(b.skus) ? b.skus : []), "::jsonb");
+    if (!sets.length) return res.json({ success: true, draft });
+    const r = await db.query(`UPDATE yandex_listing_drafts SET ${sets.join(", ")}, updated_at = now() WHERE id = $1 RETURNING ${YANDEX_DRAFT_COLUMNS}`, params);
+    res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]) });
+  } catch (error) { next(error); }
+});
+
+app.delete("/api/yandex/listing/drafts/:id", requireAuth, async (req, res, next) => {
+  try {
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    await db.query("DELETE FROM yandex_listing_drafts WHERE id = $1", [draft.id]);
+    res.json({ success: true });
+  } catch (error) { next(error); }
+});
+
+// AI 俄文填充：标题/描述/标签/类目属性
+app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const raw = draft.sourceData || {};
+    const srcTitle = String(raw.title || raw["标题"] || "").slice(0, 300);
+    const attrs = raw.attributes && typeof raw.attributes === "object" ? raw.attributes : (raw["商品属性"] || {});
+    const params = (draft.categoryParams || []).slice(0, 60).map((p) => ({
+      id: p.parameterId, name: p.name, nameZh: p.nameZh || "", required: p.required === true,
+      options: (p.options || []).slice(0, 25).map((o) => o.value),
+    }));
+    const payload = { 中文标题: srcTitle, 商品属性: attrs, 类目: draft.categoryName || "", 类目参数: params, 热词提示: draft.hotwords || "" };
+    const out = await callAIText(userId, {
+      system: [
+        "你是 Yandex Market（俄罗斯电商）专业运营。根据中国 1688 商品信息，产出可直接上架的俄文内容。",
+        "要求：标题不超过 200 字符、突出品类+关键规格+适用场景，禁止堆砌关键词；描述 300-900 字符，分段说明卖点/规格/包装清单；tags 为 5-10 个俄文搜索词。",
+        "类目参数：只填你确有把握的（无把握的给空字符串），枚举型参数必须从给定 options 中精确选择其一。",
+        "只输出 JSON：{\"title_ru\":\"\",\"description_ru\":\"\",\"tags\":[\"\"],\"params\":{\"<parameterId>\":\"<值或选项文本>\"}}",
+      ].join("\n"),
+      user: JSON.stringify(payload),
+      temperature: 0.3,
+      maxTokens: 3000,
+    });
+    let parsed = {};
+    try { parsed = JSON.parse(out) } catch (_e) {
+      const m = String(out).match(/\{[\s\S]*\}/);
+      if (m) { try { parsed = JSON.parse(m[0]); } catch (_e2) { parsed = {}; } }
+    }
+    const nextParams = (draft.categoryParams || []).map((p) => {
+      const v = parsed?.params?.[p.parameterId] ?? parsed?.params?.[p.name];
+      if (v === undefined || v === null || String(v).trim() === "") return p;
+      const text = String(v).trim();
+      const opt = (p.options || []).find((o) => o.value.toLowerCase() === text.toLowerCase());
+      return opt ? { ...p, valueId: opt.id, value: opt.value } : { ...p, value: text };
+    });
+    const r = await db.query(
+      `UPDATE yandex_listing_drafts SET title_ru=$2, description_ru=$3, tags=$4::jsonb, category_params=$5::jsonb, ai_filled_at=now(), updated_at=now()
+       WHERE id=$1 RETURNING ${YANDEX_DRAFT_COLUMNS}`,
+      [draft.id,
+       String(parsed?.title_ru || draft.titleRu || "").slice(0, 500),
+       String(parsed?.description_ru || draft.descriptionRu || "").slice(0, 6000),
+       JSON.stringify(Array.isArray(parsed?.tags) ? parsed.tags.slice(0, 20).map(String) : draft.tags),
+       JSON.stringify(nextParams)]
+    );
+    res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]), raw: String(out).slice(0, 600) });
+  } catch (error) { next(error); }
+});
+
+// 上传到 Yandex（offer-mappings/update + offer-prices/updates）
+app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const storeId = String(req.body?.store_id || "").trim() || null;
+    const ids = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(String).filter(Boolean).slice(0, 50);
+    if (!ids.length) return res.status(400).json({ success: false, error: "请选择要上传的商品" });
+    const exchangeRate = Number(req.body?.exchangeRate || 0) || YANDEX_LISTING_RATE;
+    const context = await getYandexMarketContext({ storeId, userId });
+    const results = [];
+    for (const id of ids) {
+      const draft = await getYandexDraftForUser(id, req.user);
+      if (!draft) { results.push({ id, ok: false, error: "草稿不存在" }); continue; }
+      const check = validateYandexDraftForUpload(draft);
+      if (!check.ok) {
+        await db.query(`UPDATE yandex_listing_drafts SET publish_status='failed', publish_error=$2, updated_at=now() WHERE id=$1`, [id, check.problems.join("；").slice(0, 500)]);
+        results.push({ id, ok: false, error: check.problems.join("；") });
+        continue;
+      }
+      await db.query(`UPDATE yandex_listing_drafts SET publish_status='uploading', publish_error='', updated_at=now() WHERE id=$1`, [id]);
+      try {
+        const offers = buildYandexOffersFromDraft(draft, { exchangeRate });
+        const mapping = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings/update`, {
+          method: "POST", query: { language: "RU" }, body: { offerMappings: offers.map((offer) => ({ offer })) }, timeoutMs: 90000, apiSecret: context.apiSecret,
+        });
+        // 价格单独写一次（政策/促销价更稳）
+        let pricePayload = null;
+        try {
+          pricePayload = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices/updates`, {
+            method: "POST",
+            body: { offers: offers.map((o) => ({ offerId: o.offerId, price: { value: o.basicPrice.value, currencyId: o.basicPrice.currencyId } })) },
+            timeoutMs: 90000, apiSecret: context.apiSecret,
+          });
+        } catch (pe) { pricePayload = { error: String(pe?.message || pe).slice(0, 300) }; }
+        const offerIds = offers.map((o) => o.offerId);
+        await db.query(
+          `UPDATE yandex_listing_drafts SET publish_status='published', publish_error='', uploaded_at=now(), updated_at=now(),
+             yandex_result=$2::jsonb WHERE id=$1`,
+          [id, JSON.stringify({ offerIds, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, at: new Date().toISOString() })]
+        );
+        invalidateYandexStatusCounts(storeId);
+        if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
+        results.push({ id, ok: true, offerIds, mappingStatus: mapping?.status || "OK" });
+      } catch (e) {
+        const msg = String(e?.message || e).slice(0, 800);
+        await db.query(`UPDATE yandex_listing_drafts SET publish_status='failed', publish_error=$2, updated_at=now() WHERE id=$1`, [id, msg]);
+        results.push({ id, ok: false, error: msg });
+      }
+    }
+    res.json({ success: true, results });
+  } catch (error) { next(error); }
+});
+
+// 从 Yandex 删除已上传的卡（offer-mappings/delete）
+app.post("/api/yandex/listing/drafts/:id/delete-offers", requireAuth, async (req, res, next) => {
+  try {
+    const userId = req.user.id;
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const context = await getYandexMarketContext({ storeId: draft.storeId || null, userId });
+    const offerIds = (draft.yandexResult?.offerIds || []).map(String).filter(Boolean);
+    if (!offerIds.length) return res.status(400).json({ success: false, error: "该草稿还没有上传过的货号" });
+    const r = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings/delete`, {
+      method: "POST", query: { language: "RU" }, body: { offerIds }, timeoutMs: 90000, apiSecret: context.apiSecret,
+    });
+    await db.query(`UPDATE yandex_listing_drafts SET publish_status='unpublished', yandex_result=$2::jsonb, updated_at=now() WHERE id=$1`,
+      [draft.id, JSON.stringify({ ...(draft.yandexResult || {}), deletedAt: new Date().toISOString(), deletedOfferIds: offerIds })]);
+    invalidateYandexStatusCounts(draft.storeId || null);
+    res.json({ success: true, result: r?.result || null });
   } catch (error) { next(error); }
 });
 
@@ -15629,6 +16109,10 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       await recordPreciseResults(job, req.body.results, existing.owner?.id || null, job.storeId || null).catch(() => {});
       await evaluatePreciseRisk(job, req.body.results).catch(() => {});
     }
+    // Yandex 自动上架：插件采集 1688 的结果一回来就回填草稿
+    if (job?.kind === "yandex-collect" && Array.isArray(req.body?.results) && req.body.results.length) {
+      await applyYandexCollectResults(job, req.body.results, existing.owner?.id || null).catch(() => {});
+    }
     res.json({ success: true, job });
   } catch (error) {
     next(error);
@@ -15710,6 +16194,18 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       updates.phase = "已完成，可下载 Excel";
     }
     const updated = await updateDbJob(req.params.id, updates);
+    // Yandex 自动上架采集收尾：把最后一批结果回填草稿
+    if (updated && updated.kind === "yandex-collect" && Array.isArray(updated.results) && updated.results.length) {
+      try {
+        const n = await applyYandexCollectResults(updated, updated.results, existing.owner?.id || null);
+        const rows = updated.results || [];
+        const failed = rows.filter((r) => r?.ok === false).length;
+        const phase = `采集完成：成功 ${rows.length - failed} · 失败 ${failed}`;
+        await updateDbJob(req.params.id, { phase, logs: [...(updated.logs || []), makeLogEntry(phase, "info")] }).catch(() => {});
+        updated.phase = phase;
+        console.log(`[yandex-collect] 回填草稿 ${n} 条（失败 ${failed}）`);
+      } catch (e) { console.warn("[yandex-collect] 收尾回填失败:", e?.message || e); }
+    }
     // 插件精核价收尾：把最后一批结果补齐落库，并把汇总写回 phase（报告页据此展示真实成本分布）
     if (updated && (updated.payload?.marker === PRECISE_JOB_MARKER || updated.payload?.precise === true)) {
       try {

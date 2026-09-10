@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.111";
+const VERSION = "2.2.9.112";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -953,6 +953,190 @@ async function runQueuedSourcingJob(remoteJob) {
   await completeSourcingJob(job);
 }
 
+// Yandex 自动上架采集（kind=yandex-collect）：逐个打开 1688 商品详情页，采集标题/图集/详情图/
+// SKU(规格+价格+库存+图)/商品属性/包装重量尺寸，回传给 ERP 生成上架草稿。
+async function runQueuedYandexCollectJob(remoteJob) {
+  const payload = remoteJob.payload || {};
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const job = {
+    id: remoteJob.id,
+    status: "running",
+    phase: "插件已领取，开始采集 1688 商品",
+    total: items.length,
+    processed: Math.min(Math.max(0, Array.isArray(remoteJob.results) ? remoteJob.results.length : 0), items.length),
+    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
+    results: Array.isArray(remoteJob.results) ? remoteJob.results.slice() : [],
+    error: "",
+    cancelRequested: false,
+    abortController: typeof AbortController === "function" ? new AbortController() : null,
+  };
+  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取 Yandex 上架采集任务（${items.length} 项）。`));
+  await setActiveSourcingJob(job);
+  await reportSourcingProgress(job);
+  const stopCancelMonitor = startSourcingCancelMonitor(job);
+  try {
+    for (let index = job.results.length; index < items.length; index += 1) {
+      if (job.cancelRequested) break;
+      const item = items[index] || {};
+      const url = String(item.url || "");
+      job.phase = `采集 1688 商品 ${index + 1}/${items.length}`;
+      job.logs.push(makeLog(`采集 ${url}`));
+      await reportSourcingProgress(job);
+      try {
+        if (!url) throw new Error("缺少链接");
+        const data = await collect1688ProductForListingInPlugin(url, job);
+        if (!data || !data.title) throw new Error("未采集到商品标题（页面结构变化或需要登录）");
+        job.results.push({ draftId: item.draftId || "", url, ok: true, data });
+        job.logs.push(makeLog(`✓ ${String(data.title).slice(0, 40)} | 主图 ${(data.images || []).length} 张 | SKU ${(data.skus || []).length} 个 | 属性 ${Object.keys(data.attributes || {}).length} 项`));
+      } catch (e) {
+        const msg = (e?.message || String(e)).slice(0, 300);
+        job.results.push({ draftId: item.draftId || "", url, ok: false, error: msg });
+        job.logs.push(makeLog(`✗ 采集失败 ${url}：${msg}`, "warn"));
+      }
+      job.processed = Math.min(index + 1, job.total);
+      job.phase = `已完成 ${job.processed}/${job.total}`;
+      await reportSourcingProgress(job);
+    }
+  } finally {
+    stopCancelMonitor();
+  }
+  const failed = job.results.filter((r) => r.ok === false).length;
+  job.status = job.cancelRequested ? "canceled" : (failed === job.results.length && job.results.length ? "error" : "done");
+  job.error = job.status === "error" ? "全部采集失败" : "";
+  job.phase = job.status === "done" ? `采集完成：成功 ${job.results.length - failed} · 失败 ${failed}` : (job.status === "canceled" ? "已停止" : "全部失败");
+  await completeSourcingJob(job);
+}
+
+async function collect1688ProductForListingInPlugin(url, job = null) {
+  assertSourcingNotCanceled(job);
+  const tab = await createTabWithRetry({ url, active: false }, "打开 1688 商品页");
+  if (tab?.id) active1688TabIds.add(tab.id);
+  try {
+    await waitForTabComplete(tab.id, 45000);
+    await sleep(randomInt(900, 1800));
+    assertSourcingNotCanceled(job);
+    await browse1688DetailLightInPlugin(tab.id);
+    assertSourcingNotCanceled(job);
+    const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688ListingProduct });
+    const data = result?.result || null;
+    if (!data) throw new Error("页面未返回采集数据");
+    return data;
+  } finally {
+    active1688TabIds.delete(tab.id);
+    await safeRemoveTab(tab.id);
+  }
+}
+
+// 在 1688 商品详情页上下文执行：解析内联 JSON + DOM 兜底，产出上架草稿所需数据
+function extract1688ListingProduct() {
+  const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+  const uniq = (arr) => arr.filter((u, i, a) => u && a.indexOf(u) === i);
+  const sliceJson = (text, startIdx) => {
+    let depth = 0, inStr = false, esc = false;
+    for (let i = startIdx; i < text.length; i += 1) {
+      const ch = text[i];
+      if (inStr) { if (esc) { esc = false; continue; } if (ch === "\\") { esc = true; continue; } if (ch === '"') inStr = false; continue; }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === "{" || ch === "[") depth += 1;
+      else if (ch === "}" || ch === "]") { depth -= 1; if (depth === 0) return text.slice(startIdx, i + 1); }
+    }
+    return "";
+  };
+  const extractInline = (key, wantArray) => {
+    for (const node of Array.from(document.querySelectorAll("script"))) {
+      const text = node.textContent || "";
+      if (text.length < 1500 || !text.includes(`"${key}"`)) continue;
+      const at = text.indexOf(`"${key}"`);
+      const idx = wantArray ? text.indexOf("[", at) : text.indexOf("{", at);
+      if (idx < 0) continue;
+      const raw = sliceJson(text, idx);
+      if (!raw) continue;
+      try { return JSON.parse(raw); } catch (_e) { /* 继续找下一个 script */ }
+    }
+    return null;
+  };
+  const num = (v) => { const n = Number(String(v ?? "").replace(/[^\d.]/g, "")); return Number.isFinite(n) ? n : 0; };
+
+  // 1) 标题
+  const title = clean(
+    document.querySelector('[class*="title-text"], .d-title, .offer-title, [class*="offer-title"], h1')?.innerText
+    || document.title.replace(/\s*[-_]\s*阿里巴巴.*$/i, "").replace(/\s*1688\.com.*$/i, "")
+  ).slice(0, 300);
+
+  // 2) 图集（主图）：优先内联 JSON，其次 DOM
+  const imageUrls = [];
+  const pushImgs = (list) => {
+    for (const it of (Array.isArray(list) ? list : [])) {
+      const u = typeof it === "string" ? it : (it?.fullPathImageURI || it?.imageURI || it?.url || it?.original || "");
+      if (u && /^https?:/i.test(u)) imageUrls.push(String(u));
+    }
+  };
+  pushImgs(extractInline("images", true));
+  if (!imageUrls.length) {
+    for (const img of Array.from(document.querySelectorAll('img[src*="alicdn"], img[data-src*="alicdn"]'))) {
+      const u = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+      if (!/(cbu01|img\.alicdn|sc01)/i.test(u)) continue;
+      if ((img.naturalWidth || 0) < 120) continue;
+      imageUrls.push(u);
+    }
+  }
+  const images = uniq(imageUrls.map((u) => u.replace(/_\d+x\d+.*?(\.(?:jpg|jpeg|png|webp))/i, "$1"))).slice(0, 20);
+
+  // 3) 详情图（描述区图片）
+  const detailImages = uniq(Array.from(document.querySelectorAll(
+    '#desc-lazyload-container img, .desc-lazyload-container img, [class*="detail-desc"] img, [class*="desc-container"] img, [class*="offer-desc"] img'
+  )).map((img) => img.currentSrc || img.src || img.getAttribute("data-src") || "")
+    .filter((u) => /^https?:/i.test(u) && /(alicdn|1688)/i.test(u))).slice(0, 40);
+
+  // 4) SKU（规格 + 价格 + 库存）
+  const skuMap = extractInline("skuInfoMap", false) || {};
+  const skus = Object.entries(skuMap).map(([key, v]) => ({
+    spec: clean(v?.specAttrs || key).slice(0, 80),
+    priceCny: num(v?.price ?? v?.discountPrice ?? v?.salePrice),
+    stock: num(v?.canBookCount) || 0,
+    image: String(v?.image || v?.skuImageURI || ""),
+    skuId: String(v?.skuId || ""),
+  })).filter((sku) => sku.spec);
+
+  // 5) 商品属性（货号/材质/重量/尺寸等）
+  const attributes = {};
+  const attrRaw = extractInline("productAttributes", false) || extractInline("product_attributes", false);
+  const attrSource = attrRaw?.product_attributes || attrRaw || {};
+  if (attrSource && typeof attrSource === "object") {
+    for (const [k, v] of Object.entries(attrSource)) {
+      const value = clean(typeof v === "object" ? (v?.value ?? v?.text ?? "") : v);
+      if (k && value && String(k).length <= 60) attributes[clean(k)] = value.slice(0, 200);
+    }
+  }
+  for (const row of Array.from(document.querySelectorAll("tr"))) {
+    const cells = Array.from(row.children).map((c) => clean(c.innerText)).filter(Boolean);
+    if (cells.length >= 2 && cells[0].length <= 60 && attributes[cells[0]] === undefined) attributes[cells[0]] = cells.slice(1).join(" ").slice(0, 200);
+  }
+
+  // 6) 重量/尺寸（包装信息 → 属性兜底）
+  const weightText = clean(attributes["包装重量"] || attributes["发货重量"] || attributes["商品重量"] || attributes["重量"] || "");
+  const weightMatch = weightText.match(/(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克)/i);
+  let weightKg = 0;
+  if (weightMatch) weightKg = /^(kg|公斤|千克)$/i.test(weightMatch[2]) ? Number(weightMatch[1]) : Number(weightMatch[1]) / 1000;
+  const dimMatch = clean(attributes["包装尺寸"] || attributes["商品尺寸"] || attributes["尺寸"] || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+  const dims = dimMatch ? [Number(dimMatch[1]) || 0, Number(dimMatch[2]) || 0, Number(dimMatch[3]) || 0] : [0, 0, 0];
+
+  const vendorCode = clean(attributes["货号"] || attributes["商品货号"] || attributes["型号"] || "");
+
+  return {
+    title,
+    images,
+    detailImages,
+    skus: skus.length ? skus : [{ spec: "", priceCny: 0, stock: 0, image: images[0] || "" }],
+    attributes,
+    vendorCode,
+    weightKg,
+    lengthCm: dims[0], widthCm: dims[1], heightCm: dims[2],
+    url: location.href,
+    collectedAt: new Date().toISOString(),
+  };
+}
+
 // Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
 async function runQueuedYandexResearchJob(remoteJob) {
   const payload = remoteJob.payload || {};
@@ -1066,11 +1250,12 @@ async function pollSourcingQueueOnce() {
       : "逐梦插件在线，可领取单品找货任务";
     const data = await erpApi("/api/worker/jobs/next", {
       method: "POST",
-      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research"] },
+      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research", "yandex-collect"] },
     });
     if (data.job) {
       console.log(`[SW ${VERSION}] 领取任务: ${data.job.id} kind=${data.job.kind}`);
       if (data.job.kind === "yandex-research") await runQueuedYandexResearchJob(data.job);
+      else if (data.job.kind === "yandex-collect") await runQueuedYandexCollectJob(data.job);
       else await runQueuedSourcingJob(data.job);
     }
   } catch (e) {
