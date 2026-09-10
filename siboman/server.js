@@ -95,6 +95,12 @@ const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.104";
 const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.111";
 // Yandex 自动上架采集（kind=yandex-collect）最低插件版本：v2.2.9.112 起插件才会在 /api/worker/jobs/next 里上报该 kind
 const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.112";
+// 采集类任务只在 1688 侧完成（开页面读标题/图/SKU/重量），不使用任何店铺凭据，
+// 所以不受插件 token 里的「店铺作用域」限制。否则：插件 token 的店铺来自浏览器当时的店铺选择，
+// 用户一旦在店铺切换器里切过店铺（或在别的店铺页面点过授权），已经排队的任务会永远领不到、
+// 也不会被超时捞回，界面上只显示「等待本机插件采集」，完全无从判断。
+const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect"];
+const WORKER_STORE_SCOPE_EXEMPT_SQL = `(${WORKER_STORE_SCOPE_EXEMPT_KINDS.map((k) => `'${k}'`).join(",")})`;
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -22049,7 +22055,7 @@ async function findActiveDbJobForUser(user, options = {}) {
      WHERE j.user_id = $1
        AND j.status IN ('queued','claimed','running','exporting')
        AND ($2 = '' OR j.kind = $2)
-       AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
+       AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})
      ORDER BY
        CASE j.status WHEN 'running' THEN 1 WHEN 'claimed' THEN 2 WHEN 'exporting' THEN 3 WHEN 'queued' THEN 4 ELSE 9 END,
        j.updated_at DESC
@@ -22134,7 +22140,7 @@ async function rescueStaleDbJobsForUser(user, options = {}) {
        WHERE j.user_id = $1
          AND j.status IN ('claimed','running')
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
-         AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
+         AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})
          AND j.updated_at < now() - ($4::int * interval '1 second')
          AND (COALESCE(j.total, 0) <= 0 OR COALESCE(j.processed, 0) < COALESCE(j.total, 0))
          AND NOT EXISTS (
@@ -22156,7 +22162,7 @@ async function rescueStaleDbJobsForUser(user, options = {}) {
        WHERE j.user_id = $1
          AND j.status IN ('claimed','running')
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
-         AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
+         AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})
          AND j.updated_at < now() - ($4::int * interval '1 second')
          AND (COALESCE(j.total, 0) <= 0 OR COALESCE(j.processed, 0) < COALESCE(j.total, 0))
          AND NOT EXISTS (
@@ -22178,7 +22184,7 @@ async function rescueStaleDbJobsForUser(user, options = {}) {
        WHERE j.user_id = $1
          AND j.status IN ('claimed','running')
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
-         AND ($3::uuid IS NULL OR j.store_id = $3::uuid)
+         AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})
          AND j.updated_at < now() - ($4::int * interval '1 second')
          AND (COALESCE(j.total, 0) <= 0 OR COALESCE(j.processed, 0) < COALESCE(j.total, 0))
          AND NOT EXISTS (
@@ -22237,7 +22243,7 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
        FROM app_jobs j
        WHERE j.user_id = $1
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
-          AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind = 'yandex-research')
+          AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})
           AND ($6::boolean OR COALESCE(j.payload->>'marker', '') <> 'precise-1688')
           AND (
             j.status = 'queued'
@@ -22379,8 +22385,13 @@ async function getDbJobForUser(id, user) {
     where += " AND j.user_id = $2";
   }
   if (isScopedWorkerUser(user)) {
-    params.push(String(user.tokenStoreId || ""));
-    where += ` AND j.store_id = $${params.length}`;
+    const tokenStoreId = String(user.tokenStoreId || "").trim();
+    // token 没带店铺作用域时不能拼 `store_id = ''`（uuid 比较会直接报错）；
+    // 采集类任务不受店铺作用域限制，否则插件领到了任务回来上报进度会被判 404「任务不存在」。
+    if (tokenStoreId) {
+      params.push(tokenStoreId);
+      where += ` AND (j.store_id = $${params.length} OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})`;
+    }
   }
   const result = await db.query(
     `SELECT j.*, u.username, u.display_name
