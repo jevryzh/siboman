@@ -5712,9 +5712,13 @@ function precisePickPrice(candidate, offerName) {
     const spread = Math.max(...prices) / Math.max(0.01, Math.min(...prices));
     // 1688 常在阶梯里混促销档：页面上 "1件起 ¥0.48" 是促销/新人价，"1件起 ¥1.31" 才是实际单价
     //   （页面 SKU 行显示 140酒红 ¥1.31 / 140黑色 ¥1.31）。各规格价一致时直接用规格价（实际起批单价）。
-    const singleSkuPrice = new Set(skus.map((s) => s.price)).size === 1 ? skus[0].price : 0;
-    if (dupBeginAmount && singleSkuPrice >= 0.3) {
-      return { price: singleSkuPrice, mode: "promo_adjusted", skus, tiers };
+    //   规格价里也可能夹个别促销规格（实测 1.38/1.38/1.38/0.5，其中 0.5 是 isPromotionSku）。
+    //   取「多数规格价」（同价规格 ≥ 半数且至少 2 个）作为实际单价；价格分散（真·多规格不同价）则交给规格匹配或人工。
+    const priceCounts = new Map();
+    for (const sku of skus) priceCounts.set(sku.price, (priceCounts.get(sku.price) || 0) + 1);
+    const dominant = [...priceCounts.entries()].sort((a, b) => (b[1] - a[1]) || (b[0] - a[0]))[0] || null;
+    if (dupBeginAmount && dominant && dominant[0] >= 0.3 && dominant[1] >= 2 && dominant[1] >= Math.ceil(skus.length / 2)) {
+      return { price: dominant[0], mode: "promo_adjusted", skus, tiers, dominantSkus: `${dominant[1]}/${skus.length}` };
     }
     const suspect = tiers[0].price < 0.3 || (tiers[0].price < 1 && (dupBeginAmount || spread >= 8));
     if (!suspect) return { price: tiers[0].price, mode: "tier_first", skus, tiers };
@@ -5729,7 +5733,7 @@ const PRECISE_PRICE_MODES = {
   tier_first: { trusted: true, label: "起批首档价（1688 价格阶梯）" },
   single_price: { trusted: true, label: "统一规格价" },
   sku_match: { trusted: true, label: "按规格匹配（混合配件店）" },
-  promo_adjusted: { trusted: true, label: "含促销档，已取实际规格价（保守）" },
+  promo_adjusted: { trusted: true, label: "含促销档，已取多数规格价（保守）" },
   variant_match: { trusted: true, label: "按尺寸/型号匹配规格" },
   tier_suspect: { trusted: false, label: "阶梯疑似含引流档，需人工确认" },
   ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
