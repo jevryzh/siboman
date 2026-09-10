@@ -2402,6 +2402,7 @@ async function initDatabase() {
       );
       CREATE INDEX IF NOT EXISTS idx_yld_user_store ON yandex_listing_drafts(user_id, store_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_yld_publish ON yandex_listing_drafts(publish_status);
+      ALTER TABLE yandex_listing_drafts ADD COLUMN IF NOT EXISTS image_set JSONB NOT NULL DEFAULT '[]'::jsonb;
     `);
 
     await seedInitialUsers();
@@ -6770,6 +6771,7 @@ function dbRowToYandexDraft(row) {
     videoUrl: row.video_url || "",
     skus: Array.isArray(row.skus) ? row.skus : [],
     aiFilledAt: row.ai_filled_at || null,
+    imageSet: Array.isArray(row.image_set) ? row.image_set : [],
     yandexResult: row.yandex_result || {},
     uploadedAt: row.uploaded_at || null,
     createdAt: row.created_at, updatedAt: row.updated_at,
@@ -6778,7 +6780,7 @@ function dbRowToYandexDraft(row) {
 
 const YANDEX_DRAFT_COLUMNS = `id, store_id, source_url, source_data, collect_status, collect_error, publish_status, publish_error,
   title_ru, description_ru, brand, vendor_code, origin_country, tags, hotwords, category_id, category_name, category_params,
-  images, detail_images, video_url, skus, ai_filled_at, yandex_result, uploaded_at, created_at, updated_at`;
+  images, detail_images, video_url, skus, ai_filled_at, image_set, yandex_result, uploaded_at, created_at, updated_at`;
 
 async function getYandexDraftForUser(id, user) {
   if (!db || !id) return null;
@@ -7011,6 +7013,130 @@ app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) =>
 });
 
 // 类目参数（含单位/选项/是否变体特征 + 中文名）
+// ===== AI 出图（Ozon 俄罗斯风格 7 图套图，走 TokenDun gpt-image-2 图生图）=====
+// 复用文件顶部已声明的 TOKENDUN_* 常量（TOKENDUN_BASE_URL 已含 /v1）
+const TOKENDUN_BASE = TOKENDUN_BASE_URL;
+const TOKENDUN_KEY = TOKENDUN_API_KEY;
+const yandexImageSetRunning = new Map();
+
+const KEEP_PRODUCT = "IMPORTANT: keep the product EXACTLY as in the reference photo — same shape, proportions, material, colour, packaging, labels and quantity. Do NOT redesign or replace the product. Photorealistic commercial product photography, high detail, 3:4 vertical composition, sharp focus.";
+const RU_STYLE = "Russian marketplace (Ozon) listing image, professional e-commerce style, cinematic lighting, Russian-language text only (correct Russian spelling, modern clean Cyrillic sans-serif, well spaced, never covering the product). No Chinese characters, no watermark.";
+
+const YANDEX_IMAGE_SET = [
+  ["main", "主图", `${KEEP_PRODUCT} ${RU_STYLE} MAIN COVER IMAGE. First look carefully at the reference photo and understand exactly what the product is. Scene: an appealing lifestyle setting matching the product's real usage and Russian buyer taste (warm, cosy, premium, natural props). Product hero centred occupying 55-65% of the frame, studio-level lighting, realistic shadows and highlights. Add a big bold Russian headline at the top (2-5 words, accurate for this product). Add 3 short Russian feature callouts with thin leader lines describing its REAL visible properties. Instead of plain size text, draw TECHNICAL MEASUREMENT ANNOTATIONS: thin white dimension lines with arrowheads and small numbers along the product (height, width and volume/quantity where applicable, e.g. "высота 20 см", "диаметр 8 см", "500 мл").`],
+  ["usage", "使用场景", `${KEEP_PRODUCT} ${RU_STYLE} USAGE SCENARIO IMAGE: show the product in real use in a Russian home, warm cosy setting with natural props fitting its usage, person's hands only (no face), product clearly visible and unchanged. Short bottom Russian caption describing the benefit.`],
+  ["multi", "多件摆拍", `${KEEP_PRODUCT} ${RU_STYLE} MULTI-ITEM STAGING: arrange the COMPLETE SET exactly as in the reference photo (all pieces, correct quantity) on a tasteful surface (marble/wood). Some pieces shown opened or in use, others untouched and neatly arranged. Short accurate Russian top label naming the set plus the item count found in the reference; one small bottom line "ИДЕАЛЬНЫЙ ПОДАРОК".`],
+  ["features", "产品特点", `${KEEP_PRODUCT} ${RU_STYLE} FEATURE INFOGRAPHIC: one large hero view from the reference in the centre, surrounded by 4-5 clean white callout cards joined by thin leader lines with short Russian labels describing REAL visible properties. Light elegant background, tidy structured layout, generous spacing.`],
+  ["comparison", "竞品对比", `${KEEP_PRODUCT} ${RU_STYLE} COMPARISON IMAGE: left side our product from the reference with a green check and label "НАШ НАБОР"; right side a plain generic budget alternative of the same category with a red cross and label "ОБЫЧНЫЙ НАБОР". Small Russian comparison points with check/cross icons between them. Clean split background, infographic style.`],
+  ["single", "单件摆拍", `${KEEP_PRODUCT} ${RU_STYLE} PREMIUM SINGLE ITEM SHOT (not a white background): one item from the set alone on a dark polished stone slab with soft reflection, elegant smoky gradient background, subtle rim light, gentle props blurred behind. Minimal Russian caption at the bottom.`],
+  ["details", "多角度细节", `${KEEP_PRODUCT} ${RU_STYLE} MULTI-ANGLE DETAIL COLLAGE: four macro close-ups of the same product in a neat 2x2 grid, each in a thin frame with a short Russian caption (СПЕРЕДИ / СБОКУ / СВЕРХУ / УПАКОВКА). Show texture, materials, labels and packaging detail. Consistent lighting across panels.`],
+];
+
+function tokendunEnabled() { return Boolean(TOKENDUN_KEY); }
+
+async function tokendunGenerateImage(prompt, refImageUrl, size = "1024x1536") {
+  // 参考图先转存到本机（TokenDun 需要能取到），再走图生图
+  const refUrl = await publicUrlForListingImage(refImageUrl);
+  const refResp = await fetch(refUrl, { signal: AbortSignal.timeout(60000) });
+  if (!refResp.ok) throw new Error(`参考图下载失败 ${refResp.status}`);
+  const refBuf = Buffer.from(await refResp.arrayBuffer());
+  const form = new FormData();
+  form.append("model", TOKENDUN_IMAGE_MODEL);
+  form.append("size", size);
+  form.append("prompt", prompt);
+  form.append("image[]", new Blob([refBuf], { type: "image/jpeg" }), "ref.jpg");
+  const resp = await fetch(`${TOKENDUN_BASE}/images/edits`, {
+    method: "POST", headers: { Authorization: `Bearer ${TOKENDUN_KEY}` }, body: form, signal: AbortSignal.timeout(600000),
+  });
+  const text = await resp.text();
+  if (!resp.ok) throw new Error(`TokenDun ${resp.status}: ${text.slice(0, 240)}`);
+  let payload = {}; try { payload = JSON.parse(text); } catch { throw new Error(`TokenDun 返回非 JSON: ${text.slice(0, 160)}`); }
+  const item = payload?.data?.[0] || {};
+  const uploadDir = path.join(PUBLIC_DIR, "uploads", "yandex-image-set");
+  await fs.mkdir(uploadDir, { recursive: true });
+  const name = `img-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.jpg`;
+  const dest = path.join(uploadDir, name);
+  if (item.b64_json) {
+    await fs.writeFile(dest, Buffer.from(item.b64_json, "base64"));
+  } else if (item.url) {
+    const dl = await fetch(item.url, { signal: AbortSignal.timeout(120000) });
+    if (!dl.ok) throw new Error(`生成图下载失败 ${dl.status}`);
+    await fs.writeFile(dest, Buffer.from(await dl.arrayBuffer()));
+  } else {
+    throw new Error("TokenDun 未返回图片");
+  }
+  return { url: `${bulkPricingPublicBase()}/uploads/yandex-image-set/${name}`, tokens: payload?.usage?.total_tokens || 0 };
+}
+
+async function runYandexImageSetJob(jobId, userId, draftId) {
+  if (yandexImageSetRunning.get(jobId)) return;
+  yandexImageSetRunning.set(jobId, true);
+  try {
+    const draft = await db.query(`SELECT ${YANDEX_DRAFT_COLUMNS} FROM yandex_listing_drafts WHERE id=$1`, [draftId]).then((r) => (r.rows[0] ? dbRowToYandexDraft(r.rows[0]) : null));
+    if (!draft) throw new Error("草稿不存在");
+    const refImage = (draft.images || [])[0] || draft.skus?.[0]?.image || "";
+    if (!refImage) throw new Error("草稿没有图片，先用插件采集商品图");
+    const set = Array.isArray(draft.imageSet) ? draft.imageSet.slice() : [];
+    await updateDbJob(jobId, { status: "running", phase: `正在生成套图（共 ${YANDEX_IMAGE_SET.length} 张）`, processed: set.length, total: YANDEX_IMAGE_SET.length });
+    for (let i = set.length; i < YANDEX_IMAGE_SET.length; i += 1) {
+      const [key, label, prompt] = YANDEX_IMAGE_SET[i];
+      await updateDbJob(jobId, { phase: `正在生成 ${label}（${i + 1}/${YANDEX_IMAGE_SET.length}）` });
+      try {
+        const out = await tokendunGenerateImage(prompt, refImage);
+        set.push({ key, label, url: out.url, tokens: out.tokens, ok: true, at: new Date().toISOString() });
+      } catch (e) {
+        set.push({ key, label, url: "", ok: false, error: String(e?.message || e).slice(0, 300), at: new Date().toISOString() });
+      }
+      await db.query(`UPDATE yandex_listing_drafts SET image_set=$2::jsonb, updated_at=now() WHERE id=$1`, [draftId, JSON.stringify(set)]).catch(() => {});
+      await updateDbJob(jobId, { processed: i + 1, total: YANDEX_IMAGE_SET.length, results: set });
+    }
+    const okCount = set.filter((x) => x.ok).length;
+    await updateDbJob(jobId, {
+      status: okCount ? "done" : "error", processed: set.length, total: YANDEX_IMAGE_SET.length, results: set,
+      phase: `套图完成：成功 ${okCount} / ${YANDEX_IMAGE_SET.length}`, error: okCount ? "" : "全部生成失败",
+      logs: [makeLogEntry(`AI 出图完成：成功 ${okCount} / ${YANDEX_IMAGE_SET.length} 张`, okCount ? "info" : "error")],
+    });
+  } catch (e) {
+    await updateDbJob(jobId, { status: "error", phase: "出图失败", error: String(e?.message || e).slice(0, 500) }).catch(() => {});
+  } finally {
+    yandexImageSetRunning.delete(jobId);
+  }
+}
+
+// 一键出图（异步 job：7 张约 5-8 分钟）
+app.post("/api/yandex/listing/drafts/:id/generate-images", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    if (!tokendunEnabled()) return res.status(400).json({ success: false, error: "未配置 AI 出图（TOKENDUN_API_KEY）" });
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const job = await createQueuedDbJob(req.user, {
+      id: crypto.randomUUID(), kind: "yandex-image-set", storeId: draft.storeId || null,
+      total: YANDEX_IMAGE_SET.length, phase: "排队开始 AI 出图",
+    }, { draftId: draft.id, storeId: draft.storeId || null });
+    setTimeout(() => { runYandexImageSetJob(job.id, req.user.id, draft.id).catch(() => {}); }, 50);
+    res.json({ success: true, jobId: job.id, total: YANDEX_IMAGE_SET.length, draftId: draft.id });
+  } catch (error) { next(error); }
+});
+
+// 把生成的套图应用到草稿（main=true 置首图；gallery=true 追加到商品图）
+app.post("/api/yandex/listing/drafts/:id/apply-images", requireAuth, async (req, res, next) => {
+  try {
+    const draft = await getYandexDraftForUser(req.params.id, req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const set = Array.isArray(draft.imageSet) ? draft.imageSet.filter((x) => x.ok && x.url) : [];
+    if (!set.length) return res.status(400).json({ success: false, error: "还没有生成成功的图" });
+    const mainUrl = set.find((x) => x.key === "main")?.url || set[0].url;
+    let images = Array.isArray(draft.images) ? draft.images.slice() : [];
+    if (req.body?.mode === "main-only") images = [mainUrl, ...images.filter((u) => u !== mainUrl)];
+    else images = [...new Set([mainUrl, ...set.map((x) => x.url), ...images])];
+    const skus = (draft.skus || []).map((sku) => ({ ...sku, image: mainUrl }));
+    const r = await db.query(`UPDATE yandex_listing_drafts SET images=$2::jsonb, skus=$3::jsonb, updated_at=now() WHERE id=$1 RETURNING ${YANDEX_DRAFT_COLUMNS}`,
+      [draft.id, JSON.stringify(images.slice(0, 30)), JSON.stringify(skus)]);
+    res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]) });
+  } catch (error) { next(error); }
+});
+
 // 类目中文翻译：懒加载（展开哪级翻哪级）+ 永久缓存（data/yandex_category_zh.json）
 const YANDEX_CAT_ZH_FILE = path.join(__dirname, "data", "yandex_category_zh.json");
 let yandexCatZhCache = null;
