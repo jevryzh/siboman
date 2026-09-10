@@ -7038,11 +7038,22 @@ app.post("/api/yandex/listing/tasks", requireAuth, async (req, res, next) => {
     urls = urls.filter((u) => /^https?:\/\/([a-z0-9-]+\.)?1688\.com\//i.test(u));
     if (!urls.length) return res.status(400).json({ success: false, error: "请至少填一个 1688 商品链接" });
     urls = [...new Set(urls)].slice(0, 200);
+    // 上架前先选类目（对齐熊猫：先定末级类目，采集后直接按该类目处理）
+    const categoryIdIn = String(req.body?.categoryId || "").trim();
+    const categoryNameIn = String(req.body?.categoryName || "").trim().slice(0, 300);
+    let categoryParams = [];
+    if (categoryIdIn) {
+      try {
+        const parameters = await getYandexCategoryParameters(categoryIdIn, context.apiSecret);
+        categoryParams = normalizeYandexCategoryParams(parameters);
+      } catch (e) { console.warn("[yandex-listing] 预取类目参数失败:", e?.message || e); }
+    }
     const created = [];
     for (const url of urls) {
       const r = await db.query(
-        `INSERT INTO yandex_listing_drafts (user_id, store_id, source_url, collect_status) VALUES ($1,$2,$3,'pending') RETURNING id`,
-        [userId, storeId, url]
+        `INSERT INTO yandex_listing_drafts (user_id, store_id, source_url, collect_status, category_id, category_name, category_params)
+         VALUES ($1,$2,$3,'pending',$4,$5,$6::jsonb) RETURNING id`,
+        [userId, storeId, url, categoryIdIn, categoryNameIn, JSON.stringify(categoryParams)]
       );
       created.push({ draftId: r.rows[0].id, url });
     }

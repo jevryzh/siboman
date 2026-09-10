@@ -36,7 +36,7 @@ window.YandexAutoListingView = {
       info: (m) => (window.ElementPlus?.ElMessage || console).info?.(m),
     };
 
-    const newTaskDialog = Vue.reactive({ visible: false, urls: '', busy: false, jobId: '', phase: '', processed: 0, total: 0, done: false, timer: null });
+    const newTaskDialog = Vue.reactive({ visible: false, urls: '', busy: false, jobId: '', phase: '', processed: 0, total: 0, done: false, timer: null, categoryPath: [], categoryOptions: [], categoryName: '' });
     const drawer = Vue.reactive({
       visible: false, busy: false, id: '', draft: null,
       categoryPath: [], categoryOptions: [], params: [], paramsLoading: false,
@@ -119,13 +119,24 @@ window.YandexAutoListingView = {
     };
 
     // ===== 新增上架任务 =====
-    const openNewTask = () => { newTaskDialog.visible = true; newTaskDialog.urls = ''; newTaskDialog.jobId = ''; newTaskDialog.phase = ''; newTaskDialog.processed = 0; newTaskDialog.total = 0; newTaskDialog.done = false; };
+    const loadTaskCategories = async () => {
+      if (newTaskDialog.categoryOptions.length) return;
+      try { const res = await axios.get('/api/yandex/listing/categories', { timeout: 90000 }); newTaskDialog.categoryOptions = res.data?.options || []; } catch (_e) {}
+    };
+    const taskCategoryLabel = () => {
+      const labels = []; let nodes = newTaskDialog.categoryOptions;
+      for (const id of newTaskDialog.categoryPath || []) { const n = (nodes || []).find((x) => String(x.value) === String(id)); if (!n) break; labels.push(n.label); nodes = n.children || []; }
+      return labels.join(' / ');
+    };
+    const onTaskCategoryChange = () => { newTaskDialog.categoryName = taskCategoryLabel(); };
+    const openNewTask = () => { newTaskDialog.visible = true; loadTaskCategories(); newTaskDialog.urls = ''; newTaskDialog.jobId = ''; newTaskDialog.phase = ''; newTaskDialog.processed = 0; newTaskDialog.total = 0; newTaskDialog.done = false; };
     const submitNewTask = async () => {
       const urls = String(newTaskDialog.urls || '').split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
       if (!urls.length) return notify.warning('请粘贴至少一个 1688 商品链接');
       newTaskDialog.busy = true;
       try {
-        const res = await axios.post('/api/yandex/listing/tasks', { urls }, { timeout: 60000 });
+        if (!(newTaskDialog.categoryPath || []).length) return notify.warning('请先选择 Yandex 末级类目');
+        const res = await axios.post('/api/yandex/listing/tasks', { urls, categoryId: String(newTaskDialog.categoryPath.slice(-1)[0]), categoryName: taskCategoryLabel() }, { timeout: 120000 });
         const jobId = res.data?.jobId || '';
         newTaskDialog.jobId = jobId;
         newTaskDialog.total = Number(res.data?.total || urls.length);
@@ -340,7 +351,7 @@ window.YandexAutoListingView = {
 
     return {
       loading, saving, uploading, activeTab, drafts, total, pagination, query, notify,
-      newTaskDialog, drawer,
+      newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories,
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
@@ -419,7 +430,13 @@ window.YandexAutoListingView = {
       <!-- 新增上架任务 -->
       <el-dialog v-model="newTaskDialog.visible" title="新增上架任务（1688 商品链接）" width="640px" :close-on-click-modal="false">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom:10px"
-          title="一行一个 1688 商品链接（detail.1688.com/offer/xxx.html），提交后由本机插件逐个采集。请保持 Chrome 打开。" />
+          title="先选类目（必须末级），再粘贴 1688 链接：一行一个（detail.1688.com/offer/xxx.html）。提交后由本机插件逐个采集，采集完直接按该类目处理。" />
+        <el-form label-width="90px" size="small" style="margin-bottom:8px">
+          <el-form-item label="Yandex 类目">
+            <el-cascader v-model="newTaskDialog.categoryPath" :options="newTaskDialog.categoryOptions" filterable clearable
+              placeholder="请选择末级类目（采集前必选）" style="width:100%" @change="onTaskCategoryChange" />
+          </el-form-item>
+        </el-form>
         <el-input v-model="newTaskDialog.urls" type="textarea" :rows="8" placeholder="https://detail.1688.com/offer/730322803810.html&#10;https://detail.1688.com/offer/802358394710.html" />
         <div v-if="newTaskDialog.jobId" style="margin-top:12px">
           <el-progress :percentage="newTaskDialog.total ? Math.round(newTaskDialog.processed / newTaskDialog.total * 100) : 0" />
