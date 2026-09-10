@@ -5632,11 +5632,15 @@ function precisePickPrice(candidate, offerName) {
     return { price: 0, mode: "ambiguous_manual", skus, tiers, wanted: preciseAccessoryTypes(offerName) };
   }
   if (tiers.length) {
-    // 阶梯本身也可能是“引流档 + 正常档”混在一起（如页面出现 "1件起 ¥0.16; 1件起 ¥2"）：
-    //   首档低到不合理、或同一提批量出现多档且价差极大 → 不采信，标人工，避免按引流档算成本。
     const prices = tiers.map((t) => t.price);
     const dupBeginAmount = new Set(tiers.map((t) => t.beginAmount)).size < tiers.length;
     const spread = Math.max(...prices) / Math.max(0.01, Math.min(...prices));
+    // 1688 常在阶梯里混促销档：页面上 "1件起 ¥0.48" 是促销/新人价，"1件起 ¥1.31" 才是实际单价
+    //   （页面 SKU 行显示 140酒红 ¥1.31 / 140黑色 ¥1.31）。各规格价一致时直接用规格价（实际起批单价）。
+    const singleSkuPrice = new Set(skus.map((s) => s.price)).size === 1 ? skus[0].price : 0;
+    if (dupBeginAmount && singleSkuPrice >= 0.3) {
+      return { price: singleSkuPrice, mode: "promo_adjusted", skus, tiers };
+    }
     const suspect = tiers[0].price < 0.3 || (tiers[0].price < 1 && (dupBeginAmount || spread >= 8));
     if (!suspect) return { price: tiers[0].price, mode: "tier_first", skus, tiers };
     return { price: 0, mode: "tier_suspect", skus, tiers };
@@ -5650,6 +5654,7 @@ const PRECISE_PRICE_MODES = {
   tier_first: { trusted: true, label: "起批首档价（1688 价格阶梯）" },
   single_price: { trusted: true, label: "统一规格价" },
   sku_match: { trusted: true, label: "按规格匹配（混合配件店）" },
+  promo_adjusted: { trusted: true, label: "含促销档，已取实际规格价（保守）" },
   tier_suspect: { trusted: false, label: "阶梯疑似含引流档，需人工确认" },
   ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
   no_evidence: { trusted: false, label: "未取到价格证据" },
@@ -6452,16 +6457,23 @@ async function getYandexListingWarehouses(context) {
   const storeKey = context.storeId || "__env__";
   const cached = yandexListingWarehousesCache.get(storeKey);
   if (cached && Date.now() - cached.at < YANDEX_LISTING_TREE_TTL_MS) return cached.list;
-  const payload = await callYandexMarketAPI(`/v3/businesses/${encodeURIComponent(context.businessId)}/warehouses`, {
+  const businessList = await callYandexMarketAPI(`/v3/businesses/${encodeURIComponent(context.businessId)}/warehouses`, {
     method: "POST", query: { language: "RU" }, body: {}, timeoutMs: 60000, apiSecret: context.apiSecret,
-  });
-  const list = (payload?.result?.warehouses || []).map((w) => ({
+  }).then((p2) => (p2?.result?.warehouses || []).map((w) => ({
     id: String(w?.partnerWarehouseId ?? w?.id ?? ""),
     name: String(w?.name || ""),
-    campaignId: String(w?.campaignId || ""),
-    active: w?.isActive !== false,
-  })).filter((w) => w.id);
+  })).filter((w) => w.id)).catch(() => []);
+  // 关键：库存必须写到**店铺所在 campaign 自己的仓库**，否则该 campaign 下仍是 NO_STOCKS。
+  //   v3 仓库列表不带 campaignId → 用 campaign 级读库存接口拿它自己的 warehouseId 再映射名称。
+  const campaignWarehouses = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/offers/stocks`, {
+    method: "POST", query: { language: "RU", limit: 1 }, body: {}, timeoutMs: 60000, apiSecret: context.apiSecret,
+  }).then((p2) => (p2?.result?.warehouses || []).map((w) => String(w?.warehouseId || "")).filter(Boolean)).catch(() => []);
+  const nameById = new Map(businessList.map((w) => [w.id, w.name]));
+  const list = [];
+  for (const wid of campaignWarehouses) list.push({ id: wid, name: nameById.get(wid) || context.campaignName || wid, campaignId: String(context.campaignId || ""), isCampaignWarehouse: true });
+  for (const w of businessList) if (!list.some((x) => x.id === w.id)) list.push({ ...w, campaignId: "", isCampaignWarehouse: false });
   yandexListingWarehousesCache.set(storeKey, { at: Date.now(), list });
+  console.log(`[yandex-listing] 仓库解析 store=${storeKey} campaign=${context.campaignId} 本店仓库=${campaignWarehouses.join(",") || "无"} 共${list.length}个`);
   return list;
 }
 
@@ -6706,7 +6718,8 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
           let warehouseId = String(req.body?.warehouseId || "").trim();
           if (!warehouseId) {
             const warehouses = await getYandexListingWarehouses(context).catch(() => []);
-            warehouseId = warehouses[0]?.id || "";
+            // 必须优先用“本店 campaign 的仓库”，否则库存写到别的店仓库、本店仍 NO_STOCKS
+            warehouseId = (warehouses.find((w) => w.isCampaignWarehouse) || warehouses[0])?.id || "";
           }
           const stockItems = offers.map((o, i) => ({ offerId: o.offerId, warehouseId: String(draft.skus?.[i]?.warehouseId || warehouseId), count: Number(draft.skus?.[i]?.stock || 0) }));
           const hasStock = stockItems.some((it) => Number(it.count) > 0);
