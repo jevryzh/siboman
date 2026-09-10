@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.114";
+const VERSION = "2.2.9.115";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1117,7 +1117,12 @@ function extract1688ListingMedia() {
       imageUrls.push(u);
     }
   }
-  const images = uniq(imageUrls.map((u) => u.split("_!!")[0].replace(/_\d+x\d+.*$/i, ""))).slice(0, 20);
+  // 只裁掉末尾的尺寸后缀（_120x120.jpg），保留 _!!<sellerid>-0-cib.jpg 主体 —— 否则图片 URL 失效，
+  //   Yandex 会报「Нет изображения / 无图片无法开卖」。
+  const normalizeImg = (u) => String(u)
+    .replace(/_\(\d+x\d+\)\.(jpg|jpeg|png|webp)$/i, "")
+    .replace(/\.(jpg|jpeg|png|webp)_\d+x\d+\.(jpg|jpeg|png|webp)$/i, ".$1");
+  const images = uniq(imageUrls.map(normalizeImg)).slice(0, 20);
 
   // 详情图（描述区）
   const detailImages = uniq(Array.from(document.querySelectorAll(
