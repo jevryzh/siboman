@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.113";
-    const PLUGIN_ZIP_VERSION = "2.2.9.113";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.114";
+    const PLUGIN_ZIP_VERSION = "2.2.9.114";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -427,6 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.114 Yandex 上架采集质量修复：标题复用已验证的详情抽取（不再抓成公司名）、补齐包装重量/尺寸（如 130g、12×4×4cm）、属性过滤收紧（去掉 uiType/【说明】/SKU 规格行等噪声）、详情图容器补 #description。</li>
             <li>✅ v2.2.9.113 修复核价/采集任务续跑丢结果：重新加载扩展或断线后续跑时保留服务器上已完成的 results（旧逻辑清空，导致报告只剩续跑后的行），并从 processed 断点继续不重复跑。</li>
             <li>✅ v2.2.9.112 新增 Yandex 自动上架采集能力：领取 kind=yandex-collect 任务后逐个打开 1688 商品详情页，采集标题/图集/详情图/SKU(规格+价格+库存+图)/商品属性/包装重量尺寸并回传 ERP，生成 Yandex 上架草稿（配合 ERP 新增的「Yandex 自动上架」页面使用）。</li>
             <li>✅ v2.2.9.111 修复 Yandex 精核价取不到真实价格阶梯：1688 详情页改版后 window.__INIT_DATA 已为空，商品数据被内联进页面 script 的 JSON，旧解析拿不到阶梯就退化去抓页面里第一个 ¥ 数字（曾把 ¥1 引流档当采购价）。现在解析内联 JSON 取回真实价格阶梯(skuRangePrices)与各规格价(skuInfoMap)，并输出结构化证据供「混合配件店」按规格匹配（1个边刷¥1.9 与 1个尘袋¥3.2 不再混淆）。</li>

@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.113";
+const VERSION = "2.2.9.114";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1017,9 +1017,50 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
     assertSourcingNotCanceled(job);
     await browse1688DetailLightInPlugin(tab.id);
     assertSourcingNotCanceled(job);
-    const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688ListingProduct });
-    const data = result?.result || null;
-    if (!data) throw new Error("页面未返回采集数据");
+    // v2.2.9.114: 复用已验证的 extract1688DetailData 取标题/重量/尺寸/属性（含公司名过滤），
+    //   再单独抽图集/SKU，避免自己重写一套导致标题抓成公司名、重量尺寸为空。
+    const [basicsRes] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688DetailData, args: [{}] });
+    const basics = basicsRes?.result || {};
+    const [mediaRes] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688ListingMedia });
+    const media = mediaRes?.result || {};
+    const dims = String(basics.dimensionsText || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+    // 属性过滤：只要像「商品参数」的（键含中文、短、非【说明】、非 SKU 规格行、值不是纯数字串）
+    const attributes = {};
+    const specSet = new Set((media.skus || []).map((s2) => String(s2.spec || "")));
+    for (const [k, v] of Object.entries({ ...(basics.detailAttributes || {}), ...(media.attributes || {}) })) {
+      const key = String(k || "").trim();
+      if (!key || key.length > 20) continue;
+      if (!/[\u4e00-\u9fff]/.test(key)) continue;
+      if (/^【|^\*|】/.test(key)) continue;
+      if (specSet.has(key)) continue;
+      if (/(揽收率|代发热度|分销商数|复购率|加购|收藏|浏览|访客|回头率|退款率|好评率|支付率|平台活动下价格|非平台活动下价格|发布价|全网销量)/.test(key)) continue;
+      const value = String(v ?? "").trim();
+      if (!value || value.length > 120) continue;
+      if (/^\d+([\s.]\d+)*$/.test(value)) continue;
+      attributes[key] = value;
+    }
+    const weightKg = Number(basics.weightGrams || 0) > 0 ? Number(basics.weightGrams) / 1000 : 0;
+    const skus = (Array.isArray(media.skus) && media.skus.length)
+      ? media.skus
+      : [{ spec: "", priceCny: Number((basics.price || "").replace(/[^\d.]/g, "")) || 0, stock: 0, image: (media.images || [])[0] || "" }];
+    const data = {
+      title: String(basics.title || media.title || "").slice(0, 300),
+      images: media.images || [],
+      detailImages: media.detailImages || [],
+      skus,
+      attributes,
+      vendorCode: String(attributes["货号"] || attributes["商品货号"] || attributes["型号"] || media.vendorCode || "").slice(0, 120),
+      weightKg,
+      lengthCm: dims ? Number(dims[1]) || 0 : 0,
+      widthCm: dims ? Number(dims[2]) || 0 : 0,
+      heightCm: dims ? Number(dims[3]) || 0 : 0,
+      priceText: String(basics.price || ""),
+      priceDetails: String(basics.priceDetails || ""),
+      moq: String(basics.minOrderQuantity || ""),
+      url: location.href,
+      collectedAt: new Date().toISOString(),
+    };
+    if (!data.title) throw new Error("未采集到商品标题（页面结构变化或需要登录）");
     return data;
   } finally {
     active1688TabIds.delete(tab.id);
@@ -1027,8 +1068,8 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
   }
 }
 
-// 在 1688 商品详情页上下文执行：解析内联 JSON + DOM 兜底，产出上架草稿所需数据
-function extract1688ListingProduct() {
+// 在 1688 商品详情页上下文执行：只负责图集 / 详情图 / SKU 列表 / 结构化属性（其余交给 extract1688DetailData）
+function extract1688ListingMedia() {
   const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
   const uniq = (arr) => arr.filter((u, i, a) => u && a.indexOf(u) === i);
   const sliceJson = (text, startIdx) => {
@@ -1045,25 +1086,19 @@ function extract1688ListingProduct() {
   const extractInline = (key, wantArray) => {
     for (const node of Array.from(document.querySelectorAll("script"))) {
       const text = node.textContent || "";
-      if (text.length < 1500 || !text.includes(`"${key}"`)) continue;
+      if (text.length < 1200 || !text.includes(`"${key}"`)) continue;
       const at = text.indexOf(`"${key}"`);
       const idx = wantArray ? text.indexOf("[", at) : text.indexOf("{", at);
       if (idx < 0) continue;
       const raw = sliceJson(text, idx);
       if (!raw) continue;
-      try { return JSON.parse(raw); } catch (_e) { /* 继续找下一个 script */ }
+      try { return JSON.parse(raw); } catch (_e) { /* 试下一个 script */ }
     }
     return null;
   };
   const num = (v) => { const n = Number(String(v ?? "").replace(/[^\d.]/g, "")); return Number.isFinite(n) ? n : 0; };
 
-  // 1) 标题
-  const title = clean(
-    document.querySelector('[class*="title-text"], .d-title, .offer-title, [class*="offer-title"], h1')?.innerText
-    || document.title.replace(/\s*[-_]\s*阿里巴巴.*$/i, "").replace(/\s*1688\.com.*$/i, "")
-  ).slice(0, 300);
-
-  // 2) 图集（主图）：优先内联 JSON，其次 DOM
+  // 图集（主图）：内联 JSON → DOM 兜底
   const imageUrls = [];
   const pushImgs = (list) => {
     for (const it of (Array.isArray(list) ? list : [])) {
@@ -1072,69 +1107,58 @@ function extract1688ListingProduct() {
     }
   };
   pushImgs(extractInline("images", true));
-  if (!imageUrls.length) {
+  const galleryJson = extractInline("gallery", false);
+  if (galleryJson && typeof galleryJson === "object") pushImgs(galleryJson.images || galleryJson.offerImgList);
+  if (imageUrls.length < 3) {
     for (const img of Array.from(document.querySelectorAll('img[src*="alicdn"], img[data-src*="alicdn"]'))) {
       const u = img.currentSrc || img.src || img.getAttribute("data-src") || "";
-      if (!/(cbu01|img\.alicdn|sc01)/i.test(u)) continue;
-      if ((img.naturalWidth || 0) < 120) continue;
+      if (!/(cbu01|img\.alicdn|sc01|sc02)/i.test(u)) continue;
+      if ((img.naturalWidth || 0) < 150) continue;
       imageUrls.push(u);
     }
   }
-  const images = uniq(imageUrls.map((u) => u.replace(/_\d+x\d+.*?(\.(?:jpg|jpeg|png|webp))/i, "$1"))).slice(0, 20);
+  const images = uniq(imageUrls.map((u) => u.split("_!!")[0].replace(/_\d+x\d+.*$/i, ""))).slice(0, 20);
 
-  // 3) 详情图（描述区图片）
+  // 详情图（描述区）
   const detailImages = uniq(Array.from(document.querySelectorAll(
-    '#desc-lazyload-container img, .desc-lazyload-container img, [class*="detail-desc"] img, [class*="desc-container"] img, [class*="offer-desc"] img'
+    '#description img, #desc-lazyload-container img, .desc-lazyload-container img, [class*="detail-desc"] img, [class*="desc-container"] img, [class*="offer-desc"] img, [class*="detailContent"] img'
   )).map((img) => img.currentSrc || img.src || img.getAttribute("data-src") || "")
     .filter((u) => /^https?:/i.test(u) && /(alicdn|1688)/i.test(u))).slice(0, 40);
 
-  // 4) SKU（规格 + 价格 + 库存）
+  // SKU：规格 + 价格 + 库存 + SKU 图
   const skuMap = extractInline("skuInfoMap", false) || {};
   const skus = Object.entries(skuMap).map(([key, v]) => ({
     spec: clean(v?.specAttrs || key).slice(0, 80),
     priceCny: num(v?.price ?? v?.discountPrice ?? v?.salePrice),
     stock: num(v?.canBookCount) || 0,
-    image: String(v?.image || v?.skuImageURI || ""),
+    image: String(v?.image || v?.skuImageURI || v?.imageUrl || ""),
     skuId: String(v?.skuId || ""),
   })).filter((sku) => sku.spec);
 
-  // 5) 商品属性（货号/材质/重量/尺寸等）
+  // 结构化商品属性（productAttributes.product_attributes 优先）
   const attributes = {};
-  const attrRaw = extractInline("productAttributes", false) || extractInline("product_attributes", false);
-  const attrSource = attrRaw?.product_attributes || attrRaw || {};
-  if (attrSource && typeof attrSource === "object") {
+  const attrRaw = extractInline("productAttributes", false) || extractInline("product_attributes", false) || {};
+  const attrSource = attrRaw?.product_attributes || attrRaw?.data?.product_attributes || attrRaw;
+  if (attrSource && typeof attrSource === "object" && !Array.isArray(attrSource)) {
     for (const [k, v] of Object.entries(attrSource)) {
-      const value = clean(typeof v === "object" ? (v?.value ?? v?.text ?? "") : v);
-      if (k && value && String(k).length <= 60) attributes[clean(k)] = value.slice(0, 200);
+      const value = clean(typeof v === "object" ? (v?.value ?? v?.text ?? v?.name ?? "") : v);
+      if (k && value && String(k).length <= 40) attributes[clean(k)] = value.slice(0, 200);
     }
   }
+  // DOM 表格兜底（只取像属性的行：键短、值短、不是卖家指标）
   for (const row of Array.from(document.querySelectorAll("tr"))) {
     const cells = Array.from(row.children).map((c) => clean(c.innerText)).filter(Boolean);
-    if (cells.length >= 2 && cells[0].length <= 60 && attributes[cells[0]] === undefined) attributes[cells[0]] = cells.slice(1).join(" ").slice(0, 200);
+    if (cells.length !== 2) continue;
+    const [k, v] = cells;
+    if (!k || k.length > 20 || attributes[k] !== undefined) continue;
+    if (/(揽收率|代发热度|分销商数|复购率|加购|收藏|浏览|访客|回头率|退款率|好评率|支付率|库存|价格|起批)/.test(k)) continue;
+    if (!v || v.length > 100) continue;
+    attributes[k] = v;
   }
 
-  // 6) 重量/尺寸（包装信息 → 属性兜底）
-  const weightText = clean(attributes["包装重量"] || attributes["发货重量"] || attributes["商品重量"] || attributes["重量"] || "");
-  const weightMatch = weightText.match(/(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克)/i);
-  let weightKg = 0;
-  if (weightMatch) weightKg = /^(kg|公斤|千克)$/i.test(weightMatch[2]) ? Number(weightMatch[1]) : Number(weightMatch[1]) / 1000;
-  const dimMatch = clean(attributes["包装尺寸"] || attributes["商品尺寸"] || attributes["尺寸"] || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
-  const dims = dimMatch ? [Number(dimMatch[1]) || 0, Number(dimMatch[2]) || 0, Number(dimMatch[3]) || 0] : [0, 0, 0];
-
   const vendorCode = clean(attributes["货号"] || attributes["商品货号"] || attributes["型号"] || "");
-
-  return {
-    title,
-    images,
-    detailImages,
-    skus: skus.length ? skus : [{ spec: "", priceCny: 0, stock: 0, image: images[0] || "" }],
-    attributes,
-    vendorCode,
-    weightKg,
-    lengthCm: dims[0], widthCm: dims[1], heightCm: dims[2],
-    url: location.href,
-    collectedAt: new Date().toISOString(),
-  };
+  const title = clean(document.querySelector('meta[property="og:title"]')?.content || document.title).replace(/\s*[-_]\s*阿里巴巴.*$/i, "").slice(0, 200);
+  return { images, detailImages, skus, attributes, vendorCode, title, url: location.href };
 }
 
 // Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
