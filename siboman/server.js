@@ -93,6 +93,8 @@ const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS
 const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.104";
 // 全店精核价最低插件版本：v2.2.9.110 起才按「1688 价格阶梯起批首档单价」取价
 const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.111";
+// Yandex 自动上架采集（kind=yandex-collect）最低插件版本：v2.2.9.112 起插件才会在 /api/worker/jobs/next 里上报该 kind
+const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.112";
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -7707,7 +7709,7 @@ const PRICING_DEFAULTS = {
   acquiringPct: 3.8,
   withdrawalPct: 1.2,
   returnLossPct: 0,
-  adPct: 15,
+  adPct: 16,
   targetMarginPct: 35,
   strikeDiscountPct: 50,
 };
@@ -17098,6 +17100,7 @@ app.get("/api/worker/status", async (req, res, next) => {
       const storeId = String(row.store_id || "").trim();
       const storeMatch = !requestedStoreId || storeId === requestedStoreId;
       const versionTooOld = compareNumericVersion(version, MIN_SINGLE_SOURCING_PLUGIN_VERSION) < 0;
+      const yandexCollectTooOld = compareNumericVersion(version, MIN_YANDEX_COLLECT_PLUGIN_VERSION) < 0;
       const blockedByPhase = /预览版|暂不领取|不领取任务|未开启领取任务|低于单品找货最低版本|版本\s*未知/i.test(currentPhase);
       const canClaimJobs = storeMatch && !versionTooOld && !blockedByPhase;
       const currentJob = row.current_job_id && row.job_id ? serializeJob({
@@ -17135,6 +17138,10 @@ app.get("/api/worker/status", async (req, res, next) => {
         canClaimJobs,
         versionTooOld,
         minVersion: MIN_SINGLE_SOURCING_PLUGIN_VERSION,
+        // Yandex 自动上架采集能力（老插件领不到 yandex-collect 任务，界面据此给出明确提示）
+        canCollectYandex: !yandexCollectTooOld,
+        yandexCollectTooOld,
+        yandexCollectMinVersion: MIN_YANDEX_COLLECT_PLUGIN_VERSION,
         lastSeenAt,
         online: ageMs <= onlineWindow,
         ageSeconds: Number.isFinite(ageMs) ? Math.max(0, Math.round(ageMs / 1000)) : null,
@@ -17145,6 +17152,11 @@ app.get("/api/worker/status", async (req, res, next) => {
       workers,
       queue: queueResult.rows[0] || { queued: 0, active: 0 },
       onlineWindowSeconds: Math.round(onlineWindow / 1000),
+      yandexCollect: {
+        minVersion: MIN_YANDEX_COLLECT_PLUGIN_VERSION,
+        onlineVersions: [...new Set(workers.filter((w) => w.online).map((w) => w.version).filter(Boolean))],
+        capableOnline: workers.some((w) => w.online && w.canCollectYandex),
+      },
     });
   } catch (error) {
     next(error);

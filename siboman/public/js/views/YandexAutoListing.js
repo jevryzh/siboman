@@ -37,7 +37,7 @@ window.YandexAutoListingView = {
       info: (m) => (window.ElementPlus?.ElMessage || console).info?.(m),
     };
 
-    const newTaskDialog = Vue.reactive({ visible: false, urls: '', busy: false, jobId: '', phase: '', processed: 0, total: 0, done: false, timer: null, categoryPath: [], categoryOptions: [], categoryName: '' });
+    const newTaskDialog = Vue.reactive({ visible: false, urls: '', busy: false, jobId: '', phase: '', processed: 0, total: 0, done: false, timer: null, categoryPath: [], categoryOptions: [], categoryName: '', pluginWarning: '' });
     const drawer = Vue.reactive({
       visible: false, busy: false, id: '', draft: null,
       categoryPath: [], categoryOptions: [], params: [], paramsLoading: false,
@@ -233,8 +233,40 @@ window.YandexAutoListingView = {
         notify.error('提交失败: ' + (e.response?.data?.error || e.message));
       } finally { newTaskDialog.busy = false; }
     };
+    // 任务一直排队没人领 → 查在线插件，给出可执行的结论（而不是让用户干等）
+    const cmpPluginVersion = (a, b) => {
+      const pa = String(a).split('.').map((x) => Number(x) || 0);
+      const pb = String(b).split('.').map((x) => Number(x) || 0);
+      for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) { const x = pa[i] || 0, y = pb[i] || 0; if (x !== y) return x - y; }
+      return 0;
+    };
+    const checkCollectPlugin = async (jobId) => {
+      try {
+        const res = await axios.get('/api/worker/status');
+        const online = (res.data?.workers || []).filter((w) => w.online);
+        const yc = res.data?.yandexCollect || {};
+        const minVersion = yc.minVersion || '2.2.9.112';
+        const versions = [...new Set(online.map((w) => String(w.version || '未知')))];
+        if (!online.length) {
+          newTaskDialog.pluginWarning = '任务已排队，但本机插件不在线：请确认 Chrome 已打开、逐梦插件已启用（chrome://extensions），并在该浏览器里登录过本 ERP。插件恢复在线后会自动领取（约 30 秒）。';
+          return;
+        }
+        if (yc.capableOnline === false || (yc.capableOnline === undefined && versions.every((v) => cmpPluginVersion(v, minVersion) < 0))) {
+          newTaskDialog.pluginWarning = `任务已排队，但在线插件 ${versions.join(' / ')} 不支持「Yandex 自动上架采集」，需要 v${minVersion} 及以上。请到 店铺管理 → 下载插件，解压覆盖原插件目录后，在 chrome://extensions 点「重新加载」。`;
+          return;
+        }
+        const busy = online.filter((w) => w.currentJobId && w.currentJobId !== jobId);
+        if (busy.length) {
+          newTaskDialog.pluginWarning = `任务已排队，插件当前正在跑另一个任务（${busy[0].currentPhase || busy[0].currentJobId}），跑完会自动接着采集。`;
+          return;
+        }
+        newTaskDialog.pluginWarning = '任务已排队但还没被领取。插件每约 30 秒轮询一次；若长时间不动，请重新加载插件。';
+      } catch (_e) { /* 查询失败就不打扰用户 */ }
+    };
     const pollCollectJob = async (jobId) => {
       if (newTaskDialog.timer) clearInterval(newTaskDialog.timer);
+      newTaskDialog.pluginWarning = '';
+      const startedAt = Date.now();
       const tick = async () => {
         try {
           const res = await axios.get('/api/jobs/' + encodeURIComponent(jobId));
@@ -245,7 +277,10 @@ window.YandexAutoListingView = {
           if (['done', 'error', 'canceled'].includes(job.status)) {
             clearInterval(newTaskDialog.timer); newTaskDialog.timer = null;
             newTaskDialog.done = true;
+            newTaskDialog.pluginWarning = '';
             fetchDrafts();
+          } else if (!newTaskDialog.pluginWarning && Date.now() - startedAt > 20000 && String(job.status || '') === 'queued') {
+            await checkCollectPlugin(jobId);
           }
         } catch (_e) { /* 轮询失败继续 */ }
       };
@@ -434,10 +469,29 @@ window.YandexAutoListingView = {
     const removeImage = (index) => { drawer.draft?.images?.splice(index, 1); };
     const addImage = () => { const url = window.prompt('粘贴图片 URL'); if (url) drawer.draft.images.push(url.trim()); };
 
-    Vue.onMounted(fetchDrafts);
+    // 页面级提醒：在线插件不支持 yandex-collect 时直接说清楚，别让用户对着「等待本机插件采集」干等
+    const pluginNotice = Vue.ref('');
+    const refreshPluginCapability = async () => {
+      try {
+        const res = await axios.get('/api/worker/status');
+        const online = (res.data?.workers || []).filter((w) => w.online);
+        const yc = res.data?.yandexCollect || {};
+        const minVersion = yc.minVersion || '2.2.9.112';
+        const versions = [...new Set(online.map((w) => String(w.version || '未知')))];
+        if (online.length && yc.capableOnline === false) {
+          pluginNotice.value = `本机插件 ${versions.join(' / ')} 不支持「Yandex 自动上架采集」：点了提交采集也不会有反应。请到 店铺管理 → 下载插件，解压覆盖原插件目录，再到 chrome://extensions 点「重新加载」（需要 v${minVersion} 及以上）。`;
+        } else if (online.length && yc.capableOnline === undefined && versions.every((v) => cmpPluginVersion(v, minVersion) < 0)) {
+          pluginNotice.value = `本机插件 ${versions.join(' / ')} 可能不支持「Yandex 自动上架采集」（需要 v${minVersion} 及以上），如采集不动请更新插件。`;
+        } else {
+          pluginNotice.value = '';
+        }
+      } catch (_e) { /* 读不到就不提示 */ }
+    };
+
+    Vue.onMounted(() => { fetchDrafts(); refreshPluginCapability(); });
 
     return {
-      loading, saving, uploading, activeTab, drafts, total, pagination, query, notify,
+      loading, saving, uploading, activeTab, drafts, total, pagination, query, notify, pluginNotice, refreshPluginCapability,
       newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories, taskCatProps, drawerCatProps, scrollCatPopper,
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
@@ -456,6 +510,9 @@ window.YandexAutoListingView = {
         <el-button @click="fetchDrafts">刷新</el-button>
         <el-button type="primary" @click="openNewTask">新增上架任务</el-button>
       </div>
+
+      <el-alert v-if="pluginNotice" type="warning" :closable="false" show-icon style="margin-bottom:12px"
+        title="采集器提示" :description="pluginNotice" />
 
       <el-tabs v-model="activeTab" @tab-change="() => { pagination.page = 1; fetchDrafts(); }">
         <el-tab-pane label="上架任务" name="tasks" />
@@ -539,6 +596,8 @@ window.YandexAutoListingView = {
         <div v-if="newTaskDialog.jobId" style="margin-top:12px">
           <el-progress :percentage="newTaskDialog.total ? Math.round(newTaskDialog.processed / newTaskDialog.total * 100) : 0" />
           <div style="font-size:13px; color:#334155; margin-top:6px">采集进度 {{ newTaskDialog.processed }} / {{ newTaskDialog.total }} {{ newTaskDialog.done ? '（已完成，可关闭）' : '' }} · {{ newTaskDialog.phase }}</div>
+          <el-alert v-if="newTaskDialog.pluginWarning" type="warning" :closable="false" show-icon style="margin-top:8px"
+            title="采集器没有开始采集？" :description="newTaskDialog.pluginWarning" />
         </div>
         <template #footer>
           <el-button @click="newTaskDialog.visible = false">关闭</el-button>
