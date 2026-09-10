@@ -30,6 +30,7 @@ const DATA_DIR = String(process.env.IMAGE_SET_DATA_DIR || "/opt/ozon/image-set-s
 
 const SIZE_BY_RATIO = { "1:1": "1024x1024", "3:4": "1024x1536", "4:3": "1536x1024", "9:16": "1024x1536", "16:9": "1536x1024" };
 
+const MAX_REF_IMAGES = Math.max(1, Math.min(6, Number(process.env.IMAGE_SET_MAX_REF_IMAGES || 4)));   // 最多同时给几张参考图
 const IMAGE_TIMEOUT_MS = Number(process.env.IMAGE_SET_IMAGE_TIMEOUT_MS || 300000);   // 单张生成上限(默认 5 分钟，实测约 55s)
 const KEEP = "IMPORTANT: keep the product EXACTLY as in the reference photo — same shape, proportions, material, colour, packaging, labels and quantity. Never redesign or replace the product. Photorealistic commercial product photography, high detail, sharp focus.";
 const RULES = {
@@ -113,34 +114,62 @@ function enqueueJob(job) {
   refreshQueuePhases();
   pumpQueue();
 }
+function cancelJob(job) {
+  job.cancelRequested = true;
+  const idx = pendingQueue.indexOf(job);
+  if (idx >= 0) {                      // 还在排队：直接出队，立刻变成已取消
+    pendingQueue.splice(idx, 1);
+    job.status = "canceled";
+    job.phase = "已取消（排队中被取消）";
+    job.queuedAhead = 0;
+    job.updatedAt = new Date().toISOString();
+    saveJob(job);
+    refreshQueuePhases();
+    return true;
+  }
+  const req = activeRequests.get(job.id);   // 正在生成：掐掉在飞的请求，立刻停
+  if (req) { try { req.destroy(new Error("已取消")); } catch (_e) {} }
+  saveJob(job);
+  return true;
+}
+
 async function pumpQueue() {
   if (workerBusy) return;
   const job = pendingQueue.shift();
   if (!job) return;
+  if (job.cancelRequested) { job.status = "canceled"; job.phase = "已取消"; saveJob(job); return pumpQueue(); }
   workerBusy = true;
   refreshQueuePhases();
   try { await runJob(job); } catch (e) { log("任务异常:", e?.message || e); }
   finally { workerBusy = false; refreshQueuePhases(); pumpQueue(); }
 }
 
-function postMultipart(urlStr, { fields, fileField, fileBuf, fileName, fileType }) {
+function postMultipart(urlStr, { fields, fileField, files, onRequest }) {
   return new Promise((resolve, reject) => {
     const boundary = `----imageset${crypto.randomBytes(8).toString("hex")}`;
     const chunks = [];
     for (const [k, v] of Object.entries(fields)) chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
-    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${fileName}"\r\nContent-Type: ${fileType}\r\n\r\n`));
-    chunks.push(fileBuf);
-    chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+    // OpenAI 图生图支持多张输入图：同一个字段名 image[] 重复多次
+    for (const f of files) {
+      chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${fileField}"; filename="${f.fileName}"\r\nContent-Type: ${f.fileType}\r\n\r\n`));
+      chunks.push(f.buf);
+      chunks.push(Buffer.from("\r\n"));
+    }
+    chunks.push(Buffer.from(`--${boundary}--\r\n`));
     const body = Buffer.concat(chunks);
     const u = new URL(urlStr);
     const req = https.request({ host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: "POST",
       headers: { Authorization: `Bearer ${TOKENDUN_KEY}`, "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": body.length }, timeout: IMAGE_TIMEOUT_MS },
-      (res) => { const parts = []; res.on("data", (c) => parts.push(c)); res.on("end", () => resolve({ status: res.statusCode, text: Buffer.concat(parts).toString("utf8") })); });
+      (res) => { const parts = []; res.on("data", (c) => parts.push(c)); res.on("end", () => { onRequest?.(null); resolve({ status: res.statusCode, text: Buffer.concat(parts).toString("utf8") }); }); });
     req.on("timeout", () => req.destroy(new Error(`TokenDun 单张超时（${Math.round(IMAGE_TIMEOUT_MS / 60000)} 分钟）`)));
-    req.on("error", reject);
+    req.on("error", (e) => { onRequest?.(null); reject(e); });
+    onRequest?.(req);      // 交给调用方，取消时可直接 destroy 掉在飞的请求
     req.write(body); req.end();
   });
 }
+
+// 取消：把正在飞的那个 HTTP 请求掐掉（否则要等这一张生成完才停）
+const activeRequests = new Map();   // jobId -> req
 
 async function fetchBuffer(url) {
   const r = await fetch(url, { signal: AbortSignal.timeout(90000) });
@@ -148,9 +177,12 @@ async function fetchBuffer(url) {
   return { buf: Buffer.from(await r.arrayBuffer()), type: String(r.headers.get("content-type") || "image/jpeg").split(";")[0] };
 }
 
-async function generateOne(prompt, ref, size) {
+async function generateOne(prompt, refs, size, jobId) {
   const res = await postMultipart(`${TOKENDUN_BASE}/images/edits`, {
-    fields: { model: TOKENDUN_MODEL, size, prompt }, fileField: "image[]", fileBuf: ref.buf, fileName: "ref.jpg", fileType: ref.type,
+    fields: { model: TOKENDUN_MODEL, size, prompt },
+    fileField: "image[]",
+    files: refs.map((r, i) => ({ buf: r.buf, fileName: `ref${i + 1}.jpg`, fileType: r.type })),
+    onRequest: (req) => { if (req) activeRequests.set(jobId, req); else activeRequests.delete(jobId); },
   });
   if (res.status < 200 || res.status >= 300) throw new Error(`TokenDun ${res.status}: ${String(res.text).slice(0, 200)}`);
   const payload = JSON.parse(res.text);
@@ -179,7 +211,10 @@ async function runJob(job) {
     const ctx = { rules: RULES[language] || RULES.ru, mainRule: MAIN_TEXT_RULE[language] || MAIN_TEXT_RULE.ru, langName: language === "en" ? "English" : "Russian", textOnMain: preset.textAllowedOnMain };
     const size = SIZE_BY_RATIO[ratio] || "1024x1536";
     job.ratio = ratio; job.size = size;
-    const ref = await fetchBuffer(job.refImageUrl);
+    const refUrls = (Array.isArray(job.refImageUrls) && job.refImageUrls.length ? job.refImageUrls : [job.refImageUrl]).filter(Boolean);
+    const refs = [];
+    for (const u of refUrls) refs.push(await fetchBuffer(u));
+    job.refCount = refs.length;
     const wanted = Array.isArray(job.keys) && job.keys.length ? TEMPLATES.filter(([k]) => job.keys.includes(k)) : TEMPLATES;
     job.total = wanted.length;
     saveJob(job);
@@ -188,9 +223,11 @@ async function runJob(job) {
       job.phase = `生成 ${label}（${job.images.length + 1}/${job.total}）`;
       saveJob(job);
       try {
-        const out = await generateOne(build(ctx), ref, size);
+        const out = await generateOne(build(ctx), refs, size, job.id);
+        if (job.cancelRequested) break;      // 取消把在飞的请求掐了，这张就不算数
         job.images.push({ key, label, url: out.url, tokens: out.tokens, ok: true });
       } catch (e) {
+        if (job.cancelRequested) break;
         job.images.push({ key, label, url: "", ok: false, error: String(e?.message || e).slice(0, 300) });
       }
       job.processed = job.images.length;
@@ -198,12 +235,18 @@ async function runJob(job) {
     }
     const okCount = job.images.filter((x) => x.ok).length;
     job.status = job.cancelRequested ? "canceled" : (okCount ? "done" : "error");
-    job.phase = `完成：成功 ${okCount} / ${job.total}`;
-    job.error = okCount ? "" : (job.images[0]?.error || "全部失败");
+    job.phase = job.cancelRequested ? `已取消（已生成 ${okCount} 张）` : `完成：成功 ${okCount} / ${job.total}`;
+    job.error = job.cancelRequested ? "" : (okCount ? "" : (job.images[0]?.error || "全部失败"));
     job.updatedAt = new Date().toISOString();
     saveJob(job);
     log(`任务 ${job.id} ${job.status}：成功 ${okCount}/${job.total}`);
   } catch (e) {
+    if (job.cancelRequested) {
+      job.status = "canceled"; job.phase = "已取消"; job.error = "";
+      job.updatedAt = new Date().toISOString(); saveJob(job);
+      log(`任务 ${job.id} 已取消`);
+      return;
+    }
     job.status = "error"; job.phase = "失败"; job.error = String(e?.message || e).slice(0, 400);
     saveJob(job);
     log(`任务 ${job.id} 失败:`, job.error);
@@ -256,8 +299,11 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && url.pathname === "/jobs") {
       const body = await readBody(req);
-      if (!body.refImageUrl) return json(res, 400, { ok: false, error: "refImageUrl 必填" });
-      const job = { id: crypto.randomUUID(), platform: String(body.platform || "yandex"), refImageUrl: String(body.refImageUrl),
+      const refList = (Array.isArray(body.refImageUrls) ? body.refImageUrls : [body.refImageUrl])
+        .map((u) => String(u || "").trim()).filter(Boolean).slice(0, MAX_REF_IMAGES);
+      if (!refList.length) return json(res, 400, { ok: false, error: "至少要有一张参考图（refImageUrl 或 refImageUrls）" });
+      const job = { id: crypto.randomUUID(), platform: String(body.platform || "yandex"),
+        refImageUrl: refList[0], refImageUrls: refList, refCount: refList.length,
         title: String(body.title || ""), features: Array.isArray(body.features) ? body.features : [], keys: body.keys || null,
         ratio: body.ratio || "", language: body.language || "", status: "queued", phase: "排队中", images: [], processed: 0, total: 0,
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
@@ -274,7 +320,8 @@ const server = http.createServer(async (req, res) => {
           id: j.id, platform: j.platform, status: j.status, phase: j.phase,
           processed: j.processed || 0, total: j.total || 0,
           createdAt: j.createdAt, updatedAt: j.updatedAt,
-          refImageUrl: j.refImageUrl,
+          refImageUrl: j.refImageUrl, refImageUrls: j.refImageUrls || [j.refImageUrl].filter(Boolean),
+          refCount: j.refCount || (j.refImageUrls ? j.refImageUrls.length : 1),
           images: (j.images || []).map((x) => ({ key: x.key, label: x.label, ok: Boolean(x.ok), url: x.url || "", error: x.error || "" })),
         }));
       return json(res, 200, { ok: true, count: list.length, jobs: list });
@@ -283,7 +330,11 @@ const server = http.createServer(async (req, res) => {
     if (m) {
       const job = jobs.get(m[1]);
       if (!job) return json(res, 404, { ok: false, error: "job not found" });
-      if (req.method === "POST" && m[2] === "cancel") { job.cancelRequested = true; saveJob(job); return json(res, 200, { ok: true }); }
+      if (req.method === "POST" && m[2] === "cancel") {
+        cancelJob(job);
+        log(`收到取消请求：${job.id} → ${job.status}`);
+        return json(res, 200, { ok: true, status: job.status });
+      }
       if (req.method === "GET") return json(res, 200, { ok: true, job });
     }
     return json(res, 404, { ok: false, error: "not found" });
