@@ -448,6 +448,8 @@ let currentBrowserHeadless = false;
 const isPublicPath = (path) => {
   const publicPaths = ["/login", "/api/auth/login", "/api/auth/status", "/api/version"];
   if (publicPaths.includes(path)) return true;
+  // AI 套图服务对外入口：用服务 API Key 鉴权，供 Ozon/Etsy 等其它系统调用（无需 ERP 登录）
+  if (path.startsWith("/api/image-set/public/")) return true;
   // 允许加载 JS/CSS/图片等静态资源 + 扩展下载 + 上传目录
   if (path.startsWith("/static") || path.startsWith("/extension/") || path.startsWith("/uploads/") ||
       path.endsWith(".css") || path.endsWith(".ico") || path.endsWith(".js") || path.endsWith(".zip") ||
