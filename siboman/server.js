@@ -5620,6 +5620,20 @@ const PRECISE_PRICE_MODES = {
   no_evidence: { trusted: false, label: "未取到价格证据" },
 };
 
+// 1688 详情页抓到的运费 → 定价用的国内运费（元）。
+// 插件取值：'' 未取到 / "0" 包邮 / "5.5" 具体金额 / "未公开/需选择地区"。
+function preciseShippingCny(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return { value: 4, estimated: true, raw };
+  if (/包邮|免运费|免费配送/.test(raw)) return { value: 0, estimated: false, raw };
+  if (/^\s*0(?:\.0+)?\s*$/.test(raw)) return { value: 0, estimated: false, raw };
+  const match = raw.match(/(\d+(?:\.\d+)?)/);
+  if (!match) return { value: 4, estimated: true, raw };
+  const value = Number(match[1]);
+  if (!Number.isFinite(value) || value < 0 || value > 200) return { value: 4, estimated: true, raw };
+  return { value, estimated: false, raw };
+}
+
 function preciseCandidateEvidence(result, best, pick) {
   return {
     source: "plugin-1688",
@@ -5637,6 +5651,8 @@ function preciseCandidateEvidence(result, best, pick) {
     shopName: String(best?.shopName || ""),
     weightText: String(best?.weightText || ""),
     shippingFee: String(best?.shippingFee || ""),
+    shippingFeeCnyUsed: pick.shipping?.value ?? null,
+    shippingEstimated: pick.shipping?.estimated !== false,
     trafficBaitRisk: best?.trafficBaitRisk === true,
     domPriceText: String(best?.domPriceText || ""),
     searchError: String(result?.searchError || "").slice(0, 200),
@@ -5657,11 +5673,14 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
   }
   const weightKg = Number(offer?.weightKg || 0);
   const lenCm = Number(offer?.lenCm || 0), widCm = Number(offer?.widCm || 0), heiCm = Number(offer?.heiCm || 0);
+  // 国内运费：用 1688 详情页抓到的真实运费（拿不到才退回默认 4 元，并在证据里标 estimated）
+  const shipping = preciseShippingCny(best?.shippingFee);
+  pick.shipping = shipping;
   const suggest = weightKg > 0
     ? yandexSuggestPrice({
         purchaseCny: pick.price, weightKg, dims: [lenCm, widCm, heiCm],
         categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
-        params: { exchangeRate: 12.8205, targetMarginPct: 35 },
+        params: { exchangeRate: 12.8205, targetMarginPct: 35, domesticShippingCny: shipping.value },
       })
     : { ok: false };
   const evidence = preciseCandidateEvidence(result, best, pick);
@@ -5692,6 +5711,134 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
     return { offerId, status: "error", reason: String(e?.message || e).slice(0, 160), price: pick.price, evidence };
   }
 }
+
+// ===== 告警邮件（风控/异常自动通知）=====
+// 无第三方依赖：直接用 node:tls 走 SMTPS(465) + AUTH LOGIN 发信，避免为此引入 nodemailer。
+// 配置来自 .env：ALERT_SMTP_HOST / ALERT_SMTP_PORT / ALERT_SMTP_USER / ALERT_SMTP_PASS /
+//                ALERT_MAIL_FROM（默认=ALERT_SMTP_USER） / ALERT_MAIL_TO（默认 313099488@qq.com）
+function alertMailConfig() {
+  const host = String(process.env.ALERT_SMTP_HOST || "").trim();
+  const user = String(process.env.ALERT_SMTP_USER || "").trim();
+  const pass = String(process.env.ALERT_SMTP_PASS || "").trim();
+  const port = Number(process.env.ALERT_SMTP_PORT || 465) || 465;
+  const from = String(process.env.ALERT_MAIL_FROM || user).trim();
+  const to = String(process.env.ALERT_MAIL_TO || "313099488@qq.com").trim();
+  return { host, port, user, pass, from, to, configured: Boolean(host && user && pass && to) };
+}
+
+function encodeMailHeaderText(text) {
+  const value = String(text || "");
+  return /^[\x20-\x7e]*$/.test(value) ? value : `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
+}
+
+async function sendAlertMail({ subject, text }) {
+  const cfg = alertMailConfig();
+  if (!cfg.configured) return { ok: false, error: "告警邮件未配置（缺少 ALERT_SMTP_HOST/USER/PASS）" };
+  const tls = await import("node:tls");
+  return await new Promise((resolve) => {
+    let settled = false;
+    let socket = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      try { socket?.destroy(); } catch (_e) {}
+      resolve(result);
+    };
+    const transcript = [];
+    const body = Buffer.from(String(text || ""), "utf8").toString("base64");
+    const message = [
+      `From: ${encodeMailHeaderText("逐梦ERP告警")} <${cfg.from}>`,
+      `To: <${cfg.to}>`,
+      `Subject: ${encodeMailHeaderText(subject)}`,
+      `Date: ${new Date().toUTCString()}`,
+      "MIME-Version: 1.0",
+      'Content-Type: text/plain; charset="UTF-8"',
+      "Content-Transfer-Encoding: base64",
+      "",
+      (body.match(/.{1,76}/g) || []).join("\r\n"),
+      "",
+    ].join("\r\n");
+    // 严格的 SMTP 时序：每一步声明期望的响应码（2xx/3xx 宽松匹配只用于 MAIL/RCPT/DATA 之后）
+    const script = [
+      { send: null, expect: [220], label: "greeting" },
+      { send: "EHLO zhumeng-erp", expect: [250], label: "EHLO" },
+      { send: "AUTH LOGIN", expect: [334], label: "AUTH" },
+      { send: Buffer.from(cfg.user).toString("base64"), expect: [334], label: "AUTH user" },
+      { send: Buffer.from(cfg.pass).toString("base64"), expect: [235], label: "AUTH pass" },
+      { send: `MAIL FROM:<${cfg.from}>`, expect: [250], label: "MAIL FROM" },
+      { send: `RCPT TO:<${cfg.to}>`, expect: [250, 251], label: "RCPT TO" },
+      { send: "DATA", expect: [354], label: "DATA" },
+      { send: `${message}\r\n.`, expect: [250], label: "正文投递" },
+      { send: "QUIT", expect: [221, 250], label: "QUIT" },
+    ];
+    let step = 0;
+    let buffer = "";
+    let replyLines = [];
+    socket = tls.connect({ host: cfg.host, port: cfg.port, servername: cfg.host, timeout: 20000 });
+    socket.setEncoding("utf8");
+    const runStep = () => {
+      if (step >= script.length) return finish({ ok: true, transcript });
+      const current = script[step];
+      if (current.send !== null) socket.write(`${current.send}\r\n`);
+    };
+    const handleReply = (code, lines) => {
+      transcript.push(`${code} ${lines.join(" | ").slice(0, 160)}`);
+      const expected = script[step]?.expect || [];
+      if (!expected.includes(code)) {
+        return finish({ ok: false, error: `SMTP ${script[step]?.label || step} 失败：收到 ${code} ${lines[0] || ""}`.slice(0, 300), transcript });
+      }
+      const wasLast = step === script.length - 1;
+      step += 1;
+      if (wasLast) return finish({ ok: true, transcript });
+      runStep();
+    };
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let idx = buffer.indexOf("\r\n");
+      while (idx >= 0) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        replyLines.push(line);
+        // SMTP 多行应答：只有 "250 xxx"（码后有空格）才是最后一行
+        if (/^\d{3} /.test(line)) {
+          const code = Number(line.slice(0, 3));
+          const lines = replyLines;
+          replyLines = [];
+          handleReply(code, lines);
+          if (settled) return;
+        }
+        idx = buffer.indexOf("\r\n");
+      }
+    });
+    socket.on("error", (e) => finish({ ok: false, error: String(e?.message || e), transcript }));
+    socket.on("timeout", () => finish({ ok: false, error: "SMTP 连接超时", transcript }));
+    socket.on("close", () => finish({ ok: false, error: "SMTP 连接提前关闭", transcript: transcript.slice(0, 6) }));
+    socket.on("secureConnect", runStep);
+  });
+}
+
+const alertMailThrottle = new Map(); // key -> lastSentAt
+async function sendAlertMailThrottled({ key, subject, text, minIntervalMs = 10 * 60 * 1000 }) {
+  const now = Date.now();
+  const last = alertMailThrottle.get(key) || 0;
+  if (now - last < minIntervalMs) return { ok: false, throttled: true };
+  alertMailThrottle.set(key, now);
+  const result = await sendAlertMail({ subject, text }).catch((e) => ({ ok: false, error: String(e?.message || e) }));
+  console.log(`[alert-mail] ${result.ok ? "已发送" : "发送失败"} key=${key} ${result.error || ""}`);
+  return result;
+}
+
+app.post("/api/alerts/test-email", requireAuth, async (req, res, next) => {
+  try {
+    const cfg = alertMailConfig();
+    if (!cfg.configured) return res.status(400).json({ success: false, error: "告警邮件未配置（缺少 ALERT_SMTP_HOST/USER/PASS）", config: { host: cfg.host, user: cfg.user, to: cfg.to } });
+    const result = await sendAlertMail({
+      subject: "【逐梦ERP】告警邮件测试",
+      text: `这是一封测试邮件。\n发送时间：${new Date().toLocaleString("zh-CN")}\n收到说明风控告警通道已就绪。`,
+    });
+    res.json({ success: result.ok, error: result.error || "", transcript: result.transcript || [], to: cfg.to, host: cfg.host });
+  } catch (error) { next(error); }
+});
 
 // ===== 精核价风控告警 =====
 // 插件遇 1688 验证码/滑块只会自己暂停 5 分钟后继续，不会通知任何人 → 这里在服务端识别风控特征，
@@ -5743,6 +5890,23 @@ async function evaluatePreciseRisk(job, results) {
         WHERE id = $1`,
       [job.id, JSON.stringify({ alert }), phaseText, JSON.stringify([makeLogEntry(`${alert.message} ${alert.advice}`, "warn")])]
     ).catch(() => {});
+    // 邮件通知（风控 10 分钟内最多一封；连续失败 30 分钟最多一封）
+    sendAlertMailThrottled({
+      key: `precise-${job.id}-${alert.level}`,
+      subject: alert.level === "danger" ? "【逐梦ERP·1688风控】精核价被风控拦截，需要处理" : "【逐梦ERP·核价异常】连续多个商品未核到同款",
+      text: [
+        alert.message,
+        "",
+        `任务：${job.id}（${job.storeId || "未指定店铺"}）`,
+        `进度：已核 ${Number(job.processed || 0)} / ${Number(job.total || 0)}`,
+        `时间：${new Date().toLocaleString("zh-CN")}`,
+        "",
+        alert.advice,
+        "",
+        "（本邮件由逐梦 ERP 自动发送；处理完验证后插件会自动继续，无需重发任务。）",
+      ].join("\n"),
+      minIntervalMs: alert.level === "danger" ? 10 * 60 * 1000 : 30 * 60 * 1000,
+    }).catch(() => {});
     return alert;
   }
   if (state.alerted) {
@@ -5905,6 +6069,9 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         matchedSku: pick.sku || null,
         moq: String(best?.minOrderQuantity || best?.moq || ""),
         shopName: String(best?.shopName || ""),
+        shippingFee: String(best?.shippingFee || ""),
+        shippingCnyUsed: preciseShippingCny(best?.shippingFee).value,
+        shippingEstimated: preciseShippingCny(best?.shippingFee).estimated,
         trafficBaitRisk: best?.trafficBaitRisk === true,
         savedStatus: saved?.status || "",
         suggestPriceCny: Number(saved?.suggest_price_cny || 0),
