@@ -13,6 +13,11 @@ window.YandexAutoListingView = {
     const total = Vue.ref(0);
     const pagination = Vue.reactive({ page: 1, pageSize: 20 });
     const query = Vue.reactive({ q: '', collectStatus: '', publishStatus: '' });
+    // 店铺结算币种（跨境店为 CNY；Yandex 只接受店铺币种，推错会报 Illegal input at basicPrice.currencyId）
+    const currencyId = Vue.ref('CNY');
+    const currencySymbol = Vue.computed(() => (currencyId.value === 'CNY' ? '¥' : '₽'));
+    const priceField = () => (currencyId.value === 'CNY' ? 'priceCny' : 'priceRub');
+    const oldPriceField = () => (currencyId.value === 'CNY' ? 'oldPriceCny' : 'oldPriceRub');
 
     const notify = {
       success: (m) => (window.ElementPlus?.ElMessage || console).success?.(m),
@@ -46,6 +51,7 @@ window.YandexAutoListingView = {
         });
         drafts.value = res.data?.items || [];
         total.value = Number(res.data?.total || 0);
+        if (res.data?.currencyId) currencyId.value = String(res.data.currencyId).toUpperCase();
       } catch (e) {
         notify.error('读取上架任务失败: ' + (e.response?.data?.error || e.message));
       } finally { loading.value = false; }
@@ -253,7 +259,7 @@ window.YandexAutoListingView = {
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
-      addSku, removeSku, applyWeightToAll, removeImage, addImage, categoryLabel,
+      addSku, removeSku, applyWeightToAll, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField,
     };
   },
 
@@ -415,8 +421,8 @@ window.YandexAutoListingView = {
                 </el-table-column>
                 <el-table-column label="规格/颜色" min-width="140"><template #default="{ row }"><el-input v-model="row.spec" size="small" /></template></el-table-column>
                 <el-table-column label="采购 ¥" width="100"><template #default="{ row }"><el-input-number v-model="row.purchaseCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></template></el-table-column>
-                <el-table-column label="售价 ₽" width="110"><template #default="{ row }"><el-input-number v-model="row.priceRub" :min="0" :precision="0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
-                <el-table-column label="划线价 ₽" width="110"><template #default="{ row }"><el-input-number v-model="row.oldPriceRub" :min="0" :precision="0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
+                <el-table-column :label="'售价 ' + currencySymbol" width="110"><template #default="{ row }"><el-input-number v-model="row[priceField()]" :min="0" :precision="currencyId === 'CNY' ? 2 : 0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
+                <el-table-column :label="'划线价 ' + currencySymbol" width="110"><template #default="{ row }"><el-input-number v-model="row[oldPriceField()]" :min="0" :precision="currencyId === 'CNY' ? 2 : 0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="重量kg" width="100"><template #default="{ row }"><el-input-number v-model="row.weightKg" :min="0" :precision="3" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="长" width="90"><template #default="{ row }"><el-input-number v-model="row.lengthCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="宽" width="90"><template #default="{ row }"><el-input-number v-model="row.widthCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" /></template></el-table-column>
@@ -424,7 +430,7 @@ window.YandexAutoListingView = {
                 <el-table-column label="库存" width="90"><template #default="{ row }"><el-input-number v-model="row.stock" :min="0" :precision="0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="操作" width="70"><template #default="{ $index }"><el-button size="small" type="danger" plain @click="removeSku($index)">删</el-button></template></el-table-column>
               </el-table>
-              <div style="font-size:12px; color:#94a3b8; margin-top:6px">售价/划线价填卢布 ₽（Yandex 判定币种）。只填采购 ¥ 时可按汇率换算，建议直接填 ₽。</div>
+              <div style="font-size:12px; color:#94a3b8; margin-top:6px">售价/划线价按店铺结算币种填写（当前 {{ currencyId }}）。Yandex 只接受店铺币种，填错会上传失败。</div>
             </el-card>
 
             <el-card shadow="never" style="margin-bottom:14px">

@@ -6239,6 +6239,8 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
 const yandexListingTreeCache = new Map(); // storeKey -> { at, tree }
 const YANDEX_LISTING_TREE_TTL_MS = 12 * 3600 * 1000;
 const YANDEX_LISTING_RATE = 12.8205; // CNY→RUB 兜底汇率（前端可覆盖）
+// 店铺结算币种：跨境店为 CNY（Yandex 会拒绝非店铺币种，实测推 RUB 报 Illegal input at basicPrice.currencyId）
+const YANDEX_LISTING_CURRENCY = String(process.env.YANDEX_LISTING_CURRENCY || "CNY").toUpperCase();
 
 async function getYandexCategoryTree(context, storeKey = "") {
   const key = storeKey || "__env__";
@@ -6327,8 +6329,15 @@ async function getYandexDraftForUser(id, user) {
 }
 
 // 由草稿构建 Yandex offer（对齐官方 offer-mappings/update 结构）
-function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE } = {}) {
+function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE, currencyId = YANDEX_LISTING_CURRENCY } = {}) {
   const rate = Number(exchangeRate) > 0 ? Number(exchangeRate) : YANDEX_LISTING_RATE;
+  const currency = String(currencyId || YANDEX_LISTING_CURRENCY).toUpperCase();
+  const priceOf = (sku, key) => {
+    const cny = Number(sku?.[`${key}Cny`] ?? sku?.priceCny ?? 0) || 0;
+    const rub = Number(sku?.[`${key}Rub`] ?? sku?.priceRub ?? 0) || 0;
+    if (currency === "CNY") return cny > 0 ? cny : Math.round(rub / rate * 100) / 100;
+    return rub > 0 ? rub : Math.round(cny * rate);
+  };
   const skus = Array.isArray(draft.skus) ? draft.skus.filter((s2) => s2 && (Number(s2.priceRub) > 0 || Number(s2.priceCny) > 0)) : [];
   const groupId = skus.length > 1 ? `ZM-${String(draft.id).slice(0, 8)}` : "";
   const baseParams = (Array.isArray(draft.categoryParams) ? draft.categoryParams : []).map((p) => {
@@ -6345,8 +6354,8 @@ function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE 
     return item;
   }).filter(Boolean);
   return skus.map((sku, index) => {
-    const priceRub = Number(sku.priceRub) > 0 ? Number(sku.priceRub) : Math.round(Number(sku.priceCny || 0) * rate);
-    const oldRub = Number(sku.oldPriceRub) > 0 ? Number(sku.oldPriceRub) : 0;
+    const priceValue = priceOf(sku, "price");
+    const oldValue = Number(sku.oldPriceCny || sku.oldPriceRub || 0) > 0 ? priceOf(sku, "oldPrice") : 0;
     const pictures = [sku.image, ...(Array.isArray(sku.images) ? sku.images : []), ...(draft.images || [])]
       .map((u) => String(u || "").trim()).filter(Boolean).filter((u, i, arr) => arr.indexOf(u) === i).slice(0, 30);
     const offer = {
@@ -6356,7 +6365,7 @@ function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE 
       vendor: draft.brand || "Нет бренда",
       marketCategoryId: Number(draft.categoryId),
       pictures,
-      basicPrice: { value: priceRub, currencyId: "RUB", ...(oldRub > priceRub ? { discountBase: oldRub } : {}) },
+      basicPrice: { value: priceValue, currencyId: currency, ...(oldValue > priceValue ? { discountBase: oldValue } : {}) },
       weightDimensions: {
         weight: Number(sku.weightKg || 0),
         length: Number(sku.lengthCm || 0),
@@ -6479,7 +6488,7 @@ app.get("/api/yandex/listing/drafts", requireAuth, async (req, res, next) => {
       `SELECT ${YANDEX_DRAFT_COLUMNS} FROM yandex_listing_drafts WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT $${params.length - 1} OFFSET $${params.length}`,
       params
     );
-    res.json({ success: true, total: countR.rows[0]?.cnt || 0, items: (rows.rows || []).map(dbRowToYandexDraft) });
+    res.json({ success: true, currencyId: YANDEX_LISTING_CURRENCY, total: countR.rows[0]?.cnt || 0, items: (rows.rows || []).map(dbRowToYandexDraft) });
   } catch (error) { next(error); }
 });
 
@@ -6487,7 +6496,7 @@ app.get("/api/yandex/listing/drafts/:id", requireAuth, async (req, res, next) =>
   try {
     const draft = await getYandexDraftForUser(req.params.id, req.user);
     if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
-    res.json({ success: true, draft });
+    res.json({ success: true, currencyId: YANDEX_LISTING_CURRENCY, draft });
   } catch (error) { next(error); }
 });
 
@@ -6618,6 +6627,7 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
     const ids = (Array.isArray(req.body?.ids) ? req.body.ids : []).map(String).filter(Boolean).slice(0, 50);
     if (!ids.length) return res.status(400).json({ success: false, error: "请选择要上传的商品" });
     const exchangeRate = Number(req.body?.exchangeRate || 0) || YANDEX_LISTING_RATE;
+    const currencyId = String(req.body?.currencyId || YANDEX_LISTING_CURRENCY).toUpperCase();
     const context = await getYandexMarketContext({ storeId, userId });
     const results = [];
     for (const id of ids) {
@@ -6631,7 +6641,7 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
       }
       await db.query(`UPDATE yandex_listing_drafts SET publish_status='uploading', publish_error='', updated_at=now() WHERE id=$1`, [id]);
       try {
-        const offers = buildYandexOffersFromDraft(draft, { exchangeRate });
+        const offers = buildYandexOffersFromDraft(draft, { exchangeRate, currencyId });
         const mapping = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings/update`, {
           method: "POST", query: { language: "RU" }, body: { offerMappings: offers.map((offer) => ({ offer })) }, timeoutMs: 90000, apiSecret: context.apiSecret,
         });
@@ -6648,7 +6658,7 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
         await db.query(
           `UPDATE yandex_listing_drafts SET publish_status='published', publish_error='', uploaded_at=now(), updated_at=now(),
              yandex_result=$2::jsonb WHERE id=$1`,
-          [id, JSON.stringify({ offerIds, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, at: new Date().toISOString() })]
+          [id, JSON.stringify({ offerIds, currencyId, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, at: new Date().toISOString() })]
         );
         invalidateYandexStatusCounts(storeId);
         if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
