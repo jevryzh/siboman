@@ -6850,7 +6850,10 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
   // 货号/offerId 一律用 ASCII：优先用 1688 商品编号（数字），否则用草稿短码；避免中文货号写进 Yandex
   const srcOfferId = (String(draft.sourceUrl || "").match(/offer\/(\d{6,})/) || [])[1] || "";
   const isAscii = (v) => /^[\x20-\x7e]+$/.test(String(v || ""));
-  const asciiBase = srcOfferId || `ZM${String(draft.id || "").replace(/-/g, "").slice(0, 8)}`;
+  // 货号优先级：① 草稿货号（ASCII，如 Ozon 过来的 jz-260624fwg3-4736604207-1）② 1688 商品编号 ③ 草稿短码
+  const asciiVendorCode = isAscii(draft.vendorCode) && String(draft.vendorCode || "").trim() ? String(draft.vendorCode).trim() : "";
+  const asciiBase = asciiVendorCode || srcOfferId || `ZM${String(draft.id || "").replace(/-/g, "").slice(0, 8)}`;
+  const asciiBaseHasSuffix = /-\d+$/.test(asciiBase);
   return await Promise.all(skus.map(async (sku, index) => {
     const priceValue = priceOf(sku, "price");
     const oldValue = Number(sku.oldPriceCny || sku.oldPriceRub || 0) > 0 ? priceOf(sku, "oldPrice") : 0;
@@ -6859,7 +6862,8 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
       offerId: (() => {
         const existing = String(sku.offerId || "");
         if (existing && isAscii(existing)) return existing;
-        return skus.length > 1 ? `${asciiBase}-${index + 1}` : asciiBase;
+        if (skus.length === 1) return asciiBase;
+        return asciiBaseHasSuffix ? `${asciiBase}${index === 0 ? "" : "-" + (index + 1)}` : `${asciiBase}-${index + 1}`;
       })(),
       name: String((skus.length > 1 && (sku.specRu || sku.spec)) ? `${draft.titleRu} ${sku.specRu || sku.spec}` : draft.titleRu).slice(0, 255),
       description: String(draft.descriptionRu || "").slice(0, 3000),
