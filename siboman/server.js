@@ -7022,6 +7022,148 @@ app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) =>
 });
 
 // 类目参数（含单位/选项/是否变体特征 + 中文名）
+// ===== AI 套图服务代理（独立进程 image-set.service，127.0.0.1:5190）=====
+// ERP 前端只跟 ERP 说话：这里转发到独立服务并注入内部 API Key，前端无需知道地址/密钥。
+const IMAGE_SET_URL = String(process.env.IMAGE_SET_URL || "http://127.0.0.1:5190").replace(/\/+$/, "");
+const IMAGE_SET_KEY = String(process.env.IMAGE_SET_API_KEY || "");
+
+async function callImageSetService(method, apiPath, body, timeoutMs = 60000) {
+  const resp = await fetch(`${IMAGE_SET_URL}${apiPath}`, {
+    method,
+    headers: { "Content-Type": "application/json", ...(IMAGE_SET_KEY ? { "x-api-key": IMAGE_SET_KEY } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await resp.text();
+  let payload = null;
+  try { payload = JSON.parse(text); } catch { payload = { ok: false, error: text.slice(0, 300) }; }
+  return { status: resp.status, payload };
+}
+
+// ===== 对外入口（给 Ozon/Etsy 等其它系统调用）：同域名 + 服务 API Key 鉴权，无需 ERP 登录 =====
+function imageSetPublicAuth(req) {
+  const key = String(req.headers["x-api-key"] || (req.headers.authorization || "").replace(/^Bearer\s+/i, "")).trim();
+  return Boolean(IMAGE_SET_KEY) && key === IMAGE_SET_KEY;
+}
+
+app.get("/api/image-set/public/health", async (req, res) => {
+  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+  const out = await callImageSetService("GET", "/health").catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
+  res.status(out.status).json(out.payload);
+});
+
+// body: { platform: ozon|etsy|yandex, refImageUrl, keys?, ratio?, language?, title?, features? }
+app.post("/api/image-set/public/jobs", async (req, res) => {
+  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+  const out = await callImageSetService("POST", "/jobs", req.body || {}).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
+  res.status(out.status).json(out.payload);
+});
+
+app.get("/api/image-set/public/jobs/:id", async (req, res) => {
+  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+  const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
+  res.status(out.status).json(out.payload);
+});
+
+app.post("/api/image-set/public/jobs/:id/cancel", async (req, res) => {
+  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+  const out = await callImageSetService("POST", `/jobs/${encodeURIComponent(req.params.id)}/cancel`, {}).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
+  res.status(out.status).json(out.payload);
+});
+
+// ===== Ozon 接入（第 3 步）：采集箱商品一键出图，结果写回 collect_items =====
+app.post("/api/ozon/ai-image-set", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const itemId = Number(req.body?.itemId || req.body?.collectItemId || 0);
+    if (!itemId) return res.status(400).json({ success: false, error: "itemId 必填" });
+    const r = await db.query(`SELECT id, title, name, main_image, images FROM collect_items WHERE id=$1`, [itemId]);
+    const row = r.rows?.[0];
+    if (!row) return res.status(404).json({ success: false, error: "采集商品不存在" });
+    const imgs = Array.isArray(row.images) ? row.images : [];
+    const ref = String(row.main_image || imgs[0] || "").trim();
+    if (!ref) return res.status(400).json({ success: false, error: "该商品没有图片，无法出图" });
+    const out = await callImageSetService("POST", "/jobs", {
+      platform: "ozon",
+      refImageUrl: ref,
+      title: String(row.title || row.name || "").slice(0, 200),
+      keys: Array.isArray(req.body?.keys) ? req.body.keys : null,
+    }, 60000);
+    if (!out.payload?.ok) return res.status(out.status || 502).json({ success: false, error: out.payload?.error || "出图服务返回异常" });
+    res.json({ success: true, jobId: out.payload.jobId, itemId, ref });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/ozon/ai-image-set/:jobId/apply", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const itemId = Number(req.body?.itemId || req.body?.collectItemId || 0);
+    if (!itemId) return res.status(400).json({ success: false, error: "itemId 必填" });
+    const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.jobId)}`);
+    const images = (out.payload?.job?.images || []).filter((x) => x.ok && x.url);
+    if (!images.length) return res.status(400).json({ success: false, error: "该任务还没有成功的图" });
+    const mainUrl = (images.find((x) => x.key === "main") || images[0]).url;
+    const r0 = await db.query(`SELECT images FROM collect_items WHERE id=$1`, [itemId]);
+    if (!r0.rows?.length) return res.status(404).json({ success: false, error: "采集商品不存在" });
+    const oldImages = Array.isArray(r0.rows[0].images) ? r0.rows[0].images : [];
+    const list = req.body?.mode === "main-only"
+      ? [mainUrl, ...oldImages.filter((u) => u !== mainUrl)]
+      : [...new Set([mainUrl, ...images.map((x) => x.url), ...oldImages])];
+    await db.query(`UPDATE collect_items SET images=$2::jsonb, main_image=$3, updated_at=now() WHERE id=$1`,
+      [itemId, JSON.stringify(list.slice(0, 30)), mainUrl]);
+    res.json({ success: true, itemId, count: list.length, mainImage: mainUrl, images: list.slice(0, 10) });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/image-set/health", requireAuth, async (req, res, next) => {
+  try {
+    const out = await callImageSetService("GET", "/health").catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
+    res.status(out.status).json(out.payload);
+  } catch (error) { next(error); }
+});
+
+// 提交套图任务：{ platform: ozon|etsy|yandex, refImageUrl, keys?, ratio?, language?, title?, features? }
+app.post("/api/image-set/jobs", requireAuth, async (req, res, next) => {
+  try {
+    const out = await callImageSetService("POST", "/jobs", req.body || {});
+    res.status(out.status).json(out.payload);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/image-set/jobs/:id", requireAuth, async (req, res, next) => {
+  try {
+    const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`);
+    res.status(out.status).json(out.payload);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/image-set/jobs/:id/cancel", requireAuth, async (req, res, next) => {
+  try {
+    const out = await callImageSetService("POST", `/jobs/${encodeURIComponent(req.params.id)}/cancel`, {});
+    res.status(out.status).json(out.payload);
+  } catch (error) { next(error); }
+});
+
+// 把独立服务生成的套图回写到指定草稿（复用现有 apply 逻辑的输入结构）
+app.post("/api/image-set/jobs/:id/apply-to-draft", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const draft = await getYandexDraftForUser(req.body?.draftId || "", req.user);
+    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`);
+    const images = (out.payload?.job?.images || []).filter((x) => x.ok && x.url);
+    if (!images.length) return res.status(400).json({ success: false, error: "该任务还没有成功的图" });
+    const mainUrl = (images.find((x) => x.key === "main") || images[0]).url;
+    let list = Array.isArray(draft.images) ? draft.images.slice() : [];
+    if (req.body?.mode === "main-only") list = [mainUrl, ...list.filter((u) => u !== mainUrl)];
+    else list = [...new Set([mainUrl, ...images.map((x) => x.url), ...list])];
+    const skus = (draft.skus || []).map((sku) => ({ ...sku, image: mainUrl }));
+    const r = await db.query(`UPDATE yandex_listing_drafts SET images=$2::jsonb, skus=$3::jsonb, image_set=$4::jsonb, updated_at=now() WHERE id=$1 RETURNING ${YANDEX_DRAFT_COLUMNS}`,
+      [draft.id, JSON.stringify(list.slice(0, 30)), JSON.stringify(skus), JSON.stringify(images.map((x) => ({ key: x.key, label: x.label, url: x.url, ok: true })))]);
+    res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]) });
+  } catch (error) { next(error); }
+});
+
 // ===== AI 出图（Ozon 俄罗斯风格 7 图套图，走 TokenDun gpt-image-2 图生图）=====
 // 复用文件顶部已声明的 TOKENDUN_* 常量（TOKENDUN_BASE_URL 已含 /v1）
 const TOKENDUN_BASE = /\/v1$/.test(TOKENDUN_BASE_URL) ? TOKENDUN_BASE_URL : `${TOKENDUN_BASE_URL}/v1`;
@@ -7044,22 +7186,45 @@ const YANDEX_IMAGE_SET = [
 function tokendunEnabled() { return Boolean(TOKENDUN_KEY); }
 
 async function tokendunGenerateImage(prompt, refImageUrl, size = "1024x1536") {
-  // 参考图先转存到本机（TokenDun 需要能取到），再走图生图
+  // 参考图先转存到本机公网（TokenDun 需要能取到），再走图生图
   const refUrl = await publicUrlForListingImage(refImageUrl);
   const refResp = await fetch(refUrl, { signal: AbortSignal.timeout(60000) });
   if (!refResp.ok) throw new Error(`参考图下载失败 ${refResp.status}`);
   const refBuf = Buffer.from(await refResp.arrayBuffer());
-  const form = new FormData();
-  form.append("model", TOKENDUN_IMAGE_MODEL);
-  form.append("size", size);
-  form.append("prompt", prompt);
-  form.append("image[]", new Blob([refBuf], { type: "image/jpeg" }), "ref.jpg");
-  const resp = await fetch(`${TOKENDUN_BASE}/images/edits`, {
-    method: "POST", headers: { Authorization: `Bearer ${TOKENDUN_KEY}` }, body: form, signal: AbortSignal.timeout(600000),
+  // 注意：TokenDun 网关不认 Node undici 的 fetch+FormData（返回 404 Server action not found），
+  //   必须手写 multipart/form-data（与 curl 一致），用 node:https 发送。
+  const boundary = `----zhumeng${crypto.randomBytes(8).toString("hex")}`;
+  const chunks = [];
+  const addField = (name, value) => {
+    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
+  };
+  addField("model", TOKENDUN_IMAGE_MODEL);
+  addField("size", size);
+  addField("prompt", prompt);
+  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="image[]"; filename="ref.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`));
+  chunks.push(refBuf);
+  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+  const bodyBuf = Buffer.concat(chunks);
+  const result = await new Promise((resolve, reject) => {
+    const u = new URL(`${TOKENDUN_BASE}/images/edits`);
+    const req = https.request({
+      host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: "POST",
+      headers: { Authorization: `Bearer ${TOKENDUN_KEY}`, "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": bodyBuf.length },
+      timeout: 600000,
+    }, (res) => {
+      const parts = [];
+      res.on("data", (c) => parts.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, text: Buffer.concat(parts).toString("utf8") }));
+    });
+    req.on("timeout", () => req.destroy(new Error("TokenDun 请求超时")));
+    req.on("error", reject);
+    req.write(bodyBuf);
+    req.end();
   });
-  const text = await resp.text();
-  if (!resp.ok) throw new Error(`TokenDun ${resp.status}: ${text.slice(0, 240)}`);
-  let payload = {}; try { payload = JSON.parse(text); } catch { throw new Error(`TokenDun 返回非 JSON: ${text.slice(0, 160)}`); }
+  console.log(`[tokendun-image] POST ${TOKENDUN_BASE}/images/edits model=${TOKENDUN_IMAGE_MODEL} key=${String(TOKENDUN_KEY).slice(0, 8)}… → ${result.status} ${String(result.text).slice(0, 200)}`);
+  if (result.status < 200 || result.status >= 300) throw new Error(`TokenDun ${result.status}: ${String(result.text).slice(0, 240)}`);
+  let payload = {};
+  try { payload = JSON.parse(result.text); } catch { throw new Error(`TokenDun 返回非 JSON: ${String(result.text).slice(0, 160)}`); }
   const item = payload?.data?.[0] || {};
   const uploadDir = path.join(PUBLIC_DIR, "uploads", "yandex-image-set");
   await fs.mkdir(uploadDir, { recursive: true });
@@ -7068,11 +7233,11 @@ async function tokendunGenerateImage(prompt, refImageUrl, size = "1024x1536") {
   if (item.b64_json) {
     await fs.writeFile(dest, Buffer.from(item.b64_json, "base64"));
   } else if (item.url) {
-    const dl = await fetch(item.url, { signal: AbortSignal.timeout(120000) });
+    const dl = await fetch(item.url, { signal: AbortSignal.timeout(180000) });
     if (!dl.ok) throw new Error(`生成图下载失败 ${dl.status}`);
     await fs.writeFile(dest, Buffer.from(await dl.arrayBuffer()));
   } else {
-    throw new Error("TokenDun 未返回图片");
+    throw new Error(`TokenDun 未返回图片: ${String(result.text).slice(0, 160)}`);
   }
   return { url: `${bulkPricingPublicBase()}/uploads/yandex-image-set/${name}`, tokens: payload?.usage?.total_tokens || 0 };
 }
@@ -7113,14 +7278,14 @@ async function runYandexImageSetJob(jobId, userId, draftId) {
 }
 
 // 一键出图（异步 job：7 张约 5-8 分钟）
-app.post("/api/yandex/listing/drafts/:id/generate-images", requireAuth, async (req, res, next) => {
+app.post("/api/yandex/zz-image-set-gen/:id", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
     if (!tokendunEnabled()) return res.status(400).json({ success: false, error: "未配置 AI 出图（TOKENDUN_API_KEY）" });
     const draft = await getYandexDraftForUser(req.params.id, req.user);
     if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
     const job = await createQueuedDbJob(req.user, {
-      id: crypto.randomUUID(), kind: "yandex-image-set", storeId: draft.storeId || null,
+      id: crypto.randomUUID(), kind: "zz-image-set", storeId: draft.storeId || null,
       total: YANDEX_IMAGE_SET.length, phase: "排队开始 AI 出图",
     }, { draftId: draft.id, storeId: draft.storeId || null });
     setTimeout(() => { runYandexImageSetJob(job.id, req.user.id, draft.id).catch(() => {}); }, 50);
@@ -7774,6 +7939,45 @@ app.post("/api/yandex/price-suggest", requireAuth, async (req, res, next) => {
 });
 
 // 批量执行调价（写回 Yandex + 记录历史 + 更新候选状态）
+// 价格隔离区（quarantine）：价格突变会被平台拦下，需确认后才生效 —— 用它可以解释“价格像被平台改了/没生效”
+// 读某商品原始价格对象（含 discountBase 划线价）— 用于判定划线价是否真的写进 Yandex
+app.get("/api/yandex/price-read", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const offerId = String(req.query?.offerId || "").trim();
+    if (!offerId) return res.status(400).json({ success: false, error: "offerId 必填" });
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices`, {
+      method: "POST", body: { offerIds: [offerId] }, timeoutMs: 60000, apiSecret: context.apiSecret,
+    });
+    res.json({ success: true, raw: resp?.result || resp || {} });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/yandex/price-quarantine", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/price-quarantine`, {
+      method: "POST", query: { limit: 200 }, body: {}, timeoutMs: 60000, apiSecret: context.apiSecret,
+    });
+    const offers = (resp?.result?.offers || resp?.offers || []);
+    res.json({ success: true, count: offers.length, offers: offers.slice(0, 500) });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/yandex/price-quarantine/confirm", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const offerIds = (Array.isArray(req.body?.offerIds) ? req.body.offerIds : []).map((v) => String(v)).filter(Boolean);
+    const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/price-quarantine/confirm`, {
+      method: "POST", body: { offerIds }, timeoutMs: 60000, apiSecret: context.apiSecret,
+    });
+    res.json({ success: true, count: offerIds.length, response: resp?.result || resp || {} });
+  } catch (error) { next(error); }
+});
+
 app.post("/api/yandex/price-apply", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -7800,8 +8004,14 @@ app.post("/api/yandex/price-apply", requireAuth, async (req, res, next) => {
         targetPrice = calc.priceCny; zone = calc.zone; celFee = calc.celFeeCny;
       }
       try {
+        const currency = String(it.currency || "CNY").toUpperCase();
+        const oldPriceValue = Number(it.oldPrice || it.old_price || 0);
+        // 划线价 = 售价 × (100 / 划线折扣率)；Yandex 侧字段为 oldPrice（实测生效）
+        // 划线价字段：Yandex 的 price 对象里是 discountBase（读取时同名字段），不是同级 oldPrice
+        const offerBody = { offerId, price: { value: targetPrice, currencyId: currency } };
+        if (oldPriceValue > 0) offerBody.price.discountBase = oldPriceValue;
         const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-prices/updates`, {
-          method: "POST", body: { offers: [{ offerId, price: { value: targetPrice, currencyId: String(it.currency || "CNY").toUpperCase() } }] },
+          method: "POST", body: { offers: [offerBody] },
           timeoutMs: 60000, apiSecret: context.apiSecret });
         await db.query(
           `INSERT INTO yandex_price_records (user_id, store_id, offer_id, name, purchase_cny, old_price_cny, new_price_cny, zone, cel_fee_cny, params_json, status)
@@ -13793,7 +14003,8 @@ async function handleAiImageGenerate(req, res, next) {
           form.append("size", sizeByRatio[aspectRatio] || "1024x1536");
           form.append("quality", TOKENDUN_IMAGE_QUALITY);
           form.append("n", String(requestedN));
-          form.append("image", new Blob([await imageResponse.arrayBuffer()], { type: imageType }), "reference.png");
+          // 实测：TokenDun 网关只认 image[] 字段名（用 image 会返回 404 Server action not found）
+          form.append("image[]", new Blob([await imageResponse.arrayBuffer()], { type: imageType }), "reference.png");
           response = await fetch(`${TOKENDUN_BASE_URL}/images/edits`, {
             method: "POST",
             headers: { Authorization: `Bearer ${TOKENDUN_API_KEY}` },
