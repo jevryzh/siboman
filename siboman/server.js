@@ -2,6 +2,7 @@ import express from "express";
 import { chromium } from "playwright";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import multer from "multer";
 import fs from "node:fs/promises";
 import { readFileSync, existsSync, constants as fsConstants } from "node:fs";
@@ -6987,21 +6988,29 @@ async function applyYandexCollectResults(job, results, userId) {
     const data = r?.data && typeof r.data === "object" ? r.data : null;
     if (!data) continue;
     const mainImage = String((Array.isArray(data.images) && data.images[0]) || "").trim();
-    const skus = (Array.isArray(data.skus) ? data.skus : []).map((sku, i) => ({
-      spec: String(sku?.spec || sku?.name || "").slice(0, 80),
-      // 1688 的 SKU 常常没有自己的图 → 用商品主图兜底，保证每个规格都有首图
-      ...(String(sku?.image || "").trim() ? {} : (mainImage ? { image: mainImage } : {})),
-      purchaseCny: Number(sku?.priceCny || sku?.price || 0) || 0,
-      priceCny: 0, priceRub: 0, oldPriceRub: 0,
-      image: String(sku?.image || ""),
-      images: Array.isArray(sku?.images) ? sku.images.slice(0, 10) : [],
-      stock: Number(sku?.stock || 0) || 0,
-      weightKg: Number(data.weightKg || 0) || 0,
-      lengthCm: Number(data.lengthCm || 0) || 0,
-      widthCm: Number(data.widthCm || 0) || 0,
-      heightCm: Number(data.heightCm || 0) || 0,
-      _i: i,
-    }));
+    // 1688 的「库存 99998」是无限库存占位值，原样抄过来就变成 SKU 里 99999 这种离谱数字 → 回落默认 2
+    const DEFAULT_SKU_STOCK = 2;
+    const skus = (Array.isArray(data.skus) ? data.skus : []).map((sku, i) => {
+      const rawStock = Number(sku?.stock || 0) || 0;
+      const ownImage = String(sku?.image || sku?.imageUrl || sku?.skuImageURI || "").trim();
+      const ownImages = Array.isArray(sku?.images) ? sku.images.map((u) => String(u || "").trim()).filter(Boolean) : [];
+      return {
+        spec: String(sku?.spec || sku?.name || "").slice(0, 80),
+        specRu: String(sku?.specRu || "").slice(0, 120),
+        skuId: String(sku?.skuId || ""),
+        // 1688 的 SKU 常常没有自己的图 → 用商品主图兜底，保证每个规格都有首图
+        image: ownImage || mainImage,
+        images: ownImages.length ? ownImages.slice(0, 10) : (ownImage ? [ownImage] : []),
+        purchaseCny: Number(sku?.priceCny || sku?.price || 0) || 0,
+        priceCny: 0, priceRub: 0, oldPriceRub: 0,
+        stock: rawStock > 0 && rawStock <= 9999 ? rawStock : DEFAULT_SKU_STOCK,
+        weightKg: Number(data.weightKg || 0) || 0,
+        lengthCm: Number(data.lengthCm || 0) || 0,
+        widthCm: Number(data.widthCm || 0) || 0,
+        heightCm: Number(data.heightCm || 0) || 0,
+        _i: i,
+      };
+    });
     await db.query(
       `UPDATE yandex_listing_drafts SET
          collect_status='collected', collect_error='',
@@ -7009,10 +7018,11 @@ async function applyYandexCollectResults(job, results, userId) {
          images=$3::jsonb, detail_images=$4::jsonb,
          skus=$5::jsonb,
          vendor_code=COALESCE(NULLIF(vendor_code,''), $6),
+         video_url=CASE WHEN $7 <> '' THEN $7 ELSE video_url END,
          updated_at=now()
        WHERE id=$1`,
       [draftId, JSON.stringify(data), JSON.stringify((data.images || []).slice(0, 30)), JSON.stringify((data.detailImages || []).slice(0, 60)),
-       JSON.stringify(skus), String(data.vendorCode || "").slice(0, 120)]
+       JSON.stringify(skus), String(data.vendorCode || "").slice(0, 120), String(data.videoUrl || "").trim().slice(0, 500)]
     ).catch((e) => console.warn("[yandex-listing] 回填草稿失败:", e.message));
     applied += 1;
   }
@@ -7384,7 +7394,132 @@ async function attachCategoryZh(userId, items) {
   return items.map((it) => ({ ...it, zh: cache[String(it.value)] || "" }));
 }
 
+// ===== Yandex 类目树：整棵一次性下发 =====
+// 旧实现是每展开一级请求一次，而且每次都可能触发一次 AI 翻译（几秒），所以点一层卡一下。
+// 现在整棵树一次拿完（gzip 后约 120KB）+ 前端缓存，级联框改成非懒加载：展开、搜索都不再请求后端。
+// 中文名走本地缓存 data/yandex_category_zh.json，缺失部分交给后台任务批量翻译，绝不阻塞接口。
+let yandexCatZhJob = { running: false, done: 0, total: 0, startedAt: 0, finishedAt: 0, error: "", failed: 0 };
+const YANDEX_CAT_ZH_BATCH = 80;
+
+function yandexCategoryZhStats(tree, zhCache) {
+  const missing = [];
+  let total = 0;
+  const walk = (node) => {
+    total += 1;
+    const id = String(node?.id || "");
+    if (id && !String(zhCache[id] || "").trim()) missing.push({ id, name: String(node?.name || id) });
+    for (const child of (node?.children || [])) walk(child);
+  };
+  for (const child of (tree?.children || [])) walk(child);
+  return { total, missing };
+}
+
+async function translateYandexCatChunk(userId, items) {
+  const out = await callAIText(userId, {
+    system: [
+      "你是电商类目翻译助手。把俄文类目名翻译成简体中文。",
+      "要求：用电商习惯用词、简短（≤12 字），不要解释、不要括号补充；不确定时按字面直译。",
+      '只输出 JSON：{"<id>":"<中文翻译>"}',
+    ].join("\n"),
+    user: JSON.stringify(items.map((m) => ({ id: String(m.id), name: String(m.name) }))),
+    temperature: 0.2,
+    maxTokens: 4000,
+  });
+  let parsed = {};
+  try { parsed = JSON.parse(out); } catch (_e) { const mm = String(out).match(/\{[\s\S]*\}/); if (mm) { try { parsed = JSON.parse(mm[0]); } catch (_e2) { parsed = {}; } } }
+  return parsed && typeof parsed === "object" ? parsed : {};
+}
+
+async function runYandexCatZhJob(userId, tree) {
+  if (yandexCatZhJob.running) return yandexCatZhJob;
+  const cache = loadYandexCatZh();
+  const { missing, total } = yandexCategoryZhStats(tree, cache);
+  yandexCatZhJob = { running: true, done: 0, total: missing.length, totalNodes: total, startedAt: Date.now(), finishedAt: 0, error: "", failed: 0 };
+  let changed = false;
+  for (let i = 0; i < missing.length; i += YANDEX_CAT_ZH_BATCH) {
+    const chunk = missing.slice(i, i + YANDEX_CAT_ZH_BATCH);
+    try {
+      const parsed = await translateYandexCatChunk(userId, chunk);
+      for (const [k, v] of Object.entries(parsed || {})) {
+        const zh = String(v || "").trim();
+        if (zh) { cache[String(k)] = zh; changed = true; }
+      }
+      if (changed) { saveYandexCatZh(); changed = false; }
+      yandexCatZhJob.done = Math.min(i + chunk.length, missing.length);
+    } catch (e) {
+      yandexCatZhJob.failed += 1;
+      yandexCatZhJob.error = String(e?.message || e).slice(0, 200);
+      yandexCatZhJob.done = Math.min(i + chunk.length, missing.length);
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+  }
+  yandexCatZhJob.running = false;
+  yandexCatZhJob.finishedAt = Date.now();
+  console.log(`[yandex-cat-zh] 后台翻译结束：处理 ${yandexCatZhJob.done}/${yandexCatZhJob.total}，失败批次 ${yandexCatZhJob.failed}`);
+  return yandexCatZhJob;
+}
+
+app.get("/api/yandex/listing/categories/tree", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const tree = await getYandexCategoryTree(context, storeId || "");
+    const zh = loadYandexCatZh();
+    const build = (node) => {
+      const id = String(node?.id || "");
+      const children = (Array.isArray(node?.children) ? node.children : []).map(build);
+      return { value: id, label: String(node?.name || id), zh: String(zh[id] || "").trim(), leaf: children.length === 0, children };
+    };
+    const nodes = (tree?.children || []).map(build);
+    const stats = yandexCategoryZhStats(tree, zh);
+    // 首次拉整棵树时顺手把缺失的中文翻译丢到后台（一次性，落到 data/yandex_category_zh.json）
+    if (stats.missing.length && !yandexCatZhJob.running && !yandexCatZhJob.finishedAt && !yandexCatZhJob.startedAt) {
+      runYandexCatZhJob(req.user.id, tree).catch((e) => console.warn("[yandex-cat-zh] 后台任务异常:", e?.message || e));
+    }
+    const body = JSON.stringify({
+      success: true,
+      tree: nodes,
+      zh: {
+        total: stats.total,
+        missing: stats.missing.length,
+        job: { running: yandexCatZhJob.running, done: yandexCatZhJob.done, total: yandexCatZhJob.total, failed: yandexCatZhJob.failed },
+      },
+    });
+    res.setHeader("Cache-Control", "no-store");
+    if (/\bgzip\b/.test(String(req.headers["accept-encoding"] || "")) && body.length > 4096) {
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Encoding", "gzip");
+      res.end(zlib.gzipSync(Buffer.from(body, "utf8")));
+      return;
+    }
+    res.type("application/json").send(body);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/yandex/listing/categories/zh-status", requireAuth, (req, res) => {
+  const zh = loadYandexCatZh();
+  res.json({
+    success: true,
+    cached: Object.keys(zh || {}).length,
+    job: { running: yandexCatZhJob.running, done: yandexCatZhJob.done, total: yandexCatZhJob.total, failed: yandexCatZhJob.failed, finishedAt: yandexCatZhJob.finishedAt },
+  });
+});
+
+app.post("/api/yandex/listing/categories/zh-translate", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.body?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    const tree = await getYandexCategoryTree(context, storeId || "");
+    if (yandexCatZhJob.running) return res.json({ success: true, job: { running: true, done: yandexCatZhJob.done, total: yandexCatZhJob.total } });
+    yandexCatZhJob.finishedAt = 0;
+    yandexCatZhJob.startedAt = 0;
+    runYandexCatZhJob(req.user.id, tree).catch((e) => console.warn("[yandex-cat-zh] 手动任务异常:", e?.message || e));
+    res.json({ success: true, job: { running: true, done: 0, total: 0 } });
+  } catch (error) { next(error); }
+});
+
 // 懒加载类目子级（带中文）
+
 app.get("/api/yandex/listing/categories/children", requireAuth, async (req, res, next) => {
   try {
     const storeId = String(req.query?.store_id || "").trim() || null;
@@ -7531,24 +7666,71 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
     const raw = draft.sourceData || {};
     const srcTitle = String(raw.title || raw["标题"] || "").slice(0, 300);
     const attrs = raw.attributes && typeof raw.attributes === "object" ? raw.attributes : (raw["商品属性"] || {});
-    const params = (draft.categoryParams || []).slice(0, 60).map((p) => ({
-      id: p.parameterId, name: p.name, nameZh: p.nameZh || "", required: p.required === true,
-      options: (p.options || []).slice(0, 25).map((o) => o.value),
+    // 类目参数：把必填/枚举信息给足，AI 才有机会填满（原来 options 只给 25 个，枚举型经常对不上）
+    const params = (draft.categoryParams || []).slice(0, 70).map((p) => ({
+      id: p.parameterId,
+      name: p.name,
+      nameZh: p.nameZh || "",
+      required: p.required === true,
+      isVariantGroup: p.groupName === true,
+      isVariantTrait: p.distinctive === true,
+      options: (p.options || []).slice(0, 40).map((o) => o.value),
     }));
-    const specList = (draft.skus || []).map((sku) => String(sku.spec || "")).filter(Boolean);
-    const payload = { 中文标题: srcTitle, 商品属性: attrs, 类目: draft.categoryName || "", 类目参数: params, 规格列表: specList, 热词提示: draft.hotwords || "" };
+    const skuList = (draft.skus || []).map((sku, i) => ({
+      i,
+      spec: String(sku.spec || "").trim(),
+      specRu: String(sku.specRu || "").trim(),
+      purchaseCny: Number(sku.purchaseCny || 0) || 0,
+    }));
+    const specList = skuList.map((s) => s.spec).filter(Boolean);
+    const firstSku = (draft.skus || [])[0] || {};
+    const dims = {
+      weightKg: Number(firstSku.weightKg || raw.weightKg || 0) || 0,
+      lengthCm: Number(firstSku.lengthCm || raw.lengthCm || 0) || 0,
+      widthCm: Number(firstSku.widthCm || raw.widthCm || 0) || 0,
+      heightCm: Number(firstSku.heightCm || raw.heightCm || 0) || 0,
+    };
+    const payload = {
+      中文标题: srcTitle,
+      商品属性: attrs,
+      "1688价格": String(raw.priceText || ""),
+      起批量: String(raw.moq || ""),
+      类目: draft.categoryName || "",
+      类目参数: params,
+      规格列表: skuList.map((s) => s.spec).filter(Boolean),
+      已有俄文规格: skuList.filter((s) => s.specRu).map((s) => s.specRu),
+      已有热词: draft.hotwords || "",
+      已采集尺寸重量: dims,
+      详情图数量: (draft.detailImages || []).length,
+    };
     const out = await callAIText(userId, {
       system: [
-        "你是 Yandex Market（俄罗斯电商）专业运营。根据中国 1688 商品信息，产出可直接上架的俄文内容。",
-        "要求：标题不超过 200 字符、突出品类+关键规格+适用场景，禁止堆砌关键词；描述 300-900 字符，分段说明卖点/规格/包装清单；tags 为 5-10 个俄文搜索词。",
-        "类目参数：只填你确有把握的（无把握的给空字符串），枚举型参数必须从给定 options 中精确选择其一。",
-        "严禁填写「变体组名」（Название группы вариантов，parameterId=200）以及标记为 distinctive 的变体特征参数 —— 这些留空。",
-        "规格列表：把每个规格名翻成简短俄文（颜色/尺寸/件数），顺序与输入一致，无法判断时保留原样。",
-        "只输出 JSON：{\"title_ru\":\"\",\"description_ru\":\"\",\"tags\":[\"\"],\"params\":{\"<parameterId>\":\"<值或选项文本>\"},\"specs_ru\":[\"\"]}",
+        "你是深耕 Yandex Market（俄罗斯）的中国跨境运营，负责把 1688 商品信息改写成俄罗斯买家真正会搜、会买的俄文内容。",
+        "",
+        "【最重要】俄语要用「买家口语」，不要官方书面语。",
+        "俄罗斯买家在搜索框里打的是口语短句，例如：для ванной, для кухни, в подарок, набор для душа, органайзер для хранения, чехол на телефон, для дачи。",
+        "标题和描述里要自然嵌入这类口语短语（读起来通顺，像俄罗斯卖家写的），而不是把中文直译成书面俄语（如 устройство для хранения 这种生硬说法）。",
+        "禁止关键词堆砌（不要把一堆词用逗号堆在标题里），禁止出现中文、拼音、1688 字样、批发/代发等国内用语。",
+        "",
+        "输出要求：",
+        "1) title_ru：不超过 200 字符，结构 = 核心品类词（含口语说法）+ 关键规格/数量 + 使用场景，读起来像人话。",
+        "2) description_ru：400~1000 字符，分 3~5 个自然段（卖点 / 规格参数 / 适用场景 / 包装清单），段内自然融入口语搜索短语。",
+        "3) hotwords：8~15 个「俄罗斯买家会真的打进搜索框的口语短语」，用英文逗号分隔成一行（例：органайзер для ванной, подарок маме, набор для хранения）。",
+        "4) tags：5~10 个单词级俄文标签。",
+        "5) params：**必须尽量填满**（这是本次重点，别只填两三条）。",
+        "   - isVariantGroup=true（变体组名）和 isVariantTrait=true（变体特征）的项**必须留空**，不要出现在结果里。",
+        "   - 有 options 的枚举型：value 必须是 options 里某个值的**完全一致文本**（大小写、标点都要一致）；能选就选，哪怕不够精确也要给一个最接近的。",
+        "   - 没有 options 的：按 1688 商品属性/标题/类目常识推断，给一个合理值。",
+        "   - 只有在该参数与商品**完全无关**时（例如把「汽车品牌」填给毛绒玩具）才留空。能推断的宁可给一个合理解释值，也不要空着。",
+        "6) specs_ru：把「规格列表」逐个翻成简短俄文（颜色/尺寸/图案/数量/款式），顺序与输入完全一致；无法判断就音译或保留原样。",
+        "7) 尺寸重量：已采集值不为 0 时**原样保留**；为 0 或缺失时，按同类商品零售包装估算（kg / cm，保留 1~3 位小数；不要给 0）。",
+        "",
+        "只输出 JSON，不要解释：",
+        '{"title_ru":"","description_ru":"","tags":[""],"hotwords":"","params":{"<parameterId>":"<值或选项文本>"},"specs_ru":[""],"weight_kg":0,"length_cm":0,"width_cm":0,"height_cm":0}',
       ].join("\n"),
       user: JSON.stringify(payload),
-      temperature: 0.3,
-      maxTokens: 3000,
+      temperature: 0.35,
+      maxTokens: 6000,
     });
     let parsed = {};
     try { parsed = JSON.parse(out) } catch (_e) {
@@ -7557,9 +7739,9 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
     }
     const nextParams = (draft.categoryParams || []).map((p) => {
       // 一期不做变体合并：绝不能填「变体组名(id 200)」或变体特征参数，
-      //   否则 Yandex 会把多个 SKU 当成同组无差异变体 →「Дубль варианта」并拒绝发布该组商品。
+      //   否则 Yandex 会把多个 SKU 当成同组无差异变体 →「Дубль вариантов」并拒绝发布该组商品。
       if (p.groupName === true || p.distinctive === true) return p;
-      const v = parsed?.params?.[p.parameterId] ?? parsed?.params?.[p.name];
+      const v = parsed?.params?.[p.parameterId] ?? parsed?.params?.[p.name] ?? parsed?.params?.[p.nameZh];
       if (v === undefined || v === null || String(v).trim() === "") return p;
       const text = String(v).trim();
       const opt = (p.options || []).find((o) => o.value.toLowerCase() === text.toLowerCase());
@@ -7567,22 +7749,94 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
     });
     // 规格名俄文（specs_ru 与输入顺序对齐）
     const specsRu = Array.isArray(parsed?.specs_ru) ? parsed.specs_ru.map((x) => String(x || "").trim()) : [];
-    const nextSkus = (draft.skus || []).map((sku, i) => (specsRu[i] ? { ...sku, specRu: specsRu[i].slice(0, 80) } : sku));
+    const aiDims = {
+      weightKg: Number(parsed?.weight_kg || 0) || 0,
+      lengthCm: Number(parsed?.length_cm || 0) || 0,
+      widthCm: Number(parsed?.width_cm || 0) || 0,
+      heightCm: Number(parsed?.height_cm || 0) || 0,
+    };
+    let specIdx = -1;
+    const nextSkus = (draft.skus || []).map((sku) => {
+      const spec = String(sku.spec || "").trim();
+      specIdx += 1;
+      const next = { ...sku };
+      const ru = specsRu[specIdx] || (spec ? "" : "");
+      if (ru && !String(sku.specRu || "").trim()) next.specRu = ru.slice(0, 120);
+      // 尺寸重量：1688 采集到的不动，只有为 0 时才用 AI 估算值补齐
+      if (!(Number(sku.weightKg) > 0) && aiDims.weightKg > 0) next.weightKg = Number(aiDims.weightKg.toFixed(3));
+      if (!(Number(sku.lengthCm) > 0) && aiDims.lengthCm > 0) next.lengthCm = Number(aiDims.lengthCm.toFixed(1));
+      if (!(Number(sku.widthCm) > 0) && aiDims.widthCm > 0) next.widthCm = Number(aiDims.widthCm.toFixed(1));
+      if (!(Number(sku.heightCm) > 0) && aiDims.heightCm > 0) next.heightCm = Number(aiDims.heightCm.toFixed(1));
+      return next;
+    });
+    // 热词：AI 生成的口语搜索短语写回「搜索热词」字段（上传时一并作为关键词使用）
+    const hotwordsOut = Array.isArray(parsed?.hotwords)
+      ? parsed.hotwords.map((x) => String(x || "").trim()).filter(Boolean).join(", ")
+      : String(parsed?.hotwords || draft.hotwords || "").trim();
     const r = await db.query(
-      `UPDATE yandex_listing_drafts SET title_ru=$2, description_ru=$3, tags=$4::jsonb, category_params=$5::jsonb, skus=$6::jsonb, ai_filled_at=now(), updated_at=now()
+      `UPDATE yandex_listing_drafts SET title_ru=$2, description_ru=$3, tags=$4::jsonb, hotwords=$7, category_params=$5::jsonb, skus=$6::jsonb, ai_filled_at=now(), updated_at=now()
        WHERE id=$1 RETURNING ${YANDEX_DRAFT_COLUMNS}`,
       [draft.id,
        String(parsed?.title_ru || draft.titleRu || "").slice(0, 500),
        String(parsed?.description_ru || draft.descriptionRu || "").slice(0, 6000),
        JSON.stringify(Array.isArray(parsed?.tags) ? parsed.tags.slice(0, 20).map(String) : draft.tags),
        JSON.stringify(nextParams),
-       JSON.stringify(nextSkus)]
+       JSON.stringify(nextSkus),
+       hotwordsOut.slice(0, 500)]
     );
-    res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]), raw: String(out).slice(0, 600) });
+    const filledParams = nextParams.filter((p) => String(p.value || "").trim()).length;
+    const filledSpecs = nextSkus.filter((s) => String(s.specRu || "").trim()).length;
+    const filledDims = nextSkus.filter((s) => Number(s.weightKg) > 0 && Number(s.lengthCm) > 0).length;
+    res.json({
+      success: true,
+      draft: dbRowToYandexDraft(r.rows[0]),
+      stats: { params: filledParams, paramsTotal: nextParams.length, specs: filledSpecs, skus: nextSkus.length, dims: filledDims },
+      raw: String(out).slice(0, 600),
+    });
   } catch (error) { next(error); }
 });
 
 // 上传到 Yandex（offer-mappings/update + offer-prices/updates）
+// Yandex 抓图是异步的：偶尔会有个别图 uploadState=FAILED（实测就是主图那张），
+// 表现就是"商品主图是空的"。上传后回查一次，失败的图重发一次让 Yandex 重新抓。
+async function verifyAndRetryYandexPictures(context, offers, { attempts = 2 } = {}) {
+  const offerIds = offers.map((o) => o.offerId).filter(Boolean);
+  if (!offerIds.length) return { ok: true, checked: 0, failed: [] };
+  const businessId = encodeURIComponent(context.businessId);
+  const byId = new Map(offers.map((o) => [o.offerId, o]));
+  let lastFailed = [];
+  for (let attempt = 0; attempt <= attempts; attempt += 1) {
+    if (attempt) await new Promise((r) => setTimeout(r, 5000));
+    let list = [];
+    try {
+      const res = await callYandexMarketAPI(`/v2/businesses/${businessId}/offer-mappings`, {
+        method: "POST", query: { language: "RU" }, body: { offerIds }, timeoutMs: 90000, apiSecret: context.apiSecret,
+      });
+      list = res?.result?.offerMappings || [];
+    } catch (e) { return { ok: lastFailed.length === 0, checked: 0, failed: lastFailed, error: String(e?.message || e).slice(0, 200) }; }
+    const pending = [];
+    lastFailed = [];
+    for (const m of list) {
+      const oid = String(m?.offer?.offerId || "");
+      if (!oid) continue;
+      const pics = Array.isArray(m?.offer?.mediaFiles?.pictures) ? m.offer.mediaFiles.pictures : [];
+      const bad = pics.filter((p) => String(p?.uploadState || "").toUpperCase() === "FAILED").map((p) => String(p?.url || "")).filter(Boolean);
+      if (bad.length) { lastFailed.push({ offerId: oid, urls: bad }); pending.push(oid); }
+    }
+    if (!pending.length) return { ok: true, checked: offerIds.length, attempts: attempt, failed: [] };
+    if (attempt >= attempts) break;
+    // 重发失败的那几个 offer（带上完整 pictures），Yandex 会重新抓取失败的图
+    try {
+      await callYandexMarketAPI(`/v2/businesses/${businessId}/offer-mappings/update`, {
+        method: "POST", query: { language: "RU" },
+        body: { offerMappings: pending.map((oid) => ({ offer: byId.get(oid) || { offerId: oid } })) },
+        timeoutMs: 90000, apiSecret: context.apiSecret,
+      });
+    } catch (_e) { /* 重发失败就等下一轮再查 */ }
+  }
+  return { ok: false, checked: offerIds.length, attempts, failed: lastFailed };
+}
+
 app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
@@ -7619,6 +7873,9 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
           });
         } catch (pe) { pricePayload = { error: String(pe?.message || pe).slice(0, 300) }; }
         const offerIds = offers.map((o) => o.offerId);
+        // 回查/重试图片抓取状态，避免出现"主图是空的"
+        let picturesResult = null;
+        try { picturesResult = await verifyAndRetryYandexPictures(context, offers); } catch (pe) { picturesResult = { ok: false, error: String(pe?.message || pe).slice(0, 200) }; }
         try {
           const nextSkus = (draft.skus || []).map((sku, i) => (offers[i] ? { ...sku, offerId: offers[i].offerId } : sku));
           await db.query(`UPDATE yandex_listing_drafts SET skus=$2::jsonb, updated_at=now() WHERE id=$1`, [id, JSON.stringify(nextSkus)]);
@@ -7640,11 +7897,11 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
         await db.query(
           `UPDATE yandex_listing_drafts SET publish_status='published', publish_error='', uploaded_at=now(), updated_at=now(),
              yandex_result=$2::jsonb WHERE id=$1`,
-          [id, JSON.stringify({ offerIds, currencyId, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, stocks: stockResult, at: new Date().toISOString() })]
+          [id, JSON.stringify({ offerIds, currencyId, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, stocks: stockResult, pictures: picturesResult, at: new Date().toISOString() })]
         );
         invalidateYandexStatusCounts(storeId);
         if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
-        results.push({ id, ok: true, offerIds, mappingStatus: mapping?.status || "OK", stocks: stockResult });
+        results.push({ id, ok: true, offerIds, mappingStatus: mapping?.status || "OK", stocks: stockResult, pictures: picturesResult });
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 800);
         await db.query(`UPDATE yandex_listing_drafts SET publish_status='failed', publish_error=$2, updated_at=now() WHERE id=$1`, [id, msg]);

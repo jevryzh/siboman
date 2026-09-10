@@ -357,6 +357,61 @@ const initApp = () => {
   register('store-management-view', window.StoreManagementView);
 
   app.mount('#app');
+  setupPluginWorkerKeepAlive();
 };
+
+// 插件 worker token 只有 15 分钟有效期，而全站此前只有「选品中心 / 单品找货」两个页面会把它推给插件。
+// 结果：在别的页面停留超过 15 分钟，插件就一直拿着过期 token 轮询（服务端 401），
+// 界面上表现为「采集器没有开始采集」。这里改成任意页面常驻续期，每 8 分钟推一次新 token。
+function setupPluginWorkerKeepAlive() {
+  const PROTO = "__zhumeng_proto";
+  const PROTO_VAL = "zhumeng-v1";
+  if (!window.__zhumeng_pending__) window.__zhumeng_pending__ = {};
+  if (!window.__zhumeng_bridge_ready__) {
+    window.__zhumeng_bridge_ready__ = true;
+    window.addEventListener("message", (event) => {
+      const d = event.data;
+      if (!d || typeof d !== "object" || d[PROTO] !== PROTO_VAL || !d.reqId) return;
+      const resolver = window.__zhumeng_pending__[d.reqId];
+      if (typeof resolver === "function") { delete window.__zhumeng_pending__[d.reqId]; resolver(d); }
+    });
+  }
+  const sendToExtension = (kind, extra = {}, timeoutMs = 8000) => new Promise((resolve) => {
+    const reqId = `${kind.split(".")[0]}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    let resolved = false;
+    window.__zhumeng_pending__[reqId] = (data) => {
+      if (resolved) return;
+      resolved = true;
+      delete window.__zhumeng_pending__[reqId];
+      resolve(data);
+    };
+    try {
+      window.postMessage({ [PROTO]: PROTO_VAL, reqId, kind, ...extra }, "*");
+    } catch (e) {
+      resolved = true; delete window.__zhumeng_pending__[reqId]; resolve({ ok: false, error: e.message }); return;
+    }
+    setTimeout(() => {
+      if (resolved) return;
+      resolved = true; delete window.__zhumeng_pending__[reqId];
+      resolve(null);
+    }, timeoutMs);
+  });
+  const refresh = async () => {
+    try {
+      const resp = await fetch("/api/worker/plugin-token", { credentials: "include", headers: { Accept: "application/json" } });
+      if (!resp.ok) return null;
+      const data = await resp.json();
+      if (!data?.token) return null;
+      const reply = await sendToExtension("workerAuth.request", { token: data.token }, 8000);
+      return reply?.ok === true ? data.token : null;
+    } catch (_e) { return null; }
+  };
+  if (!window.__zhumeng_keepalive_started__) {
+    window.__zhumeng_keepalive_started__ = true;
+    setTimeout(refresh, 1200);
+    setInterval(refresh, 8 * 60 * 1000);
+  }
+  window.__zhumengRefreshWorkerAuth__ = refresh;   // 页面可按需立即续期（如刚提交采集任务）
+}
 
 if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', initApp); } else { initApp(); }

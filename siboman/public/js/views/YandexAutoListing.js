@@ -161,23 +161,69 @@ window.YandexAutoListingView = {
     };
 
     // ===== 新增上架任务 =====
-    // 类目懒加载（展开哪级翻哪级，中俄对照显示）
-    const fetchCatChildren = async (parentId) => {
-      const res = await axios.get('/api/yandex/listing/categories/children', { params: { parent_id: parentId || 'root' }, timeout: 90000 });
-      return (res.data?.children || []).map((c) => ({ value: c.value, label: c.zh ? `${c.zh}（${c.label}）` : c.label, ruLabel: c.label, zh: c.zh || '', leaf: c.leaf, children: undefined }));
-    };
-    const catLazyProps = (target) => ({
-      lazy: true, value: 'value', label: 'label', leaf: 'leaf',
-      lazyLoad: async (node, resolve) => {
+    // 类目树：整棵一次拿完（gzip 后约 120KB）+ sessionStorage 缓存，级联框用非懒加载。
+    // 旧实现是每展开一级请求一次（每次还可能触发一次 AI 翻译，几秒），所以点一层卡一下。
+    const catTree = Vue.ref([]);
+    const catTreeMeta = Vue.reactive({ loading: false, loadedAt: 0, zhMissing: 0, zhRunning: false, zhDone: 0, zhTotal: 0 });
+    const CAT_TREE_CACHE_KEY = 'yl_cat_tree_v1';
+    const CAT_TREE_TTL_MS = 12 * 60 * 60 * 1000;
+    const loadCatTree = async (force = false) => {
+      if (!force && catTree.value.length && Date.now() - catTreeMeta.loadedAt < CAT_TREE_TTL_MS) return catTree.value;
+      if (!force && !catTree.value.length) {
         try {
-          resolve(await fetchCatChildren(node.level === 0 ? 'root' : node.value));
-          setTimeout(scrollCatPopper, 60);
-        } catch (e) {
-          notify.error('类目加载失败（可重新点开该类目）: ' + (e.response?.data?.error || e.message));
-          resolve([]);
+          const raw = sessionStorage.getItem(CAT_TREE_CACHE_KEY);
+          const j = raw ? JSON.parse(raw) : null;
+          if (Array.isArray(j?.tree) && j.tree.length) { catTree.value = j.tree; catTreeMeta.loadedAt = Number(j.at || 0); }
+        } catch (_e) { /* 缓存坏了就当没有 */ }
+      }
+      if (!force && catTree.value.length && Date.now() - catTreeMeta.loadedAt < CAT_TREE_TTL_MS) return catTree.value;
+      catTreeMeta.loading = true;
+      try {
+        const res = await axios.get('/api/yandex/listing/categories/tree', { timeout: 180000 });
+        catTree.value = res.data?.tree || [];
+        catTreeMeta.zhMissing = Number(res.data?.zh?.missing || 0);
+        catTreeMeta.zhRunning = res.data?.zh?.job?.running === true;
+        catTreeMeta.zhDone = Number(res.data?.zh?.job?.done || 0);
+        catTreeMeta.zhTotal = Number(res.data?.zh?.job?.total || 0);
+        catTreeMeta.loadedAt = Date.now();
+        try { sessionStorage.setItem(CAT_TREE_CACHE_KEY, JSON.stringify({ at: catTreeMeta.loadedAt, tree: catTree.value })); } catch (_e) { /* 超配额就算了 */ }
+      } catch (e) {
+        notify.error('读取 Yandex 类目树失败: ' + (e.response?.data?.error || e.message));
+      } finally { catTreeMeta.loading = false; }
+      return catTree.value;
+    };
+    const findCatNode = (id) => {
+      const target = String(id || ""); let hit = null;
+      const walk = (nodes) => {
+        for (const n of (nodes || [])) {
+          if (hit) return;
+          if (String(n.value) === target) { hit = n; return; }
+          if (n.children && n.children.length) walk(n.children);
         }
-      },
-    });
+      };
+      walk(catTree.value);
+      return hit;
+    };
+    // 中文（俄文）显示；还没翻译到的就只显示俄文
+    const catLabel = (node) => {
+      if (!node) return '';
+      const zh = String(node.zh || '').trim();
+      return zh ? `${zh}（${node.label}）` : String(node.label || '');
+    };
+    const catPathLabels = (path) => (path || []).map((id) => catLabel(findCatNode(id)) || String(id));
+    // 由末级 id 反推完整路径（打开老草稿时用，级联框才能显示出完整中文路径）
+    const findCatPath = (categoryId) => {
+      const target = String(categoryId || ""); const trail = [];
+      const walk = (nodes, acc) => {
+        for (const n of (nodes || [])) {
+          const next = [...acc, String(n.value)];
+          if (String(n.value) === target) { trail.push(...next); return true; }
+          if (n.children && n.children.length && walk(n.children, next)) return true;
+        }
+        return false;
+      };
+      return walk(catTree.value, []) ? trail : (target ? [target] : []);
+    };
     // 类目树最深 8 级；默认列宽会把第 5 列以后顶出视口 → 列点不到就等于"选不到末级"。
     // 展开出新一列后，把面板横向滚到最右，保证最新一列始终可见。
     const scrollCatPopper = () => {
@@ -188,34 +234,32 @@ window.YandexAutoListingView = {
         });
       });
     };
-    const taskCatProps = catLazyProps();
-    const drawerCatProps = catLazyProps();
-    // 打开已有草稿时，按 id 逐级拉出路径，让级联框能显示"中文（俄文）"
-    const buildCategoryLadder = async (categoryId) => {
-      if (!categoryId) return [];
-      const ladder = [];
-      let level = await fetchCatChildren('root').catch(() => []);
-      let guard = 0;
-      while (level.length && guard < 6) {
-        guard += 1;
-        const hit = level.find((n) => String(n.value) === String(categoryId));
-        ladder.push(...level);
-        if (hit) break;
-        level = [];
-      }
-      return ladder;
+    const catProps = { value: 'value', label: 'label', children: 'children', leaf: 'leaf', expandTrigger: 'click' };
+    const taskCatProps = catProps;
+    const drawerCatProps = catProps;
+    const loadTaskCategories = async () => { await loadCatTree(); };
+    // 后台中文翻译：翻好了自动刷新一次标签
+    let catZhTimer = null;
+    const watchCatZh = () => {
+      if (catZhTimer) return;
+      catZhTimer = setInterval(async () => {
+        try {
+          const res = await axios.get('/api/yandex/listing/categories/zh-status');
+          const job = res.data?.job || {};
+          catTreeMeta.zhRunning = job.running === true;
+          catTreeMeta.zhDone = Number(job.done || 0);
+          catTreeMeta.zhTotal = Number(job.total || 0);
+          if (!catTreeMeta.zhRunning && catTreeMeta.zhDone > 0) {
+            clearInterval(catZhTimer); catZhTimer = null;
+            await loadCatTree(true);            // 翻译阶段结束，拉一次带中文的树
+            notify.success('类目中文名翻译完成，已刷新');
+          }
+        } catch (_e) { /* 轮询失败继续 */ }
+      }, 20000);
     };
-    const loadTaskCategories = async () => {
-      if (newTaskDialog.categoryOptions.length) return;
-      try { newTaskDialog.categoryOptions = await fetchCatChildren('root'); } catch (_e) {}
-    };
-    const taskCategoryLabel = () => {
-      const labels = []; let nodes = newTaskDialog.categoryOptions;
-      for (const id of newTaskDialog.categoryPath || []) { const n = (nodes || []).find((x) => String(x.value) === String(id)); if (!n) break; labels.push(n.label); nodes = n.children || []; }
-      return labels.join(' / ');
-    };
-    const onTaskCategoryChange = () => { newTaskDialog.categoryName = taskCategoryLabel(); };
-    const openNewTask = () => { newTaskDialog.visible = true; loadTaskCategories(); newTaskDialog.urls = ''; newTaskDialog.jobId = ''; newTaskDialog.phase = ''; newTaskDialog.processed = 0; newTaskDialog.total = 0; newTaskDialog.done = false; };
+    const onTaskCategoryChange = () => { newTaskDialog.categoryName = catPathLabels(newTaskDialog.categoryPath).join(' / '); };
+    const taskCategoryLabel = () => catPathLabels(newTaskDialog.categoryPath || []).join(' / ');
+    const openNewTask = () => { newTaskDialog.visible = true; loadTaskCategories(); watchCatZh(); newTaskDialog.urls = ''; newTaskDialog.jobId = ''; newTaskDialog.phase = ''; newTaskDialog.processed = 0; newTaskDialog.total = 0; newTaskDialog.done = false; };
     const submitNewTask = async () => {
       const urls = String(newTaskDialog.urls || '').split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean);
       if (!urls.length) return notify.warning('请粘贴至少一个 1688 商品链接');
@@ -227,6 +271,7 @@ window.YandexAutoListingView = {
         newTaskDialog.jobId = jobId;
         newTaskDialog.total = Number(res.data?.total || urls.length);
         notify.success(`已提交 ${res.data?.total || urls.length} 个商品，等待本机插件采集`);
+        nudgePluginAuth();          // 立刻续 token → 插件马上来领任务
         if (jobId) pollCollectJob(jobId);
         fetchDrafts();
       } catch (e) {
@@ -289,13 +334,7 @@ window.YandexAutoListingView = {
     };
 
     // ===== 编辑属性 =====
-    const loadCategoryOptions = async () => {
-      if (drawer.categoryOptions.length) return;
-      try {
-        const res = await axios.get('/api/yandex/listing/categories', { timeout: 90000 });
-        drawer.categoryOptions = res.data?.options || [];
-      } catch (e) { notify.error('读取 Yandex 类目树失败: ' + (e.response?.data?.error || e.message)); }
-    };
+    const loadCategoryOptions = async () => { await loadCatTree(); drawer.categoryOptions = catTree.value; };
     const loadCategoryParams = async (categoryId) => {
       if (!categoryId) return;
       drawer.paramsLoading = true;
@@ -320,11 +359,11 @@ window.YandexAutoListingView = {
         d.skus = (Array.isArray(d.skus) ? d.skus : []).map((s) => ({ ...s, images: Array.isArray(s.images) ? s.images : [] }));
         drawer.draft = d;
         drawer.tagsText = (d.tags || []).join(', ');
-        drawer.categoryOptions = d.categoryId ? await buildCategoryLadder(d.categoryId) : [];
-        drawer.categoryPath = d.categoryId ? [String(d.categoryId)] : [];
         loadWarehouses();
         loadProfitDefaults();
-        await loadCategoryOptions();
+        await loadCatTree();                       // 整棵树（有缓存就是瞬时）
+        drawer.categoryPath = d.categoryId ? findCatPath(d.categoryId) : [];
+        drawer.categoryOptions = catTree.value;
         if (d.categoryId) await loadCategoryParams(d.categoryId);
         else drawer.params = [];
       } catch (e) {
@@ -332,29 +371,8 @@ window.YandexAutoListingView = {
         drawer.visible = false;
       } finally { drawer.busy = false; }
     };
-    const findCategoryPath = async (categoryId) => {
-      await loadCategoryOptions();
-      const target = String(categoryId);
-      const walk = (nodes, path) => {
-        for (const n of nodes || []) {
-          const next = [...path, n.value];
-          if (String(n.value) === target) return next;
-          if (n.children?.length) { const hit = walk(n.children, next); if (hit) return hit; }
-        }
-        return null;
-      };
-      return walk(drawer.categoryOptions, []) || [];
-    };
-    const categoryLabel = (path) => {
-      const labels = [];
-      let nodes = drawer.categoryOptions;
-      for (const id of path || []) {
-        const node = (nodes || []).find((n) => String(n.value) === String(id));
-        if (!node) break;
-        labels.push(node.label); nodes = node.children || [];
-      };
-      return labels.join(' / ');
-    };
+    const findCategoryPath = async (categoryId) => { await loadCatTree(); return findCatPath(categoryId); };
+    const categoryLabel = (path) => catPathLabels(path).join(' / ');
     const onCategoryChange = async (path) => {
       const id = String((path || []).slice(-1)[0] || '');
       if (!drawer.draft) return;
@@ -392,11 +410,16 @@ window.YandexAutoListingView = {
         const d = res.data?.draft;
         if (d) {
           drawer.draft.titleRu = d.titleRu; drawer.draft.descriptionRu = d.descriptionRu;
+          drawer.draft.hotwords = d.hotwords || drawer.draft.hotwords;
           drawer.tagsText = (d.tags || []).join(', ');
+          // 俄文规格 / SKU 尺寸重量（AI 只补 0 值）也要同步回抽屉，否则看着还是空的
+          const savedSkus = new Map((d.skus || []).map((x, i) => [Number(x._i ?? i), x]));
+          drawer.draft.skus = (drawer.draft.skus || []).map((sku, i) => ({ ...sku, ...(savedSkus.get(i) || {}) }));
           const saved = new Map((d.categoryParams || []).map((p) => [String(p.parameterId), p]));
           drawer.params = (drawer.params || []).map((p) => ({ ...p, ...(saved.get(String(p.parameterId)) || {}) }));
         }
-        notify.success('AI 填充完成，请核对后保存');
+        const st = res.data?.stats || {};
+        notify.success(`AI 填充完成：属性 ${st.params ?? 0}/${st.paramsTotal ?? 0} · 俄文规格 ${st.specs ?? 0}/${st.skus ?? 0} · 带尺寸重量 ${st.dims ?? 0}/${st.skus ?? 0}，请核对后保存`);
         fetchDrafts();
       } catch (e) { notify.error('AI 填充失败: ' + (e.response?.data?.error || e.message)); }
       finally { drawer.aiBusy = false; }
@@ -407,7 +430,11 @@ window.YandexAutoListingView = {
       if (r.ok) {
         const st = r.stocks || {};
         const stockText = st.ok ? `；库存已写入（${st.count} 条）` : `；库存未写入（${st.error || '跳过'}）`;
-        notify.success(`已上传到 Yandex：${(r.offerIds || []).join(', ')}${stockText}`);
+        const pic = r.pictures || {};
+        const picText = (pic.failed || []).length
+          ? `；⚠️ ${pic.failed.length} 个 SKU 的图片 Yandex 抓取失败（主图可能空白），已自动重发，可在 Yandex 后台刷新查看`
+          : '';
+        notify.success(`已上传到 Yandex：${(r.offerIds || []).join(', ')}${stockText}${picText}`);
       }
       else notify.error('上传失败: ' + (r.error || '未知错误'));
       fetchDrafts();
@@ -458,6 +485,36 @@ window.YandexAutoListingView = {
     };
     const addSku = () => { if (!drawer.draft) return; drawer.draft.skus = [...(drawer.draft.skus || []), { spec: '', priceRub: 0, oldPriceRub: 0, purchaseCny: 0, image: drawer.draft.images?.[0] || '', images: [], weightKg: 0.2, lengthCm: 0, widthCm: 0, heightCm: 0, stock: 0 }]; };
     const removeSku = (i) => { if (drawer.draft?.skus) drawer.draft.skus.splice(i, 1); };
+    // ===== SKU 批量编辑（价格 / 尺寸 / 重量 / 库存 / 规格图）=====
+    const skuBatch = Vue.reactive({ visible: false, selection: [], price: null, oldPrice: null, purchaseCny: null, weightKg: null, lengthCm: null, widthCm: null, heightCm: null, stock: null, image: '' });
+    const onSkuSelectionChange = (rows) => { skuBatch.selection = rows || []; };
+    const openSkuBatch = () => {
+      Object.assign(skuBatch, { visible: true, price: null, oldPrice: null, purchaseCny: null, weightKg: null, lengthCm: null, widthCm: null, heightCm: null, stock: null, image: '' });
+    };
+    const applySkuBatch = () => {
+      const all = drawer.draft?.skus || [];
+      const rows = (skuBatch.selection || []).length ? skuBatch.selection : all;
+      if (!rows.length) { notify.warning('没有可编辑的 SKU'); return; }
+      const pf = priceField(); const opf = oldPriceField();
+      const has = (v) => v !== null && v !== undefined && v !== '' && !Number.isNaN(Number(v));
+      let touched = 0;
+      for (const row of rows) {
+        let changed = false;
+        if (has(skuBatch.price)) { row[pf] = Number(skuBatch.price); changed = true; }
+        if (has(skuBatch.oldPrice)) { row[opf] = Number(skuBatch.oldPrice); changed = true; }
+        if (has(skuBatch.purchaseCny)) { row.purchaseCny = Number(skuBatch.purchaseCny); changed = true; }
+        if (has(skuBatch.weightKg)) { row.weightKg = Number(skuBatch.weightKg); changed = true; }
+        if (has(skuBatch.lengthCm)) { row.lengthCm = Number(skuBatch.lengthCm); changed = true; }
+        if (has(skuBatch.widthCm)) { row.widthCm = Number(skuBatch.widthCm); changed = true; }
+        if (has(skuBatch.heightCm)) { row.heightCm = Number(skuBatch.heightCm); changed = true; }
+        if (has(skuBatch.stock)) { row.stock = Math.max(0, Math.round(Number(skuBatch.stock))); changed = true; }
+        if (skuBatch.image) { row.image = skuBatch.image; row.images = [skuBatch.image, ...(row.images || []).filter((u) => u !== skuBatch.image)]; changed = true; }
+        if (changed) touched += 1;
+      }
+      if (!touched) { notify.warning('没有填任何要修改的值'); return; }
+      skuBatch.visible = false;
+      notify.success(`已批量更新 ${touched} 个 SKU（记得保存草稿再上传）`);
+    };
     const applyWeightToAll = () => {
       const first = drawer.draft?.skus?.[0];
       if (!first) return;
@@ -488,15 +545,32 @@ window.YandexAutoListingView = {
       } catch (_e) { /* 读不到就不提示 */ }
     };
 
-    Vue.onMounted(() => { fetchDrafts(); refreshPluginCapability(); });
+    // 立刻给插件续一次 token（会让插件马上来领任务，不用等它 30 秒轮询），再刷新在线状态
+    const nudgePluginAuth = async () => {
+      try { if (typeof window.__zhumengRefreshWorkerAuth__ === 'function') await window.__zhumengRefreshWorkerAuth__(); } catch (_e) { /* 插件不在就算了 */ }
+      await refreshPluginCapability();
+    };
+    let autoRefreshTimer = null;
+    Vue.onMounted(() => {
+      fetchDrafts();
+      refreshPluginCapability();
+      setTimeout(nudgePluginAuth, 1500);
+      // 有草稿还在等采集时，每 10 秒自动刷新列表，采集进度不用手动点刷新
+      autoRefreshTimer = setInterval(() => {
+        const waiting = (drafts.value || []).some((d) => d.collectStatus === 'pending' || d.collectStatus === 'collecting');
+        if (waiting) { fetchDrafts(); refreshPluginCapability(); }
+      }, 10000);
+    });
+    Vue.onUnmounted(() => { if (autoRefreshTimer) clearInterval(autoRefreshTimer); });
 
     return {
-      loading, saving, uploading, activeTab, drafts, total, pagination, query, notify, pluginNotice, refreshPluginCapability,
+      loading, saving, uploading, activeTab, drafts, total, pagination, query, notify, pluginNotice, refreshPluginCapability, nudgePluginAuth,
       newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories, taskCatProps, drawerCatProps, scrollCatPopper,
+      catTree, catTreeMeta, catLabel, catPathLabels, loadCatTree,
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
-      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, profit, imageSet, generateImageSet, applyImageSet, loadProfitDefaults, calcProfit, applyProfitPrices, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
+      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, skuBatch, openSkuBatch, applySkuBatch, onSkuSelectionChange, profit, imageSet, generateImageSet, applyImageSet, loadProfitDefaults, calcProfit, applyProfitPrices, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
     };
   },
 
@@ -577,18 +651,20 @@ window.YandexAutoListingView = {
           title="先选类目（必须点到带「末级」标记的那一项），再粘贴 1688 链接：一行一个（detail.1688.com/offer/xxx.html）。提交后由本机插件逐个采集，采集完直接按该类目处理。" />
         <el-form label-width="90px" size="small" style="margin-bottom:8px">
           <el-form-item label="Yandex 类目">
-            <el-cascader v-model="newTaskDialog.categoryPath" :props="taskCatProps" filterable clearable
+            <el-cascader v-model="newTaskDialog.categoryPath" :options="catTree" :props="taskCatProps"
+              filterable clearable :loading="catTreeMeta.loading"
               popper-class="yl-cat-popper" @expand-change="scrollCatPopper"
-              placeholder="请选择末级类目（中文｜俄文，采集前必选）" style="width:100%" @change="onTaskCategoryChange">
+              placeholder="可直接搜索类目（中/俄文），或逐级点到「末级」" style="width:100%" @change="onTaskCategoryChange">
               <template #default="{ node, data }">
-                <span class="yl-cat-label" :title="data.label">{{ data.label }}</span>
+                <span class="yl-cat-label" :title="catLabel(data)">{{ catLabel(data) }}</span>
                 <span v-if="node.isLeaf" class="yl-cat-leaf">末级</span>
                 <span v-else class="yl-cat-more">还有下级</span>
               </template>
             </el-cascader>
             <div class="yl-cat-tip">
-              点到带 <b>末级</b> 的那一项才会选中；右边还在冒新的一列 = 还没到底，继续点。
-              <span v-if="newTaskDialog.categoryName">已选：{{ newTaskDialog.categoryName }}</span>
+              整棵类目树一次加载完（不再逐级请求），可以在输入框里直接搜中文/俄文；点到带 <b>末级</b> 的那一项才算选好。
+              <span v-if="catTreeMeta.zhRunning"> · 中文名后台翻译中 {{ catTreeMeta.zhDone }}/{{ catTreeMeta.zhTotal }}（不影响选择）</span>
+              <span v-if="newTaskDialog.categoryName"> · 已选：{{ newTaskDialog.categoryName }}</span>
             </div>
           </el-form-item>
         </el-form>
@@ -613,11 +689,12 @@ window.YandexAutoListingView = {
               <template #header><b>基本信息</b><span style="font-size:12px; color:#94a3b8; float:right">类目必须选末级；属性随类目变化</span></template>
               <el-form label-width="90px" size="small">
                 <el-form-item label="类目">
-                  <el-cascader v-model="drawer.categoryPath" :props="drawerCatProps" filterable clearable
+                  <el-cascader v-model="drawer.categoryPath" :options="catTree" :props="drawerCatProps"
+                    filterable clearable :loading="catTreeMeta.loading"
                     popper-class="yl-cat-popper" @expand-change="scrollCatPopper"
-                    placeholder="请选择 Yandex 末级类目（中文｜俄文）" style="width:100%" @change="onCategoryChange">
+                    placeholder="可直接搜索类目（中/俄文），或逐级点到「末级」" style="width:100%" @change="onCategoryChange">
                     <template #default="{ node, data }">
-                      <span class="yl-cat-label" :title="data.label">{{ data.label }}</span>
+                      <span class="yl-cat-label" :title="catLabel(data)">{{ catLabel(data) }}</span>
                       <span v-if="node.isLeaf" class="yl-cat-leaf">末级</span>
                       <span v-else class="yl-cat-more">还有下级</span>
                     </template>
@@ -677,11 +754,13 @@ window.YandexAutoListingView = {
               <template #header>
                 <b>SKU / 价格</b>
                 <div style="float:right; display:flex; gap:8px">
+                  <el-button size="small" type="warning" plain @click="openSkuBatch">批量编辑{{ (skuBatch.selection || []).length ? '（已选 ' + skuBatch.selection.length + ' 个）' : '（全部）' }}</el-button>
                   <el-button size="small" @click="applyWeightToAll">尺寸套用到全部 SKU</el-button>
                   <el-button size="small" type="primary" plain @click="addSku">添加 SKU</el-button>
                 </div>
               </template>
-              <el-table :data="drawer.draft.skus" size="small" border>
+              <el-table :data="drawer.draft.skus" size="small" border row-key="_i" @selection-change="onSkuSelectionChange">
+                <el-table-column type="selection" width="40" />
                 <el-table-column label="#" width="46"><template #default="{ $index }">{{ $index + 1 }}</template></el-table-column>
                 <el-table-column label="首图" width="80">
                   <template #default="{ row }"><el-image v-if="row.image" :src="row.image" referrerpolicy="no-referrer" fit="cover" style="width:46px;height:46px;border-radius:4px" :preview-src-list="[row.image]" preview-teleported hide-on-click-modal /></template>
@@ -724,6 +803,38 @@ window.YandexAutoListingView = {
               </div>
               <div style="font-size:12px; color:#94a3b8; margin-top:6px">售价/划线价按店铺结算币种填写（当前 {{ currencyId }}）。Yandex 只接受店铺币种，填错会上传失败。</div>
             </el-card>
+
+      <el-dialog v-model="skuBatch.visible" title="批量编辑 SKU" width="660px" append-to-body>
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom:12px"
+          :title="(skuBatch.selection || []).length ? ('只改勾选的 ' + skuBatch.selection.length + ' 个 SKU —— 留空的字段不动') : '没有勾选任何 SKU → 改本商品全部 SKU —— 留空的字段不动'" />
+        <el-row :gutter="10">
+          <el-col :span="8"><div class="yl-batch-label">售价</div><el-input-number v-model="skuBatch.price" :min="0" :precision="2" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+          <el-col :span="8"><div class="yl-batch-label">划线价</div><el-input-number v-model="skuBatch.oldPrice" :min="0" :precision="2" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+          <el-col :span="8"><div class="yl-batch-label">采购价 ¥</div><el-input-number v-model="skuBatch.purchaseCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+        </el-row>
+        <el-row :gutter="10" style="margin-top:10px">
+          <el-col :span="6"><div class="yl-batch-label">重量 kg</div><el-input-number v-model="skuBatch.weightKg" :min="0" :precision="3" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+          <el-col :span="6"><div class="yl-batch-label">长 cm</div><el-input-number v-model="skuBatch.lengthCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+          <el-col :span="6"><div class="yl-batch-label">宽 cm</div><el-input-number v-model="skuBatch.widthCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+          <el-col :span="6"><div class="yl-batch-label">高 cm</div><el-input-number v-model="skuBatch.heightCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+        </el-row>
+        <el-row :gutter="10" style="margin-top:10px">
+          <el-col :span="6"><div class="yl-batch-label">库存</div><el-input-number v-model="skuBatch.stock" :min="0" :precision="0" :controls="false" size="small" style="width:100%" placeholder="不改" /></el-col>
+          <el-col :span="18">
+            <div class="yl-batch-label">规格图（从本商品图片里选一张，批量设为规格首图）</div>
+            <el-select v-model="skuBatch.image" clearable filterable placeholder="不改" size="small" style="width:100%">
+              <el-option v-for="(u, i) in (drawer.draft?.images || [])" :key="u" :label="'图 ' + (i + 1)" :value="u">
+                <img :src="u" referrerpolicy="no-referrer" style="width:28px;height:28px;object-fit:cover;border-radius:3px;margin-right:8px;vertical-align:middle" />
+                <span style="font-size:12px">图 {{ i + 1 }}</span>
+              </el-option>
+            </el-select>
+          </el-col>
+        </el-row>
+        <template #footer>
+          <el-button @click="skuBatch.visible = false">取消</el-button>
+          <el-button type="primary" @click="applySkuBatch">应用到 {{ (skuBatch.selection || []).length ? skuBatch.selection.length + ' 个勾选 SKU' : '全部 SKU' }}</el-button>
+        </template>
+      </el-dialog>
 
             <el-card shadow="never" style="margin-bottom:14px">
               <template #header>

@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.121";
-    const PLUGIN_ZIP_VERSION = "2.2.9.121";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.122";
+    const PLUGIN_ZIP_VERSION = "2.2.9.122";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');

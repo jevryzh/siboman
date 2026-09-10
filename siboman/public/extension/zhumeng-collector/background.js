@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.121";
+const VERSION = "2.2.9.122";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1189,15 +1189,46 @@ function extract1688ListingMedia() {
   )).map((img) => img.currentSrc || img.src || img.getAttribute("data-src") || "")
     .filter((u) => /^https?:/i.test(u) && /(alicdn|1688)/i.test(u))).slice(0, 40);
 
+  // SKU 规格图：内联 skuProps（规格值→图）优先，DOM 缩略图兜底
+  const specImageMap = {};
+  try {
+    const props = extractInline("skuProps", true) || extractInline("skuProp", true) || extractInline("skuPropsMap", true) || [];
+    for (const prop of (Array.isArray(props) ? props : [])) {
+      for (const val of (prop?.value || prop?.values || [])) {
+        const name = clean(val?.name || val?.value || val?.specAttrs || "");
+        const img = String(val?.imageUrl || val?.image || val?.skuImageURI || val?.fullPathImageURI || val?.imageURI || "").trim();
+        if (name && img) specImageMap[name] = img;
+      }
+    }
+  } catch (_e) { /* 拿不到就算了 */ }
+  const domSpecImage = (spec) => {
+    if (!spec) return "";
+    try {
+      for (const img of Array.from(document.querySelectorAll("img"))) {
+        const u = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+        if (!u || !/(alicdn|1688)/i.test(u)) continue;
+        const box = img.closest("li, button, label, span, div");
+        const text = clean(box?.innerText || img.alt || img.title || "");
+        if (text && text.includes(spec) && text.length <= spec.length + 24) return u;
+      }
+    } catch (_e) { /* 忽略 */ }
+    return "";
+  };
   // SKU：规格 + 价格 + 库存 + SKU 图
   const skuMap = extractInline("skuInfoMap", false) || {};
-  const skus = Object.entries(skuMap).map(([key, v]) => ({
-    spec: clean(v?.specAttrs || key).slice(0, 80),
-    priceCny: num(v?.price ?? v?.discountPrice ?? v?.salePrice),
-    stock: num(v?.canBookCount) || 0,
-    image: String(v?.image || v?.skuImageURI || v?.imageUrl || ""),
-    skuId: String(v?.skuId || ""),
-  })).filter((sku) => sku.spec);
+  const skus = Object.entries(skuMap).map(([key, v]) => {
+    const spec = clean(v?.specAttrs || key).slice(0, 80);
+    const rawStock = num(v?.canBookCount);
+    return {
+      spec,
+      priceCny: num(v?.price ?? v?.discountPrice ?? v?.salePrice),
+      // 1688 用 99998 表示"库存充足"，直接抄过去 ERP 就变成 99999 → 统一按 0 交回，由 ERP 落默认值
+      stock: rawStock >= 9999 ? 0 : rawStock,
+      image: String(v?.image || v?.skuImageURI || v?.imageUrl || v?.skuImage || v?.fullPathImageURI || v?.imageURI || "").trim()
+        || specImageMap[spec] || domSpecImage(spec) || "",
+      skuId: String(v?.skuId || ""),
+    };
+  }).filter((sku) => sku.spec);
 
   // 结构化商品属性（productAttributes.product_attributes 优先）
   const attributes = {};
@@ -1243,8 +1274,34 @@ function extract1688ListingMedia() {
   }
   const vendorCode = clean(attributes["货号"] || attributes["商品货号"] || attributes["型号"] || "");
   const vendOut = vendorCode;
+  // 主图视频：内联 gallery/videos → 页面 <video> → og:video
+  const videoUrl = (() => {
+    const candidates = [];
+    try {
+      const g = extractInline("gallery", false);
+      const v = g?.video || g?.videoUrl || g?.mainVideo;
+      if (typeof v === "string") candidates.push(v);
+      if (v && typeof v === "object") candidates.push(v.url || v.videoUrl || v.fullPathVideoURI || v.videoURI || "");
+    } catch (_e) { /* 忽略 */ }
+    try {
+      const vids = extractInline("videos", true);
+      if (Array.isArray(vids)) for (const v of vids) candidates.push(typeof v === "string" ? v : (v?.url || v?.videoUrl || v?.fullPathVideoURI || ""));
+    } catch (_e) { /* 忽略 */ }
+    try {
+      for (const el of Array.from(document.querySelectorAll("video"))) {
+        const src = el.currentSrc || el.src || el.getAttribute("data-src") || "";
+        if (src) candidates.push(src);
+        for (const so of Array.from(el.querySelectorAll("source"))) if (so.src) candidates.push(so.src);
+      }
+    } catch (_e) { /* 忽略 */ }
+    try {
+      const meta = document.querySelector('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"]');
+      if (meta?.content) candidates.push(meta.content);
+    } catch (_e) { /* 忽略 */ }
+    return candidates.map((u) => String(u || "").trim()).find((u) => /^https?:\/\//i.test(u) && /\.(mp4|m3u8|mov|webm)(\?|$)/i.test(u)) || "";
+  })();
   const title = clean(document.querySelector('meta[property="og:title"]')?.content || document.title).replace(/\s*[-_]\s*阿里巴巴.*$/i, "").slice(0, 200);
-  return { images, detailImages, skus, attributes, vendorCode: vendOut, title, weightGrams, lengthCm, widthCm, heightCm, url: location.href };
+  return { images, detailImages, skus, attributes, vendorCode: vendOut, title, weightGrams, lengthCm, widthCm, heightCm, videoUrl, url: location.href };
 }
 
 // Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
