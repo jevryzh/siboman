@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.118";
+const VERSION = "2.2.9.119";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1041,8 +1041,10 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
     }
     const [mediaRes] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688ListingMedia });
     const media = mediaRes?.result || {};
-    const dimsText = String(basics.dimensionsText || attrAll["包装尺寸"] || attrAll["商品尺寸"] || attrAll["尺寸"] || attrText || "");
-    const dims = dimsText.match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+    // basics 提供的重量/尺寸（可能为空，后面会用属性/页面文本兜底）
+    const basicsWeightKg = Number(basics.weightGrams || 0) > 0 ? Number(basics.weightGrams) / 1000 : 0;
+    const dimsMatch = String(basics.dimensionsText || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+    const dims = dimsMatch;
     // 属性过滤：只要像「商品参数」的（键含中文、短、非【说明】、非 SKU 规格行、值不是纯数字串）
     const attributes = {};
     const specSet = new Set((media.skus || []).map((s2) => String(s2.spec || "")));
@@ -1069,13 +1071,13 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
     const attrText2 = Object.entries(attributes).map(([k, v]) => `${k}:${v}`).join(" ");
     const weightSource = [basics.weightText, attrText2, pageText].filter(Boolean).join(" ");
     const wm2 = String(weightSource).match(/(?:包装重量|发货重量|商品重量|产品重量|毛重|净重|重量)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克)/i);
-    const finalWeightKg = weightKg > 0
-      ? weightKg
+    const finalWeightKg = basicsWeightKg > 0
+      ? basicsWeightKg
       : (wm2 ? (/^(kg|公斤|千克)$/i.test(wm2[2]) ? Number(wm2[1]) : Number(wm2[1]) / 1000) : 0);
     const dm2 = String([basics.dimensionsText, attrText2, pageText].filter(Boolean).join(" "))
       .match(/(?:包装尺寸|商品尺寸|产品尺寸|尺寸)\s*[:：]?\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
     const finalDims = dims ? [Number(dims[1]) || 0, Number(dims[2]) || 0, Number(dims[3]) || 0] : (dm2 ? [Number(dm2[1]) || 0, Number(dm2[2]) || 0, Number(dm2[3]) || 0] : [0, 0, 0]);
-    if (job) job.logs.push(makeLog(`货号采集 汇总：重量=${finalWeightKg}kg 尺寸=${finalDims.join("x")} 来源=${weightKg > 0 ? "basics" : (finalWeightKg > 0 ? "页面文本" : "无")}`, finalWeightKg > 0 ? "info" : "warn"));
+    if (job) job.logs.push(makeLog(`货号采集 汇总：重量=${finalWeightKg}kg 尺寸=${finalDims.join("x")} 来源=${basicsWeightKg > 0 ? "basics" : (finalWeightKg > 0 ? "页面文本" : "无")}`, finalWeightKg > 0 ? "info" : "warn"));
     const data = {
       title: String(basics.title || media.title || "").slice(0, 300),
       images: media.images || [],
