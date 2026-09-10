@@ -6237,6 +6237,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
 // 对齐熊猫 ERP「Yandex → 自动上架」：粘贴 1688 链接/Excel → 插件采集 → 选末级类目+参数 →
 // AI 俄文标题/描述 → 定价 → 一键上传（offer-mappings/update）→ 上传记录。
 const yandexListingTreeCache = new Map(); // storeKey -> { at, tree }
+const yandexListingWarehousesCache = new Map(); // storeKey -> { at, list }
 const YANDEX_LISTING_TREE_TTL_MS = 12 * 3600 * 1000;
 const YANDEX_LISTING_RATE = 12.8205; // CNY→RUB 兜底汇率（前端可覆盖）
 // 店铺结算币种：跨境店为 CNY（Yandex 会拒绝非店铺币种，实测推 RUB 报 Illegal input at basicPrice.currencyId）
@@ -6360,7 +6361,7 @@ function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING_RATE,
       .map((u) => String(u || "").trim()).filter(Boolean).filter((u, i, arr) => arr.indexOf(u) === i).slice(0, 30);
     const offer = {
       offerId: String(sku.offerId || (skus.length > 1 ? `${draft.vendorCode || String(draft.id).slice(0, 8)}-${index + 1}` : (draft.vendorCode || String(draft.id).slice(0, 8)))),
-      name: String((skus.length > 1 && sku.spec) ? `${draft.titleRu} ${sku.spec}` : draft.titleRu).slice(0, 255),
+      name: String((skus.length > 1 && (sku.specRu || sku.spec)) ? `${draft.titleRu} ${sku.specRu || sku.spec}` : draft.titleRu).slice(0, 255),
       description: String(draft.descriptionRu || "").slice(0, 3000),
       vendor: draft.brand || "Нет бренда",
       marketCategoryId: Number(draft.categoryId),
@@ -6445,6 +6446,44 @@ async function applyYandexCollectResults(job, results, userId) {
   }
   return applied;
 }
+
+// 店铺仓库列表（写库存要用 partnerWarehouseId）
+async function getYandexListingWarehouses(context) {
+  const storeKey = context.storeId || "__env__";
+  const cached = yandexListingWarehousesCache.get(storeKey);
+  if (cached && Date.now() - cached.at < YANDEX_LISTING_TREE_TTL_MS) return cached.list;
+  const payload = await callYandexMarketAPI(`/v3/businesses/${encodeURIComponent(context.businessId)}/warehouses`, {
+    method: "POST", query: { language: "RU" }, body: {}, timeoutMs: 60000, apiSecret: context.apiSecret,
+  });
+  const list = (payload?.result?.warehouses || []).map((w) => ({
+    id: String(w?.partnerWarehouseId ?? w?.id ?? ""),
+    name: String(w?.name || ""),
+    campaignId: String(w?.campaignId || ""),
+    active: w?.isActive !== false,
+  })).filter((w) => w.id);
+  yandexListingWarehousesCache.set(storeKey, { at: Date.now(), list });
+  return list;
+}
+
+// 写库存（v3 主体级，适用于无仓库组的店铺）
+async function updateYandexListingStocks(context, items) {
+  const skuItems = (Array.isArray(items) ? items : [])
+    .filter((it) => it && it.offerId && it.warehouseId && Number(it.count) >= 0)
+    .map((it) => ({ sku: String(it.offerId), partnerWarehouseId: Number(it.warehouseId), count: Math.max(0, Math.floor(Number(it.count))), updatedAt: new Date().toISOString() }));
+  if (!skuItems.length) return { ok: false, skipped: true, error: "没有可写的库存（缺仓库或数量）" };
+  const payload = await callYandexMarketAPI(`/v3/businesses/${encodeURIComponent(context.businessId)}/offers/stocks/update`, {
+    method: "POST", body: { skuItems }, timeoutMs: 90000, apiSecret: context.apiSecret,
+  });
+  return { ok: payload?.status === "OK", status: payload?.status || "", raw: payload?.raw || null, count: skuItems.length };
+}
+
+app.get("/api/yandex/listing/warehouses", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    res.json({ success: true, warehouses: await getYandexListingWarehouses(context), currencyId: YANDEX_LISTING_CURRENCY });
+  } catch (error) { next(error); }
+});
 
 // 类目树
 app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) => {
@@ -6581,13 +6620,15 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
       id: p.parameterId, name: p.name, nameZh: p.nameZh || "", required: p.required === true,
       options: (p.options || []).slice(0, 25).map((o) => o.value),
     }));
-    const payload = { 中文标题: srcTitle, 商品属性: attrs, 类目: draft.categoryName || "", 类目参数: params, 热词提示: draft.hotwords || "" };
+    const specList = (draft.skus || []).map((sku) => String(sku.spec || "")).filter(Boolean);
+    const payload = { 中文标题: srcTitle, 商品属性: attrs, 类目: draft.categoryName || "", 类目参数: params, 规格列表: specList, 热词提示: draft.hotwords || "" };
     const out = await callAIText(userId, {
       system: [
         "你是 Yandex Market（俄罗斯电商）专业运营。根据中国 1688 商品信息，产出可直接上架的俄文内容。",
         "要求：标题不超过 200 字符、突出品类+关键规格+适用场景，禁止堆砌关键词；描述 300-900 字符，分段说明卖点/规格/包装清单；tags 为 5-10 个俄文搜索词。",
         "类目参数：只填你确有把握的（无把握的给空字符串），枚举型参数必须从给定 options 中精确选择其一。",
-        "只输出 JSON：{\"title_ru\":\"\",\"description_ru\":\"\",\"tags\":[\"\"],\"params\":{\"<parameterId>\":\"<值或选项文本>\"}}",
+        "规格列表：把每个规格名翻成简短俄文（颜色/尺寸/件数），顺序与输入一致，无法判断时保留原样。",
+        "只输出 JSON：{\"title_ru\":\"\",\"description_ru\":\"\",\"tags\":[\"\"],\"params\":{\"<parameterId>\":\"<值或选项文本>\"},\"specs_ru\":[\"\"]}",
       ].join("\n"),
       user: JSON.stringify(payload),
       temperature: 0.3,
@@ -6605,14 +6646,18 @@ app.post("/api/yandex/listing/drafts/:id/ai-fill", requireAuth, async (req, res,
       const opt = (p.options || []).find((o) => o.value.toLowerCase() === text.toLowerCase());
       return opt ? { ...p, valueId: opt.id, value: opt.value } : { ...p, value: text };
     });
+    // 规格名俄文（specs_ru 与输入顺序对齐）
+    const specsRu = Array.isArray(parsed?.specs_ru) ? parsed.specs_ru.map((x) => String(x || "").trim()) : [];
+    const nextSkus = (draft.skus || []).map((sku, i) => (specsRu[i] ? { ...sku, specRu: specsRu[i].slice(0, 80) } : sku));
     const r = await db.query(
-      `UPDATE yandex_listing_drafts SET title_ru=$2, description_ru=$3, tags=$4::jsonb, category_params=$5::jsonb, ai_filled_at=now(), updated_at=now()
+      `UPDATE yandex_listing_drafts SET title_ru=$2, description_ru=$3, tags=$4::jsonb, category_params=$5::jsonb, skus=$6::jsonb, ai_filled_at=now(), updated_at=now()
        WHERE id=$1 RETURNING ${YANDEX_DRAFT_COLUMNS}`,
       [draft.id,
        String(parsed?.title_ru || draft.titleRu || "").slice(0, 500),
        String(parsed?.description_ru || draft.descriptionRu || "").slice(0, 6000),
        JSON.stringify(Array.isArray(parsed?.tags) ? parsed.tags.slice(0, 20).map(String) : draft.tags),
-       JSON.stringify(nextParams)]
+       JSON.stringify(nextParams),
+       JSON.stringify(nextSkus)]
     );
     res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]), raw: String(out).slice(0, 600) });
   } catch (error) { next(error); }
@@ -6655,14 +6700,27 @@ app.post("/api/yandex/listing/upload", requireAuth, async (req, res, next) => {
           });
         } catch (pe) { pricePayload = { error: String(pe?.message || pe).slice(0, 300) }; }
         const offerIds = offers.map((o) => o.offerId);
+        // 库存：Yandex FBS 必须传库存才会从 NO_STOCKS 变可售（v3 主体级，无仓库组时使用）
+        let stockResult = null;
+        try {
+          let warehouseId = String(req.body?.warehouseId || "").trim();
+          if (!warehouseId) {
+            const warehouses = await getYandexListingWarehouses(context).catch(() => []);
+            warehouseId = warehouses[0]?.id || "";
+          }
+          const stockItems = offers.map((o, i) => ({ offerId: o.offerId, warehouseId: String(draft.skus?.[i]?.warehouseId || warehouseId), count: Number(draft.skus?.[i]?.stock || 0) }));
+          const hasStock = stockItems.some((it) => Number(it.count) > 0);
+          if (warehouseId && hasStock) stockResult = await updateYandexListingStocks(context, stockItems);
+          else stockResult = { ok: false, skipped: true, error: warehouseId ? "SKU 库存都为 0，未写库存" : "店铺没有可用仓库，未写库存" };
+        } catch (se) { stockResult = { ok: false, error: String(se?.message || se).slice(0, 300) }; }
         await db.query(
           `UPDATE yandex_listing_drafts SET publish_status='published', publish_error='', uploaded_at=now(), updated_at=now(),
              yandex_result=$2::jsonb WHERE id=$1`,
-          [id, JSON.stringify({ offerIds, currencyId, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, at: new Date().toISOString() })]
+          [id, JSON.stringify({ offerIds, currencyId, mapping: mapping?.result || mapping || null, prices: pricePayload?.result || pricePayload || null, stocks: stockResult, at: new Date().toISOString() })]
         );
         invalidateYandexStatusCounts(storeId);
         if (storeId) invalidateYandexAllOffersCache(storeId); else invalidateYandexAllOffersCache();
-        results.push({ id, ok: true, offerIds, mappingStatus: mapping?.status || "OK" });
+        results.push({ id, ok: true, offerIds, mappingStatus: mapping?.status || "OK", stocks: stockResult });
       } catch (e) {
         const msg = String(e?.message || e).slice(0, 800);
         await db.query(`UPDATE yandex_listing_drafts SET publish_status='failed', publish_error=$2, updated_at=now() WHERE id=$1`, [id, msg]);

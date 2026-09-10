@@ -16,6 +16,8 @@ window.YandexAutoListingView = {
     // 店铺结算币种（跨境店为 CNY；Yandex 只接受店铺币种，推错会报 Illegal input at basicPrice.currencyId）
     const currencyId = Vue.ref('CNY');
     const currencySymbol = Vue.computed(() => (currencyId.value === 'CNY' ? '¥' : '₽'));
+    const warehouses = Vue.ref([]);
+    const warehouseId = Vue.ref('');
     const priceField = () => (currencyId.value === 'CNY' ? 'priceCny' : 'priceRub');
     const oldPriceField = () => (currencyId.value === 'CNY' ? 'oldPriceCny' : 'oldPriceRub');
 
@@ -38,6 +40,15 @@ window.YandexAutoListingView = {
     const publishStatusText = (s) => ({ unpublished: '未上传', uploading: '上传中', published: '已上传', failed: '上传失败' }[s] || s || '-');
     const publishStatusType = (s) => ({ unpublished: 'info', uploading: 'warning', published: 'success', failed: 'danger' }[s] || 'info');
     const firstImage = (d) => (Array.isArray(d.images) && d.images.length ? d.images[0] : (d.skus?.[0]?.image || ''));
+
+    const loadWarehouses = async () => {
+      if (warehouses.value.length) return;
+      try {
+        const res = await axios.get('/api/yandex/listing/warehouses', { timeout: 60000 });
+        warehouses.value = res.data?.warehouses || [];
+        if (!warehouseId.value && warehouses.value.length) warehouseId.value = warehouses.value[0].id;
+      } catch (_e) { /* 仓库读取失败不阻塞 */ }
+    };
 
     const fetchDrafts = async () => {
       loading.value = true;
@@ -128,6 +139,7 @@ window.YandexAutoListingView = {
         drawer.draft = d;
         drawer.tagsText = (d.tags || []).join(', ');
         drawer.categoryPath = d.categoryId ? await findCategoryPath(d.categoryId) : [];
+        loadWarehouses();
         await loadCategoryOptions();
         if (d.categoryId) await loadCategoryParams(d.categoryId);
         else drawer.params = [];
@@ -206,9 +218,13 @@ window.YandexAutoListingView = {
       finally { drawer.aiBusy = false; }
     };
     const uploadOne = async (id) => {
-      const res = await axios.post('/api/yandex/listing/upload', { ids: [id] }, { timeout: 180000 });
+      const res = await axios.post('/api/yandex/listing/upload', { ids: [id], warehouseId: warehouseId.value || undefined }, { timeout: 180000 });
       const r = (res.data?.results || [])[0] || {};
-      if (r.ok) notify.success(`已上传到 Yandex：${(r.offerIds || []).join(', ')}`);
+      if (r.ok) {
+        const st = r.stocks || {};
+        const stockText = st.ok ? `；库存已写入（${st.count} 条）` : `；库存未写入（${st.error || '跳过'}）`;
+        notify.success(`已上传到 Yandex：${(r.offerIds || []).join(', ')}${stockText}`);
+      }
       else notify.error('上传失败: ' + (r.error || '未知错误'));
       fetchDrafts();
       return r;
@@ -259,7 +275,7 @@ window.YandexAutoListingView = {
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
-      addSku, removeSku, applyWeightToAll, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField,
+      addSku, removeSku, applyWeightToAll, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
     };
   },
 
@@ -419,7 +435,12 @@ window.YandexAutoListingView = {
                 <el-table-column label="首图" width="80">
                   <template #default="{ row }"><el-image v-if="row.image" :src="row.image" referrerpolicy="no-referrer" fit="cover" style="width:46px;height:46px;border-radius:4px" :preview-src-list="[row.image]" preview-teleported hide-on-click-modal /></template>
                 </el-table-column>
-                <el-table-column label="规格/颜色" min-width="140"><template #default="{ row }"><el-input v-model="row.spec" size="small" /></template></el-table-column>
+                <el-table-column label="规格（中文→俄文）" min-width="170">
+                  <template #default="{ row }">
+                    <el-input v-model="row.spec" size="small" placeholder="1688 规格" />
+                    <el-input v-model="row.specRu" size="small" placeholder="俄文规格（AI 填充/手填，上传用这个）" style="margin-top:4px" />
+                  </template>
+                </el-table-column>
                 <el-table-column label="采购 ¥" width="100"><template #default="{ row }"><el-input-number v-model="row.purchaseCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column :label="'售价 ' + currencySymbol" width="110"><template #default="{ row }"><el-input-number v-model="row[priceField()]" :min="0" :precision="currencyId === 'CNY' ? 2 : 0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column :label="'划线价 ' + currencySymbol" width="110"><template #default="{ row }"><el-input-number v-model="row[oldPriceField()]" :min="0" :precision="currencyId === 'CNY' ? 2 : 0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
@@ -430,6 +451,14 @@ window.YandexAutoListingView = {
                 <el-table-column label="库存" width="90"><template #default="{ row }"><el-input-number v-model="row.stock" :min="0" :precision="0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="操作" width="70"><template #default="{ $index }"><el-button size="small" type="danger" plain @click="removeSku($index)">删</el-button></template></el-table-column>
               </el-table>
+              <div style="display:flex; align-items:center; gap:10px; margin-top:8px; flex-wrap:wrap">
+                <span style="font-size:13px; color:#334155">写库存仓库：</span>
+                <el-select v-model="warehouseId" placeholder="选择仓库（FBS 必须写库存才可售）" style="width:260px" size="small">
+                  <el-option v-for="w in warehouses" :key="w.id" :label="w.name + ' (' + w.id + ')'" :value="w.id" />
+                </el-select>
+                <el-button size="small" @click="loadWarehouses">刷新仓库</el-button>
+                <span style="font-size:12px; color:#94a3b8">每个 SKU 的「库存」列 > 0 时，上传会一并写到该仓库（Yandex FBS 不写库存会停在 NO_STOCKS 不可售）</span>
+              </div>
               <div style="font-size:12px; color:#94a3b8; margin-top:6px">售价/划线价按店铺结算币种填写（当前 {{ currencyId }}）。Yandex 只接受店铺币种，填错会上传失败。</div>
             </el-card>
 
