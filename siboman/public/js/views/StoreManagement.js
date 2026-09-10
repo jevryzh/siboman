@@ -192,7 +192,8 @@ window.StoreManagementView = {
         await axios.patch(`/api/seller/shops/${row.id}/settings`, {
           watermark_enabled: row.watermark_enabled === true,
           watermark_text: row.watermark_text || row.name || '逐梦ERP',
-          logistics_provider: row.logistics_provider || '',
+          logistics_provider: row.logistics_provider || 'CEL',
+          last_mile_pct: Number(row.last_mile_pct ?? 3),
           last_mile_cny: Number(row.last_mile_cny || 4.68) || 4.68,
         });
         ElementPlus.ElMessage.success('店铺设置已保存');
@@ -348,16 +349,16 @@ window.StoreManagementView = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="物流商 / 尾程费" min-width="240">
+          <el-table-column label="物流商 / 尾程费率" min-width="250">
             <template #default="{ row }">
               <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap">
-                <el-input v-model="row.logistics_provider" size="small" maxlength="80" placeholder="物流商（如 CEL）"
-                  @change="saveShopSettings(row)" style="max-width:120px" />
-                <el-input-number v-model="row.last_mile_cny" size="small" :min="0" :precision="2" :step="0.5" :controls="false"
-                  @change="saveShopSettings(row)" style="width:88px" />
-                <span style="font-size:11px; color:#909399">尾程 ¥/件</span>
+                <el-input v-model="row.logistics_provider" size="small" maxlength="80" placeholder="CEL"
+                  @change="saveShopSettings(row)" style="max-width:110px" />
+                <el-input-number v-model="row.last_mile_pct" size="small" :min="0" :precision="1" :step="0.5" :controls="false"
+                  @change="saveShopSettings(row)" style="width:84px" />
+                <span style="font-size:11px; color:#909399">尾程 %（按售价）</span>
               </div>
-              <div style="font-size:11px; color:#909399; margin-top:4px">该店铺定价时用此尾程费（默认 ¥4.68），代贴单费¥3/国内运费¥5/佣金24%/广告15%/毛利35% 为全局默认</div>
+              <div style="font-size:11px; color:#909399; margin-top:4px">默认物流商 CEL、尾程按售价 3%；代贴单费¥3 / 国内运费¥5 / 佣金24%（可按类目） / 广告15% / 毛利35% / 汇率为实际值</div>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="120" fixed="right" align="center">

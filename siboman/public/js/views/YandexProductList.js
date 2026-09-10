@@ -46,7 +46,8 @@ window.YandexProductListView = {
         lengthCm: 0,
         widthCm: 0,
         heightCm: 0,
-        lastMileCny: 4.68,
+        lastMilePct: 3,   // 尾程费按售价 3%（物流商默认 CEL）
+        lastMileCny: 4.68, // 仅当 lastMilePct=0 时按固定金额
         commissionPct: 0, // 0 = 按 Yandex 官方费率表自动匹配类目佣金（手动填数则优先手动）
         acquiringPct: 3.8,
         withdrawalPct: 1.2,
@@ -473,7 +474,7 @@ window.YandexProductListView = {
         + Number(c.domesticShippingCny || 0)
         + Number(c.serviceFeeCny || 0)
         + Number(crossBorderFeeCny || 0)
-        + Number(c.lastMileCny || 0),
+        + (Number(c.lastMilePct || 0) > 0 ? 0 : Number(c.lastMileCny || 0)),
       );
     };
 
@@ -485,6 +486,7 @@ window.YandexProductListView = {
         + Number(c.withdrawalPct || 0)
         + Number(c.returnLossPct || 0)
         + Number(c.adPct || 0)
+        + Number(c.lastMilePct || 0)
       ) / 100);
     });
 
@@ -506,7 +508,7 @@ window.YandexProductListView = {
       const baseCost = Number(profitDialog.cost.purchaseCny || 0)
         + Number(profitDialog.cost.domesticShippingCny || 0)
         + Number(profitDialog.cost.serviceFeeCny || 0)
-        + Number(profitDialog.cost.lastMileCny || 0);
+        + (Number(profitDialog.cost.lastMilePct || 0) > 0 ? 0 : Number(profitDialog.cost.lastMileCny || 0));
       if (baseCost <= 0 || denominator <= 0.01) return { priceCny: 0, logistics: calcCelEconomy(0), fixedCostCny: 0 };
 
       let priceCny = roundMoney((baseCost + calcCelEconomy(0).feeCny) / denominator);
@@ -1750,6 +1752,7 @@ window.YandexProductListView = {
         const c = profitDialog.cost;
         if (!(Number(c.serviceFeeCny) > 0) || Number(c.serviceFeeCny) === 3) c.serviceFeeCny = Number(d.serviceFeeCny || c.serviceFeeCny);
         if (!(Number(c.domesticShippingCny) > 0) || Number(c.domesticShippingCny) === 5) c.domesticShippingCny = Number(d.domesticShippingCny || c.domesticShippingCny);
+        if (Number.isFinite(Number(d.lastMilePct))) c.lastMilePct = Number(d.lastMilePct);
         if (!(Number(c.lastMileCny) > 0)) c.lastMileCny = Number(d.lastMileCny || c.lastMileCny);
         if (!(Number(c.adPct) > 0)) c.adPct = Number(d.adPct || c.adPct);
         if (!(Number(c.acquiringPct) > 0)) c.acquiringPct = Number(d.acquiringPct || c.acquiringPct);
@@ -2159,7 +2162,7 @@ window.YandexProductListView = {
             <el-input-number v-model="profitDialog.cost.weightKg" :min="0" :precision="3" :step="0.01" style="width:100%" />
           </el-form-item>
           <el-form-item label="尾程费(¥)" label-position="top">
-            <el-input-number v-model="profitDialog.cost.lastMileCny" :min="0" :precision="2" :step="1" style="width:100%" />
+            <el-input-number v-model="profitDialog.cost.lastMilePct" :min="0" :precision="1" :step="0.5" style="width:100%" />
           </el-form-item>
           <el-form-item label="长(cm)" label-position="top">
             <el-input-number v-model="profitDialog.cost.lengthCm" :min="0" :precision="1" :step="1" style="width:100%" />
@@ -2221,7 +2224,7 @@ window.YandexProductListView = {
             <template #default>¥{{ currentCrossBorder.feeCny.toFixed(2) }}</template>
           </el-table-column>
           <el-table-column label="尾程费" width="100">
-            <template #default>¥{{ Number(profitDialog.cost.lastMileCny || 0).toFixed(2) }}</template>
+            <template #default>{{ Number(profitDialog.cost.lastMilePct || 0).toFixed(1) }}%{{ Number(profitDialog.cost.lastMilePct || 0) > 0 ? '' : '（固定 ¥' + Number(profitDialog.cost.lastMileCny || 0).toFixed(2) + '）' }}</template>
           </el-table-column>
           <el-table-column label="固定成本" width="110">
             <template #default>¥{{ fixedCostCny.toFixed(2) }}</template>
