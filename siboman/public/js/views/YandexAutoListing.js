@@ -169,10 +169,25 @@ window.YandexAutoListingView = {
     const catLazyProps = (target) => ({
       lazy: true, value: 'value', label: 'label', leaf: 'leaf',
       lazyLoad: async (node, resolve) => {
-        try { resolve(await fetchCatChildren(node.level === 0 ? 'root' : node.value)); }
-        catch (_e) { resolve([]); }
+        try {
+          resolve(await fetchCatChildren(node.level === 0 ? 'root' : node.value));
+          setTimeout(scrollCatPopper, 60);
+        } catch (e) {
+          notify.error('类目加载失败（可重新点开该类目）: ' + (e.response?.data?.error || e.message));
+          resolve([]);
+        }
       },
     });
+    // 类目树最深 8 级；默认列宽会把第 5 列以后顶出视口 → 列点不到就等于"选不到末级"。
+    // 展开出新一列后，把面板横向滚到最右，保证最新一列始终可见。
+    const scrollCatPopper = () => {
+      Vue.nextTick(() => {
+        document.querySelectorAll('.yl-cat-popper').forEach((pop) => {
+          const box = pop.querySelector('.el-cascader-panel') || pop;
+          try { box.scrollLeft = box.scrollWidth; } catch (_e) { /* 忽略 */ }
+        });
+      });
+    };
     const taskCatProps = catLazyProps();
     const drawerCatProps = catLazyProps();
     // 打开已有草稿时，按 id 逐级拉出路径，让级联框能显示"中文（俄文）"
@@ -206,7 +221,7 @@ window.YandexAutoListingView = {
       if (!urls.length) return notify.warning('请粘贴至少一个 1688 商品链接');
       newTaskDialog.busy = true;
       try {
-        if (!(newTaskDialog.categoryPath || []).length) return notify.warning('请先选择 Yandex 末级类目');
+        if (!(newTaskDialog.categoryPath || []).length) return notify.warning('请先选择类目：一直点到带「末级」绿色标记的那一项才算选好（右侧若还有新列，说明还没到底）');
         const res = await axios.post('/api/yandex/listing/tasks', { urls, categoryId: String(newTaskDialog.categoryPath.slice(-1)[0]), categoryName: taskCategoryLabel() }, { timeout: 120000 });
         const jobId = res.data?.jobId || '';
         newTaskDialog.jobId = jobId;
@@ -423,7 +438,7 @@ window.YandexAutoListingView = {
 
     return {
       loading, saving, uploading, activeTab, drafts, total, pagination, query, notify,
-      newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories, taskCatProps, drawerCatProps,
+      newTaskDialog, drawer, onTaskCategoryChange, loadTaskCategories, taskCatProps, drawerCatProps, scrollCatPopper,
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
@@ -502,11 +517,22 @@ window.YandexAutoListingView = {
       <!-- 新增上架任务 -->
       <el-dialog v-model="newTaskDialog.visible" title="新增上架任务（1688 商品链接）" width="640px" :close-on-click-modal="false">
         <el-alert type="info" :closable="false" show-icon style="margin-bottom:10px"
-          title="先选类目（必须末级），再粘贴 1688 链接：一行一个（detail.1688.com/offer/xxx.html）。提交后由本机插件逐个采集，采集完直接按该类目处理。" />
+          title="先选类目（必须点到带「末级」标记的那一项），再粘贴 1688 链接：一行一个（detail.1688.com/offer/xxx.html）。提交后由本机插件逐个采集，采集完直接按该类目处理。" />
         <el-form label-width="90px" size="small" style="margin-bottom:8px">
           <el-form-item label="Yandex 类目">
             <el-cascader v-model="newTaskDialog.categoryPath" :props="taskCatProps" filterable clearable
-              placeholder="请选择末级类目（中文｜俄文，采集前必选）" style="width:100%" @change="onTaskCategoryChange" />
+              popper-class="yl-cat-popper" @expand-change="scrollCatPopper"
+              placeholder="请选择末级类目（中文｜俄文，采集前必选）" style="width:100%" @change="onTaskCategoryChange">
+              <template #default="{ node, data }">
+                <span class="yl-cat-label" :title="data.label">{{ data.label }}</span>
+                <span v-if="node.isLeaf" class="yl-cat-leaf">末级</span>
+                <span v-else class="yl-cat-more">还有下级</span>
+              </template>
+            </el-cascader>
+            <div class="yl-cat-tip">
+              点到带 <b>末级</b> 的那一项才会选中；右边还在冒新的一列 = 还没到底，继续点。
+              <span v-if="newTaskDialog.categoryName">已选：{{ newTaskDialog.categoryName }}</span>
+            </div>
           </el-form-item>
         </el-form>
         <el-input v-model="newTaskDialog.urls" type="textarea" :rows="8" placeholder="https://detail.1688.com/offer/730322803810.html&#10;https://detail.1688.com/offer/802358394710.html" />
@@ -529,7 +555,14 @@ window.YandexAutoListingView = {
               <el-form label-width="90px" size="small">
                 <el-form-item label="类目">
                   <el-cascader v-model="drawer.categoryPath" :props="drawerCatProps" filterable clearable
-                    placeholder="请选择 Yandex 末级类目（中文｜俄文）" style="width:100%" @change="onCategoryChange" />
+                    popper-class="yl-cat-popper" @expand-change="scrollCatPopper"
+                    placeholder="请选择 Yandex 末级类目（中文｜俄文）" style="width:100%" @change="onCategoryChange">
+                    <template #default="{ node, data }">
+                      <span class="yl-cat-label" :title="data.label">{{ data.label }}</span>
+                      <span v-if="node.isLeaf" class="yl-cat-leaf">末级</span>
+                      <span v-else class="yl-cat-more">还有下级</span>
+                    </template>
+                  </el-cascader>
                   <div v-if="drawer.draft.categoryName" style="font-size:12px; color:#64748b; margin-top:4px">当前：{{ drawer.draft.categoryName }}</div>
                 </el-form-item>
                 <el-form-item label="商品标题">

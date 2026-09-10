@@ -112,6 +112,17 @@
       .screen-marquee span { display:inline-block; padding-left:100%; animation:screen-scroll 22s linear infinite; }
       @keyframes screen-scroll { to { transform:translateX(-100%); } }
       @media(max-width:1100px) { .screen-grid { grid-template-columns:240px 1fr; } .screen-feed { grid-column:1/-1; } .data-screen { min-height:auto; } }
+      /* Yandex 类目级联选择：类目树最深 8 级，默认列宽会把第 5 列以后顶出视口（列点不到=选不到末级）。
+         这里把每列固定 216px、面板限制在视口内并允许横向滚动，配合展开后自动滚到最右列。 */
+      .yl-cat-popper.el-cascader__dropdown { max-width: calc(100vw - 24px); }
+      .yl-cat-popper .el-cascader-panel { max-width: calc(100vw - 24px); overflow-x: auto; overflow-y: hidden; }
+      .yl-cat-popper .el-cascader-menu { flex: 0 0 216px; width: 216px; min-width: 216px; max-width: 216px; }
+      .yl-cat-popper .el-cascader-node { padding-left: 12px; padding-right: 6px; }
+      .yl-cat-popper .yl-cat-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .yl-cat-popper .yl-cat-leaf { flex: 0 0 auto; margin-left: 6px; padding: 0 5px; border-radius: 4px; font-size: 11px; font-weight: 800; color: #15803d; background: #dcfce7; }
+      .yl-cat-popper .yl-cat-more { flex: 0 0 auto; margin-left: 6px; font-size: 11px; font-weight: 800; color: #b45309; }
+      .yl-cat-tip { margin-top: 4px; font-size: 12px; color: #64748b; line-height: 1.5; }
+      .yl-cat-tip b { padding: 0 4px; border-radius: 4px; font-size: 11px; color: #15803d; background: #dcfce7; }
     </style>
   </head>
   <body>
@@ -139,8 +150,8 @@
     <script src="/js/views/SingleSourcingReview.js?v=23017"></script>
     <script src="/js/views/CollectionBox.js?v=23261"></script>
     <script src="/js/views/ProductList.js?v=23173"></script>
-    <script src="/js/views/YandexProductList.js?v=23240"></script>
-    <script src="/js/views/YandexAutoListing.js?v=23260"></script>
+    <script src="/js/views/YandexProductList.js?v=23243"></script>
+    <script src="/js/views/YandexAutoListing.js?v=23261"></script>
     <script src="/js/views/YandexInventoryManagement.js?v=23217"></script>
     <script src="/js/views/InventoryManagement.js?v=23006"></script>
     <script src="/js/views/OrderList.js?v=22964"></script>
