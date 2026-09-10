@@ -6763,7 +6763,8 @@ function yandexSuggestPrice(input = {}) {
     cel = yandexCelEconomy(price, { weightKg, dims, exchangeRate: rate });
   }
   const priceInt = Math.ceil(price); // Yandex 价格取整
-  const strikeDiscountPct = Math.max(1, Number(params.strikeDiscountPct || 0)) || 50;
+  // 修复：未传 strikeDiscountPct 时默认 50%（旧写法 Math.max(1, 0) = 1 → 划线价被算成售价的 100 倍）
+  const strikeDiscountPct = Number(params.strikeDiscountPct) > 0 ? Number(params.strikeDiscountPct) : 50;
   const strikePriceCny = Math.ceil(priceInt * 100 / strikeDiscountPct); // 划线价 = 售价 ÷ 折扣率 × 100
   const profitCny = Math.round(price * (1 - vrate) - base - cel.feeCny); // 扣除平台费率后的利润
   return { ok: true, priceCny: priceInt, zone: cel.zone, chargeKg: cel.chargeKg, celFeeCny: cel.feeCny, rubValue: Math.round(priceInt * rate), strikePriceCny, profitCny, marginPct: targetMargin, commissionUsed: commission, commissionSource: manualCommission > 0 ? "manual" : "auto" };
