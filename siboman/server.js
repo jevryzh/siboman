@@ -5109,6 +5109,14 @@ app.post("/api/yandex/research-job", requireAuth, async (req, res, next) => {
     const storeId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(rawStoreId) ? rawStoreId : null;
     const activeJob = await findActiveDbJobForUser(req.user, { kind: "yandex-research" });
     if (activeJob) {
+      // 全店插件精核价跑批期间：手动核价不要复用它的任务（更不要回落到 AlphaShop 的不可信价源）
+      if (activeJob.payload?.marker === PRECISE_JOB_MARKER || activeJob.payload?.precise === true) {
+        return res.status(409).json({
+          success: false,
+          code: "precise_running",
+          error: `本机插件正在跑「全店精核价」（${Number(activeJob.processed || 0)}/${Number(activeJob.total || 0)}），请等它跑完再单独核价；避免两批任务抢占插件。`,
+        });
+      }
       return res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, status: activeJob.status });
     }
     const queued = await createQueuedDbJob(req.user, {

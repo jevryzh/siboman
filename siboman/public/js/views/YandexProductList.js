@@ -1055,7 +1055,15 @@ window.YandexProductListView = {
         if (!jobId) throw new Error('服务端未返回任务号');
         researchDialog.jobId = jobId;
         researchDialog.pluginPhase = true;
-      } catch (_e) {
+      } catch (err) {
+        const data = (err && err.response && err.response.data) || {};
+        if (err && err.response && err.response.status === 409 && data.code === 'precise_running') {
+          // 全店精核价占着插件：明确提示并停止本轮，绝不回落到 AlphaShop（那是不可信价源）
+          researchDialog.error = data.error || '本机插件正在跑全店精核价，请等它跑完再单独核价。';
+          researchDialog.jobText = '已暂停本批核价：全店精核价进行中';
+          targets.forEach((t) => { t.message = '全店精核价进行中，稍后重试'; });
+          return 'aborted';
+        }
         researchDialog.pluginDisabled = true;
         researchDialog.jobText = '插件任务不可用，回落 AlphaShop 搜索';
         return false;
