@@ -88,10 +88,28 @@
           </div>
         </div>
         <input id="fRef" placeholder="https://... 商品主图（也可直接粘贴链接）" style="margin-top:10px" />
-        <label>只生成部分图片（不勾选 = 全部 7 张）</label>
+        <label>要生成的图片（默认 7 张全生成；取消勾选可少生成几张省钱）
+          <span style="float:right">
+            <a href="javascript:void(0)" id="keysAll">全选</a> ·
+            <a href="javascript:void(0)" id="keysNone">全不选</a>
+          </span>
+        </label>
         <div class="keys" id="keysBox"></div>
+        <div class="mono" id="keysHint" style="margin-top:8px"></div>
         <div style="margin-top:16px"><button id="submitBtn">开始出图</button>
           <span class="mono" id="submitHint" style="margin-left:12px"></span></div>
+        <div id="live" style="display:none; margin-top:16px; border:1px solid #334155; border-radius:10px; padding:14px; background:#0b1220">
+          <div style="display:flex; justify-content:space-between; gap:10px; flex-wrap:wrap; font-size:13px">
+            <b id="liveTitle">当前任务</b>
+            <span id="liveStatus" class="mono"></span>
+          </div>
+          <div style="margin-top:10px; height:8px; background:#1e293b; border-radius:99px; overflow:hidden">
+            <div id="liveBar" style="height:100%; width:0%; background:#2563eb; transition:.4s"></div>
+          </div>
+          <div class="mono" id="livePhase" style="margin-top:8px"></div>
+          <div class="thumbs" id="liveThumbs"></div>
+          <div style="margin-top:12px"><button class="ghost" id="liveCancel">取消这个任务</button></div>
+        </div>
         <div class="err" id="fErr"></div>
       </div>
 
@@ -212,9 +230,29 @@ function initRefDropzone() {
   });
 }
 
+const STATUS_ZH = { queued: '排队中', running: '生成中', done: '已完成', error: '失败', canceled: '已取消' };
+const statusZh = (s) => STATUS_ZH[s] || s || '';
+
+function selectedKeys() {
+  return Array.from(document.querySelectorAll('#keysBox input:checked')).map(x => x.value);
+}
+function updateKeysHint() {
+  const n = selectedKeys().length;
+  el('keysHint').textContent = n === 0
+    ? '⚠ 一张都没勾：这样不会生成任何图，请至少勾一张'
+    : `本次将生成 ${n} 张（预计 ${Math.max(1, Math.round(n * 1.1))} 分钟左右，一张约 60 秒）`;
+}
+function setAllKeys(checked) {
+  document.querySelectorAll('#keysBox input').forEach(x => { x.checked = checked; });
+  updateKeysHint();
+}
 function renderKeys() {
   el('keysBox').innerHTML = KEYS.map(([k, zh]) =>
-    `<label><input type="checkbox" value="${k}" />${zh}</label>`).join('');
+    `<label><input type="checkbox" value="${k}" checked />${zh}</label>`).join('');
+  document.querySelectorAll('#keysBox input').forEach(x => x.addEventListener('change', updateKeysHint));
+  el('keysAll').addEventListener('click', () => setAllKeys(true));
+  el('keysNone').addEventListener('click', () => setAllKeys(false));
+  updateKeysHint();
 }
 
 async function checkAuth() {
@@ -252,27 +290,68 @@ async function refreshHealth() {
 async function submitJob() {
   el('fErr').textContent = '';
   const ref = el('fRef').value.trim();
-  if (!ref) { el('fErr').textContent = '请填写参考图 URL'; return; }
-  const keys = Array.from(document.querySelectorAll('#keysBox input:checked')).map(x => x.value);
+  if (!ref) { el('fErr').textContent = '请先选择或粘贴一张参考图'; return; }
+  const keys = selectedKeys();
+  if (!keys.length) { el('fErr').textContent = '请至少勾选一张要生成的图片（或点「全选」生成 7 张）'; return; }
   const body = {
     platform: el('fPlatform').value,
     refImageUrl: ref,
     title: el('fTitle').value.trim(),
-    keys: keys.length ? keys : null,
+    keys: keys.length === KEYS.length ? null : keys,
   };
   el('submitBtn').disabled = true;
   el('submitHint').textContent = '提交中…';
-  const { data } = await api('/jobs', { method: 'POST', body: JSON.stringify(body) });
-  el('submitBtn').disabled = false;
-  if (!data || !data.ok) { el('fErr').textContent = (data && data.error) || '提交失败'; el('submitHint').textContent = ''; return; }
-  el('submitHint').textContent = '任务号 ' + data.jobId;
-  refreshJobs();
+  try {
+    const { data } = await api('/jobs', { method: 'POST', body: JSON.stringify(body) });
+    if (!data || !data.ok) { el('fErr').textContent = (data && data.error) || '提交失败'; el('submitHint').textContent = ''; return; }
+    el('submitHint').textContent = '任务号 ' + data.jobId;
+    watchJob(data.jobId, body.platform, keys.length);
+    refreshJobs();
+  } catch (e) {
+    el('fErr').textContent = '提交失败：' + (e.message || e) + '（若长时间无反应，请刷新页面重新登录）';
+  } finally {
+    el('submitBtn').disabled = false;   // 无论如何都要恢复，否则按钮会永久点不动
+  }
+}
+
+// ===== 当前任务面板：提交后立刻盯住它，不用去列表里找 =====
+let liveJobId = null;
+function watchJob(jobId, platform, total) {
+  liveJobId = jobId;
+  el('live').style.display = 'block';
+  el('liveTitle').textContent = `当前任务 · ${platform} · 计划 ${total} 张`;
+  el('liveStatus').textContent = '';
+  el('livePhase').textContent = '正在提交…';
+  el('liveBar').style.width = '0%';
+  el('liveThumbs').innerHTML = '';
+}
+function renderLive(job) {
+  if (!liveJobId || !job) return;
+  const imgs = job.images || [];
+  const okImgs = imgs.filter(x => x.ok && x.url);
+  const total = Number(job.total || 0);
+  const done = Number(job.processed || okImgs.length || 0);
+  el('liveStatus').textContent = statusZh(job.status) + (job.queuedAhead ? `（前面还有 ${job.queuedAhead} 个任务）` : '');
+  el('livePhase').textContent = String(job.phase || '') + (total ? `　成功 ${okImgs.length}/${total}` : '') + (job.error ? `　${job.error}` : '');
+  el('liveBar').style.width = total ? Math.round((done / total) * 100) + '%' : (job.status === 'running' ? '15%' : '0%');
+  el('liveThumbs').innerHTML = imgs.map(x => x.ok && x.url
+    ? `<a href="${x.url}" target="_blank" title="${x.label || x.key}"><img src="${x.url}" /></a>`
+    : `<div class="ph" title="${String(x.error || '生成中').replace(/"/g, '')}"></div>`).join('');
+  if (['done', 'error', 'canceled'].includes(job.status)) {
+    el('liveBar').style.width = '100%';
+    el('liveBar').style.background = job.status === 'done' ? '#16a34a' : '#dc2626';
+  }
 }
 
 let timer = null;
 async function refreshJobs() {
   const { data } = await api('/jobs');
   const list = (data && data.jobs) || [];
+  if (liveJobId) {
+    const mine = list.find(j => j.id === liveJobId);
+    if (mine) renderLive(mine);
+    else api('/jobs/' + encodeURIComponent(liveJobId)).then(({ data: d }) => d && d.job && renderLive(d.job)).catch(() => {});
+  }
   if (!list.length) { el('jobs').innerHTML = '<div class="mono">还没有任务</div>'; return; }
   el('jobs').innerHTML = list.map(j => {
     const imgs = (j.images || []);
@@ -281,7 +360,7 @@ async function refreshJobs() {
       : `<div class="ph" title="${(x.error || '').replace(/"/g, '')}"></div>`).join('');
     return `<div class="job">
       <div class="job-head">
-        <div><b>${j.platform || ''}</b> · <span class="pill${j.status === 'done' ? '' : ' bad'}">${j.status}</span>
+        <div><b>${j.platform || ''}</b> · <span class="pill${j.status === 'done' ? '' : ' bad'}">${statusZh(j.status)}</span>
           <div class="mono">${j.id}</div></div>
         <div class="mono">${j.processed || 0}/${j.total || 0} · ${(j.phase || '').slice(0, 70)}</div>
       </div>
@@ -294,6 +373,11 @@ async function refreshJobs() {
 el('lgBtn').addEventListener('click', login);
 el('lgPass').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
 el('submitBtn').addEventListener('click', submitJob);
+el('liveCancel').addEventListener('click', async () => {
+  if (!liveJobId) return;
+  await api('/jobs/' + encodeURIComponent(liveJobId) + '/cancel', { method: 'POST' }).catch(() => {});
+  el('livePhase').textContent = '已请求取消，等当前这张生成完就会停';
+});
 el('refreshBtn').addEventListener('click', () => { refreshHealth(); refreshJobs(); });
 el('logoutBtn').addEventListener('click', async () => {
   await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
@@ -304,6 +388,10 @@ initRefDropzone();
 checkAuth();
 timer = setInterval(() => { if (el('appArea').style.display !== 'none') refreshJobs(); }, 10000);
 
+el('fPlatform').addEventListener('change', () => {
+  const p = el('fPlatform').value;
+  el('submitHint').textContent = p === 'etsy' ? 'Etsy：1:1 英文' : '3:4 俄文';
+});
 const qs = new URLSearchParams(location.search);
 if (qs.get('ref')) el('fRef').value = qs.get('ref');
 if (qs.get('platform')) el('fPlatform').value = qs.get('platform');

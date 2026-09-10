@@ -30,6 +30,7 @@ const DATA_DIR = String(process.env.IMAGE_SET_DATA_DIR || "/opt/ozon/image-set-s
 
 const SIZE_BY_RATIO = { "1:1": "1024x1024", "3:4": "1024x1536", "4:3": "1536x1024", "9:16": "1024x1536", "16:9": "1536x1024" };
 
+const IMAGE_TIMEOUT_MS = Number(process.env.IMAGE_SET_IMAGE_TIMEOUT_MS || 300000);   // 单张生成上限(默认 5 分钟，实测约 55s)
 const KEEP = "IMPORTANT: keep the product EXACTLY as in the reference photo — same shape, proportions, material, colour, packaging, labels and quantity. Never redesign or replace the product. Photorealistic commercial product photography, high detail, sharp focus.";
 const RULES = {
   ru: "Russian marketplace listing image, professional e-commerce style, cinematic lighting, ALL text in Russian only (correct spelling, modern clean Cyrillic sans-serif, well spaced, never covering the product). No Chinese characters, no watermark.",
@@ -68,13 +69,58 @@ function saveJob(job) {
 }
 function loadJobs() {
   try {
+    let interrupted = 0;
     for (const f of fs.readdirSync(DATA_DIR)) {
       if (!f.endsWith(".json")) continue;
       const job = JSON.parse(fs.readFileSync(path.join(DATA_DIR, f), "utf8"));
+      // 进程重启时还在跑的任务不可能自己恢复（生成请求已随进程断开），标成失败让用户能重试
+      if (job.status === "running" || job.status === "queued") {
+        job.status = "error";
+        job.phase = "服务重启，任务已中断";
+        job.error = "出图服务重启，该任务已中断，请重新提交";
+        job.updatedAt = new Date().toISOString();
+        saveJob(job);
+        interrupted += 1;
+      }
       jobs.set(job.id, job);
     }
-    log(`已恢复 ${jobs.size} 个历史任务`);
+    log(`已恢复 ${jobs.size} 个历史任务${interrupted ? `（其中 ${interrupted} 个中断任务已标记失败）` : ""}`);
   } catch { /* 首次运行无数据 */ }
+}
+
+// ===== 出图串行队列 =====
+// 实测：TokenDun 同一 key 并发提交时，第二个请求会被网关挂住（连接一直 ESTABLISHED、
+//   既不返回也不报错），任务就永远停在“生成中”。所以这里强制一次只跑一个任务。
+const pendingQueue = [];
+let workerBusy = false;
+
+function queuedAhead(job) {
+  const idx = pendingQueue.indexOf(job);
+  return idx < 0 ? 0 : idx + (workerBusy ? 1 : 0);
+}
+function refreshQueuePhases() {
+  for (const q of pendingQueue) {
+    if (q.status !== "queued") continue;
+    const ahead = queuedAhead(q);
+    q.queuedAhead = ahead;
+    q.phase = ahead > 0 ? `排队中（前面还有 ${ahead} 个任务）` : "排队中，即将开始";
+    saveJob(q);
+  }
+}
+function enqueueJob(job) {
+  pendingQueue.push(job);
+  job.status = "queued";
+  refreshQueuePhases();
+  pumpQueue();
+}
+async function pumpQueue() {
+  if (workerBusy) return;
+  const job = pendingQueue.shift();
+  if (!job) return;
+  workerBusy = true;
+  refreshQueuePhases();
+  try { await runJob(job); } catch (e) { log("任务异常:", e?.message || e); }
+  finally { workerBusy = false; refreshQueuePhases(); pumpQueue(); }
 }
 
 function postMultipart(urlStr, { fields, fileField, fileBuf, fileName, fileType }) {
@@ -88,9 +134,9 @@ function postMultipart(urlStr, { fields, fileField, fileBuf, fileName, fileType 
     const body = Buffer.concat(chunks);
     const u = new URL(urlStr);
     const req = https.request({ host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: "POST",
-      headers: { Authorization: `Bearer ${TOKENDUN_KEY}`, "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": body.length }, timeout: 600000 },
+      headers: { Authorization: `Bearer ${TOKENDUN_KEY}`, "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": body.length }, timeout: IMAGE_TIMEOUT_MS },
       (res) => { const parts = []; res.on("data", (c) => parts.push(c)); res.on("end", () => resolve({ status: res.statusCode, text: Buffer.concat(parts).toString("utf8") })); });
-    req.on("timeout", () => req.destroy(new Error("TokenDun 超时")));
+    req.on("timeout", () => req.destroy(new Error(`TokenDun 单张超时（${Math.round(IMAGE_TIMEOUT_MS / 60000)} 分钟）`)));
     req.on("error", reject);
     req.write(body); req.end();
   });
@@ -123,6 +169,9 @@ async function generateOne(prompt, ref, size) {
 
 async function runJob(job) {
   job.status = "running";
+  job.queuedAhead = 0;
+  job.phase = "开始生成";
+  saveJob(job);
   try {
     const preset = PLATFORMS[job.platform] || PLATFORMS.yandex;
     const ratio = job.ratio || preset.ratio;
@@ -189,7 +238,7 @@ function sniffImageType(buf) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
-    if (url.pathname === "/health") return json(res, 200, { ok: true, service: "image-set", tokendunConfigured: Boolean(TOKENDUN_KEY), model: TOKENDUN_MODEL, base: TOKENDUN_BASE, platforms: Object.keys(PLATFORMS), jobs: jobs.size });
+    if (url.pathname === "/health") return json(res, 200, { ok: true, service: "image-set", tokendunConfigured: Boolean(TOKENDUN_KEY), model: TOKENDUN_MODEL, base: TOKENDUN_BASE, platforms: Object.keys(PLATFORMS), jobs: jobs.size, queued: pendingQueue.length, busy: workerBusy });
     const key = String(req.headers["x-api-key"] || (req.headers.authorization || "").replace(/^Bearer\s+/i, ""));
     if (API_KEY && key !== API_KEY) return json(res, 401, { ok: false, error: "invalid api key" });
     if (req.method === "POST" && url.pathname === "/upload") {
@@ -213,8 +262,8 @@ const server = http.createServer(async (req, res) => {
         ratio: body.ratio || "", language: body.language || "", status: "queued", phase: "排队中", images: [], processed: 0, total: 0,
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
       jobs.set(job.id, job); saveJob(job);
-      setTimeout(() => runJob(job), 20);
-      return json(res, 200, { ok: true, jobId: job.id, total: TEMPLATES.length });
+      enqueueJob(job);
+      return json(res, 200, { ok: true, jobId: job.id, total: (Array.isArray(job.keys) && job.keys.length) ? job.keys.length : TEMPLATES.length, queuedAhead: queuedAhead(job) });
     }
     if (req.method === "GET" && url.pathname === "/jobs") {
       const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 30)));
