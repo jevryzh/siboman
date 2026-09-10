@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.120";
+const VERSION = "2.2.9.121";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1092,12 +1092,15 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
     const attrText2 = Object.entries(attributes).map(([k, v]) => `${k}:${v}`).join(" ");
     const weightSource = [basics.weightText, attrText2, pageText].filter(Boolean).join(" ");
     const wm2 = String(weightSource).match(/(?:包装重量|发货重量|商品重量|产品重量|毛重|净重|重量)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克)/i);
+    const mediaWeightKg = Number(media.weightGrams || 0) > 0 ? Number(media.weightGrams) / 1000 : 0;
     const finalWeightKg = basicsWeightKg > 0
       ? basicsWeightKg
-      : (wm2 ? (/^(kg|公斤|千克)$/i.test(wm2[2]) ? Number(wm2[1]) : Number(wm2[1]) / 1000) : 0);
+      : (mediaWeightKg > 0 ? mediaWeightKg : (wm2 ? (/^(kg|公斤|千克)$/i.test(wm2[2]) ? Number(wm2[1]) : Number(wm2[1]) / 1000) : 0));
     const dm2 = String([basics.dimensionsText, attrText2, pageText].filter(Boolean).join(" "))
       .match(/(?:包装尺寸|商品尺寸|产品尺寸|尺寸)\s*[:：]?\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
-    const finalDims = dims ? [Number(dims[1]) || 0, Number(dims[2]) || 0, Number(dims[3]) || 0] : (dm2 ? [Number(dm2[1]) || 0, Number(dm2[2]) || 0, Number(dm2[3]) || 0] : [0, 0, 0]);
+    const mediaDims = [Number(media.lengthCm || 0), Number(media.widthCm || 0), Number(media.heightCm || 0)];
+    const finalDims = dims ? [Number(dims[1]) || 0, Number(dims[2]) || 0, Number(dims[3]) || 0]
+      : (mediaDims.every((v) => v > 0) ? mediaDims : (dm2 ? [Number(dm2[1]) || 0, Number(dm2[2]) || 0, Number(dm2[3]) || 0] : [0, 0, 0]));
     if (job) job.logs.push(makeLog(`货号采集 汇总：重量=${finalWeightKg}kg 尺寸=${finalDims.join("x")} 来源=${basicsWeightKg > 0 ? "basics" : (finalWeightKg > 0 ? "页面文本" : "无")}`, finalWeightKg > 0 ? "info" : "warn"));
     const data = {
       title: String(basics.title || media.title || "").slice(0, 300),
@@ -1217,9 +1220,31 @@ function extract1688ListingMedia() {
     attributes[k] = v;
   }
 
+  // 包装重量/尺寸：部分 1688 页面 window.context 未初始化，需直接从内联 JSON 里取（pieceWeightScale/productPackInfo）
+  const packInfo = extractInline("productPackInfo", false) || {};
+  const scale = extractInline("pieceWeightScaleInfo", true) || extractInline("pieceWeightScale", false) || {};
+  const scaleItem = (Array.isArray(scale) && scale.length ? scale[0] : (scale?.pieceWeightScaleInfo?.[0] || scale || {})) || {};
+  const colList = Array.isArray(scale?.columnList) ? scale.columnList : [];
+  const pickCol = (re) => {
+    const col = colList.find((c) => re.test(clean(c?.label || c?.title || c?.name)));
+    return col ? clean(col.name || col.field || col.key) : "";
+  };
+  const numOf = (v) => { const n = Number(String(v ?? "").replace(/[^\d.]/g, "")); return Number.isFinite(n) && n > 0 ? n : 0; };
+  const weightRaw = scaleItem[pickCol(/重|weight/i)] ?? scaleItem.weight ?? scaleItem.unitWeight ?? scaleItem.grossWeight ?? packInfo.unitWeight ?? packInfo.grossWeight ?? packInfo.weight ?? "";
+  let weightGrams = numOf(weightRaw);
+  if (weightGrams > 0 && weightGrams < 100) weightGrams = Math.round(weightGrams * 1000); // 单位是 kg
+  const lengthCm = numOf(scaleItem[pickCol(/长|length/i)] ?? scaleItem.length ?? packInfo.length ?? packInfo.packageLength);
+  const widthCm = numOf(scaleItem[pickCol(/宽|width/i)] ?? scaleItem.width ?? packInfo.width ?? packInfo.packageWidth);
+  const heightCm = numOf(scaleItem[pickCol(/高|height/i)] ?? scaleItem.height ?? packInfo.height ?? packInfo.packageHeight);
+  if (!weightGrams) {
+    const blob = Array.from(document.querySelectorAll("script")).map((n) => n.textContent || "").find((t) => /包装重量|"weight"\s*:/.test(t)) || "";
+    const m3 = blob.match(/"weight"\s*:\s*"?([\d.]+)"?/);
+    if (m3) { const w = Number(m3[1]); weightGrams = w > 0 ? (w < 100 ? Math.round(w * 1000) : Math.round(w)) : 0; }
+  }
   const vendorCode = clean(attributes["货号"] || attributes["商品货号"] || attributes["型号"] || "");
+  const vendOut = vendorCode;
   const title = clean(document.querySelector('meta[property="og:title"]')?.content || document.title).replace(/\s*[-_]\s*阿里巴巴.*$/i, "").slice(0, 200);
-  return { images, detailImages, skus, attributes, vendorCode, title, url: location.href };
+  return { images, detailImages, skus, attributes, vendorCode: vendOut, title, weightGrams, lengthCm, widthCm, heightCm, url: location.href };
 }
 
 // Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
