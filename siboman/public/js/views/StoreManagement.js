@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.117";
-    const PLUGIN_ZIP_VERSION = "2.2.9.117";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.118";
+    const PLUGIN_ZIP_VERSION = "2.2.9.118";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -427,6 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.118 修复上架采集兜底代码的引用顺序错误（Cannot access attrAll before initialization）并改为直接从页面参数表文本解析包装重量/尺寸。</li>
             <li>✅ v2.2.9.117 上架采集补诊断与兜底：打印每次 basics 注入结果（标题/重量/尺寸/异常），basics 取不到时从商品属性与页面文本兜底解析包装重量/尺寸（旧版这两项为空会拦住上架校验）。</li>
             <li>✅ v2.2.9.116 上架采集补齐包装重量/尺寸：1688 的包装信息比标题晚加载，旧逻辑只等 2-3 秒导致重量尺寸为空（上传被拦）；现在缺失时滚动触发懒加载并重试最多 3 次。</li>
             <li>✅ v2.2.9.115 修复 Yandex 上架图片地址失效：采集时误把 1688 图片 URL 的 _!!<卖家id>-0-cib.jpg 后缀一起裁掉，导致 Yandex 报「Нет изображения 无图片无法开卖」；现在只裁末尾尺寸后缀、保留原图地址。</li>

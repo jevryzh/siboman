@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.117";
+const VERSION = "2.2.9.118";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1058,17 +1058,24 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
       if (/^\d+([\s.]\d+)*$/.test(value)) continue;
       attributes[key] = value;
     }
-    // 兜底：basics 取不到包装重量/尺寸时，从（属性/页面文本）里再解析一次
-    const attrAll = { ...(media.attributes || {}), ...(basics.detailAttributes || {}) };
-    const attrText = Object.entries(attrAll).map(([k, v]) => `${k}:${v}`).join(" ");
-    const weightText = [basics.weightText, attrAll["包装重量"], attrAll["发货重量"], attrAll["商品重量"], attrAll["重量"], attrText].filter(Boolean).join(" ");
-    const wm = String(weightText).match(/(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克)\b/i);
-    const weightKg = Number(basics.weightGrams || 0) > 0
-      ? Number(basics.weightGrams) / 1000
-      : (wm ? (/^(kg|公斤|千克)$/i.test(wm[2]) ? Number(wm[1]) : Number(wm[1]) / 1000) : 0);
     const skus = (Array.isArray(media.skus) && media.skus.length)
       ? media.skus
       : [{ spec: "", priceCny: Number((basics.price || "").replace(/[^\d.]/g, "")) || 0, stock: 0, image: (media.images || [])[0] || "" }];
+    // 兜底：basics/属性都拿不到包装重量/尺寸时，直接从页面可见文本里解析（1688 商品参数表里通常有「包装重量/包装尺寸」）
+    const pageText = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => (document.body?.innerText || "").replace(/\s+/g, " ").slice(0, 20000),
+    }).then((r) => r?.[0]?.result || "").catch(() => "");
+    const attrText2 = Object.entries(attributes).map(([k, v]) => `${k}:${v}`).join(" ");
+    const weightSource = [basics.weightText, attrText2, pageText].filter(Boolean).join(" ");
+    const wm2 = String(weightSource).match(/(?:包装重量|发货重量|商品重量|产品重量|毛重|净重|重量)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克)/i);
+    const finalWeightKg = weightKg > 0
+      ? weightKg
+      : (wm2 ? (/^(kg|公斤|千克)$/i.test(wm2[2]) ? Number(wm2[1]) : Number(wm2[1]) / 1000) : 0);
+    const dm2 = String([basics.dimensionsText, attrText2, pageText].filter(Boolean).join(" "))
+      .match(/(?:包装尺寸|商品尺寸|产品尺寸|尺寸)\s*[:：]?\s*([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+    const finalDims = dims ? [Number(dims[1]) || 0, Number(dims[2]) || 0, Number(dims[3]) || 0] : (dm2 ? [Number(dm2[1]) || 0, Number(dm2[2]) || 0, Number(dm2[3]) || 0] : [0, 0, 0]);
+    if (job) job.logs.push(makeLog(`货号采集 汇总：重量=${finalWeightKg}kg 尺寸=${finalDims.join("x")} 来源=${weightKg > 0 ? "basics" : (finalWeightKg > 0 ? "页面文本" : "无")}`, finalWeightKg > 0 ? "info" : "warn"));
     const data = {
       title: String(basics.title || media.title || "").slice(0, 300),
       images: media.images || [],
@@ -1076,10 +1083,10 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
       skus,
       attributes,
       vendorCode: String(attributes["货号"] || attributes["商品货号"] || attributes["型号"] || media.vendorCode || "").slice(0, 120),
-      weightKg,
-      lengthCm: dims ? Number(dims[1]) || 0 : 0,
-      widthCm: dims ? Number(dims[2]) || 0 : 0,
-      heightCm: dims ? Number(dims[3]) || 0 : 0,
+      weightKg: finalWeightKg,
+      lengthCm: finalDims[0],
+      widthCm: finalDims[1],
+      heightCm: finalDims[2],
       priceText: String(basics.price || ""),
       priceDetails: String(basics.priceDetails || ""),
       moq: String(basics.minOrderQuantity || ""),
