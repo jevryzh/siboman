@@ -1174,12 +1174,14 @@ async function runQueuedYandexResearchJob(remoteJob) {
     phase: "插件已领取，开始 Yandex 核价（1688 官方同款）",
     total: items.length,
     // v2.2.9.113: 续跑时保留服务器上已完成的 results（旧逻辑清空 results，导致报告表只剩续跑后的行）
+    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
     results: Array.isArray(remoteJob.results) ? remoteJob.results.slice() : [],
     error: "",
     cancelRequested: false,
     abortController: typeof AbortController === "function" ? new AbortController() : null,
   };
   job.processed = Math.min(Math.max(Number(remoteJob.processed || 0), job.results.length), items.length);
+  if (!Array.isArray(job.logs)) job.logs = [];
   job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取 Yandex 核价任务（${items.length} 项${job.processed > 0 ? `，从第 ${job.processed + 1} 项续跑` : ""}）。`));
   await setActiveSourcingJob(job);
   await reportSourcingProgress(job);
