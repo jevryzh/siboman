@@ -5634,7 +5634,7 @@ function preciseShippingCny(text) {
   return { value, estimated: false, raw };
 }
 
-function preciseCandidateEvidence(result, best, pick) {
+function preciseCandidateEvidence(result, best, pick, extra = {}) {
   return {
     source: "plugin-1688",
     offerId1688: String(best?.offerId || best?.offerId1688 || ""),
@@ -5653,8 +5653,8 @@ function preciseCandidateEvidence(result, best, pick) {
     shippingFee: String(best?.shippingFee || ""),
     shippingFeeCnyUsed: pick.shipping?.value ?? null,
     shippingEstimated: pick.shipping?.estimated !== false,
-    weightSource,
-    dimsSource: hasYandexDims ? "yandex" : (dimsFrom1688.every((v) => v > 0) ? "1688" : ""),
+    weightSource: extra.weightSource || "",
+    dimsSource: extra.dimsSource || "",
     trafficBaitRisk: best?.trafficBaitRisk === true,
     domPriceText: String(best?.domPriceText || ""),
     searchError: String(result?.searchError || "").slice(0, 200),
@@ -5697,7 +5697,10 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
         params: { exchangeRate: 12.8205, targetMarginPct: 35, domesticShippingCny: shipping.value },
       })
     : { ok: false };
-  const evidence = preciseCandidateEvidence(result, best, pick);
+  const evidence = preciseCandidateEvidence(result, best, pick, {
+    weightSource,
+    dimsSource: hasYandexDims ? "yandex" : (dimsFrom1688.every((v) => v > 0) ? "1688" : ""),
+  });
   const status = "ready";
   try {
     const existing = await db.query(
@@ -5945,19 +5948,28 @@ async function recordPreciseResults(job, results, userId, storeId) {
   const rows = Array.isArray(results) ? results : [];
   let seen = preciseRecordedByJob.get(job.id);
   if (!seen) { seen = new Set(); preciseRecordedByJob.set(job.id, seen); }
-  const pending = rows.filter((r) => r && r.offerId && !seen.has(String(r.offerId)));
-  if (!pending.length) return { written: 0 };
-  for (const r of pending) seen.add(String(r.offerId));
+  // 店铺缓存（Yandex 商品重量/尺寸/名称来源）可能尚未预热：未就绪时记录的结果不记入 seen，
+  // 等缓存好了自动重刷一遍，避免把"缺重量"写死在候选上。
   const cache = yandexOfferCacheObj(storeId || "__env__");
   const cacheById = new Map();
   for (const it of [...(cache?.active || []), ...(cache?.archived || [])]) {
     const oid = String(it?.offer_id || it?.offerId || "");
     if (oid) cacheById.set(oid, it);
   }
+  const cacheReady = cacheById.size > 0;
+  const pending = rows.filter((r) => r && r.offerId && (!cacheReady || !seen.has(String(r.offerId))));
+  if (!pending.length) return { written: 0 };
+  if (cacheReady) { for (const r of pending) seen.add(String(r.offerId)); }
   const outcomes = [];
   for (const r of pending) {
-    outcomes.push(await upsertPreciseCandidateRow({ userId, storeId, result: r, cacheById }));
+    try {
+      outcomes.push(await upsertPreciseCandidateRow({ userId, storeId, result: r, cacheById }));
+    } catch (e) {
+      outcomes.push({ offerId: String(r?.offerId || ""), status: "exception", reason: String(e?.message || e).slice(0, 200) });
+    }
   }
+  const errs = outcomes.filter((o) => o.status === "error" || o.status === "exception");
+  console.log(`[precise-1688] 落库 job=${job.id} results=${rows.length} pending=${pending.length} cache=${cacheById.size} 异常=${errs.length}` + (errs.length ? ` 首个异常=${JSON.stringify(errs[0]).slice(0, 300)}` : ""));
   return { written: outcomes.length, outcomes };
 }
 
