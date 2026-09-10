@@ -6588,7 +6588,15 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         yandexImage: yandexImages[0] || "",
         yandexImages: yandexImages.slice(0, 3),
         yandexPriceRub: Number(yandexOffer.price || 0),
-        currentPriceCny: Number(yandexOffer.price || 0) > 0 ? Math.round((Number(yandexOffer.price) / rubPerCnyNow()) * 100) / 100 : 0,
+        currencyCode: String(yandexOffer.currency_code || "CNY").toUpperCase(),
+        // 现价换算：按商品自身币种（跨境店是 CNY，旧口径错把 CNY 当 RUB 除汇率 → 会误报亏本）
+        currentPriceCny: (() => {
+          const raw = Number(yandexOffer.price || 0);
+          if (!(raw > 0)) return 0;
+          const ccy = String(yandexOffer.currency_code || "CNY").toUpperCase();
+          const rubToCny = Number(process.env.RUB_CNY_RATE) || 0.0862;
+          return Math.round((ccy === "RUB" ? raw * rubToCny : raw) * 100) / 100;
+        })(),
         detailUrl: String(best?.link || best?.detailUrl || ""),
         price: pick.price || (savedTrusted ? Number(saved?.purchase_cny || 0) : 0),
         priceDetails: String(best?.priceDetails || "").slice(0, 200),
