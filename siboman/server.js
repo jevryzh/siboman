@@ -101,6 +101,13 @@ const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.112";
 // 也不会被超时捞回，界面上只显示「等待本机插件采集」，完全无从判断。
 const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect"];
 const WORKER_STORE_SCOPE_EXEMPT_SQL = `(${WORKER_STORE_SCOPE_EXEMPT_KINDS.map((k) => `'${k}'`).join(",")})`;
+// 已停用的采集端（扩展 ID 或 worker 名，逗号分隔，可用环境变量 DISABLED_WORKER_IDS 追加）。
+// 默认拉黑那台已弃用的 Windows 机器上的旧插件副本：它只会上报 run/yandex-research，
+// 留着会抢单品找货/精核价任务，还会让"在线插件版本"看起来是旧的。
+const DISABLED_WORKER_IDS = new Set(
+  String(process.env.DISABLED_WORKER_IDS || "mjegcnmknbbdkhljbcgmdabgjfdlhegf,zhumeng-plugin-mjegcnmk")
+    .split(",").map((v) => v.trim()).filter(Boolean),
+);
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
 const DEFAULT_DELAY_MIN_MS = Number(process.env.DEFAULT_DELAY_MIN_MS || 8000);
 const DEFAULT_DELAY_MAX_MS = Number(process.env.DEFAULT_DELAY_MAX_MS || 20000);
@@ -16998,6 +17005,23 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
       : [];
     const workerVersion = String(req.body?.version || req.body?.pluginVersion || "").trim();
     const isChromeExtensionWorker = String(req.body?.platform || "").trim() === "chrome-extension";
+    // 已停用的采集端：按扩展 ID / worker 名拉黑，仍能轮询但一律不发任务（用 DISABLED_WORKER_IDS 追加，逗号分隔）。
+    const workerProfileDir = String(req.body?.profileDir || "").trim();
+    if (DISABLED_WORKER_IDS.has(workerProfileDir) || DISABLED_WORKER_IDS.has(String(workerName || "").trim())) {
+      const disabledPhase = "该采集端已被停用（不再参与采集任务），请在浏览器扩展页停用或卸载。";
+      await upsertWorkerHeartbeat(req.user, workerName, {
+        version: req.body?.version,
+        pluginVersion: req.body?.pluginVersion,
+        platform: req.body?.platform,
+        hostname: req.body?.hostname,
+        profileDir: workerProfileDir,
+        currentJobId: "",
+        currentPhase: disabledPhase,
+      });
+      console.log(`[jobs/next] BLOCKED(停用) worker=${workerName} ext=${workerProfileDir}`);
+      res.json({ success: true, job: null, blocked: true, error: disabledPhase });
+      return;
+    }
     const wantsSingleSourcing = !kinds.length || kinds.includes("run");
     const versionTooOld = isChromeExtensionWorker
       && wantsSingleSourcing
