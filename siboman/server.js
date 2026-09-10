@@ -7078,33 +7078,6 @@ async function callImageSetService(method, apiPath, body, timeoutMs = 60000) {
   return { status: resp.status, payload };
 }
 
-// ===== 对外入口（给 Ozon/Etsy 等其它系统调用）：同域名 + 服务 API Key 鉴权，无需 ERP 登录 =====
-function imageSetPublicAuth(req) {
-  const key = String(req.headers["x-api-key"] || (req.headers.authorization || "").replace(/^Bearer\s+/i, "")).trim();
-  return Boolean(IMAGE_SET_KEY) && key === IMAGE_SET_KEY;
-}
-
-app.get("/api/image-set/public/health", requireAuth, async (req, res) => {
-  const out = await callImageSetService("GET", "/health").catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
-  res.status(out.status).json(out.payload);
-});
-
-// body: { platform: ozon|etsy|yandex, refImageUrl, keys?, ratio?, language?, title?, features? }
-app.post("/api/image-set/public/jobs", requireAuth, async (req, res) => {
-  const out = await callImageSetService("POST", "/jobs", req.body || {}).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
-  res.status(out.status).json(out.payload);
-});
-
-app.get("/api/image-set/public/jobs/:id", requireAuth, async (req, res) => {
-  const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
-  res.status(out.status).json(out.payload);
-});
-
-app.post("/api/image-set/public/jobs/:id/cancel", requireAuth, async (req, res) => {
-  const out = await callImageSetService("POST", `/jobs/${encodeURIComponent(req.params.id)}/cancel`, {}).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
-  res.status(out.status).json(out.payload);
-});
-
 // Ozon 静态图尺寸段升级：/wc100/ → /wc1000/（采集箱里存的是 100px 缩略图）
 function upgradeOzonImageUrl(url) {
   if (!url) return "";
@@ -7216,132 +7189,48 @@ app.post("/api/image-set/jobs/:id/cancel", requireAuth, async (req, res, next) =
   } catch (error) { next(error); }
 });
 
-// 把独立服务生成的套图回写到指定草稿（复用现有 apply 逻辑的输入结构）
-app.post("/api/image-set/jobs/:id/apply-to-draft", requireAuth, async (req, res, next) => {
-  if (!requireDb(res)) return;
-  try {
-    const draft = await getYandexDraftForUser(req.body?.draftId || "", req.user);
-    if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
-    const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`);
-    const images = (out.payload?.job?.images || []).filter((x) => x.ok && x.url);
-    if (!images.length) return res.status(400).json({ success: false, error: "该任务还没有成功的图" });
-    const mainUrl = (images.find((x) => x.key === "main") || images[0]).url;
-    let list = Array.isArray(draft.images) ? draft.images.slice() : [];
-    if (req.body?.mode === "main-only") list = [mainUrl, ...list.filter((u) => u !== mainUrl)];
-    else list = [...new Set([mainUrl, ...images.map((x) => x.url), ...list])];
-    const skus = (draft.skus || []).map((sku) => ({ ...sku, image: mainUrl }));
-    const r = await db.query(`UPDATE yandex_listing_drafts SET images=$2::jsonb, skus=$3::jsonb, image_set=$4::jsonb, updated_at=now() WHERE id=$1 RETURNING ${YANDEX_DRAFT_COLUMNS}`,
-      [draft.id, JSON.stringify(list.slice(0, 30)), JSON.stringify(skus), JSON.stringify(images.map((x) => ({ key: x.key, label: x.label, url: x.url, ok: true })))]);
-    res.json({ success: true, draft: dbRowToYandexDraft(r.rows[0]) });
-  } catch (error) { next(error); }
+// ===== AI 套图（统一入口：独立出图服务 image-set）=====
+// 收敛说明：ERP 内曾有一套自己的 TokenDun 图生图 + 7 个模板（与 services/image-set 重复），已删除。
+// 现在 Yandex / Ozon / Etsy 三家共用同一个出图服务（独立进程 + 独立密钥 + 独立控制台），
+// ERP 这里只做三件事：转参考图到公网、提交任务、把进度与结果镜像回草稿和 job。
+const YANDEX_IMAGE_SET_TOTAL = 7;              // 与服务侧模板数一致，仅用于提交前显示
+const yandexImageSetRunning = new Set();
+
+const imageSetResultRow = (x) => ({
+  key: x.key, label: x.label || x.key, url: x.ok ? (x.url || "") : "",
+  ok: Boolean(x.ok), error: x.ok ? "" : String(x.error || "").slice(0, 300), at: new Date().toISOString(),
 });
 
-// ===== AI 出图（Ozon 俄罗斯风格 7 图套图，走 TokenDun gpt-image-2 图生图）=====
-// 复用文件顶部已声明的 TOKENDUN_* 常量（TOKENDUN_BASE_URL 已含 /v1）
-const TOKENDUN_BASE = /\/v1$/.test(TOKENDUN_BASE_URL) ? TOKENDUN_BASE_URL : `${TOKENDUN_BASE_URL}/v1`;
-const TOKENDUN_KEY = TOKENDUN_API_KEY;
-const yandexImageSetRunning = new Map();
-
-const KEEP_PRODUCT = "IMPORTANT: keep the product EXACTLY as in the reference photo — same shape, proportions, material, colour, packaging, labels and quantity. Do NOT redesign or replace the product. Photorealistic commercial product photography, high detail, 3:4 vertical composition, sharp focus.";
-const RU_STYLE = "Russian marketplace (Ozon) listing image, professional e-commerce style, cinematic lighting, Russian-language text only (correct Russian spelling, modern clean Cyrillic sans-serif, well spaced, never covering the product). No Chinese characters, no watermark.";
-
-const YANDEX_IMAGE_SET = [
-  ["main", "主图", `${KEEP_PRODUCT} ${RU_STYLE} MAIN COVER IMAGE. First look carefully at the reference photo and understand exactly what the product is. Scene: an appealing lifestyle setting matching the product's real usage and Russian buyer taste (warm, cosy, premium, natural props). Product hero centred occupying 55-65% of the frame, studio-level lighting, realistic shadows and highlights. Add a big bold Russian headline at the top (2-5 words, accurate for this product). Add 3 short Russian feature callouts with thin leader lines describing its REAL visible properties. Instead of plain size text, draw TECHNICAL MEASUREMENT ANNOTATIONS: thin white dimension lines with arrowheads and small numbers along the product (height, width and volume/quantity where applicable, e.g. "высота 20 см", "диаметр 8 см", "500 мл").`],
-  ["usage", "使用场景", `${KEEP_PRODUCT} ${RU_STYLE} USAGE SCENARIO IMAGE: show the product in real use in a Russian home, warm cosy setting with natural props fitting its usage, person's hands only (no face), product clearly visible and unchanged. Short bottom Russian caption describing the benefit.`],
-  ["multi", "多件摆拍", `${KEEP_PRODUCT} ${RU_STYLE} MULTI-ITEM STAGING: arrange the COMPLETE SET exactly as in the reference photo (all pieces, correct quantity) on a tasteful surface (marble/wood). Some pieces shown opened or in use, others untouched and neatly arranged. Short accurate Russian top label naming the set plus the item count found in the reference; one small bottom line "ИДЕАЛЬНЫЙ ПОДАРОК".`],
-  ["features", "产品特点", `${KEEP_PRODUCT} ${RU_STYLE} FEATURE INFOGRAPHIC: one large hero view from the reference in the centre, surrounded by 4-5 clean white callout cards joined by thin leader lines with short Russian labels describing REAL visible properties. Light elegant background, tidy structured layout, generous spacing.`],
-  ["comparison", "竞品对比", `${KEEP_PRODUCT} ${RU_STYLE} COMPARISON IMAGE: left side our product from the reference with a green check and label "НАШ НАБОР"; right side a plain generic budget alternative of the same category with a red cross and label "ОБЫЧНЫЙ НАБОР". Small Russian comparison points with check/cross icons between them. Clean split background, infographic style.`],
-  ["single", "单件摆拍", `${KEEP_PRODUCT} ${RU_STYLE} PREMIUM SINGLE ITEM SHOT (not a white background): one item from the set alone on a dark polished stone slab with soft reflection, elegant smoky gradient background, subtle rim light, gentle props blurred behind. Minimal Russian caption at the bottom.`],
-  ["details", "多角度细节", `${KEEP_PRODUCT} ${RU_STYLE} MULTI-ANGLE DETAIL COLLAGE: four macro close-ups of the same product in a neat 2x2 grid, each in a thin frame with a short Russian caption (СПЕРЕДИ / СБОКУ / СВЕРХУ / УПАКОВКА). Show texture, materials, labels and packaging detail. Consistent lighting across panels.`],
-];
-
-function tokendunEnabled() { return Boolean(TOKENDUN_KEY); }
-
-async function tokendunGenerateImage(prompt, refImageUrl, size = "1024x1536") {
-  // 参考图先转存到本机公网（TokenDun 需要能取到），再走图生图
-  const refUrl = await publicUrlForListingImage(refImageUrl);
-  const refResp = await fetch(refUrl, { signal: AbortSignal.timeout(60000) });
-  if (!refResp.ok) throw new Error(`参考图下载失败 ${refResp.status}`);
-  const refBuf = Buffer.from(await refResp.arrayBuffer());
-  // 注意：TokenDun 网关不认 Node undici 的 fetch+FormData（返回 404 Server action not found），
-  //   必须手写 multipart/form-data（与 curl 一致），用 node:https 发送。
-  const boundary = `----zhumeng${crypto.randomBytes(8).toString("hex")}`;
-  const chunks = [];
-  const addField = (name, value) => {
-    chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${name}"\r\n\r\n${value}\r\n`));
-  };
-  addField("model", TOKENDUN_IMAGE_MODEL);
-  addField("size", size);
-  addField("prompt", prompt);
-  chunks.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="image[]"; filename="ref.jpg"\r\nContent-Type: image/jpeg\r\n\r\n`));
-  chunks.push(refBuf);
-  chunks.push(Buffer.from(`\r\n--${boundary}--\r\n`));
-  const bodyBuf = Buffer.concat(chunks);
-  const result = await new Promise((resolve, reject) => {
-    const u = new URL(`${TOKENDUN_BASE}/images/edits`);
-    const req = https.request({
-      host: u.hostname, port: u.port || 443, path: u.pathname + u.search, method: "POST",
-      headers: { Authorization: `Bearer ${TOKENDUN_KEY}`, "Content-Type": `multipart/form-data; boundary=${boundary}`, "Content-Length": bodyBuf.length },
-      timeout: 600000,
-    }, (res) => {
-      const parts = [];
-      res.on("data", (c) => parts.push(c));
-      res.on("end", () => resolve({ status: res.statusCode, text: Buffer.concat(parts).toString("utf8") }));
-    });
-    req.on("timeout", () => req.destroy(new Error("TokenDun 请求超时")));
-    req.on("error", reject);
-    req.write(bodyBuf);
-    req.end();
-  });
-  console.log(`[tokendun-image] POST ${TOKENDUN_BASE}/images/edits model=${TOKENDUN_IMAGE_MODEL} key=${String(TOKENDUN_KEY).slice(0, 8)}… → ${result.status} ${String(result.text).slice(0, 200)}`);
-  if (result.status < 200 || result.status >= 300) throw new Error(`TokenDun ${result.status}: ${String(result.text).slice(0, 240)}`);
-  let payload = {};
-  try { payload = JSON.parse(result.text); } catch { throw new Error(`TokenDun 返回非 JSON: ${String(result.text).slice(0, 160)}`); }
-  const item = payload?.data?.[0] || {};
-  const uploadDir = path.join(PUBLIC_DIR, "uploads", "yandex-image-set");
-  await fs.mkdir(uploadDir, { recursive: true });
-  const name = `img-${Date.now()}-${crypto.randomBytes(4).toString("hex")}.jpg`;
-  const dest = path.join(uploadDir, name);
-  if (item.b64_json) {
-    await fs.writeFile(dest, Buffer.from(item.b64_json, "base64"));
-  } else if (item.url) {
-    const dl = await fetch(item.url, { signal: AbortSignal.timeout(180000) });
-    if (!dl.ok) throw new Error(`生成图下载失败 ${dl.status}`);
-    await fs.writeFile(dest, Buffer.from(await dl.arrayBuffer()));
-  } else {
-    throw new Error(`TokenDun 未返回图片: ${String(result.text).slice(0, 160)}`);
-  }
-  return { url: `${bulkPricingPublicBase()}/uploads/yandex-image-set/${name}`, tokens: payload?.usage?.total_tokens || 0 };
-}
-
 async function runYandexImageSetJob(jobId, userId, draftId) {
-  if (yandexImageSetRunning.get(jobId)) return;
-  yandexImageSetRunning.set(jobId, true);
+  if (yandexImageSetRunning.has(jobId)) return;
+  yandexImageSetRunning.add(jobId);
   try {
     const draft = await db.query(`SELECT ${YANDEX_DRAFT_COLUMNS} FROM yandex_listing_drafts WHERE id=$1`, [draftId]).then((r) => (r.rows[0] ? dbRowToYandexDraft(r.rows[0]) : null));
     if (!draft) throw new Error("草稿不存在");
     const refImage = (draft.images || [])[0] || draft.skus?.[0]?.image || "";
     if (!refImage) throw new Error("草稿没有图片，先用插件采集商品图");
-    const set = Array.isArray(draft.imageSet) ? draft.imageSet.slice() : [];
-    await updateDbJob(jobId, { status: "running", phase: `正在生成套图（共 ${YANDEX_IMAGE_SET.length} 张）`, processed: set.length, total: YANDEX_IMAGE_SET.length });
-    for (let i = set.length; i < YANDEX_IMAGE_SET.length; i += 1) {
-      const [key, label, prompt] = YANDEX_IMAGE_SET[i];
-      await updateDbJob(jobId, { phase: `正在生成 ${label}（${i + 1}/${YANDEX_IMAGE_SET.length}）` });
-      try {
-        const out = await tokendunGenerateImage(prompt, refImage);
-        set.push({ key, label, url: out.url, tokens: out.tokens, ok: true, at: new Date().toISOString() });
-      } catch (e) {
-        set.push({ key, label, url: "", ok: false, error: String(e?.message || e).slice(0, 300), at: new Date().toISOString() });
-      }
-      await db.query(`UPDATE yandex_listing_drafts SET image_set=$2::jsonb, updated_at=now() WHERE id=$1`, [draftId, JSON.stringify(set)]).catch(() => {});
-      await updateDbJob(jobId, { processed: i + 1, total: YANDEX_IMAGE_SET.length, results: set });
+    // 1688/CDN 图外部抓不到，先转存到本机公网域名再交给出图服务
+    const refUrl = await publicUrlForListingImage(refImage);
+    // 先确认参考图真能下载：否则要等出图服务里每张都失败，报错还看不出原因
+    const probe = await fetch(refUrl, { signal: AbortSignal.timeout(30000) }).catch(() => null);
+    if (!probe?.ok) {
+      probe?.body?.cancel?.().catch(() => {});
+      throw new Error(`参考图无法下载（HTTP ${probe?.status || "网络错误"}），请在草稿里换一张商品图后重试`);
     }
-    const okCount = set.filter((x) => x.ok).length;
-    await updateDbJob(jobId, {
-      status: okCount ? "done" : "error", processed: set.length, total: YANDEX_IMAGE_SET.length, results: set,
-      phase: `套图完成：成功 ${okCount} / ${YANDEX_IMAGE_SET.length}`, error: okCount ? "" : "全部生成失败",
-      logs: [makeLogEntry(`AI 出图完成：成功 ${okCount} / ${YANDEX_IMAGE_SET.length} 张`, okCount ? "info" : "error")],
-    });
+    probe.body?.cancel?.().catch(() => {});
+    const submit = await callImageSetService("POST", "/jobs", {
+      platform: "yandex",
+      refImageUrl: refUrl,
+      title: String(draft.titleRu || "").slice(0, 200),
+    }, 60000);
+    if (!submit.payload?.ok) throw new Error(submit.payload?.error || `出图服务不可用 (HTTP ${submit.status})`);
+    const serviceJobId = submit.payload.jobId;
+    const total = Number(submit.payload.total || YANDEX_IMAGE_SET_TOTAL);
+    // 记下服务侧任务号：ERP 重启后能凭它接着轮询，不会把 job 永久卡在 running
+    await db.query(`UPDATE app_jobs SET payload = payload || $2::jsonb WHERE id=$1`,
+      [jobId, JSON.stringify({ serviceJobId, draftId })]);
+    await updateDbJob(jobId, { status: "running", phase: `已提交出图服务，开始生成 ${total} 张`, processed: 0, total });
+    return await pollYandexImageSetJob(jobId, draftId, serviceJobId, total);
   } catch (e) {
     await updateDbJob(jobId, { status: "error", phase: "出图失败", error: String(e?.message || e).slice(0, 500) }).catch(() => {});
   } finally {
@@ -7349,19 +7238,66 @@ async function runYandexImageSetJob(jobId, userId, draftId) {
   }
 }
 
-// 一键出图（异步 job：7 张约 5-8 分钟）
-app.post("/api/yandex/zz-image-set-gen/:id", requireAuth, async (req, res, next) => {
+// ERP 重启/进程中断后，凭 payload.serviceJobId 接着轮询出图服务（不重复提交、不重复扣费）
+async function resumeYandexImageSetIfStalled(job) {
+  if (!db || !job || job.kind !== "yandex-image-set") return;
+  if (!["queued", "running"].includes(job.status)) return;
+  if (yandexImageSetRunning.has(job.id)) return;
+  const serviceJobId = job.payload?.serviceJobId;
+  const draftId = job.payload?.draftId;
+  if (!serviceJobId || !draftId) return;
+  yandexImageSetRunning.add(job.id);
+  try {
+    await updateDbJob(job.id, { status: "running", phase: "ERP 重启后继续跟踪出图任务…" });
+    await pollYandexImageSetJob(job.id, draftId, serviceJobId, Number(job.total || YANDEX_IMAGE_SET_TOTAL));
+  } catch (_e) { /* 下一轮读取时再试 */ }
+  finally { yandexImageSetRunning.delete(job.id); }
+}
+
+async function pollYandexImageSetJob(jobId, draftId, serviceJobId, total) {
+  let lastSeen = -1;
+  for (let i = 0; i < 240; i += 1) {            // 最多等 40 分钟
+    await sleep(10000);
+    const cur = await callImageSetService("GET", `/jobs/${encodeURIComponent(serviceJobId)}`, null, 30000).catch(() => null);
+    const j = cur?.payload?.job;
+    if (!j) continue;
+    const imgs = Array.isArray(j.images) ? j.images : [];
+    const okCount = imgs.filter((x) => x.ok && x.url).length;
+    // 每出一张就落草稿，前端能边出边看
+    const changed = imgs.length !== lastSeen;
+    if (changed) lastSeen = imgs.length;
+    const set = imgs.map(imageSetResultRow);
+    if (changed) {
+      await db.query(`UPDATE yandex_listing_drafts SET image_set=$2::jsonb, updated_at=now() WHERE id=$1`, [draftId, JSON.stringify(set)]).catch(() => {});
+    }
+    const finished = ["done", "error", "canceled"].includes(j.status);
+    const ok = set.filter((x) => x.ok).length;
+    await updateDbJob(jobId, finished ? {
+      status: ok ? "done" : "error", processed: ok, total, results: set,
+      phase: `套图完成：成功 ${ok} / ${total}`, error: ok ? "" : String(j.error || "全部生成失败").slice(0, 300),
+      logs: [makeLogEntry(`AI 套图完成：成功 ${ok} / ${total} 张`, ok ? "info" : "error")],
+    } : { phase: `${j.phase || "生成中"}（成功 ${okCount}/${total}）`, processed: okCount, total, ...(changed ? { results: set } : {}) });
+    if (finished) return;
+  }
+  throw new Error("出图超时（超过 40 分钟仍未完成）");
+}
+
+// 一键 AI 套图（异步 job：7 张约 5-8 分钟）
+app.post("/api/yandex/listing/drafts/:id/image-set", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
-    if (!tokendunEnabled()) return res.status(400).json({ success: false, error: "未配置 AI 出图（TOKENDUN_API_KEY）" });
     const draft = await getYandexDraftForUser(req.params.id, req.user);
     if (!draft) return res.status(404).json({ success: false, error: "草稿不存在" });
+    const health = await callImageSetService("GET", "/health").catch(() => null);
+    if (!health?.payload?.ok) return res.status(503).json({ success: false, error: "AI 套图服务不可用（image-set.service），请联系管理员" });
+    const refImage = (draft.images || [])[0] || draft.skus?.[0]?.image || "";
+    if (!refImage) return res.status(400).json({ success: false, error: "草稿还没有图片，先用插件采集商品图" });
     const job = await createQueuedDbJob(req.user, {
-      id: crypto.randomUUID(), kind: "zz-image-set", storeId: draft.storeId || null,
-      total: YANDEX_IMAGE_SET.length, phase: "排队开始 AI 出图",
+      id: crypto.randomUUID(), kind: "yandex-image-set", storeId: draft.storeId || null,
+      total: YANDEX_IMAGE_SET_TOTAL, phase: "排队开始 AI 套图",
     }, { draftId: draft.id, storeId: draft.storeId || null });
     setTimeout(() => { runYandexImageSetJob(job.id, req.user.id, draft.id).catch(() => {}); }, 50);
-    res.json({ success: true, jobId: job.id, total: YANDEX_IMAGE_SET.length, draftId: draft.id });
+    res.json({ success: true, jobId: job.id, total: YANDEX_IMAGE_SET_TOTAL, draftId: draft.id });
   } catch (error) { next(error); }
 });
 
@@ -16730,6 +16666,8 @@ app.get("/api/jobs/:id", async (req, res, next) => {
     if (db) {
       const job = await getDbJobForUser(req.params.id, req.user);
       if (job) {
+        // AI 套图 job：ERP 若在生成中途重启，这里凭服务侧 jobId 续上，避免永远停在 running
+        if (job.kind === "yandex-image-set") resumeYandexImageSetIfStalled(job).catch(() => {});
         res.json({ success: true, job: truncateForLight(job) });
         return;
       }

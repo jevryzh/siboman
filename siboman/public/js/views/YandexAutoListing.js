@@ -58,7 +58,7 @@ window.YandexAutoListingView = {
       if (!drawer.id) return;
       imageSet.busy = true; imageSet.phase = '正在提交出图任务…';
       try {
-        const res = await axios.post(`/api/yandex/listing/drafts/${encodeURIComponent(drawer.id)}/generate-images`, {}, { timeout: 60000 });
+        const res = await axios.post(`/api/yandex/listing/drafts/${encodeURIComponent(drawer.id)}/image-set`, {}, { timeout: 60000 });
         imageSet.jobId = res.data?.jobId || '';
         imageSet.total = Number(res.data?.total || 7); imageSet.processed = 0;
         notify.success('AI 出图已开始（7 张约 5-8 分钟），可关闭弹窗后台跑');

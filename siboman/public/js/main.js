@@ -138,6 +138,8 @@ const initApp = () => {
       };
 
       const goTo = (p) => { window.location.hash = p; };
+      // 独立出图服务（image-set）的控制台：同域，未登录会跳 ERP 登录页
+      const openImageSetConsole = () => window.open('/image-set-console.html', '_blank', 'noopener');
       const handleStoreChange = (val) => {
         // 双写: localStorage (拦截器读) + 全局事件 (视图刷新)
         currentStoreId.value = val;
@@ -207,7 +209,7 @@ const initApp = () => {
         }
       });
 
-      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl };
+      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, openImageSetConsole, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl };
     },
     template: `
       <el-container class="layout-container" v-loading="!isReady">
@@ -257,7 +259,10 @@ const initApp = () => {
               <el-icon><Document /></el-icon><span>上架记录</span>
             </el-menu-item>
             <el-menu-item index="#/ai-generator" @click="goTo('#/ai-generator')">
-              <el-icon><MagicStick /></el-icon><span>AI 套图</span>
+              <el-icon><MagicStick /></el-icon><span>AI 图片生成</span>
+            </el-menu-item>
+            <el-menu-item index="#/image-set-console" @click="openImageSetConsole">
+              <el-icon><PictureFilled /></el-icon><span>AI 套图控制台</span>
             </el-menu-item>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>

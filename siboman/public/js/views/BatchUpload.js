@@ -504,40 +504,22 @@ window.BatchUploadView = {
       });
     };
 
-    // ========== AI 出图（独立出图服务：Ozon 3:4 俄文 7 图套图）==========
+    // ========== AI 出图（共享客户端：public/js/image-set-client.js）==========
     const aiImg = Vue.reactive({});   // collectId -> { busy, jobId, phase, processed, total, error }
-    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const aiImageSet = async (row) => {
-      const itemId = row.collectId;
+      const itemId = String(row?.collectId || '');
       if (!itemId) return notify.warning('该行没有关联采集商品（从「采集箱」跳转过来的行才有），无法出图');
-      const key = String(itemId);
-      aiImg[key] = { busy: true, jobId: '', phase: '正在提交出图任务…', processed: 0, total: 7, error: '' };
+      aiImg[itemId] = { busy: true, jobId: '', phase: '正在提交出图任务…', processed: 0, total: 7, error: '' };
+      const onState = (patch) => Object.assign(aiImg[itemId], patch);
       try {
-        const res = await axios.post('/api/ozon/ai-image-set', { itemId }, { timeout: 60000 });
-        aiImg[key].jobId = res.data?.jobId || '';
-        if (!aiImg[key].jobId) throw new Error(res.data?.error || '未返回任务号');
         notify.success('AI 出图已开始（7 张约 5-8 分钟），可继续其它操作');
-        for (let i = 0; i < 60; i += 1) {
-          await sleep(10000);
-          const jr = await axios.get('/api/image-set/jobs/' + encodeURIComponent(aiImg[key].jobId), { timeout: 30000 });
-          const job = jr.data?.job || {};
-          aiImg[key].phase = job.phase || ''; aiImg[key].processed = Number(job.processed || 0); aiImg[key].total = Number(job.total || 7);
-          if (['done', 'error', 'canceled'].includes(job.status)) {
-            if (job.status === 'done') {
-              const ap = await axios.post(`/api/ozon/ai-image-set/${encodeURIComponent(aiImg[key].jobId)}/apply`, { itemId, mode: 'all' }, { timeout: 60000 });
-              aiImg[key].phase = `✓ 已写入商品图片（共 ${ap.data?.count || 0} 张，主图已置首）`;
-              notify.success('AI 套图已写回该商品图片，可直接批量上架');
-            } else {
-              aiImg[key].error = job.error || job.phase || '生成失败';
-              notify.error('AI 出图失败: ' + aiImg[key].error);
-            }
-            break;
-          }
-        }
+        const r = await ImageSetClient.runOzonItem({ itemId, onState });
+        if (r.status === 'done') notify.success('AI 套图已写回该商品图片，可直接批量上架');
+        else notify.error('AI 出图失败: ' + r.error);
       } catch (e) {
-        aiImg[key].error = e.response?.data?.error || e.message || '失败';
-        notify.error('AI 出图失败: ' + aiImg[key].error);
-      } finally { aiImg[key].busy = false; }
+        onState({ error: e.response?.data?.error || e.message || '失败' });
+        notify.error('AI 出图失败: ' + aiImg[itemId].error);
+      } finally { aiImg[itemId].busy = false; }
     };
 
     // ========== 解析粘贴 → 预览表 → 自动采集 (保留) ==========
