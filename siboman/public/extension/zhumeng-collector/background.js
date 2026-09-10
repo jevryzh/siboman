@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.119";
+const VERSION = "2.2.9.120";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1039,6 +1039,27 @@ async function collect1688ProductForListingInPlugin(url, job = null) {
         await sleep(randomInt(2200, 3200));
       }
     }
+    // 诊断：确认该标签页里 1688 的数据源是否可用（一次性日志，便于定位重量/尺寸取不到的原因）
+    const diag = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        const w = window;
+        const bodyText = (document.body && document.body.innerText) || "";
+        return {
+          url: location.href,
+          hasContext: !!w.context,
+          contextKeys: w.context ? Object.keys(w.context).slice(0, 8) : [],
+          hasInitData: !!w.__INIT_DATA,
+          initKeys: w.__INIT_DATA ? Object.keys(w.__INIT_DATA).slice(0, 8) : [],
+          textLen: bodyText.length,
+          hasPackWeightText: /包装重量|发货重量|商品重量/.test(bodyText),
+          hasPackSizeText: /包装尺寸|商品尺寸/.test(bodyText),
+          weightSnippet: (bodyText.match(/.{0,18}(包装重量|发货重量|商品重量).{0,30}/) || [])[0] || "",
+          iframes: Array.from(document.querySelectorAll("iframe")).length,
+        };
+      },
+    }).then((r) => r?.[0]?.result || null).catch((e) => ({ error: String(e?.message || e) }));
+    if (job) job.logs.push(makeLog(`货号采集 页面诊断：${JSON.stringify(diag).slice(0, 600)}`, "info"));
     const [mediaRes] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extract1688ListingMedia });
     const media = mediaRes?.result || {};
     // basics 提供的重量/尺寸（可能为空，后面会用属性/页面文本兜底）

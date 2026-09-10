@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.119";
-    const PLUGIN_ZIP_VERSION = "2.2.9.119";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.120";
+    const PLUGIN_ZIP_VERSION = "2.2.9.120";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -427,6 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.120 上架采集加页面诊断日志（window.context/文本里是否有包装重量尺寸），用于定位部分 1688 商品重量尺寸取不到。</li>
             <li>✅ v2.2.9.119 修复上架采集变量定义缺失（attrAll/weightKg undefined 导致采集失败），重量/尺寸：basics → 商品属性 → 页面参数表文本 三级兜底。</li>
             <li>✅ v2.2.9.118 修复上架采集兜底代码的引用顺序错误（Cannot access attrAll before initialization）并改为直接从页面参数表文本解析包装重量/尺寸。</li>
             <li>✅ v2.2.9.117 上架采集补诊断与兜底：打印每次 basics 注入结果（标题/重量/尺寸/异常），basics 取不到时从商品属性与页面文本兜底解析包装重量/尺寸（旧版这两项为空会拦住上架校验）。</li>
