@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.112";
+const VERSION = "2.2.9.113";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1149,14 +1149,14 @@ async function runQueuedYandexResearchJob(remoteJob) {
     status: "running",
     phase: "插件已领取，开始 Yandex 核价（1688 官方同款）",
     total: items.length,
-    processed: Math.min(Math.max(0, Number(remoteJob.processed || 0)), items.length),
-    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
-    results: [],
+    // v2.2.9.113: 续跑时保留服务器上已完成的 results（旧逻辑清空 results，导致报告表只剩续跑后的行）
+    results: Array.isArray(remoteJob.results) ? remoteJob.results.slice() : [],
     error: "",
     cancelRequested: false,
     abortController: typeof AbortController === "function" ? new AbortController() : null,
   };
-  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取 Yandex 核价任务（${items.length} 项）。`));
+  job.processed = Math.min(Math.max(Number(remoteJob.processed || 0), job.results.length), items.length);
+  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取 Yandex 核价任务（${items.length} 项${job.processed > 0 ? `，从第 ${job.processed + 1} 项续跑` : ""}）。`));
   await setActiveSourcingJob(job);
   await reportSourcingProgress(job);
   const stopCancelMonitor = startSourcingCancelMonitor(job);

@@ -6100,7 +6100,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
     let persisted = new Map();
     if (storeId) {
       const r = await db.query(
-        `SELECT offer_id, purchase_cny, status, suggest_price_cny FROM yandex_price_candidates
+        `SELECT offer_id, purchase_cny, status, suggest_price_cny, evidence FROM yandex_price_candidates
           WHERE store_id = $1 AND source = 'plugin-1688'`,
         [storeId]
       ).catch(() => ({ rows: [] }));
@@ -6159,6 +6159,42 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         suggestPriceCny: Number(saved?.suggest_price_cny || 0),
       };
     });
+    // 续跑/重载插件后 job.results 可能只含后半段：用候选表证据把缺失的已核商品补回报告
+    const seenOffers = new Set(rows.map((r) => String(r.offerId)));
+    for (const [offerId, item] of payloadItems) {
+      if (!offerId || seenOffers.has(offerId)) continue;
+      const saved = persisted.get(offerId);
+      if (!saved) continue;
+      const ev = saved.evidence && typeof saved.evidence === "object" ? saved.evidence : {};
+      const shipping = preciseShippingCny(ev.shippingFee);
+      rows.push({
+        offerId,
+        name: String(item?.name || "").slice(0, 120),
+        matched: Boolean(ev.candidateTitle),
+        reason: (Number(saved.purchase_cny) > 0 && String(saved.status) !== "need_confirm") ? "ok" : "need_confirm",
+        priceMode: ev.priceMode || "tier_first",
+        priceModeLabel: ev.priceModeLabel || "起批首档价（1688 价格阶梯）",
+        searchError: String(ev.searchError || "").slice(0, 160),
+        candidateTitle: String(ev.candidateTitle || "").slice(0, 120),
+        candidateImage: String(ev.candidateImage || ""),
+        detailUrl: String(ev.detailUrl || ""),
+        price: Number(saved.purchase_cny || 0),
+        priceDetails: String(ev.priceDetails || "").slice(0, 200),
+        skuOptions: Array.isArray(ev.skuOptions) ? ev.skuOptions.slice(0, 12) : [],
+        matchedSku: ev.matchedSku || null,
+        moq: String(ev.moq || ""),
+        shopName: String(ev.shopName || ""),
+        shippingFee: String(ev.shippingFee || ""),
+        shippingCnyUsed: shipping.value,
+        shippingEstimated: shipping.estimated,
+        weightKg: 0, weightSource: ev.weightSource || "",
+        trafficBaitRisk: ev.trafficBaitRisk === true,
+        savedStatus: saved.status || "",
+        suggestPriceCny: Number(saved.suggest_price_cny || 0),
+        fromDb: true,
+      });
+      seenOffers.add(offerId);
+    }
     const priced = rows.filter((r) => r.price > 0);
     const bands = [
       { label: "<¥1", min: 0, max: 1 }, { label: "¥1-3", min: 1, max: 3 }, { label: "¥3-5", min: 3, max: 5 },
