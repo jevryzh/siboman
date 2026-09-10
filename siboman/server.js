@@ -6451,8 +6451,9 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
   // 变体合并（groupId）需要配合“变体特征参数(distinctive)”才有效，否则 Yandex 报「Дубль варианта」不发布；
   //   一期先每个 SKU 独立成卡，二期做正规变体（选特征参数 + 每 SKU 不同值）。
   const groupId = "";
-  const baseParams = (Array.isArray(draft.categoryParams) ? draft.categoryParams : []).map((p) => {
+  const toParamItems = (list) => (Array.isArray(list) ? list : []).map((p) => {
     const item = { parameterId: String(p.parameterId ?? "") };
+    if (!item.parameterId) return null;
     const valueId = p.valueId ?? (p.optionId || "");
     if (valueId) {
       item.valueId = /^\d+$/.test(String(valueId)) ? Number(valueId) : String(valueId);
@@ -6464,6 +6465,13 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
     if (p.unitId) item.unitId = /^\d+$/.test(String(p.unitId)) ? Number(p.unitId) : String(p.unitId);
     return item;
   }).filter(Boolean);
+  const baseParams = toParamItems(draft.categoryParams);
+  // 合并「每个 SKU 自己的参数」：用于变体特征值（distinctive）——同组内每个变体必须在该参数上不同
+  const mergeSkuParams = (skuParams) => {
+    const map = new Map(baseParams.map((it) => [String(it.parameterId), it]));
+    for (const it of toParamItems(skuParams)) map.set(String(it.parameterId), it);
+    return [...map.values()];
+  };
   return await Promise.all(skus.map(async (sku, index) => {
     const priceValue = priceOf(sku, "price");
     const oldValue = Number(sku.oldPriceCny || sku.oldPriceRub || 0) > 0 ? priceOf(sku, "oldPrice") : 0;
@@ -6487,7 +6495,8 @@ async function buildYandexOffersFromDraft(draft, { exchangeRate = YANDEX_LISTING
     if (draft.originCountry) offer.manufacturerCountries = [String(draft.originCountry)];
     if (Array.isArray(draft.tags) && draft.tags.length) offer.tags = draft.tags.slice(0, 20).map((t) => String(t).slice(0, 40));
     if (draft.videoUrl) offer.videos = [String(draft.videoUrl)];
-    if (baseParams.length) offer.parameterValues = baseParams;
+    const mergedParams = mergeSkuParams(sku.params);
+    if (mergedParams.length) offer.parameterValues = mergedParams;
     if (groupId) offer.groupId = groupId;
     return offer;
   }));

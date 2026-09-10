@@ -17,6 +17,8 @@ window.YandexAutoListingView = {
     const currencyId = Vue.ref('CNY');
     const currencySymbol = Vue.computed(() => (currencyId.value === 'CNY' ? '¥' : '₽'));
     const warehouses = Vue.ref([]);
+    // 变体特征值编辑（每个 SKU 同一特征参数给不同值，Yandex 才允许同组发布）
+    const skuParamDialog = Vue.reactive({ visible: false, index: -1, spec: '', rows: [] });
     const warehouseId = Vue.ref('');
     const priceField = () => (currencyId.value === 'CNY' ? 'priceCny' : 'priceRub');
     const oldPriceField = () => (currencyId.value === 'CNY' ? 'oldPriceCny' : 'oldPriceRub');
@@ -254,6 +256,24 @@ window.YandexAutoListingView = {
     };
 
     // SKU 行操作
+    const openSkuParams = (row, index) => {
+      const distinctive = (drawer.params || []).filter((p) => p.distinctive === true);
+      const current = new Map((Array.isArray(row.params) ? row.params : []).map((p) => [String(p.parameterId), p]));
+      skuParamDialog.rows = distinctive.map((p) => {
+        const old = current.get(String(p.parameterId)) || {};
+        return { parameterId: p.parameterId, name: p.name, nameZh: p.nameZh, options: p.options || [], units: p.units || [], type: p.type, value: old.value || '', valueId: old.valueId || '', unitId: old.unitId || '' };
+      });
+      skuParamDialog.index = index; skuParamDialog.spec = row.spec || ('SKU ' + (index + 1));
+      skuParamDialog.visible = true;
+    };
+    const saveSkuParams = () => {
+      if (!drawer.draft || skuParamDialog.index < 0) return;
+      const row = drawer.draft.skus[skuParamDialog.index];
+      row.params = skuParamDialog.rows.filter((r) => r.valueId || (r.value !== '' && r.value !== undefined && r.value !== null))
+        .map((r) => ({ parameterId: r.parameterId, name: r.name, type: r.type, value: r.value, valueId: r.valueId, unitId: r.unitId }));
+      skuParamDialog.visible = false;
+      notify.success('已设置该 SKU 的变体特征值（记得保存并上传）');
+    };
     const addSku = () => { if (!drawer.draft) return; drawer.draft.skus = [...(drawer.draft.skus || []), { spec: '', priceRub: 0, oldPriceRub: 0, purchaseCny: 0, image: drawer.draft.images?.[0] || '', images: [], weightKg: 0.2, lengthCm: 0, widthCm: 0, heightCm: 0, stock: 0 }]; };
     const removeSku = (i) => { if (drawer.draft?.skus) drawer.draft.skus.splice(i, 1); };
     const applyWeightToAll = () => {
@@ -275,7 +295,7 @@ window.YandexAutoListingView = {
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
-      addSku, removeSku, applyWeightToAll, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
+      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
     };
   },
 
@@ -449,6 +469,13 @@ window.YandexAutoListingView = {
                 <el-table-column label="宽" width="90"><template #default="{ row }"><el-input-number v-model="row.widthCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="高" width="90"><template #default="{ row }"><el-input-number v-model="row.heightCm" :min="0" :precision="1" :controls="false" size="small" style="width:100%" /></template></el-table-column>
                 <el-table-column label="库存" width="90"><template #default="{ row }"><el-input-number v-model="row.stock" :min="0" :precision="0" :controls="false" size="small" style="width:100%" /></template></el-table-column>
+                <el-table-column label="变体特征" width="110">
+                  <template #default="{ row, $index }">
+                    <el-button size="small" plain @click="openSkuParams(row, $index)">
+                      {{ (row.params || []).length ? '已设(' + row.params.length + ')' : '设置' }}
+                    </el-button>
+                  </template>
+                </el-table-column>
                 <el-table-column label="操作" width="70"><template #default="{ $index }"><el-button size="small" type="danger" plain @click="removeSku($index)">删</el-button></template></el-table-column>
               </el-table>
               <div style="display:flex; align-items:center; gap:10px; margin-top:8px; flex-wrap:wrap">
@@ -458,6 +485,11 @@ window.YandexAutoListingView = {
                 </el-select>
                 <el-button size="small" @click="loadWarehouses">刷新仓库</el-button>
                 <span style="font-size:12px; color:#94a3b8">每个 SKU 的「库存」列 > 0 时，上传会一并写到该仓库（Yandex FBS 不写库存会停在 NO_STOCKS 不可售）</span>
+              </div>
+              <div style="font-size:12px; color:#b45309; margin-top:4px">
+                变体：多个 SKU 会被 Yandex 归到同一张卡。若要同卡发布，需在「类目参数」里填「Название группы вариантов(变体组名)」，并用每个 SKU 的「变体特征」按钮给特征参数设不同值；否则 Yandex 会报「Дубль варианта」不发布该组。
+              </div>
+              <div style="display:none">
               </div>
               <div style="font-size:12px; color:#94a3b8; margin-top:6px">售价/划线价按店铺结算币种填写（当前 {{ currencyId }}）。Yandex 只接受店铺币种，填错会上传失败。</div>
             </el-card>
@@ -489,6 +521,29 @@ window.YandexAutoListingView = {
           </template>
         </div>
       </el-drawer>
+
+      <!-- 每个 SKU 的变体特征值 -->
+      <el-dialog v-model="skuParamDialog.visible" :title="'变体特征值 · ' + skuParamDialog.spec" width="560px">
+        <el-alert type="info" :closable="false" show-icon style="margin-bottom:10px"
+          title="同一张卡的不同变体，必须在这里给「变体特征」参数填不同的值（其余参数保持一致）。" />
+        <el-table :data="skuParamDialog.rows" size="small" border empty-text="当前类目没有变体特征参数">
+          <el-table-column label="特征参数" min-width="180">
+            <template #default="{ row }"><div>{{ row.name }}</div><div v-if="row.nameZh" style="font-size:12px;color:#94a3b8">{{ row.nameZh }}</div></template>
+          </el-table-column>
+          <el-table-column label="值" min-width="200">
+            <template #default="{ row }">
+              <el-select v-if="row.options && row.options.length" v-model="row.valueId" filterable clearable placeholder="选择枚举值" style="width:100%">
+                <el-option v-for="o in row.options" :key="o.id" :label="o.value" :value="o.id" />
+              </el-select>
+              <el-input v-else v-model="row.value" placeholder="数值/文本" />
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer>
+          <el-button @click="skuParamDialog.visible = false">取消</el-button>
+          <el-button type="primary" @click="saveSkuParams">保存</el-button>
+        </template>
+      </el-dialog>
     </div>
   `,
 };
