@@ -504,6 +504,42 @@ window.BatchUploadView = {
       });
     };
 
+    // ========== AI 出图（独立出图服务：Ozon 3:4 俄文 7 图套图）==========
+    const aiImg = Vue.reactive({});   // collectId -> { busy, jobId, phase, processed, total, error }
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const aiImageSet = async (row) => {
+      const itemId = row.collectId;
+      if (!itemId) return notify.warning('该行没有关联采集商品（从「采集箱」跳转过来的行才有），无法出图');
+      const key = String(itemId);
+      aiImg[key] = { busy: true, jobId: '', phase: '正在提交出图任务…', processed: 0, total: 7, error: '' };
+      try {
+        const res = await axios.post('/api/ozon/ai-image-set', { itemId }, { timeout: 60000 });
+        aiImg[key].jobId = res.data?.jobId || '';
+        if (!aiImg[key].jobId) throw new Error(res.data?.error || '未返回任务号');
+        notify.success('AI 出图已开始（7 张约 5-8 分钟），可继续其它操作');
+        for (let i = 0; i < 60; i += 1) {
+          await sleep(10000);
+          const jr = await axios.get('/api/image-set/jobs/' + encodeURIComponent(aiImg[key].jobId), { timeout: 30000 });
+          const job = jr.data?.job || {};
+          aiImg[key].phase = job.phase || ''; aiImg[key].processed = Number(job.processed || 0); aiImg[key].total = Number(job.total || 7);
+          if (['done', 'error', 'canceled'].includes(job.status)) {
+            if (job.status === 'done') {
+              const ap = await axios.post(`/api/ozon/ai-image-set/${encodeURIComponent(aiImg[key].jobId)}/apply`, { itemId, mode: 'all' }, { timeout: 60000 });
+              aiImg[key].phase = `✓ 已写入商品图片（共 ${ap.data?.count || 0} 张，主图已置首）`;
+              notify.success('AI 套图已写回该商品图片，可直接批量上架');
+            } else {
+              aiImg[key].error = job.error || job.phase || '生成失败';
+              notify.error('AI 出图失败: ' + aiImg[key].error);
+            }
+            break;
+          }
+        }
+      } catch (e) {
+        aiImg[key].error = e.response?.data?.error || e.message || '失败';
+        notify.error('AI 出图失败: ' + aiImg[key].error);
+      } finally { aiImg[key].busy = false; }
+    };
+
     // ========== 解析粘贴 → 预览表 → 自动采集 (保留) ==========
     const parsePaste = async () => {
       const raw = pasteText.value.trim();
@@ -1515,6 +1551,7 @@ window.BatchUploadView = {
       candidateSearch, filteredCandidates, categoryStats, applyCategoryHistory,
       pickerFocusIdx, onPickerKeydown,
       warehousesByStore, selectedWarehousesByStore, fetchingWarehouses, fetchWarehousesForStore,
+      aiImg, aiImageSet,
     };
   },
   template: `
@@ -1622,6 +1659,7 @@ window.BatchUploadView = {
                     <th style="padding:10px 12px; text-align:left; width:80px">格式</th>
                     <th style="padding:10px 12px; text-align:left; width:260px">类目 (含自动 type_id)</th>
                     <th style="padding:10px 12px; text-align:left; width:120px">问题/状态</th>
+                    <th style="padding:10px 12px; text-align:left; width:150px">AI 出图</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1681,6 +1719,16 @@ window.BatchUploadView = {
                       <span v-else-if="!row.valid" style="color:#dc2626">{{ row.reason }}</span>
                       <span v-else-if="row._collectError" style="color:#dc2626">{{ row._collectError }}</span>
                       <span v-else style="color:#94a3b8">待采</span>
+                    </td>
+                    <td style="padding:10px 12px; font-size:12px">
+                      <template v-if="row.collectId">
+                        <button v-if="!aiImg[String(row.collectId)] || !aiImg[String(row.collectId)].busy" @click="aiImageSet(row)"
+                          style="background:#eff6ff; border:1px solid #bfdbfe; color:#1d4ed8; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px">AI 出图</button>
+                        <div v-else style="color:#b45309; font-size:11px">{{ aiImg[String(row.collectId)].phase }} {{ aiImg[String(row.collectId)].processed }}/{{ aiImg[String(row.collectId)].total }}</div>
+                        <div v-if="aiImg[String(row.collectId)] && aiImg[String(row.collectId)].error" style="color:#b91c1c; font-size:11px; margin-top:3px">{{ aiImg[String(row.collectId)].error.slice(0, 60) }}</div>
+                        <div v-else-if="aiImg[String(row.collectId)] && aiImg[String(row.collectId)].phase && aiImg[String(row.collectId)].phase.startsWith('✓')" style="color:#059669; font-size:11px; margin-top:3px">{{ aiImg[String(row.collectId)].phase }}</div>
+                      </template>
+                      <span v-else style="color:#cbd5e1; font-size:11px">-</span>
                     </td>
                   </tr>
                 </tbody>

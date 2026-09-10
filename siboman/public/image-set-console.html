@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 套图服务 · 控制台</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0f172a; color: #e2e8f0; }
+    .wrap { max-width: 1180px; margin: 0 auto; padding: 26px 20px 60px; }
+    h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: .5px; }
+    .sub { color: #94a3b8; font-size: 13px; margin-bottom: 20px; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px 20px; margin-bottom: 16px; }
+    .card h2 { font-size: 15px; margin: 0 0 14px; color: #f1f5f9; }
+    label { display: block; font-size: 12px; color: #94a3b8; margin: 10px 0 5px; }
+    input, select, textarea { width: 100%; background: #0f172a; border: 1px solid #334155; color: #e2e8f0;
+      border-radius: 8px; padding: 9px 11px; font-size: 13px; font-family: inherit; }
+    input:focus, select:focus { outline: none; border-color: #3b82f6; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 180px; }
+    button { background: #2563eb; border: none; color: #fff; padding: 10px 18px; border-radius: 8px;
+      font-size: 13px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    button:disabled { background: #475569; cursor: not-allowed; }
+    button.ghost { background: transparent; border: 1px solid #475569; color: #cbd5e1; }
+    .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px; background: #14532d; color: #86efac; }
+    .pill.bad { background: #7f1d1d; color: #fca5a5; }
+    .keys { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin-top: 6px; }
+    .keys label { display: flex; align-items: center; gap: 7px; margin: 0; color: #cbd5e1; font-size: 13px;
+      background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 8px 10px; cursor: pointer; }
+    .keys input { width: auto; }
+    .job { border: 1px solid #334155; border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; background: #0f172a; }
+    .job-head { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; flex-wrap: wrap; }
+    .mono { font-family: ui-monospace, Menlo, monospace; font-size: 11px; color: #94a3b8; word-break: break-all; }
+    .thumbs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .thumbs img, .thumbs .ph { width: 78px; height: 104px; object-fit: cover; border-radius: 6px; background: #1e293b; }
+    .log { font-size: 12px; color: #94a3b8; margin-top: 10px; white-space: pre-wrap; }
+    .err { color: #fca5a5; font-size: 13px; margin-top: 10px; }
+    a { color: #60a5fa; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>AI 套图服务 · 控制台</h1>
+    <div class="sub">给 Ozon / Etsy / Yandex 生成 3:4（Etsy 1:1）套图 · 用 ERP 账号登录后使用</div>
+
+    <!-- 未登录 -->
+    <div class="card" id="loginCard" style="display:none">
+      <h2>请登录（ERP 账号密码）</h2>
+      <div class="row">
+        <div><label>账号</label><input id="lgUser" autocomplete="username" /></div>
+        <div><label>密码</label><input id="lgPass" type="password" autocomplete="current-password" /></div>
+      </div>
+      <div style="margin-top:14px"><button id="lgBtn">登录</button></div>
+      <div class="err" id="lgErr"></div>
+    </div>
+
+    <div id="appArea" style="display:none">
+      <div class="card">
+        <h2>服务状态 <span class="pill" id="hPill">检测中…</span></h2>
+        <div class="mono" id="hInfo"></div>
+        <div style="margin-top:12px">
+          <button class="ghost" id="refreshBtn">刷新任务列表</button>
+          <button class="ghost" id="logoutBtn" style="margin-left:8px">退出登录</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>新建套图任务</h2>
+        <div class="row">
+          <div>
+            <label>平台</label>
+            <select id="fPlatform">
+              <option value="ozon">Ozon（3:4 俄文 7 图）</option>
+              <option value="yandex">Yandex（3:4 俄文 7 图）</option>
+              <option value="etsy">Etsy（1:1 英文 7 图）</option>
+            </select>
+          </div>
+          <div><label>标题（可选，影响文案）</label><input id="fTitle" placeholder="商品标题" /></div>
+        </div>
+        <label>参考图 URL（必填，直接用商品原图，越清晰越好）</label>
+        <input id="fRef" placeholder="https://... 商品主图" />
+        <label>只生成部分图片（不勾选 = 全部 7 张）</label>
+        <div class="keys" id="keysBox"></div>
+        <div style="margin-top:16px"><button id="submitBtn">开始出图</button>
+          <span class="mono" id="submitHint" style="margin-left:12px"></span></div>
+        <div class="err" id="fErr"></div>
+      </div>
+
+      <div class="card">
+        <h2>任务列表</h2>
+        <div id="jobs"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+const KEYS = [
+  ['main', '主图'], ['usage', '使用场景'], ['multi', '多件摆拍'], ['features', '产品特点'],
+  ['comparison', '竞品对比'], ['single', '单件摆拍'], ['details', '多角度细节'],
+];
+const BASE = '/api/image-set';
+
+async function api(path, opts) {
+  const res = await fetch(BASE + path, { credentials: 'include', headers: { 'Content-Type': 'application/json' }, ...(opts || {}) });
+  const text = await res.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch { data = { ok: false, error: '响应不是 JSON（可能未登录）：' + text.slice(0, 120) }; }
+  return { status: res.status, data };
+}
+
+function el(id) { return document.getElementById(id); }
+
+function renderKeys() {
+  el('keysBox').innerHTML = KEYS.map(([k, zh]) =>
+    `<label><input type="checkbox" value="${k}" />${zh}</label>`).join('');
+}
+
+async function checkAuth() {
+  const res = await fetch('/api/auth/status', { credentials: 'include' });
+  const d = await res.json().catch(() => ({}));
+  const ok = Boolean(d.authenticated);
+  el('loginCard').style.display = ok ? 'none' : 'block';
+  el('appArea').style.display = ok ? 'block' : 'none';
+  if (ok) { refreshHealth(); refreshJobs(); }
+}
+
+async function login() {
+  el('lgErr').textContent = '';
+  const username = el('lgUser').value.trim();
+  const password = el('lgPass').value;
+  const res = await fetch('/api/auth/login', {
+    method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok || !d.success) { el('lgErr').textContent = d.error || '登录失败'; return; }
+  await checkAuth();
+}
+
+async function refreshHealth() {
+  const { data } = await api('/health');
+  const ok = data && data.ok;
+  el('hPill').textContent = ok ? '正常' : '异常';
+  el('hPill').className = 'pill' + (ok ? '' : ' bad');
+  el('hInfo').textContent = ok
+    ? `模型 ${data.model} · 入口 ${data.base} · 支持平台 ${(data.platforms || []).join(' / ')} · 历史任务 ${data.jobs}`
+    : (data && data.error) || '无法连接出图服务';
+}
+
+async function submitJob() {
+  el('fErr').textContent = '';
+  const ref = el('fRef').value.trim();
+  if (!ref) { el('fErr').textContent = '请填写参考图 URL'; return; }
+  const keys = Array.from(document.querySelectorAll('#keysBox input:checked')).map(x => x.value);
+  const body = {
+    platform: el('fPlatform').value,
+    refImageUrl: ref,
+    title: el('fTitle').value.trim(),
+    keys: keys.length ? keys : null,
+  };
+  el('submitBtn').disabled = true;
+  el('submitHint').textContent = '提交中…';
+  const { data } = await api('/jobs', { method: 'POST', body: JSON.stringify(body) });
+  el('submitBtn').disabled = false;
+  if (!data || !data.ok) { el('fErr').textContent = (data && data.error) || '提交失败'; el('submitHint').textContent = ''; return; }
+  el('submitHint').textContent = '任务号 ' + data.jobId;
+  refreshJobs();
+}
+
+let timer = null;
+async function refreshJobs() {
+  const { data } = await api('/jobs');
+  const list = (data && data.jobs) || [];
+  if (!list.length) { el('jobs').innerHTML = '<div class="mono">还没有任务</div>'; return; }
+  el('jobs').innerHTML = list.map(j => {
+    const imgs = (j.images || []);
+    const thumbs = imgs.map(x => x.ok && x.url
+      ? `<a href="${x.url}" target="_blank"><img src="${x.url}" /></a>`
+      : `<div class="ph" title="${(x.error || '').replace(/"/g, '')}"></div>`).join('');
+    return `<div class="job">
+      <div class="job-head">
+        <div><b>${j.platform || ''}</b> · <span class="pill${j.status === 'done' ? '' : ' bad'}">${j.status}</span>
+          <div class="mono">${j.id}</div></div>
+        <div class="mono">${j.processed || 0}/${j.total || 0} · ${(j.phase || '').slice(0, 70)}</div>
+      </div>
+      <div class="thumbs">${thumbs}</div>
+      <div class="log">${(j.refImageUrl || '').slice(0, 160)}</div>
+    </div>`;
+  }).join('');
+}
+
+el('lgBtn').addEventListener('click', login);
+el('lgPass').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+el('submitBtn').addEventListener('click', submitJob);
+el('refreshBtn').addEventListener('click', () => { refreshHealth(); refreshJobs(); });
+el('logoutBtn').addEventListener('click', async () => {
+  await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
+  checkAuth();
+});
+renderKeys();
+checkAuth();
+timer = setInterval(() => { if (el('appArea').style.display !== 'none') refreshJobs(); }, 10000);
+
+const qs = new URLSearchParams(location.search);
+if (qs.get('ref')) el('fRef').value = qs.get('ref');
+if (qs.get('platform')) el('fPlatform').value = qs.get('platform');
+</script>
+</body>
+</html>

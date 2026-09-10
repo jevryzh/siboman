@@ -448,8 +448,6 @@ let currentBrowserHeadless = false;
 const isPublicPath = (path) => {
   const publicPaths = ["/login", "/api/auth/login", "/api/auth/status", "/api/version"];
   if (publicPaths.includes(path)) return true;
-  // AI 套图服务对外入口：用服务 API Key 鉴权，供 Ozon/Etsy 等其它系统调用（无需 ERP 登录）
-  if (path.startsWith("/api/image-set/public/")) return true;
   // 允许加载 JS/CSS/图片等静态资源 + 扩展下载 + 上传目录
   if (path.startsWith("/static") || path.startsWith("/extension/") || path.startsWith("/uploads/") ||
       path.endsWith(".css") || path.endsWith(".ico") || path.endsWith(".js") || path.endsWith(".zip") ||
@@ -7048,47 +7046,53 @@ function imageSetPublicAuth(req) {
   return Boolean(IMAGE_SET_KEY) && key === IMAGE_SET_KEY;
 }
 
-app.get("/api/image-set/public/health", async (req, res) => {
-  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+app.get("/api/image-set/public/health", requireAuth, async (req, res) => {
   const out = await callImageSetService("GET", "/health").catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
   res.status(out.status).json(out.payload);
 });
 
 // body: { platform: ozon|etsy|yandex, refImageUrl, keys?, ratio?, language?, title?, features? }
-app.post("/api/image-set/public/jobs", async (req, res) => {
-  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+app.post("/api/image-set/public/jobs", requireAuth, async (req, res) => {
   const out = await callImageSetService("POST", "/jobs", req.body || {}).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
   res.status(out.status).json(out.payload);
 });
 
-app.get("/api/image-set/public/jobs/:id", async (req, res) => {
-  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+app.get("/api/image-set/public/jobs/:id", requireAuth, async (req, res) => {
   const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
   res.status(out.status).json(out.payload);
 });
 
-app.post("/api/image-set/public/jobs/:id/cancel", async (req, res) => {
-  if (!imageSetPublicAuth(req)) return res.status(401).json({ ok: false, error: "invalid api key" });
+app.post("/api/image-set/public/jobs/:id/cancel", requireAuth, async (req, res) => {
   const out = await callImageSetService("POST", `/jobs/${encodeURIComponent(req.params.id)}/cancel`, {}).catch((e) => ({ status: 503, payload: { ok: false, error: String(e?.message || e) } }));
   res.status(out.status).json(out.payload);
 });
+
+// Ozon 静态图尺寸段升级：/wc100/ → /wc1000/（采集箱里存的是 100px 缩略图）
+function upgradeOzonImageUrl(url) {
+  if (!url) return "";
+  return url.replace(/\/wc(\d+)\//, (_m, w) => (Number(w) < 1000 ? "/wc1000/" : `/wc${w}/`))
+            .replace(/\/c(\d+)\//, (_m, w) => (Number(w) < 1000 ? "/c1000/" : `/c${w}/`));
+}
 
 // ===== Ozon 接入（第 3 步）：采集箱商品一键出图，结果写回 collect_items =====
 app.post("/api/ozon/ai-image-set", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
-    const itemId = Number(req.body?.itemId || req.body?.collectItemId || 0);
+    const itemId = String(req.body?.itemId || req.body?.collectItemId || "").trim();
     if (!itemId) return res.status(400).json({ success: false, error: "itemId 必填" });
-    const r = await db.query(`SELECT id, title, name, main_image, images FROM collect_items WHERE id=$1`, [itemId]);
+    const r = await db.query(`SELECT id, title, ozon_sku, main_image, images FROM collect_items WHERE id=$1`, [itemId]);
     const row = r.rows?.[0];
     if (!row) return res.status(404).json({ success: false, error: "采集商品不存在" });
     const imgs = Array.isArray(row.images) ? row.images : [];
-    const ref = String(row.main_image || imgs[0] || "").trim();
+    // 采集箱存的是 wc100 缩略图(100px)，出图必须用大图，否则生成质量极差；
+    // 且必须优先用「原始商品图」做参考：用上一次 AI 生成图打底会逐次风格漂移。
+    const original = imgs.find((u) => typeof u === "string" && u && !u.includes("/uploads/image-set/"));
+    const ref = upgradeOzonImageUrl(String(original || row.main_image || imgs[0] || "").trim());
     if (!ref) return res.status(400).json({ success: false, error: "该商品没有图片，无法出图" });
     const out = await callImageSetService("POST", "/jobs", {
       platform: "ozon",
       refImageUrl: ref,
-      title: String(row.title || row.name || "").slice(0, 200),
+      title: String(row.title || "").slice(0, 200),
       keys: Array.isArray(req.body?.keys) ? req.body.keys : null,
     }, 60000);
     if (!out.payload?.ok) return res.status(out.status || 502).json({ success: false, error: out.payload?.error || "出图服务返回异常" });
@@ -7099,7 +7103,7 @@ app.post("/api/ozon/ai-image-set", requireAuth, async (req, res, next) => {
 app.post("/api/ozon/ai-image-set/:jobId/apply", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
-    const itemId = Number(req.body?.itemId || req.body?.collectItemId || 0);
+    const itemId = String(req.body?.itemId || req.body?.collectItemId || "").trim();
     if (!itemId) return res.status(400).json({ success: false, error: "itemId 必填" });
     const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.jobId)}`);
     const images = (out.payload?.job?.images || []).filter((x) => x.ok && x.url);
@@ -7128,6 +7132,13 @@ app.get("/api/image-set/health", requireAuth, async (req, res, next) => {
 app.post("/api/image-set/jobs", requireAuth, async (req, res, next) => {
   try {
     const out = await callImageSetService("POST", "/jobs", req.body || {});
+    res.status(out.status).json(out.payload);
+  } catch (error) { next(error); }
+});
+
+app.get("/api/image-set/jobs", requireAuth, async (req, res, next) => {
+  try {
+    const out = await callImageSetService("GET", "/jobs");
     res.status(out.status).json(out.payload);
   } catch (error) { next(error); }
 });

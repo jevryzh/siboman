@@ -200,6 +200,47 @@ window.CollectionBoxView = {
       window.location.hash = '#/upload';
     };
 
+    // ===== AI 套图（Ozon 3:4 俄文 7 图）=====
+    const aiImg = Vue.reactive({});   // itemId -> { busy, jobId, phase, processed, total, error, images }
+    const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+    const aiImageSet = async (row) => {
+      const itemId = String(row?.id || '');
+      if (!itemId) return ElementPlus.ElMessage.warning('该采集项没有 ID，无法出图');
+      if (!row.main_image && !(row.images || []).length) return ElementPlus.ElMessage.warning('该采集项没有图片，无法出图');
+      const key = itemId;
+      aiImg[key] = { busy: true, jobId: '', phase: '正在提交出图任务…', processed: 0, total: 7, error: '', images: [] };
+      try {
+        const res = await axios.post('/api/ozon/ai-image-set', { itemId }, { timeout: 60000 });
+        aiImg[key].jobId = res.data?.jobId || '';
+        if (!aiImg[key].jobId) throw new Error(res.data?.error || '未返回任务号');
+        ElementPlus.ElMessage.success('AI 出图已开始（7 张，约 5-8 分钟），可以先去干别的');
+        for (let i = 0; i < 80; i += 1) {
+          await sleepMs(10000);
+          const jr = await axios.get('/api/image-set/jobs/' + encodeURIComponent(aiImg[key].jobId), { timeout: 30000 });
+          const job = jr.data?.job || {};
+          aiImg[key].phase = job.phase || '';
+          aiImg[key].processed = Number(job.processed || 0);
+          aiImg[key].total = Number(job.total || 7);
+          aiImg[key].images = (job.images || []).filter((x) => x.ok && x.url).map((x) => x.url);
+          if (['done', 'error', 'canceled'].includes(job.status)) {
+            if (job.status === 'done') {
+              const ap = await axios.post(`/api/ozon/ai-image-set/${encodeURIComponent(aiImg[key].jobId)}/apply`, { itemId, mode: 'all' }, { timeout: 60000 });
+              aiImg[key].phase = `✓ 已写入商品图片（共 ${ap.data?.count || 0} 张，主图置首）`;
+              ElementPlus.ElMessage.success('AI 套图已写回该商品，可直接送上架');
+              fetchItems().catch(() => {});
+            } else {
+              aiImg[key].error = job.error || job.phase || '生成失败';
+              ElementPlus.ElMessage.error('AI 出图失败: ' + aiImg[key].error);
+            }
+            break;
+          }
+        }
+      } catch (e) {
+        aiImg[key].error = e.response?.data?.error || e.message || '失败';
+        ElementPlus.ElMessage.error('AI 出图失败: ' + aiImg[key].error);
+      } finally { aiImg[key].busy = false; }
+    };
+
     const exportCsv = () => {
       const rows = [['Ozon SKU','标题','Ozon链接','主图','全部图片','售价(RUB)','1688链接','1688成本(CNY)','状态','失败原因'], ...items.value.map(row => [row.ozon_sku,row.title,row.ozon_url,row.main_image,(row.images || []).join(' | '),row.price_rub,row.source_url_1688,row.price_cny,statusLabel(row.status),row.note])];
       const csv = rows.map(row => row.map(value => `"${String(value ?? '').replaceAll('"','""')}"`).join(',')).join('\n');
@@ -233,6 +274,7 @@ window.CollectionBoxView = {
       pagination, fetchItems, getProfitStyle, suggestedPrice, applySuggestedPrice, saveDraft,
       onTabChange, onSearch, onSearchInput, onSizeChange, onSelectionChange, updateStatus, bulkDelete, deleteItem, retryItem, sendToListing, exportCsv,
       statusLabel, statusType, statusDescriptions, rowFailureReason, taskSummary,
+      aiImg, aiImageSet,
     };
   },
   template: `
@@ -321,6 +363,20 @@ window.CollectionBoxView = {
               <el-tooltip :content="statusDescriptions[row.status] || statusLabel(row.status)" placement="top">
                 <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
               </el-tooltip>
+            </template>
+          </el-table-column>
+          <el-table-column label="AI 套图" width="190" align="center">
+            <template #default="{ row }">
+              <el-button v-if="!(aiImg[row.id] && aiImg[row.id].busy)" link type="primary" :disabled="!row.main_image && !(row.images || []).length" @click="aiImageSet(row)">AI 出图</el-button>
+              <div v-else style="font-size:11px; color:#b45309; line-height:1.5">
+                {{ aiImg[row.id].phase }}<br />{{ aiImg[row.id].processed }}/{{ aiImg[row.id].total }}
+              </div>
+              <div v-if="aiImg[row.id] && aiImg[row.id].error" style="font-size:11px; color:#f56c6c; max-width:170px; white-space:normal">{{ aiImg[row.id].error.slice(0, 60) }}</div>
+              <div v-if="(aiImg[row.id] && aiImg[row.id].images || []).length" style="display:flex; gap:4px; flex-wrap:wrap; justify-content:center; margin-top:6px">
+                <el-image v-for="(u, i) in aiImg[row.id].images.slice(0, 7)" :key="u" :src="u"
+                  :preview-src-list="aiImg[row.id].images" :initial-index="i" preview-teleported fit="cover"
+                  style="width:26px; height:34px; border-radius:3px; background:#f1f5f9" />
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="操作" width="240" fixed="right" align="center">

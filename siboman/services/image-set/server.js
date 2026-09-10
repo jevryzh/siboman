@@ -181,6 +181,20 @@ const server = http.createServer(async (req, res) => {
       setTimeout(() => runJob(job), 20);
       return json(res, 200, { ok: true, jobId: job.id, total: TEMPLATES.length });
     }
+    if (req.method === "GET" && url.pathname === "/jobs") {
+      const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 30)));
+      const list = Array.from(jobs.values())
+        .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")))
+        .slice(0, limit)
+        .map((j) => ({
+          id: j.id, platform: j.platform, status: j.status, phase: j.phase,
+          processed: j.processed || 0, total: j.total || 0,
+          createdAt: j.createdAt, updatedAt: j.updatedAt,
+          refImageUrl: j.refImageUrl,
+          images: (j.images || []).map((x) => ({ key: x.key, label: x.label, ok: Boolean(x.ok), url: x.url || "", error: x.error || "" })),
+        }));
+      return json(res, 200, { ok: true, count: list.length, jobs: list });
+    }
     const m = url.pathname.match(/^\/jobs\/([\w-]+)(?:\/(cancel))?$/);
     if (m) {
       const job = jobs.get(m[1]);
