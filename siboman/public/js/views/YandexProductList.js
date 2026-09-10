@@ -2230,7 +2230,7 @@ window.YandexProductListView = {
       <el-dialog v-model="preciseDialog.visible" title="插件精核价（1688 官方真实价）" width="1440px" append-to-body destroy-on-close
         :close-on-click-modal="false" @closed="stopPrecisePoll">
         <el-alert type="warning" :closable="false" show-icon style="margin-bottom:12px"
-          title="本机插件用 1688 官方以图找货 + 打开详情页读「真实价格阶梯」，采购价取起批首档单价（小批量真能买到的价）。可直接采用 = 有完整阶梯；待人工核对 = 阶梯缺失或疑似引流档，需要你点开链接确认。建议价里已含 1688 国内运费（抓到真实运费就用真实值，抓到「未公开/需选地区」则按默认 ¥4 并标「默认」）。需要浏览器插件在线并登录 1688。" />
+          title="本机插件用 1688 官方以图找货 + 打开详情页读「真实价格阶梯」，采购价取起批首档单价（小批量真能买到的价）。可直接采用 = 有完整阶梯；待人工核对 = 阶梯缺失或疑似引流档，需要你点开链接确认。建议价里已含 1688 国内运费（抓到真实运费就用真实值，抓到「未公开/需选地区」则按默认 ¥4 并标「默认」）。重量列标「1688」表示 Yandex 没填重量、用 1688 详情页重量兜底算的建议价。需要浏览器插件在线并登录 1688。" />
         <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:12px">
           <el-tag type="info" size="large">进度 {{ preciseDialog.processed }} / {{ preciseDialog.total }}</el-tag>
           <el-tag v-if="['queued','claimed'].includes(preciseDialog.status)" type="warning" size="large">等待本机插件领取…</el-tag>
@@ -2330,6 +2330,14 @@ window.YandexProductListView = {
             </el-table-column>
             <el-table-column label="起批" width="90" show-overflow-tooltip>
               <template #default="{ row }">{{ row.moq || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="重量" width="95" align="right">
+              <template #default="{ row }">
+                <span v-if="row.weightKg">{{ Number(row.weightKg).toFixed(3) }} kg
+                  <span v-if="row.weightSource === '1688'" style="color:#b45309; font-size:11px">1688</span>
+                </span>
+                <span v-else>-</span>
+              </template>
             </el-table-column>
             <el-table-column label="1688 运费" width="105" align="right">
               <template #default="{ row }">

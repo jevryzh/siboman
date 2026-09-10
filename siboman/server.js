@@ -5653,6 +5653,8 @@ function preciseCandidateEvidence(result, best, pick) {
     shippingFee: String(best?.shippingFee || ""),
     shippingFeeCnyUsed: pick.shipping?.value ?? null,
     shippingEstimated: pick.shipping?.estimated !== false,
+    weightSource,
+    dimsSource: hasYandexDims ? "yandex" : (dimsFrom1688.every((v) => v > 0) ? "1688" : ""),
     trafficBaitRisk: best?.trafficBaitRisk === true,
     domPriceText: String(best?.domPriceText || ""),
     searchError: String(result?.searchError || "").slice(0, 200),
@@ -5671,8 +5673,20 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
   if (!(pick.price > 0) || !(PRECISE_PRICE_MODES[pick.mode] || {}).trusted) {
     return { offerId, status: "need_confirm", reason: pick.mode, mode: pick.mode, skus: pick.skus || [] };
   }
-  const weightKg = Number(offer?.weightKg || 0);
-  const lenCm = Number(offer?.lenCm || 0), widCm = Number(offer?.widCm || 0), heiCm = Number(offer?.heiCm || 0);
+  // 重量/尺寸：优先 Yandex 商品卡片自带值；缺失时用 1688 详情页抓到的包装重量/尺寸兜底
+  //   （用户确认：可以用 1688 重量兜底算建议价，但必须标清来源，便于人工复核）
+  const yandexWeightKg = Number(offer?.weightKg || 0);
+  const fallbackWeightKg = Number(best?.weightGrams || 0) > 0 ? Number(best.weightGrams) / 1000 : 0;
+  const weightKg = yandexWeightKg > 0 ? yandexWeightKg : fallbackWeightKg;
+  const weightSource = yandexWeightKg > 0 ? "yandex" : (fallbackWeightKg > 0 ? "1688" : "");
+  const dimsFrom1688 = (() => {
+    const m = String(best?.dimensionsText || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+    return m ? [Number(m[1]) || 0, Number(m[2]) || 0, Number(m[3]) || 0] : [0, 0, 0];
+  })();
+  const yandexDims = [Number(offer?.lenCm || 0), Number(offer?.widCm || 0), Number(offer?.heiCm || 0)];
+  const hasYandexDims = yandexDims.every((v) => v > 0);
+  const dims = hasYandexDims ? yandexDims : (dimsFrom1688.every((v) => v > 0) ? dimsFrom1688 : [0, 0, 0]);
+  const lenCm = dims[0], widCm = dims[1], heiCm = dims[2];
   // 国内运费：用 1688 详情页抓到的真实运费（拿不到才退回默认 4 元，并在证据里标 estimated）
   const shipping = preciseShippingCny(best?.shippingFee);
   pick.shipping = shipping;
@@ -6089,6 +6103,10 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         shippingFee: String(best?.shippingFee || ""),
         shippingCnyUsed: preciseShippingCny(best?.shippingFee).value,
         shippingEstimated: preciseShippingCny(best?.shippingFee).estimated,
+        weightKg: Number(yandexOffer.weightKg || 0) > 0
+          ? Number(yandexOffer.weightKg)
+          : (Number(best?.weightGrams || 0) > 0 ? Number(best.weightGrams) / 1000 : 0),
+        weightSource: Number(yandexOffer.weightKg || 0) > 0 ? "yandex" : (Number(best?.weightGrams || 0) > 0 ? "1688" : ""),
         trafficBaitRisk: best?.trafficBaitRisk === true,
         savedStatus: saved?.status || "",
         suggestPriceCny: Number(saved?.suggest_price_cny || 0),
