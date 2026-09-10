@@ -5543,6 +5543,7 @@ app.get("/api/yandex/bulk-pricing/:id", requireAuth, async (req, res, next) => {
 // 采购价一律取「起批首档单价」（小批量能真正买到的价）；拿不到阶梯证据的只标记待人工，不写采购价。
 const PRECISE_JOB_MARKER = "precise-1688";
 const preciseRecordedByJob = new Map(); // jobId -> Set(offerId)，避免同一 offer 重复落库
+const preciseVariantResolving = new Map(); // jobId -> true（多规格图片比对进行中）
 
 async function mapWithConcurrency(items, limit, worker) {
   const list = Array.isArray(items) ? items : [];
@@ -5735,6 +5736,7 @@ const PRECISE_PRICE_MODES = {
   sku_match: { trusted: true, label: "按规格匹配（混合配件店）" },
   promo_adjusted: { trusted: true, label: "含促销档，已取多数规格价（保守）" },
   variant_match: { trusted: true, label: "按尺寸/型号匹配规格" },
+  image_match: { trusted: true, label: "按图片比对选规格" },
   tier_suspect: { trusted: false, label: "阶梯疑似含引流档，需人工确认" },
   ambiguous_manual: { trusted: false, label: "规格无法自动对齐，需人工选" },
   no_evidence: { trusted: false, label: "未取到价格证据" },
@@ -5781,14 +5783,16 @@ function preciseCandidateEvidence(result, best, pick, extra = {}) {
   };
 }
 
-async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById }) {
+async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById, pickOverride = null, extraEvidence = {} }) {
   const offerId = String(result?.offerId || "").trim();
   if (!offerId) return { offerId, status: "skipped", reason: "no_offer_id" };
   const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
   const best = candidates[0] || null;
   if (!best) return { offerId, status: "no_match", reason: "no_candidate" };
   const offer = cacheById?.get(offerId) || {};
-  const pick = precisePickPrice(best, result?.name || offer?.name || "");
+  const pick = pickOverride
+    ? { price: Number(pickOverride.price || 0), mode: "image_match", sku: pickOverride.sku || null, skus: pickOverride.skus || [], tiers: [] }
+    : precisePickPrice(best, result?.name || offer?.name || "");
   // 只在取到可信价（阶梯首档 / 统一价 / 规格匹配）时落库；取不到可信价的一律不写，避免不可信成本进候选表
   if (!(pick.price > 0) || !(PRECISE_PRICE_MODES[pick.mode] || {}).trusted) {
     return { offerId, status: "need_confirm", reason: pick.mode, mode: pick.mode, skus: pick.skus || [] };
@@ -5817,10 +5821,13 @@ async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById })
         params: { exchangeRate: 12.8205, targetMarginPct: 35, domesticShippingCny: shipping.value },
       })
     : { ok: false };
-  const evidence = preciseCandidateEvidence(result, best, pick, {
-    weightSource,
-    dimsSource: hasYandexDims ? "yandex" : (dimsFrom1688.every((v) => v > 0) ? "1688" : ""),
-  });
+  const evidence = {
+    ...preciseCandidateEvidence(result, best, pick, {
+      weightSource,
+      dimsSource: hasYandexDims ? "yandex" : (dimsFrom1688.every((v) => v > 0) ? "1688" : ""),
+    }),
+    ...extraEvidence,
+  };
   const status = "ready";
   try {
     const existing = await db.query(
@@ -6093,6 +6100,85 @@ async function recordPreciseResults(job, results, userId, storeId) {
   return { written: outcomes.length, outcomes };
 }
 
+// ===== 多规格自动对齐：用图片比对选出该 Yandex 商品对应的 1688 规格 =====
+// AlphaShop 详情接口每个规格都带 skuImageUrl，用 dHash 与 Yandex 主图比对，唯一明显更近才采用。
+async function fetchImageBufferSafe(url) {
+  const target = String(url || "").trim();
+  if (!/^https?:\/\//i.test(target)) return null;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const resp = await fetch(target, { signal: controller.signal, headers: { Referer: "https://www.1688.com/" } });
+    if (!resp.ok) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length || buf.length > 10 * 1024 * 1024) return null;
+    return buf;
+  } catch (_e) {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function dHashFromBuffer(Jimp, buf) {
+  if (!buf) return null;
+  try {
+    const img = await Jimp.read(buf);
+    img.resize({ w: 9, h: 8 });
+    img.greyscale();
+    const data = img.bitmap.data;
+    const bits = [];
+    for (let y = 0; y < 8; y += 1) {
+      for (let x = 0; x < 8; x += 1) {
+        const left = data[(y * 9 + x) * 4];
+        const right = data[(y * 9 + x + 1) * 4];
+        bits.push(left > right ? 1 : 0);
+      }
+    }
+    return bits;
+  } catch (_e) {
+    return null;
+  }
+}
+
+function hashDistance(a, b) {
+  if (!a || !b || a.length !== b.length) return 999;
+  let n = 0;
+  for (let i = 0; i < a.length; i += 1) if (a[i] !== b[i]) n += 1;
+  return n;
+}
+
+async function resolveVariantByImage({ yandexImageUrl, offerId1688, Jimp }) {
+  const yHash = await dHashFromBuffer(Jimp, await fetchImageBufferSafe(yandexImageUrl));
+  if (!yHash) return { ok: false, reason: "yandex_image_unreadable" };
+  const detail = await alphaShopMcpCall("productDetailQuery", { productId: String(offerId1688) }, 45000).catch(() => null);
+  const product = detail && (detail.result || detail);
+  const skus = Array.isArray(product?.productSkuInfos) ? product.productSkuInfos : [];
+  if (skus.length < 2) return { ok: false, reason: "no_multi_sku" };
+  const scored = [];
+  for (const sku of skus) {
+    const price = Number(sku?.price || 0);
+    if (!(price > 0 && price <= 50000)) continue;
+    const attrs = Array.isArray(sku?.productSkuAttributeInfos) ? sku.productSkuAttributeInfos : [];
+    const imageUrl = attrs.map((a) => a?.skuImageUrl).find(Boolean) || "";
+    const label = attrs.map((a) => a?.value).filter(Boolean).join(" / ");
+    const labelTrans = attrs.map((a) => a?.valueTrans).filter(Boolean).join(" / ");
+    const hash = imageUrl ? await dHashFromBuffer(Jimp, await fetchImageBufferSafe(imageUrl)) : null;
+    scored.push({ price, label, labelTrans, imageUrl, distance: hash ? hashDistance(yHash, hash) : null, amountOnSale: Number(sku?.amountOnSale || 0) });
+  }
+  const withHash = scored.filter((x) => x.distance != null).sort((a, b) => a.distance - b.distance);
+  if (!withHash.length) return { ok: false, reason: "no_sku_images", skuCount: scored.length };
+  const best = withHash[0];
+  const second = withHash[1] || null;
+  const clearWinner = best.distance <= 10 && (!second || second.distance - best.distance >= 4);
+  return {
+    ok: clearWinner,
+    reason: clearWinner ? "matched" : "ambiguous",
+    best, second, skuCount: scored.length,
+    candidates: withHash.slice(0, 3).map((x) => `${x.label}¥${x.price}(d=${x.distance})`),
+  };
+}
+
 // 启动/续跑一次全店精核价（任务由本机插件领取执行，服务端只编排 + 落库）
 app.post("/api/yandex/precise-1688", requireAuth, async (req, res, next) => {
   try {
@@ -6142,6 +6228,96 @@ app.post("/api/yandex/precise-1688", requireAuth, async (req, res, next) => {
       phase: `已排队 ${items.length} 个商品，等待本机插件领取（1688 官方核价）`,
     }, { items, marker: PRECISE_JOB_MARKER, precise: true, storeId, skipped });
     res.json({ success: true, jobId: job.id, total: items.length, skipped: skipped.length, published: publishedCount, queued: true });
+  } catch (error) { next(error); }
+});
+
+// 多规格自动对齐：对「待人工核对」的行用图片比对选规格 → 写候选（只用明显命中，不确定的仍留人工）
+app.post("/api/yandex/precise-1688/:id/resolve-variants", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const job = await getDbJobForUser(req.params.id, req.user);
+    if (!job) return res.status(404).json({ success: false, error: "精核价任务不存在" });
+    if (job.payload?.marker !== PRECISE_JOB_MARKER && job.payload?.precise !== true) {
+      return res.status(400).json({ success: false, error: "该任务不是插件精核价任务" });
+    }
+    if (!alphaCreds()) return res.status(400).json({ success: false, error: "AlphaShop 凭据未配置，无法做图片比对" });
+    if (preciseVariantResolving.get(job.id)) {
+      return res.json({ success: true, started: false, reason: "already_running", message: "自动对齐正在进行中，稍后刷新查看结果" });
+    }
+    preciseVariantResolving.set(job.id, true);
+    const userId = job.owner?.id || null;
+    const storeId = job.storeId || null;
+    const results = Array.isArray(job.results) ? job.results : [];
+    const yandexCache = yandexOfferCacheObj(storeId || "__env__");
+    const cacheById = new Map();
+    for (const it of [...(yandexCache?.active || []), ...(yandexCache?.archived || [])]) {
+      const oid = String(it?.offer_id || it?.offerId || "");
+      if (oid) cacheById.set(oid, it);
+    }
+    const onlyOfferIds = Array.isArray(req.body?.offerIds) ? req.body.offerIds.map((v) => String(v)) : [];
+    const { Jimp } = await import("jimp");
+    const targets = [];
+    for (const r of results) {
+      const offerId = String(r?.offerId || "");
+      if (!offerId) continue;
+      if (onlyOfferIds.length && !onlyOfferIds.includes(offerId)) continue;
+      const best = Array.isArray(r?.candidates) ? r.candidates[0] : null;
+      if (!best) continue;
+      const pick = precisePickPrice(best, r?.name || "");
+      if (pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) continue; // 已能取到可信价，跳过
+      const offerId1688 = String(best?.offerId || best?.offerId1688 || "").trim();
+      if (!/^\d{6,}$/.test(offerId1688)) continue;
+      const offer = cacheById.get(offerId) || {};
+      const image = String((Array.isArray(offer.images) && offer.images[0]) || offer.image || "").trim();
+      if (!image) continue;
+      targets.push({ result: r, best, offerId, offerId1688, image });
+    }
+    if (!targets.length) {
+      preciseVariantResolving.delete(job.id);
+      return res.json({ success: true, total: 0, matched: 0, manual: 0, message: "没有可自动对齐的多规格行" });
+    }
+    // 后台跑（每条要下 10+ 张规格图，全量可能超过反向代理超时）→ 立即返回，前端轮询报告看进度
+    const targetsToRun = targets.slice(0, 60);
+    res.json({ success: true, started: true, total: targetsToRun.length, message: `已开始自动对齐 ${targetsToRun.length} 条（后台执行，完成后报告自动更新）` });
+    (async () => {
+    let matched = 0, manual = 0;
+    const rows = [];
+    for (const t of targetsToRun) {
+      let outcome = { ok: false, reason: "error" };
+      try {
+        outcome = await resolveVariantByImage({ yandexImageUrl: t.image, offerId1688: t.offerId1688, Jimp });
+      } catch (e) {
+        outcome = { ok: false, reason: String(e?.message || e).slice(0, 120) };
+      }
+      if (outcome.ok && outcome.best) {
+        const write = await upsertPreciseCandidateRow({
+          userId, storeId, result: t.result, cacheById,
+          pickOverride: { price: outcome.best.price, sku: { name: outcome.best.label, price: outcome.best.price, stock: outcome.best.amountOnSale } },
+          extraEvidence: {
+            imageMatch: {
+              label: outcome.best.label, labelTrans: outcome.best.labelTrans || "",
+              price: outcome.best.price, distance: outcome.best.distance,
+              runnerUpDistance: outcome.second ? outcome.second.distance : null,
+              skuCount: outcome.skuCount, skuImageUrl: outcome.best.imageUrl || "",
+            },
+          },
+        });
+        if (write.status === "ready" || write.status === "already_applied") matched += 1;
+        else manual += 1;
+        rows.push({ offerId: t.offerId, ok: write.status === "ready", status: write.status, price: outcome.best.price, label: outcome.best.label, distance: outcome.best.distance, runnerUpDistance: outcome.second ? outcome.second.distance : null });
+      } else {
+        manual += 1;
+        rows.push({ offerId: t.offerId, ok: false, reason: outcome.reason, candidates: outcome.candidates || [] });
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    await db.query(
+      `UPDATE app_jobs SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb, updated_at = now() WHERE id = $1`,
+      [job.id, JSON.stringify({ variantResolve: { at: new Date().toISOString(), total: targetsToRun.length, matched, manual, rows: rows.slice(0, 60) } })]
+    ).catch(() => {});
+    console.log(`[precise-1688] 图片比对自动对齐完成 job=${job.id} total=${targetsToRun.length} matched=${matched} manual=${manual}`);
+    })().catch((e) => console.warn("[precise-1688] 自动对齐后台任务失败:", e?.message || e)).finally(() => preciseVariantResolving.delete(job.id));
+    return;
   } catch (error) { next(error); }
 });
 
@@ -6204,6 +6380,9 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
       const best = candidates[0] || null;
       const pick = precisePickPrice(best, r?.name || "");
       const saved = persisted.get(String(r?.offerId || "")) || null;
+      const savedEvidence = (saved && saved.evidence) || {};
+      const savedMode = String(savedEvidence.priceMode || "");
+      const savedTrusted = Boolean(savedMode) && (PRECISE_PRICE_MODES[savedMode] || {}).trusted === true;
       const yandexOffer = yandexById.get(String(r?.offerId || "")) || {};
       const yandexImages = (Array.isArray(yandexOffer.images) && yandexOffer.images.length
         ? yandexOffer.images
@@ -6213,11 +6392,12 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         offerId: String(r?.offerId || ""),
         name: String(r?.name || "").slice(0, 120),
         matched: Boolean(best),
-        reason: best
-          ? ((pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) ? "ok" : "need_confirm")
-          : "no_match",
-        priceMode: pick.mode,
-        priceModeLabel: (PRECISE_PRICE_MODES[pick.mode] || {}).label || pick.mode,
+        reason: !best
+          ? "no_match"
+          : (savedTrusted || (pick.price > 0 && (PRECISE_PRICE_MODES[pick.mode] || {}).trusted) ? "ok" : "need_confirm"),
+        priceMode: savedTrusted ? savedMode : pick.mode,
+        priceModeLabel: (PRECISE_PRICE_MODES[savedTrusted ? savedMode : pick.mode] || {}).label || (savedTrusted ? savedMode : pick.mode),
+        imageMatchLabel: savedEvidence.imageMatch ? String(savedEvidence.imageMatch.label || "") : "",
         searchError: String(r?.searchError || "").slice(0, 160),
         candidateTitle: String(best?.title || "").slice(0, 120),
         candidateImage: String(best?.image || best?.img || ""),
@@ -6225,8 +6405,9 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         yandexImage: yandexImages[0] || "",
         yandexImages: yandexImages.slice(0, 3),
         yandexPriceRub: Number(yandexOffer.price || 0),
+        currentPriceCny: Number(yandexOffer.price || 0) > 0 ? Math.round((Number(yandexOffer.price) / 12.8205) * 100) / 100 : 0,
         detailUrl: String(best?.link || best?.detailUrl || ""),
-        price: pick.price || Number(saved?.purchase_cny || 0),
+        price: pick.price || (savedTrusted ? Number(saved?.purchase_cny || 0) : 0),
         priceDetails: String(best?.priceDetails || "").slice(0, 200),
         skuOptions: (pick.skus || []).slice(0, 12),
         matchedSku: pick.sku || null,
@@ -6285,6 +6466,8 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
       { label: "<¥1", min: 0, max: 1 }, { label: "¥1-3", min: 1, max: 3 }, { label: "¥3-5", min: 3, max: 5 },
       { label: "¥5-10", min: 5, max: 10 }, { label: "¥10-20", min: 10, max: 20 }, { label: "≥¥20", min: 20, max: Infinity },
     ].map((b) => ({ label: b.label, count: priced.filter((r) => r.price >= b.min && r.price < b.max).length }));
+    const belowCostRows = rows.filter((r) => r.price > 0 && r.currentPriceCny > 0 && r.currentPriceCny < r.price);
+    const belowCost = belowCostRows.length;
     const modeCounts = {};
     for (const row of rows) {
       if (!row.matched) continue;
@@ -6309,6 +6492,7 @@ app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
         noPrice: 0,
         needConfirm: rows.filter((r) => r.reason === "need_confirm").length,
         ready: rows.filter((r) => r.reason === "ok").length,
+        belowCost,
         modeCounts,
         savedCount: persisted.size,
         bands,
