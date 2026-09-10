@@ -671,7 +671,50 @@ window.YandexProductListView = {
       priced: '✓ 已定价', need_weight: '⚠ 待补重量', no_match: '✗ 无同款', no_image: '✗ 无图',
       already_applied: '已应用(跳过)', bad_price: '✗ 价格异常', not_in_cache: '? 缓存缺失', error: '✗ 出错',
     }[reason] || reason || '-');
+    // 查询最近的后台核价任务：返回最近一条 running/queued（或最近 done）
+    const checkRecentBulkJob = async () => {
+      try {
+        const res = await axios.get('/api/yandex/bulk-pricing');
+        const jobs = res.data?.jobs || [];
+        return jobs[0] || null;
+      } catch (_e) { return null; }
+    };
+    const resumeBulkPricing = async (job) => {
+      if (!job || !job.id) return;
+      bulkPricingDialog.jobId = job.id;
+      bulkPricingDialog.status = job.status || '';
+      bulkPricingDialog.phase = job.phase || '';
+      bulkPricingDialog.total = Number(job.total || 0);
+      bulkPricingDialog.processed = Number(job.processed || 0);
+      bulkPricingDialog.visible = true;
+      pollBulkPricing();
+    };
     const openBulkPricingCurrentTab = async () => {
+      // 已有任务在跑 → 直接打开进度，避免重复发起
+      const recent = await checkRecentBulkJob();
+      if (recent && ['queued', 'running'].includes(recent.status)) {
+        await resumeBulkPricing(recent);
+        notify.info('检测到后台核价任务仍在进行，已为你打开进度（进度 ' + (recent.processed || 0) + '/' + (recent.total || 0) + '）。');
+        return;
+      }
+      if (recent && recent.status === 'done' && recent.processed === recent.total) {
+        // 最近一次已完成：询问是查看结果还是重新发起
+        try {
+          await window.ElementPlus.ElMessageBox.confirm(
+            `最近一次后台核价已完成（${recent.processed || 0} 条），要查看结果还是重新对当前筛选核价？`,
+            '后台批量核价',
+            { type: 'info', confirmButtonText: '重新核价', cancelButtonText: '查看上次结果', distinguishCancelAndClose: true },
+          );
+          // 确认 → 新建
+        } catch (cancelResult) {
+          // 取消按钮 → 查看上次结果
+          if (cancelResult === 'cancel' || cancelResult === 'close') {
+            await resumeBulkPricing(recent);
+            return;
+          }
+          return;
+        }
+      }
       const msg = activeTab.value === 'all'
         ? '将对「全部」筛选下的商品发起后台批量核价（AlphaShop 图搜），数量多时需较长时间，是否继续？'
         : `将对「${(statusTabItems.value.find(t => t.value === activeTab.value) || {}).label || activeTab.value}」筛选下的商品后台批量核价？`;
@@ -679,6 +722,138 @@ window.YandexProductListView = {
         await window.ElementPlus.ElMessageBox.confirm(msg, '后台批量核价', { type: 'warning', confirmButtonText: '开始核价', cancelButtonText: '取消' });
       } catch { return; }
       startBulkPricing();
+    };
+
+    // ===== 全店插件精核价（1688 官方真实价，用本机插件的 1688 登录态）=====
+    // 与 AlphaShop 批量核价的区别：AlphaShop 图搜只能给“这家店最便宜那个 SKU”（常是引流配件档），
+    // 本流程让插件以图找货 + 打开 1688 详情页读真实价格阶梯，采购价取「起批首档单价」。
+    const preciseDialog = Vue.reactive({
+      visible: false, jobId: '', status: '', phase: '', total: 0, processed: 0,
+      busy: false, pollTimer: null, error: '', report: null, onlyIssues: false, notice: '',
+    });
+    const stopPrecisePoll = () => {
+      if (preciseDialog.pollTimer) { clearInterval(preciseDialog.pollTimer); preciseDialog.pollTimer = null; }
+    };
+    const preciseReasonText = (reason) => ({
+      ok: '可直接采用（起批首档价）', need_confirm: '待人工核对（无完整阶梯）',
+      no_price: '价格未取到', no_match: '无同款',
+    }[reason] || reason || '-');
+    const preciseReasonTag = (reason) => ({
+      ok: 'success', need_confirm: 'warning', no_price: 'warning', no_match: 'danger',
+    }[reason] || 'info');
+    const preciseRows = Vue.computed(() => {
+      const rows = (preciseDialog.report && preciseDialog.report.rows) || [];
+      return preciseDialog.onlyIssues ? rows.filter((r) => r.reason !== 'ok') : rows;
+    });
+    const preciseBands = Vue.computed(() => (preciseDialog.report && preciseDialog.report.bands) || []);
+    const pollPrecise1688 = async () => {
+      stopPrecisePoll();
+      const doPoll = async () => {
+        if (!preciseDialog.jobId) return;
+        try {
+          const res = await axios.get('/api/yandex/precise-1688/' + encodeURIComponent(preciseDialog.jobId));
+          const job = res.data?.job || {};
+          preciseDialog.status = job.status || '';
+          preciseDialog.phase = job.phase || '';
+          preciseDialog.total = Number(job.total || preciseDialog.total || 0);
+          preciseDialog.processed = Number(job.processed || 0);
+          preciseDialog.error = job.error || '';
+          preciseDialog.report = res.data?.report || null;
+          if (!['queued', 'claimed', 'running'].includes(job.status) && !preciseDialog.status) preciseDialog.status = job.status || '';
+          if (['done', 'error', 'canceled'].includes(job.status)) {
+            stopPrecisePoll();
+            if (job.status === 'done') {
+              const r = preciseDialog.report || {};
+              notify.success(`插件精核价完成：可直接采用 ${r.ready || 0} · 待人工核对 ${(r.needConfirm || 0) + (r.noPrice || 0)} · 无同款 ${r.noMatch || 0}`);
+              fetchProducts();
+            } else if (job.error) notify.error('插件精核价失败: ' + job.error);
+          }
+        } catch (_e) { /* 轮询失败继续 */ }
+      };
+      await doPoll();
+      if (!['done', 'error', 'canceled'].includes(preciseDialog.status)) {
+        preciseDialog.pollTimer = setInterval(doPoll, 6000);
+      }
+    };
+    const checkRecentPreciseJob = async () => {
+      try {
+        const res = await axios.get('/api/yandex/precise-1688');
+        return (res.data?.jobs || [])[0] || null;
+      } catch (_e) { return null; }
+    };
+    const resumePrecise1688 = async (job) => {
+      if (!job || !job.id) return;
+      preciseDialog.jobId = job.id;
+      preciseDialog.status = job.status || '';
+      preciseDialog.phase = job.phase || '';
+      preciseDialog.total = Number(job.total || 0);
+      preciseDialog.processed = Number(job.processed || 0);
+      preciseDialog.visible = true;
+      pollPrecise1688();
+    };
+    const startPrecise1688 = async () => {
+      preciseDialog.busy = true;
+      preciseDialog.error = '';
+      preciseDialog.notice = '';
+      try {
+        const res = await axios.post('/api/yandex/precise-1688', {}, { timeout: 120000 });
+        preciseDialog.jobId = res.data?.jobId || '';
+        preciseDialog.total = Number(res.data?.total || 0);
+        if (!preciseDialog.jobId) throw new Error('未返回任务号');
+        preciseDialog.visible = true;
+        if (res.data?.existing) {
+          notify.info('已有插件精核价任务在进行，已为你打开进度。');
+        } else {
+          notify.success(`已提交 ${res.data?.total || 0} 个「销售中」商品给本机插件核价（1688 官方），需插件在线并登录 1688。`);
+          if (Number(res.data?.skipped || 0) > 0) preciseDialog.notice = `有 ${res.data.skipped} 个商品无可用图片被跳过。`;
+        }
+        pollPrecise1688();
+      } catch (e) {
+        const msg = e.response?.data?.error || e.message || '启动失败';
+        preciseDialog.error = msg;
+        notify.error('启动插件精核价失败: ' + msg);
+      } finally {
+        preciseDialog.busy = false;
+      }
+    };
+    const openPreciseCurrentTab = async () => {
+      const recent = await checkRecentPreciseJob();
+      if (recent && ['queued', 'claimed', 'running'].includes(recent.status)) {
+        await resumePrecise1688(recent);
+        notify.info(`检测到插件精核价仍在进行（${recent.processed || 0}/${recent.total || 0}），已打开进度。`);
+        return;
+      }
+      if (recent && recent.status === 'done') {
+        try {
+          await window.ElementPlus.ElMessageBox.confirm(
+            `上次精核价已完成（${recent.processed || 0}/${recent.total || 0}）。要查看上次结果，还是重新核价？`,
+            '插件精核价（1688 官方真实价）',
+            { type: 'info', confirmButtonText: '重新核价', cancelButtonText: '查看上次结果', distinguishCancelAndClose: true },
+          );
+        } catch (cancelResult) {
+          if (cancelResult === 'cancel' || cancelResult === 'close') { await resumePrecise1688(recent); return; }
+          return;
+        }
+      }
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          '将对本店「销售中」商品逐个做 1688 官方以图找货 + 打开详情页读真实价格阶梯，采购价取「起批首档单价」。\n'
+          + '需要：本机 Chrome 装着采集插件并已登录 1688；核价期间请保持浏览器开启（可关本弹窗，后台继续）。\n'
+          + '速度约 15-40 秒/个，163 个约 40-90 分钟。是否开始？',
+          '插件精核价（1688 官方真实价）',
+          { type: 'warning', confirmButtonText: '开始核价', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      await startPrecise1688();
+    };
+    const stopPreciseJob = async () => {
+      if (!preciseDialog.jobId) return;
+      try {
+        await axios.post('/api/jobs/' + encodeURIComponent(preciseDialog.jobId) + '/cancel', {}, { timeout: 15000 });
+        notify.info('已请求停止插件精核价（插件端会尽快中止，已核结果已保存）');
+      } catch (_e) {
+        notify.warning('停止请求发送失败，任务可能刚好完成');
+      }
     };
 
     // 上架/下架：调 /api/yandex/products/visibility（hidden-offers）。list=恢复显示，unlist=隐藏
@@ -1505,9 +1680,19 @@ window.YandexProductListView = {
       fetchProducts();
     };
 
-    Vue.onMounted(() => {
+    Vue.onMounted(async () => {
       fetchProducts();
       window.addEventListener('shop-changed', onShopChanged);
+      // 若上次有未完成/刚完成的后台核价任务，进入页面自动弹进度（避免误以为要重新发起）
+      const recent = await checkRecentBulkJob();
+      if (recent && ['queued', 'running', 'done'].includes(recent.status)) {
+        if (recent.status === 'done' && recent.processed === recent.total) {
+          // 已完成：不自动弹窗打扰，仅留按钮可查；这里静默
+        } else {
+          await resumeBulkPricing(recent);
+          notify.info('检测到未完成的后台核价任务，已为你打开进度。');
+        }
+      }
     });
     Vue.onBeforeUnmount(() => window.removeEventListener('shop-changed', onShopChanged));
 
@@ -1520,7 +1705,8 @@ window.YandexProductListView = {
       hoverImg, onImgEnter, onImgMove, onImgLeave,
       selectedRows, priceState, researchDialog, researchTableRef, stateDrawer, applyDialog,
       handleSelectionChange, changeVisibility, visBusy, openResearchBatch, openResearchRow, openStateDrawer,
-      bulkPricingDialog, reasonText, startBulkPricing, openBulkPricingCurrentTab, stopBulkPoll, collectFilteredOfferIds,
+      bulkPricingDialog, reasonText, startBulkPricing, openBulkPricingCurrentTab, resumeBulkPricing, checkRecentBulkJob, stopBulkPoll, collectFilteredOfferIds,
+      preciseDialog, preciseRows, preciseBands, preciseReasonText, preciseReasonTag, openPreciseCurrentTab, stopPreciseJob, stopPrecisePoll,
       retryFailedResearch, saveCandidates, calcRowSuggest, stopPluginJob, ozonReverse,
       reverseDialog, reverseOneRow, openReversePricing, reverseAllRows, applyReverseToYandex,
       calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
@@ -1600,6 +1786,7 @@ window.YandexProductListView = {
         <el-button type="primary" @click="openReversePricing">Ozon 反推定价</el-button>
         <el-button type="primary" plain @click="openResearchBatch">批量核价（1688 找货）</el-button>
         <el-button type="primary" plain :loading="bulkPricingDialog.busy" @click="openBulkPricingCurrentTab">后台全店核价（AlphaShop）</el-button>
+        <el-button type="danger" plain :loading="preciseDialog.busy" @click="openPreciseCurrentTab">插件精核价（1688 官方真实价）</el-button>
         <el-button type="warning" plain @click="openApplyBatch">批量应用候选调价</el-button>
         <el-button type="success" plain :disabled="!selectedRows.length || visBusy" @click="changeVisibility('list')">上架</el-button>
         <el-button type="danger" plain :disabled="!selectedRows.length || visBusy" @click="changeVisibility('unlist')">下架</el-button>
@@ -2024,6 +2211,94 @@ window.YandexProductListView = {
         <template #footer>
           <el-button @click="bulkPricingDialog.visible = false; stopBulkPoll()">关闭（后台继续）</el-button>
           <el-button v-if="bulkPricingDialog.status==='running'" :loading="bulkPricingDialog.busy" @click="fetchProducts">刷新商品</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- 插件精核价（1688 官方真实价）：进度 + 真实成本分布 -->
+      <el-dialog v-model="preciseDialog.visible" title="插件精核价（1688 官方真实价）" width="1180px" append-to-body destroy-on-close
+        :close-on-click-modal="false" @closed="stopPrecisePoll">
+        <el-alert type="warning" :closable="false" show-icon style="margin-bottom:12px"
+          title="本机插件用 1688 官方以图找货 + 打开详情页读「真实价格阶梯」，采购价取起批首档单价（小批量真能买到的价）。可直接采用 = 有完整阶梯；待人工核对 = 阶梯缺失或疑似引流档，需要你点开链接确认。需要浏览器插件在线并登录 1688。" />
+        <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap; margin-bottom:12px">
+          <el-tag type="info" size="large">进度 {{ preciseDialog.processed }} / {{ preciseDialog.total }}</el-tag>
+          <el-tag v-if="['queued','claimed'].includes(preciseDialog.status)" type="warning" size="large">等待本机插件领取…</el-tag>
+          <el-tag v-else-if="preciseDialog.status==='running'" type="warning" size="large">核价中…</el-tag>
+          <el-tag v-else-if="preciseDialog.status==='done'" type="success" size="large">已完成</el-tag>
+          <el-tag v-else-if="preciseDialog.status==='error'" type="danger" size="large">失败</el-tag>
+          <span style="font-size:13px; color:#334155">{{ preciseDialog.phase }}</span>
+        </div>
+        <div v-if="preciseDialog.notice" style="color:#b45309; font-size:13px; margin-bottom:8px">{{ preciseDialog.notice }}</div>
+        <div v-if="preciseDialog.error" style="color:#dc2626; font-size:13px; margin-bottom:10px">{{ preciseDialog.error }}</div>
+        <template v-if="preciseDialog.report">
+          <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:12px">
+            <div style="border:1px solid #d1fae5; background:#ecfdf5; border-radius:8px; padding:12px; text-align:center">
+              <div style="font-size:12px;color:#047857;font-weight:800">可直接采用（起批首档价）</div>
+              <strong style="font-size:24px;color:#047857">{{ preciseDialog.report.ready }}</strong>
+            </div>
+            <div style="border:1px solid #fde68a; background:#fffbeb; border-radius:8px; padding:12px; text-align:center">
+              <div style="font-size:12px;color:#92400e;font-weight:800">待人工核对</div>
+              <strong style="font-size:24px;color:#b45309">{{ (preciseDialog.report.needConfirm || 0) + (preciseDialog.report.noPrice || 0) }}</strong>
+            </div>
+            <div style="border:1px solid #fecaca; background:#fef2f2; border-radius:8px; padding:12px; text-align:center">
+              <div style="font-size:12px;color:#991b1b;font-weight:800">无同款</div>
+              <strong style="font-size:24px;color:#b91c1c">{{ preciseDialog.report.noMatch }}</strong>
+            </div>
+            <div style="border:1px solid #bfdbfe; background:#eff6ff; border-radius:8px; padding:12px; text-align:center">
+              <div style="font-size:12px;color:#1d4ed8;font-weight:800">已落库候选</div>
+              <strong style="font-size:24px;color:#1d4ed8">{{ preciseDialog.report.savedCount }}</strong>
+            </div>
+          </div>
+          <div style="margin-bottom:10px; font-size:13px; color:#334155">
+            <b>真实采购成本分布</b>（按已核到价的 {{ preciseDialog.report.ready + preciseDialog.report.needConfirm }} 个商品）：
+            <el-tag v-for="b in preciseBands" :key="b.label" size="small" style="margin-left:6px" :type="b.count ? 'primary' : 'info'">
+              {{ b.label }}：{{ b.count }}
+            </el-tag>
+          </div>
+          <div style="display:flex; align-items:center; gap:10px; margin-bottom:8px">
+            <el-checkbox v-model="preciseDialog.onlyIssues">只看待人工/无同款</el-checkbox>
+            <span style="font-size:12px; color:#94a3b8">共 {{ preciseRows.length }} 行</span>
+          </div>
+          <el-table :data="preciseRows" size="small" border max-height="420" empty-text="暂无结果">
+            <el-table-column label="货号" prop="offerId" width="140" show-overflow-tooltip />
+            <el-table-column label="状态" width="170" align="center">
+              <template #default="{ row }">
+                <el-tag size="small" :type="preciseReasonTag(row.reason)">{{ preciseReasonText(row.reason) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="1688 同款图" width="90" align="center">
+              <template #default="{ row }">
+                <el-image v-if="row.candidateImage" :src="row.candidateImage" referrerpolicy="no-referrer" fit="cover"
+                  style="width:46px;height:46px;border-radius:4px;background:#f1f5f9"
+                  :preview-src-list="[row.candidateImage]" preview-teleported hide-on-click-modal />
+                <span v-else>-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="1688 同款标题 / 来源店" min-width="240">
+              <template #default="{ row }">
+                <a v-if="row.detailUrl" :href="row.detailUrl" target="_blank" style="color:#2563eb; text-decoration:none">{{ row.candidateTitle || '打开 1688 链接' }}</a>
+                <span v-else>{{ row.candidateTitle || '-' }}</span>
+                <div v-if="row.shopName" style="font-size:12px;color:#94a3b8">{{ row.shopName }}</div>
+                <div v-if="!row.matched && row.searchError" style="font-size:12px;color:#b91c1c">{{ row.searchError }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="起批首档 ¥" width="100" align="right">
+              <template #default="{ row }"><b v-if="row.price" :style="{color: row.reason==='ok' ? '#047857' : '#b45309'}">{{ Number(row.price).toFixed(2) }}</b><span v-else>-</span></template>
+            </el-table-column>
+            <el-table-column label="1688 价格阶梯（起批量→单价）" min-width="200" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.priceDetails || '（未取到阶梯）' }}</template>
+            </el-table-column>
+            <el-table-column label="起批" width="90" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.moq || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="引流风险" width="80" align="center">
+              <template #default="{ row }"><el-tag v-if="row.trafficBaitRisk" size="small" type="danger">可疑</el-tag><span v-else>-</span></template>
+            </el-table-column>
+          </el-table>
+        </template>
+        <template #footer>
+          <el-button @click="preciseDialog.visible = false; stopPrecisePoll()">关闭（后台继续）</el-button>
+          <el-button v-if="['queued','claimed','running'].includes(preciseDialog.status)" @click="stopPreciseJob">停止核价</el-button>
+          <el-button type="primary" plain @click="fetchProducts">刷新商品</el-button>
         </template>
       </el-dialog>
 

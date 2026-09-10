@@ -2298,6 +2298,8 @@ async function initDatabase() {
       ALTER TABLE app_stores ADD COLUMN IF NOT EXISTS api_secret TEXT NOT NULL DEFAULT '';
       ALTER TABLE yandex_price_candidates ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
       ALTER TABLE yandex_price_records ADD COLUMN IF NOT EXISTS store_id UUID REFERENCES app_stores(id) ON DELETE CASCADE;
+      -- 核价证据（同款标题/图/链接/1688 价格阶梯/起批等），供人工核对采购价来源
+      ALTER TABLE yandex_price_candidates ADD COLUMN IF NOT EXISTS evidence JSONB NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE app_stores DROP CONSTRAINT IF EXISTS app_stores_user_id_client_id_key;
     `);
     await db.query(`
@@ -5485,6 +5487,309 @@ app.get("/api/yandex/bulk-pricing/:id", requireAuth, async (req, res, next) => {
     const job = await getDbJobForUser(req.params.id, req.user);
     if (!job) return res.status(404).json({ success: false, error: "批量核价任务不存在" });
     res.json({ success: true, job });
+  } catch (error) { next(error); }
+});
+
+// ===== 全店插件精核价（1688 官方真实价，用本机插件的 1688 登录态）=====
+// 与「后台全店核价(AlphaShop)」互补：AlphaShop 图搜只能给这家店的“最低价那个 SKU”（常是引流配件档），
+// 本流程把商品图派给插件以图找货 + 打开第 1 候选的 1688 详情页，读真实价格阶梯，
+// 采购价一律取「起批首档单价」（小批量能真正买到的价）；拿不到阶梯证据的只标记待人工，不写采购价。
+const PRECISE_JOB_MARKER = "precise-1688";
+const preciseRecordedByJob = new Map(); // jobId -> Set(offerId)，避免同一 offer 重复落库
+
+async function mapWithConcurrency(items, limit, worker) {
+  const list = Array.isArray(items) ? items : [];
+  const size = Math.max(1, Math.min(Number(limit) || 4, list.length || 1));
+  const out = new Array(list.length);
+  let cursor = 0;
+  const runners = new Array(size).fill(0).map(async () => {
+    while (cursor < list.length) {
+      const index = cursor++;
+      try { out[index] = await worker(list[index], index); } catch (_e) { out[index] = null; }
+    }
+  });
+  await Promise.all(runners);
+  return out;
+}
+
+// 组织本次精核价的目标：店铺「销售中」商品 + 把商品图转存成插件可抓的公网 URL
+// （Yandex 图片域名不在插件 host_permissions 内；转存到本服务 /uploads 后插件才抓得到）
+async function buildPreciseCampaignItems(storeId) {
+  const cacheKey = storeId || "__env__";
+  const cache = yandexOfferCacheObj(cacheKey);
+  // 缓存可能还在预热（或已有请求在跑 → refresh 会因 inflight 直接返回），这里等到就绪再取名单，
+  // 否则会误报“没有销售中商品”。
+  if (!cache.at) {
+    await refreshYandexStoreCache(cacheKey).catch(() => {});
+    for (let i = 0; i < 30 && !cache.at; i += 1) await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  const published = (cache.active || []).filter((it) => String(it?.status || "") === "published");
+  const items = [];
+  const skipped = [];
+  for (const it of published) {
+    const offerId = String(it?.offer_id || it?.offerId || "").trim();
+    const raw = (Array.isArray(it?.images) && it.images.length ? it.images : (it?.image ? [it.image] : []))
+      .map((s) => String(s || "").trim()).filter(Boolean).slice(0, 3);
+    if (!offerId || !raw.length) { skipped.push({ offerId, name: String(it?.name || "").slice(0, 80), reason: "no_image" }); continue; }
+    const proxied = await mapWithConcurrency(raw, 4, (url) => proxyImageToPublicUrl(url).catch(() => ""));
+    const images = proxied.map((pub, i) => pub || raw[i]).filter(Boolean).slice(0, 3);
+    if (!images.length) { skipped.push({ offerId, name: String(it?.name || "").slice(0, 80), reason: "no_image" }); continue; }
+    items.push({ offerId, name: String(it?.name || it?.title || "").slice(0, 200), images });
+  }
+  return { items, skipped, publishedCount: published.length, cacheReady: cache.at > 0 };
+}
+
+// 取「起批首档单价」：优先用详情页价格阶梯里起批量最小的一档（小批量真实采购价）；
+// 没有阶梯时退化为详情/SKU 价，并标记 hasTier=false（服务端据此标待人工核对）。
+function preciseTierPriceInServer(candidate) {
+  const tiers = (Array.isArray(candidate?.priceTiers) ? candidate.priceTiers : [])
+    .map((t) => ({ beginAmount: Math.max(1, Number(t?.beginAmount || 1) || 1), price: Number(t?.price || 0) }))
+    .filter((t) => t.price > 0 && t.price <= 50000)
+    .sort((a, b) => a.beginAmount - b.beginAmount);
+  if (tiers.length) return { price: tiers[0].price, hasTier: true, tiers };
+  const fallback = Number(candidate?.priceFirstTier || candidate?.price || 0);
+  return { price: fallback > 0 && fallback <= 50000 ? fallback : 0, hasTier: false, tiers: [] };
+}
+
+function preciseCandidateEvidence(result, best, tier) {
+  return {
+    source: "plugin-1688",
+    offerId1688: String(best?.offerId || best?.offerId1688 || ""),
+    candidateTitle: String(best?.title || "").slice(0, 200),
+    candidateImage: String(best?.image || best?.img || ""),
+    detailUrl: String(best?.link || best?.detailUrl || ""),
+    priceDetails: String(best?.priceDetails || "").slice(0, 300),
+    priceTiers: tier.tiers,
+    hasTier: tier.hasTier,
+    tierPrice: tier.price,
+    moq: String(best?.minOrderQuantity || best?.moq || ""),
+    shopName: String(best?.shopName || ""),
+    weightText: String(best?.weightText || ""),
+    shippingFee: String(best?.shippingFee || ""),
+    trafficBaitRisk: best?.trafficBaitRisk === true,
+    searchError: String(result?.searchError || "").slice(0, 200),
+  };
+}
+
+async function upsertPreciseCandidateRow({ userId, storeId, result, cacheById }) {
+  const offerId = String(result?.offerId || "").trim();
+  if (!offerId) return { offerId, status: "skipped", reason: "no_offer_id" };
+  const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+  const best = candidates[0] || null;
+  if (!best) return { offerId, status: "no_match", reason: "no_candidate" };
+  const tier = preciseTierPriceInServer(best);
+  if (!(tier.price > 0)) return { offerId, status: "need_confirm", reason: "no_price" };
+  const offer = cacheById?.get(offerId) || {};
+  const weightKg = Number(offer?.weightKg || 0);
+  const lenCm = Number(offer?.lenCm || 0), widCm = Number(offer?.widCm || 0), heiCm = Number(offer?.heiCm || 0);
+  const suggest = weightKg > 0
+    ? yandexSuggestPrice({
+        purchaseCny: tier.price, weightKg, dims: [lenCm, widCm, heiCm],
+        categoryName: offer?.category_name || "", categoryLeaf: offer?.category_leaf || "",
+        params: { exchangeRate: 12.8205, targetMarginPct: 35 },
+      })
+    : { ok: false };
+  const evidence = preciseCandidateEvidence(result, best, tier);
+  // 有完整阶梯 → ready（可信）；只有兜底价（无阶梯证据）→ need_confirm 待人工核对
+  const status = tier.hasTier && !evidence.trafficBaitRisk ? "ready" : "need_confirm";
+  try {
+    const existing = await db.query(
+      "SELECT id, status FROM yandex_price_candidates WHERE store_id IS NOT DISTINCT FROM $1 AND offer_id=$2 LIMIT 1",
+      [storeId || null, offerId]
+    );
+    if (existing.rows[0]?.status === "applied") return { offerId, status: "already_applied", reason: "applied", price: tier.price, evidence };
+    await db.query(
+      `INSERT INTO yandex_price_candidates (user_id, store_id, offer_id, name, purchase_cny, supplier, source_url_1688, score,
+         weight_kg, len_cm, wid_cm, hei_cm, pkg_qty, suggest_price_cny, zone, cel_fee_cny, status, source, evidence)
+       VALUES ($1,$2,$3,$4,$5,'1688插件核价',COALESCE(NULLIF($6,''),''),$7,$8,$9,$10,$11,1,$12,$13,$14,$15,'plugin-1688',$16::jsonb)
+       ON CONFLICT (store_id, offer_id) DO UPDATE SET
+         name=EXCLUDED.name, purchase_cny=EXCLUDED.purchase_cny, supplier=EXCLUDED.supplier,
+         source_url_1688=EXCLUDED.source_url_1688, score=EXCLUDED.score, weight_kg=EXCLUDED.weight_kg,
+         len_cm=EXCLUDED.len_cm, wid_cm=EXCLUDED.wid_cm, hei_cm=EXCLUDED.hei_cm,
+         suggest_price_cny=EXCLUDED.suggest_price_cny, zone=EXCLUDED.zone, cel_fee_cny=EXCLUDED.cel_fee_cny,
+         status=EXCLUDED.status, source='plugin-1688', evidence=EXCLUDED.evidence, updated_at=now()`,
+      [userId, storeId || null, offerId, String(result?.name || offer?.name || "").slice(0, 500), tier.price,
+       evidence.detailUrl, Number(best?.sold || 0), weightKg, lenCm, widCm, heiCm,
+       suggest?.ok ? suggest.priceCny : 0, suggest?.ok ? (suggest.zone || "") : "", suggest?.ok ? (suggest.celFeeCny || 0) : 0,
+       status, JSON.stringify(evidence)]
+    );
+    return { offerId, status, price: tier.price, hasTier: tier.hasTier, suggestPriceCny: suggest?.ok ? suggest.priceCny : 0, evidence };
+  } catch (e) {
+    return { offerId, status: "error", reason: String(e?.message || e).slice(0, 160), price: tier.price, evidence };
+  }
+}
+
+// 插件每回传一次进度就增量落库（插件中途掉线/续跑也不会丢已核结果；重复调用幂等）
+async function recordPreciseResults(job, results, userId, storeId) {
+  if (!job?.id || !db) return { written: 0 };
+  const rows = Array.isArray(results) ? results : [];
+  let seen = preciseRecordedByJob.get(job.id);
+  if (!seen) { seen = new Set(); preciseRecordedByJob.set(job.id, seen); }
+  const pending = rows.filter((r) => r && r.offerId && !seen.has(String(r.offerId)));
+  if (!pending.length) return { written: 0 };
+  for (const r of pending) seen.add(String(r.offerId));
+  const cache = yandexOfferCacheObj(storeId || "__env__");
+  const cacheById = new Map();
+  for (const it of [...(cache?.active || []), ...(cache?.archived || [])]) {
+    const oid = String(it?.offer_id || it?.offerId || "");
+    if (oid) cacheById.set(oid, it);
+  }
+  const outcomes = [];
+  for (const r of pending) {
+    outcomes.push(await upsertPreciseCandidateRow({ userId, storeId, result: r, cacheById }));
+  }
+  return { written: outcomes.length, outcomes };
+}
+
+// 启动/续跑一次全店精核价（任务由本机插件领取执行，服务端只编排 + 落库）
+app.post("/api/yandex/precise-1688", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const userId = req.user && (req.user.id || req.user.user_id);
+    let storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const context = await getYandexMarketContext({ storeId, userId, refresh: false }).catch(() => null);
+    if (!context) return res.status(400).json({ success: false, error: "没有可用的 Yandex 店铺凭证，请先在店铺管理授权。" });
+    storeId = storeId || String(context.storeId || "").trim() || null;
+    // 已有精核价任务在跑 → 直接复用，避免重复发起
+    const running = await db.query(
+      `SELECT id, status, phase, processed, total FROM app_jobs
+        WHERE user_id = $1 AND kind = 'yandex-research'
+          AND (payload->>'marker') = $3
+          AND ($2::uuid IS NULL OR store_id = $2::uuid)
+          AND status IN ('queued','claimed','running')
+        ORDER BY created_at DESC LIMIT 1`,
+      [userId, storeId, PRECISE_JOB_MARKER]
+    ).catch(() => ({ rows: [] }));
+    if (running.rows?.length) {
+      const r = running.rows[0];
+      return res.json({ success: true, jobId: r.id, existing: true, status: r.status, phase: r.phase, processed: Number(r.processed || 0), total: Number(r.total || 0) });
+    }
+    const { items, skipped, publishedCount } = await buildPreciseCampaignItems(storeId);
+    // dry_run：只侦查目标清单（不建任务、不影响插件），用于上线自检
+    if (req.body?.dry_run === true || req.query?.dry_run === "1") {
+      return res.json({
+        success: true, dryRun: true, storeId, published: publishedCount,
+        total: items.length, skipped: skipped.length,
+        sample: items.slice(0, 3).map((it) => ({ offerId: it.offerId, name: it.name.slice(0, 60), images: it.images })),
+        skippedSample: skipped.slice(0, 5),
+      });
+    }
+    if (!items.length) {
+      return res.status(400).json({
+        success: false,
+        error: publishedCount
+          ? `销售中 ${publishedCount} 个商品都没有可用图片，无法图搜核价`
+          : "店铺缓存里没有「销售中」商品（缓存可能还在预热，请稍等 30 秒重试）",
+      });
+    }
+    const job = await createQueuedDbJob(req.user, {
+      id: crypto.randomUUID(),
+      kind: "yandex-research",
+      storeId,
+      total: items.length,
+      phase: `已排队 ${items.length} 个商品，等待本机插件领取（1688 官方核价）`,
+    }, { items, marker: PRECISE_JOB_MARKER, precise: true, storeId, skipped });
+    res.json({ success: true, jobId: job.id, total: items.length, skipped: skipped.length, published: publishedCount, queued: true });
+  } catch (error) { next(error); }
+});
+
+// 最近的精核价任务（页面加载时判断是否已有任务在跑，避免重复发起）
+app.get("/api/yandex/precise-1688", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.json({ success: true, jobs: [] });
+    const userId = req.user && (req.user.id || req.user.user_id);
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const result = await db.query(
+      `SELECT id, status, phase, processed, total, error, created_at, updated_at
+         FROM app_jobs
+        WHERE user_id = $1 AND (payload->>'marker') = $3
+          AND ($2::uuid IS NULL OR store_id = $2::uuid)
+        ORDER BY created_at DESC LIMIT 5`,
+      [userId, storeId, PRECISE_JOB_MARKER]
+    );
+    res.json({
+      success: true,
+      jobs: (result.rows || []).map((r) => ({
+        id: r.id, status: r.status, phase: r.phase || "",
+        processed: Number(r.processed || 0), total: Number(r.total || 0),
+        error: r.error || "", createdAt: r.created_at, updatedAt: r.updated_at,
+      })),
+    });
+  } catch (error) { next(error); }
+});
+
+// 精核价进度 + 报告（真实成本分布）
+app.get("/api/yandex/precise-1688/:id", requireAuth, async (req, res, next) => {
+  try {
+    const job = await getDbJobForUser(req.params.id, req.user);
+    if (!job) return res.status(404).json({ success: false, error: "精核价任务不存在" });
+    if (job.payload?.marker !== PRECISE_JOB_MARKER && job.payload?.precise !== true) {
+      return res.status(400).json({ success: false, error: "该任务不是插件精核价任务" });
+    }
+    const results = Array.isArray(job.results) ? job.results : [];
+    const storeId = job.storeId || null;
+    // 已落库候选（含插件写价结果）：用于给报告标注“已采用/待人工”
+    const userId = job.owner?.id || null;
+    let persisted = new Map();
+    if (storeId) {
+      const r = await db.query(
+        `SELECT offer_id, purchase_cny, status, suggest_price_cny FROM yandex_price_candidates
+          WHERE store_id = $1 AND source = 'plugin-1688'`,
+        [storeId]
+      ).catch(() => ({ rows: [] }));
+      persisted = new Map((r.rows || []).map((row) => [String(row.offer_id), row]));
+    }
+    const rows = results.map((r) => {
+      const candidates = Array.isArray(r?.candidates) ? r.candidates : [];
+      const best = candidates[0] || null;
+      const tier = preciseTierPriceInServer(best);
+      const saved = persisted.get(String(r?.offerId || "")) || null;
+      return {
+        offerId: String(r?.offerId || ""),
+        name: String(r?.name || "").slice(0, 120),
+        matched: Boolean(best),
+        reason: best ? (tier.price > 0 ? (tier.hasTier ? "ok" : "need_confirm") : "no_price") : "no_match",
+        searchError: String(r?.searchError || "").slice(0, 160),
+        candidateTitle: String(best?.title || "").slice(0, 120),
+        candidateImage: String(best?.image || best?.img || ""),
+        detailUrl: String(best?.link || best?.detailUrl || ""),
+        price: tier.price || Number(saved?.purchase_cny || 0),
+        priceDetails: String(best?.priceDetails || "").slice(0, 200),
+        moq: String(best?.minOrderQuantity || best?.moq || ""),
+        shopName: String(best?.shopName || ""),
+        trafficBaitRisk: best?.trafficBaitRisk === true,
+        savedStatus: saved?.status || "",
+        suggestPriceCny: Number(saved?.suggest_price_cny || 0),
+      };
+    });
+    const priced = rows.filter((r) => r.price > 0 && r.reason !== "no_price");
+    const bands = [
+      { label: "<¥1", min: 0, max: 1 }, { label: "¥1-3", min: 1, max: 3 }, { label: "¥3-5", min: 3, max: 5 },
+      { label: "¥5-10", min: 5, max: 10 }, { label: "¥10-20", min: 10, max: 20 }, { label: "≥¥20", min: 20, max: Infinity },
+    ].map((b) => ({ label: b.label, count: priced.filter((r) => r.price >= b.min && r.price < b.max).length }));
+    res.json({
+      success: true,
+      job: {
+        id: job.id, status: job.status, phase: job.phase || "", kind: job.kind,
+        total: Number(job.total || 0), processed: Number(job.processed || 0),
+        error: job.error || "", storeId: job.storeId || "",
+        createdAt: job.createdAt, updatedAt: job.updatedAt,
+        preciseTotal: Number(job.payload?.items?.length || 0),
+        finalizedAt: job.payload?.finalizedAt || "",
+      },
+      report: {
+        total: Number(job.payload?.items?.length || job.total || 0),
+        processed: Number(job.processed || 0),
+        matched: rows.filter((r) => r.matched).length,
+        noMatch: rows.filter((r) => r.reason === "no_match").length,
+        noPrice: rows.filter((r) => r.reason === "no_price").length,
+        needConfirm: rows.filter((r) => r.reason === "need_confirm").length,
+        ready: rows.filter((r) => r.reason === "ok").length,
+        savedCount: persisted.size,
+        bands,
+        rows,
+      },
+    });
   } catch (error) { next(error); }
 });
 
@@ -14947,6 +15252,10 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       delete updates.status;
     }
     const job = Object.keys(updates).length ? await updateDbJob(req.params.id, updates) : existing;
+    // 插件精核价：结果一回来就增量落库（长任务跑到一半插件掉线/续跑也不丢已核结果，重复调用幂等）
+    if ((job?.payload?.marker === PRECISE_JOB_MARKER || job?.payload?.precise === true) && Array.isArray(req.body?.results) && req.body.results.length) {
+      await recordPreciseResults(job, req.body.results, existing.owner?.id || null, job.storeId || null).catch(() => {});
+    }
     res.json({ success: true, job });
   } catch (error) {
     next(error);
@@ -15028,6 +15337,33 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       updates.phase = "已完成，可下载 Excel";
     }
     const updated = await updateDbJob(req.params.id, updates);
+    // 插件精核价收尾：把最后一批结果补齐落库，并把汇总写回 phase（报告页据此展示真实成本分布）
+    if (updated && (updated.payload?.marker === PRECISE_JOB_MARKER || updated.payload?.precise === true)) {
+      try {
+        await recordPreciseResults(updated, updated.results, existing.owner?.id || null, updated.storeId || null);
+        const rows = Array.isArray(updated.results) ? updated.results : [];
+        let matched = 0, noMatch = 0, ready = 0, needConfirm = 0, noPrice = 0;
+        for (const r of rows) {
+          const best = Array.isArray(r?.candidates) ? r.candidates[0] : null;
+          if (!best) { noMatch += 1; continue; }
+          matched += 1;
+          const tier = preciseTierPriceInServer(best);
+          if (!(tier.price > 0)) noPrice += 1;
+          else if (tier.hasTier && best?.trafficBaitRisk !== true) ready += 1;
+          else needConfirm += 1;
+        }
+        const summary = { matched, noMatch, ready, needConfirm, noPrice, total: Number(updated.payload?.items?.length || updated.total || rows.length) };
+        await db.query(
+          `UPDATE app_jobs SET payload = COALESCE(payload, '{}'::jsonb) || $2::jsonb, phase = $3, updated_at = now() WHERE id = $1`,
+          [updated.id, JSON.stringify({ finalizedAt: new Date().toISOString(), summary }),
+           `插件精核价完成：可直接采用 ${ready} · 待人工核对 ${needConfirm + noPrice} · 无同款 ${noMatch}`]
+        ).catch(() => {});
+        updated.phase = `插件精核价完成：可直接采用 ${ready} · 待人工核对 ${needConfirm + noPrice} · 无同款 ${noMatch}`;
+        updated.payload = { ...(updated.payload || {}), finalizedAt: new Date().toISOString(), summary };
+      } catch (e) {
+        console.warn("[precise-1688] 收尾落库失败:", e?.message || e);
+      }
+    }
     res.json({ success: true, job: updated, downloadUrl });
   } catch (error) {
     next(error);

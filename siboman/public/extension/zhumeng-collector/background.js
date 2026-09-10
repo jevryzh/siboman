@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.109";
+const VERSION = "2.2.9.110";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -956,6 +956,7 @@ async function runQueuedSourcingJob(remoteJob) {
 // Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
 async function runQueuedYandexResearchJob(remoteJob) {
   const payload = remoteJob.payload || {};
+  const preciseMode = payload.precise === true; // 全店精核价：必须拿到 1688 真实价格阶梯
   const rawItems = Array.isArray(payload.items) ? payload.items : [];
   const declaredTotal = Math.max(0, Number(remoteJob.total || rawItems.length || 0));
   const items = declaredTotal > 0 ? rawItems.slice(0, declaredTotal) : rawItems;
@@ -1005,6 +1006,25 @@ async function runQueuedYandexResearchJob(remoteJob) {
               if (!oid || seen.has(oid)) continue;
               seen.add(oid);
               result.candidates.push({ source: "plugin-1688", ...c });
+            }
+            // 精核价：采购价必须取自 1688 真实价格阶梯首档。轻量模式只为第 1 个候选开详情页，
+            // 但候选会按起批量重排，重排后的榜首可能没详情 → 补开它的详情页，避免用搜索列表的引流价。
+            if (preciseMode && result.candidates.length) {
+              try {
+                const bestCand = result.candidates[0];
+                const hasTier = Array.isArray(bestCand.priceTiers) && bestCand.priceTiers.length > 0;
+                if (!hasTier) {
+                  const details = await scrape1688CandidateDetailsInPlugin(bestCand, job, { lightMode: true });
+                  const merged = addTrafficBaitAssessmentInPlugin(merge1688CandidateDetailsInPlugin(bestCand, details));
+                  result.candidates[0] = { source: "plugin-1688", ...merged };
+                  const ladder = Array.isArray(merged.priceTiers) && merged.priceTiers.length
+                    ? merged.priceTiers.map((t) => `${t.beginAmount}件起¥${t.price}`).join("; ")
+                    : "未取到";
+                  job.logs.push(makeLog(`货号 ${offerId} 榜首候选补详情页：价格阶梯 ${ladder}`, merged.priceTiers?.length ? "info" : "warn"));
+                }
+              } catch (e) {
+                job.logs.push(makeLog(`货号 ${offerId} 榜首候选补详情页失败：${(e?.message || String(e)).slice(0, 120)}`, "warn"));
+              }
             }
             job.logs.push(makeLog(`货号 ${offerId} 第 ${imgIndex}/${images.length} 张图搜 OK：接口返回 ${step.candidates.length} 个原始候选（${stepMs}ms）` + (step.candidates[0]
               ? `；首候选 keys=[${Object.keys(step.candidates[0]).join(",")}] oid="${String(step.candidates[0]?.offerId || step.candidates[0]?.id || step.candidates[0]?.itemId || step.candidates[0]?.offerId1688 || "")}" img="${String((step.candidates[0]?.image || step.candidates[0]?.img || "").slice(0, 60))}"`
@@ -2252,6 +2272,16 @@ function extract1688DetailData(fallback) {
   return {
     title,
     price,
+    // v2.2.9.110: 价格阶梯结构化输出（起批量 → 单价）。核价取「起批首档单价」，
+    //   不再用价格文本里的第一个数字（过去会把 "10件起 ¥3.2" 误读成 10）。
+    priceTiers: priceRanges
+      .map((item) => ({
+        beginAmount: Math.max(1, Number(item.beginAmount || 1) || 1),
+        price: Number(String(item.price).replace(/[^\d.]/g, "")) || 0,
+      }))
+      .filter((tier) => tier.price > 0 && tier.price <= 50000)
+      .sort((a, b) => a.beginAmount - b.beginAmount),
+    priceRangeCount: priceRanges.length,
     priceDetails: priceDetails || (price ? `1件起 ¥${price}` : ""),
     minOrderQuantity,
     moq: minOrderQuantity,
@@ -2378,11 +2408,22 @@ function merge1688CandidateDetailsInPlugin(candidate, details = {}) {
     .join(" ");
   const inferredPack = inferPackQuantityFromTextInPlugin([details.title, candidate.title, detailAttrText].join(" "));
   const pack = details.packQuantity || candidate.packQuantity || inferredPack.quantity;
+  // v2.2.9.110: 采购价口径 = 1688 详情页价格阶梯的「起批首档单价」（起批量最小的一档 = 小批量真实能买到的价）。
+  //   旧逻辑取价格文本里第一个数字，会把 "10件起 ¥3.2" 误读成 10；没有阶梯时退回详情/SKU 兜底价并标 hasTier=false。
+  const tiers = (Array.isArray(details.priceTiers) ? details.priceTiers : [])
+    .filter((tier) => tier && Number(tier.price) > 0)
+    .sort((a, b) => (Number(a.beginAmount) || 1) - (Number(b.beginAmount) || 1));
+  const firstTier = tiers[0] || null;
+  const fallbackPrice = normalize1688PriceOnlyInPlugin(details.price || candidate.price || "");
   return {
     ...candidate,
     ...details,
     title: details.title || candidate.title,
-    price: normalize1688PriceOnlyInPlugin(details.priceDetails || candidate.priceDetails || details.price || candidate.price),
+    price: firstTier ? String(firstTier.price) : fallbackPrice,
+    priceFirstTier: firstTier ? String(firstTier.price) : "",
+    priceTiers: tiers,
+    priceHasTier: tiers.length > 0,
+    priceLadderText: details.priceDetails || candidate.priceDetails || "",
     minOrderQuantity: details.minOrderQuantity || candidate.minOrderQuantity || candidate.moq,
     moq: details.moq || details.minOrderQuantity || candidate.moq,
     shippingFee: details.shippingFee || candidate.shippingFee || "",

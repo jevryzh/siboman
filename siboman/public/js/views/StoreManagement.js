@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.109";
-    const PLUGIN_ZIP_VERSION = "2.2.9.109";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.110";
+    const PLUGIN_ZIP_VERSION = "2.2.9.110";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -427,6 +427,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.110 Yandex 全店精核价（1688 官方真实价）：采购价口径改为「1688 详情页价格阶梯的起批首档单价」（小批量真正能买到的价），修掉旧逻辑把价格文本里第一个数字当价格（"10件起 ¥3.2" 被读成 10）的问题；精核价时若榜首候选没有详情证据会补开它的详情页，避免用搜索列表的引流最低价。</li>
             <li>✅ v2.2.9.109 Yandex 核价提速：任务领取轮询从最长 30s 缩短到数秒（SW 存活期间每 4s 快轮询）；核价轻量模式只为首个候选开 1688 详情页补 MOQ/运费，其余候选直接用搜索接口字段，避免逐个开关详情页导致单行 60s+。</li>
             <li>✅ v2.2.9.104 修复单品找货"Ozon 主图为空"：Ozon 商品图 CDN 域名升级为 ozonstatic.cn，插件域名白名单/图片正则未覆盖新域名导致主图全被丢弃。已补 ozonstatic.cn/com 域名 + DOM 图片兜底采集 + 过滤价格标签营销图（payments-cdn）。</li>
             <li>✅ v2.2.9.102 单品找货采集买家实际支付价：Ozon 页面同时有 webPrice（卖家设置价）和 finalPrice（买家实际支付价，含平台自动拉活动的折扣后价，如 69）。现在独立提取两者，Excel 新增「Ozon买家价RMB(含活动)」列，方便看出哪些商品被平台拉低价格。</li>
