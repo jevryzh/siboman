@@ -17,6 +17,12 @@ window.YandexAutoListingView = {
     const currencyId = Vue.ref('CNY');
     const currencySymbol = Vue.computed(() => (currencyId.value === 'CNY' ? '¥' : '₽'));
     const warehouses = Vue.ref([]);
+    // 利润计算（对齐熊猫口径：代贴单费/国内运费/物流商/佣金/收单/提现/退货/广告/目标毛利/划线折扣/实际汇率）
+    const profit = Vue.reactive({
+      visible: true, busy: false, rows: [], applied: false,
+      cost: { serviceFeeCny: 3, domesticShippingCny: 5, lastMileCny: 4.68, commissionPct: 24, acquiringPct: 3.8, withdrawalPct: 1.2, returnLossPct: 0, adPct: 15, targetMarginPct: 35, strikeDiscountPct: 50, exchangeRate: 12.8205 },
+      rateText: '',
+    });
     // 变体特征值编辑（每个 SKU 同一特征参数给不同值，Yandex 才允许同组发布）
     const skuParamDialog = Vue.reactive({ visible: false, index: -1, spec: '', rows: [] });
     const warehouseId = Vue.ref('');
@@ -42,6 +48,48 @@ window.YandexAutoListingView = {
     const publishStatusText = (s) => ({ unpublished: '未上传', uploading: '上传中', published: '已上传', failed: '上传失败' }[s] || s || '-');
     const publishStatusType = (s) => ({ unpublished: 'info', uploading: 'warning', published: 'success', failed: 'danger' }[s] || 'info');
     const firstImage = (d) => (Array.isArray(d.images) && d.images.length ? d.images[0] : (d.skus?.[0]?.image || ''));
+
+    const loadProfitDefaults = async () => {
+      try {
+        const res = await axios.get('/api/yandex/pricing-defaults', { timeout: 30000 });
+        const d = res.data || {};
+        for (const k of Object.keys(profit.cost)) if (d[k] !== undefined && d[k] !== null && d[k] !== '') profit.cost[k] = Number(d[k]);
+        profit.rateText = `当前汇率 1 CNY = ${Number(profit.cost.exchangeRate || 0).toFixed(4)} RUB`;
+      } catch (_e) { profit.rateText = '汇率读取失败，使用默认值'; }
+    };
+    const calcProfit = async () => {
+      if (!drawer.draft) return;
+      profit.busy = true;
+      try {
+        const items = (drawer.draft.skus || []).map((sku, i) => ({
+          offerId: String(i + 1), purchaseCny: Number(sku.purchaseCny || 0), weightKg: Number(sku.weightKg || 0),
+          dims: [Number(sku.lengthCm || 0), Number(sku.widthCm || 0), Number(sku.heightCm || 0)],
+          categoryName: drawer.draft.categoryName || '', params: { ...profit.cost },
+        }));
+        const res = await axios.post('/api/yandex/price-suggest', { items }, { timeout: 60000 });
+        const results = res.data?.results || [];
+        profit.rows = results.map((r, i) => ({
+          idx: i, spec: drawer.draft.skus[i]?.spec || ('SKU ' + (i + 1)), ok: !!r.ok, priceCny: r.priceCny || 0, priceRub: r.rubValue || 0,
+          strikeCny: r.strikePriceCny || 0, profitCny: r.profitCny || 0, zone: r.zone || '', celFeeCny: r.celFeeCny || 0,
+          commission: r.commissionUsed || 0, commissionSource: r.commissionSource || 'auto',
+        }));
+        const bad = profit.rows.filter((r) => !r.ok);
+        if (bad.length) notify.warning(`${bad.length} 个 SKU 计算失败（采购价/重量/尺寸不完整）`);
+      } catch (e) { notify.error('利润计算失败: ' + (e.response?.data?.error || e.message)); }
+      finally { profit.busy = false; }
+    };
+    const applyProfitPrices = () => {
+      if (!drawer.draft || !profit.rows.length) return;
+      const f = priceField(), of = oldPriceField();
+      for (const r of profit.rows) {
+        const sku = drawer.draft.skus[r.idx];
+        if (!sku || !r.ok) continue;
+        if (currencyId.value === 'CNY') { sku.priceCny = r.priceCny; sku.oldPriceCny = r.strikeCny; }
+        else { sku.priceRub = Math.round(r.priceRub || r.priceCny * profit.cost.exchangeRate); sku.oldPriceRub = Math.round((r.strikeCny || 0) * profit.cost.exchangeRate); }
+      }
+      profit.applied = true;
+      notify.success(`已把 ${profit.rows.filter((r) => r.ok).length} 个 SKU 的售价/划线价填入（记得保存并上传）`);
+    };
 
     const loadWarehouses = async () => {
       if (warehouses.value.length) return;
@@ -142,6 +190,7 @@ window.YandexAutoListingView = {
         drawer.tagsText = (d.tags || []).join(', ');
         drawer.categoryPath = d.categoryId ? await findCategoryPath(d.categoryId) : [];
         loadWarehouses();
+        loadProfitDefaults();
         await loadCategoryOptions();
         if (d.categoryId) await loadCategoryParams(d.categoryId);
         else drawer.params = [];
@@ -295,7 +344,7 @@ window.YandexAutoListingView = {
       collectStatusText, collectStatusType, publishStatusText, publishStatusType, firstImage,
       fetchDrafts, openNewTask, submitNewTask,
       openDrawer, onCategoryChange, saveDraft, aiFill, uploadFromDrawer, uploadRow, removeDraft, deleteYandexOffers,
-      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
+      addSku, removeSku, applyWeightToAll, skuParamDialog, openSkuParams, saveSkuParams, profit, loadProfitDefaults, calcProfit, applyProfitPrices, removeImage, addImage, categoryLabel, currencyId, currencySymbol, priceField, oldPriceField, warehouses, warehouseId, loadWarehouses,
     };
   },
 
@@ -492,6 +541,43 @@ window.YandexAutoListingView = {
               <div style="display:none">
               </div>
               <div style="font-size:12px; color:#94a3b8; margin-top:6px">售价/划线价按店铺结算币种填写（当前 {{ currencyId }}）。Yandex 只接受店铺币种，填错会上传失败。</div>
+            </el-card>
+
+            <el-card shadow="never" style="margin-bottom:14px">
+              <template #header>
+                <b>利润计算</b>
+                <span style="font-size:12px; color:#94a3b8; float:right">{{ profit.rateText || '正在读取汇率…' }}</span>
+              </template>
+              <el-row :gutter="8">
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">代贴单费 ¥</div><el-input-number v-model="profit.cost.serviceFeeCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">国内运费 ¥</div><el-input-number v-model="profit.cost.domesticShippingCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">尾程/物流商 ¥</div><el-input-number v-model="profit.cost.lastMileCny" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">平台佣金 %</div><el-input-number v-model="profit.cost.commissionPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">银行收单 %</div><el-input-number v-model="profit.cost.acquiringPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">提现费率 %</div><el-input-number v-model="profit.cost.withdrawalPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+              </el-row>
+              <el-row :gutter="8" style="margin-top:8px">
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">退货亏损 %</div><el-input-number v-model="profit.cost.returnLossPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">广告费率 %</div><el-input-number v-model="profit.cost.adPct" :min="0" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">目标毛利率 %</div><el-input-number v-model="profit.cost.targetMarginPct" :min="0" :max="90" :precision="2" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">划线价折扣 %</div><el-input-number v-model="profit.cost.strikeDiscountPct" :min="1" :max="100" :precision="0" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4"><div style="font-size:12px;color:#64748b">汇率 CNY→RUB</div><el-input-number v-model="profit.cost.exchangeRate" :min="0" :precision="4" :controls="false" size="small" style="width:100%" /></el-col>
+                <el-col :span="4" style="display:flex; align-items:flex-end; gap:6px">
+                  <el-button size="small" type="primary" plain :loading="profit.busy" @click="calcProfit">计算</el-button>
+                  <el-button size="small" type="success" plain :disabled="!profit.rows.length" @click="applyProfitPrices">填入售价</el-button>
+                </el-col>
+              </el-row>
+              <div style="font-size:12px; color:#94a3b8; margin-top:6px">佣金：填 0 时按类目自动匹配（兜底 24%）；尾程/物流商默认 ¥4.68，可按你实际物流商改。计算后点「填入售价」写入 SKU 表（{{ currencyId }} 币种），再保存/上传。</div>
+              <el-table v-if="profit.rows.length" :data="profit.rows" size="small" border style="margin-top:8px">
+                <el-table-column label="SKU" prop="spec" min-width="120" show-overflow-tooltip />
+                <el-table-column label="建议售价 ¥" width="100" align="right"><template #default="{ row }"><b v-if="row.ok" style="color:#047857">{{ row.priceCny }}</b><span v-else style="color:#b91c1c">算不出</span></template></el-table-column>
+                <el-table-column label="建议售价 ₽" width="100" align="right"><template #default="{ row }">{{ row.priceRub || '-' }}</template></el-table-column>
+                <el-table-column label="划线价 ¥" width="90" align="right"><template #default="{ row }">{{ row.strikeCny || '-' }}</template></el-table-column>
+                <el-table-column label="头程 ¥" width="80" align="right"><template #default="{ row }">{{ row.celFeeCny }}</template></el-table-column>
+                <el-table-column label="佣金 %" width="90" align="right"><template #default="{ row }">{{ row.commission }}<span v-if="row.commissionSource==='auto'" style="color:#94a3b8;font-size:11px"> 类目</span></template></el-table-column>
+                <el-table-column label="利润 ¥" width="90" align="right"><template #default="{ row }"><b style="color:#2563eb">{{ row.profitCny }}</b></template></el-table-column>
+                <el-table-column label="分区" prop="zone" width="110" show-overflow-tooltip />
+              </el-table>
             </el-card>
 
             <el-card shadow="never" style="margin-bottom:14px">
