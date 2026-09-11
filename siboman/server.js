@@ -8283,6 +8283,18 @@ app.post("/api/yandex/price-apply", requireAuth, async (req, res, next) => {
         if (!calc.ok) { results.push({ offerId, ok: false, error: "成本参数无效" }); continue; }
         targetPrice = calc.priceCny; zone = calc.zone; celFee = calc.celFeeCny;
       }
+      // 【重要】Yandex 的防错价保护：单次降价幅度过大（实测 ≥51%）会把商品 DISABLED_AUTOMATICALLY 自动禁售，
+      // 事后必须把价格调回去才会恢复（2026-09-11 凌晨一次全量改价砍 50~75% → 960 个商品被自动下架）。
+      // 这里默认拦在 49% 以内；确实要降更多就分两次改（第一次降到安全线，隔一段时间再降第二次）。
+      const maxDropPct = Math.max(1, Math.min(90, Number(process.env.YANDEX_PRICE_MAX_DROP_PCT || 49))) / 100;
+      if (oldPriceCny && targetPrice > 0 && targetPrice < oldPriceCny * (1 - maxDropPct) && req.body?.allowBigDrop !== true) {
+        const safeFloor = Math.ceil(oldPriceCny * (1 - maxDropPct) * 100) / 100;
+        results.push({
+          offerId, ok: false, code: "PRICE_DROP_TOO_LARGE", oldPrice: oldPriceCny, safeFloor,
+          error: `降价幅度过大（${oldPriceCny} → ${targetPrice}）。Yandex 会在单次降价超过约 50% 时自动禁售商品（9/11 凌晨就是这么掉了 960 个）。本次最多降到 ${safeFloor}；要到 ${targetPrice} 请分两步：先改成 ${safeFloor}，过一段时间再改成 ${targetPrice}。`,
+        });
+        continue;
+      }
       try {
         const currency = String(it.currency || "CNY").toUpperCase();
         const oldPriceValue = Number(it.oldPrice || it.old_price || 0);
