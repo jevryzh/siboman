@@ -52,7 +52,7 @@ window.YandexProductListView = {
         acquiringPct: 3.8,
         withdrawalPct: 1.2,
         returnLossPct: 0,
-        adPct: 15,
+        adPct: 16,
         targetMarginPct: 35,
         strikeDiscountPct: 50,
         ozonMarginPct: 10, // Ozon 反推采购价用的目标利润率
@@ -187,6 +187,15 @@ window.YandexProductListView = {
       { label: '一般(60-79 橙)', value: 'medium' },
       { label: '待优化(<60 红)', value: 'low' },
     ];
+    // 官方卡片质量分（Yandex contentRating，来自 offer-cards 接口）：all | below80 | high | medium | low
+    const officialFilter = Vue.ref('all');
+    const officialOptions = [
+      { label: '全部官方分', value: 'all' },
+      { label: '官方<80(待优化)', value: 'below80' },
+      { label: '官方≥80(优秀)', value: 'high' },
+      { label: '官方60-79(一般)', value: 'medium' },
+      { label: '官方<60(差)', value: 'low' },
+    ];
     // AI 优化状态：是否做过 AI 优化 + 次数/最近时间（来自 ai_stats）
     const aiFilter = Vue.ref('all');
     const aiOptions = [
@@ -300,6 +309,7 @@ window.YandexProductListView = {
           params: {
             status: activeTab.value,
             quality: qualityFilter.value,
+            official: officialFilter.value,
             ai: aiFilter.value,
             diagnostic: diagnosticFilter.value,
             price: priceFilter.value,
@@ -1648,6 +1658,37 @@ window.YandexProductListView = {
     };
     const qualityTagType = (grade) => (grade === 'high' ? 'success' : grade === 'medium' ? 'warning' : 'danger');
 
+    // ===== Yandex 官方卡片质量分（contentRating）与官方改进建议 =====
+    const officialScoreOf = (row) => {
+      const v = row?.official_score;
+      if (v === null || v === undefined || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) && n >= 0 ? n : null;
+    };
+    const officialColor = (score) => (score === null ? '#94a3b8' : score >= 80 ? '#16a34a' : score >= 60 ? '#f59e0b' : '#dc2626');
+    const officialRecLabel = (type) => ({
+      TITLE_LENGTH: '标题结构/长度',
+      DESCRIPTION_LENGTH: '描述长度',
+      MAIN: '类目关键属性',
+      ADDITIONAL: '附加属性',
+      DISTINCTIVE: '区分性属性',
+      FILTERABLE: '可筛选属性',
+      RECOGNIZED_VENDOR: '品牌写法',
+      PICTURE_COUNT: '图片数量',
+      FIRST_PICTURE_SIZE: '首图质量',
+      AVERAGE_PICTURE_SIZE: '图片整体质量',
+      HAS_VIDEO: '视频',
+      VIDEO_COUNT: '视频数量',
+      FIRST_VIDEO_SIZE: '首个视频质量',
+      FIRST_VIDEO_LENGTH: '首个视频时长',
+      AVERAGE_VIDEO_SIZE: '视频整体质量',
+      HAS_DESCRIPTION: '描述',
+      HAS_BARCODE: '条码',
+    }[type] || type);
+    const officialMediaRec = (type) => ['PICTURE_COUNT', 'FIRST_PICTURE_SIZE', 'AVERAGE_PICTURE_SIZE', 'HAS_VIDEO', 'VIDEO_COUNT', 'FIRST_VIDEO_SIZE', 'FIRST_VIDEO_LENGTH', 'AVERAGE_VIDEO_SIZE'].includes(type);
+    const officialDialog = Vue.reactive({ visible: false, row: null });
+    const openOfficialDetail = (row) => { officialDialog.row = row; officialDialog.visible = true; };
+
     const aiDialog = Vue.reactive({ visible: false, busy: false, rows: [], applying: false });
     const aiChecked = Vue.reactive({}); // offerId -> bool
 
@@ -1795,6 +1836,7 @@ window.YandexProductListView = {
       reverseDialog, reverseOneRow, openReversePricing, reverseAllRows, applyReverseToYandex,
       calcDrawerSuggest, saveDrawerCandidate, applyOnePrice, openApplyBatch, confirmApplyBatch,
       qgradeInfo, qualityTagType, aiDialog, aiChecked, openAiOptimize, applyAiOptimize,
+      officialFilter, officialOptions, officialScoreOf, officialColor, officialRecLabel, officialMediaRec, officialDialog, openOfficialDetail,
       drawer, saveLoading, editDrawerMode, aiFillProduct, setAttrValue, attrTemplateOf, drawerMissingAttrs,
       aiFilter, aiOptions, aiStats, aiRecordsDialog, openAiRecords,
       priceFilter, priceOptions, displayProducts, isPromoRow,
@@ -1853,6 +1895,9 @@ window.YandexProductListView = {
         <el-select v-model="qualityFilter" size="large" style="width:160px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
           <el-option v-for="opt in qualityOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
+        <el-select v-model="officialFilter" size="large" style="width:175px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
+          <el-option v-for="opt in officialOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
         <el-select v-model="diagnosticFilter" size="large" style="width:160px" @change="() => { pagination.currentPage = 1; fetchProducts(); }">
           <el-option v-for="opt in diagnosticOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
         </el-select>
@@ -1904,9 +1949,28 @@ window.YandexProductListView = {
         </el-table-column>
         <el-table-column label="状态" width="130">
           <template #default="{ row }">
-            <el-tooltip :content="row.status_name || row.card_status || row.campaign_status || ''" placement="top">
-              <el-tag :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
+            <el-tooltip placement="top" effect="light">
+              <template #content>
+                <div style="max-width:360px; white-space:normal; line-height:1.6">
+                  <div v-if="row.hide_reason_text"><b>被隐藏/禁售原因：</b>{{ row.hide_reason_text }}</div>
+                  <div v-if="row.hide_action_text" style="margin-top:4px"><b>处理建议：</b>{{ row.hide_action_text }}</div>
+                  <div v-if="!row.hide_reason_text">{{ row.status_name || row.card_status || row.campaign_status || '' }}</div>
+                </div>
+              </template>
+              <span>
+                <el-tag :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
+                <span v-if="row.hide_reason_text" style="margin-left:4px; color:#e6a23c; font-weight:700">⚠</span>
+              </span>
             </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="隐藏原因（Yandex官方）" min-width="220" show-overflow-tooltip>
+          <template #default="{ row }">
+            <div v-if="row.hide_reason_text" style="line-height:1.4">
+              <div style="color:#c45656; font-size:12px">{{ row.hide_reason_text }}</div>
+              <div v-if="row.hide_action_text" style="color:#909399; font-size:11px; margin-top:2px">{{ row.hide_action_text }}</div>
+            </div>
+            <span v-else style="color:#c0c4cc">—</span>
           </template>
         </el-table-column>
         <el-table-column label="卡片质量" width="130">
@@ -1917,6 +1981,21 @@ window.YandexProductListView = {
               </el-tag>
             </el-tooltip>
             <el-tag v-else :type="qualityTagType(row.qgrade)" effect="light">{{ qgradeInfo(row).text }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="官方分" width="120" align="center">
+          <template #default="{ row }">
+            <el-button v-if="officialScoreOf(row) !== null" link @click="openOfficialDetail(row)">
+              <el-tag
+                :type="officialScoreOf(row) >= 80 ? 'success' : officialScoreOf(row) >= 60 ? 'warning' : 'danger'"
+                effect="light"
+                style="cursor:pointer"
+              >
+                {{ officialScoreOf(row) }}
+                <span v-if="Array.isArray(row.official_recommendations) && row.official_recommendations.length">·{{ row.official_recommendations.length }}项建议</span>
+              </el-tag>
+            </el-button>
+            <span v-else style="color:#cbd5e1; font-size:12px">—</span>
           </template>
         </el-table-column>
         <el-table-column label="AI 优化" width="130" align="center">
@@ -2790,8 +2869,52 @@ window.YandexProductListView = {
           </el-table-column>
           <el-table-column label="状态" width="90"><template #default="{ row }"><el-tag size="small" :type="row.status === 'applied' ? 'success' : 'danger'">{{ row.status === 'applied' ? '已提交' : '失败' }}</el-tag></template></el-table-column>
           <el-table-column label="说明" min-width="160"><template #default="{ row }"><span style="font-size:12px; color:#94a3b8">{{ row.detail || '' }}</span></template></el-table-column>
-        </el-table>
-      </el-dialog>
-    </div>
-  `
-};
+         </el-table>
+       </el-dialog>
+
+       <el-dialog v-model="officialDialog.visible" title="Yandex 官方卡片质量分与改进建议" width="860px" append-to-body destroy-on-close>
+         <template v-if="officialDialog.row">
+           <div style="display:flex; align-items:center; gap:14px; margin-bottom:12px">
+             <div :style="{ fontSize: '30px', fontWeight: 800, color: officialColor(officialScoreOf(officialDialog.row)) }">{{ officialScoreOf(officialDialog.row) }}</div>
+             <div style="font-size:13px; color:#475569">
+               <div style="font-weight:700">{{ officialDialog.row.name }}</div>
+               <div style="color:#94a3b8">{{ officialDialog.row.offer_id }}</div>
+               <div v-if="officialDialog.row.official_average_score" style="margin-top:4px">类目平均分：{{ officialDialog.row.official_average_score }}</div>
+             </div>
+           </div>
+           <el-alert
+             v-if="officialDialog.row.official_rating_status === 'UPDATING'"
+             type="info" :closable="false" show-icon
+             title="Yandex 正在重算该卡片评分，分数可能随后变化"
+             style="margin-bottom:10px"
+           />
+           <div style="font-weight:700; font-size:13px; margin:8px 0 6px">官方改进建议（按可提升分数排序）</div>
+           <el-table :data="(officialDialog.row.official_recommendations || []).slice().sort((a, b) => (b.remainingRatingPoints || 0) - (a.remainingRatingPoints || 0))" size="small" border empty-text="暂无建议">
+             <el-table-column label="建议项" min-width="150">
+               <template #default="{ row }">{{ officialRecLabel(row.type) }}</template>
+             </el-table-column>
+             <el-table-column label="完成度" width="90" align="center">
+               <template #default="{ row }">{{ row.percent === undefined || row.percent === null ? '—' : row.percent + '%' }}</template>
+             </el-table-column>
+             <el-table-column label="可提升分" width="95" align="center">
+               <template #default="{ row }"><el-tag size="small" type="success" effect="light">+{{ row.remainingRatingPoints || 0 }}</el-tag></template>
+             </el-table-column>
+             <el-table-column label="谁来做" width="110" align="center">
+               <template #default="{ row }">
+                 <el-tag size="small" :type="officialMediaRec(row.type) ? 'warning' : 'primary'" effect="plain">{{ officialMediaRec(row.type) ? '需补素材' : 'AI 可优化' }}</el-tag>
+               </template>
+             </el-table-column>
+           </el-table>
+           <template v-if="(officialDialog.row.official_errors || []).length || (officialDialog.row.official_warnings || []).length">
+             <div style="font-weight:700; font-size:13px; margin:12px 0 6px">平台错误 / 警告</div>
+             <div v-for="(e, i) in (officialDialog.row.official_errors || [])" :key="'e' + i" style="font-size:12px; color:#c45656">错误：{{ e.message }} {{ e.comment || '' }}</div>
+             <div v-for="(w, i) in (officialDialog.row.official_warnings || [])" :key="'w' + i" style="font-size:12px; color:#b45309">警告：{{ w.message }} {{ w.comment || '' }}</div>
+           </template>
+         </template>
+         <template #footer>
+           <el-button @click="officialDialog.visible = false">关闭</el-button>
+         </template>
+       </el-dialog>
+     </div>
+   `
+ };
