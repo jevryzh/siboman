@@ -5,6 +5,7 @@ window.YandexProductListView = {
     const pulling = Vue.ref(false);       // 正在全量拉取店铺商品（后台刷新中）
     const pullSeconds = Vue.ref(0);
     let pullTimer = null;
+    let officialRefetchTimer = null;      // 「官方分」后台缓存未就绪时的一次性延迟重拉
     const saveLoading = Vue.ref(false);
     const hasFetched = Vue.ref(false);
     const activeTab = Vue.ref('all');
@@ -300,7 +301,22 @@ window.YandexProductListView = {
       pulling.value = false;
       if (pullTimer) { clearInterval(pullTimer); pullTimer = null; }
     };
-    Vue.onBeforeUnmount(stopPullProgress);
+    Vue.onBeforeUnmount(() => { stopPullProgress(); if (officialRefetchTimer) { clearTimeout(officialRefetchTimer); officialRefetchTimer = null; } });
+
+    // 官方分后台缓存未就绪时轮询重拉（每 20s，最多 6 次）
+    const scheduleOfficialRefetch = () => {
+      let attempts = 0;
+      const tick = () => {
+        const missing = (products.value || []).some((it) => it.official_score === null || it.official_score === undefined || it.official_score === '');
+        if (!missing || attempts >= 6) { officialRefetchTimer = null; return; }
+        attempts += 1;
+        officialRefetchTimer = setTimeout(async () => {
+          try { await fetchProducts(); } catch { /* 忽略 */ }
+          tick();
+        }, 20000);
+      };
+      tick();
+    };
 
     const fetchProducts = async () => {
       loading.value = true;
@@ -328,6 +344,9 @@ window.YandexProductListView = {
         aiStats.value = res.data?.ai_stats || {};
         const stateIds = (res.data?.items || []).map((it) => it.offer_id).filter(Boolean);
         if (stateIds.length) refreshPriceState(stateIds);
+        // 官方分（contentRating）是后台 offer-cards 缓存刷新出来的：服务刚启动/缓存未就绪时第一次拉会为空。
+        // 这里轮询重拉（每 20s、最多 6 次 ≈ 2 分钟），等后台缓存刷好后自动补上，避免「官方分」一直为空。
+        if (!officialRefetchTimer) scheduleOfficialRefetch();
       } catch (error) {
         if (error.response?.status === 404) {
           apiReady.value = false;

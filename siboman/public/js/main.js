@@ -188,6 +188,7 @@ const initApp = () => {
         if (path.includes('data-screen')) return 'data-screen';
         if (path.includes('market-discovery')) return 'market-discovery';
         if (path.includes('stores')) return 'stores';
+        if (path.includes('ozon-patrol')) return 'ozon-patrol';
         return 'dashboard';
       });
 
@@ -245,6 +246,9 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/inventory" @click="goTo('#/inventory')">
               <el-icon><House /></el-icon><span>库存管理</span>
+            </el-menu-item>
+            <el-menu-item index="#/ozon-patrol" @click="goTo('#/ozon-patrol')">
+              <el-icon><View /></el-icon><span>巡查跟卖</span>
             </el-menu-item>
             <el-menu-item index="#/orders" @click="goTo('#/orders')">
               <el-icon><ShoppingCart /></el-icon><span>订单管理</span>
@@ -316,6 +320,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
             <div v-else-if="routeName === 'market-discovery'" class="erp-route-page"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
+            <div v-else-if="routeName === 'ozon-patrol'" class="erp-route-page"><ozon-patrol-view /></div>
           </el-main>
         </el-container>
       </el-container>
@@ -355,6 +360,7 @@ const initApp = () => {
   register('data-screen-view', window.DataScreenView);
   register('market-discovery-view', window.MarketDiscoveryView);
   register('store-management-view', window.StoreManagementView);
+  register('ozon-patrol-view', window.OzonPatrolView);
 
   app.mount('#app');
   setupPluginWorkerKeepAlive();
@@ -372,6 +378,12 @@ function setupPluginWorkerKeepAlive() {
     window.addEventListener("message", (event) => {
       const d = event.data;
       if (!d || typeof d !== "object" || d[PROTO] !== PROTO_VAL || !d.reqId) return;
+      // v2.2.9.124 修复：必须忽略自己发出去的 *.request 回弹。
+      //   window.postMessage 会在调用方自己的 window 同步触发 message，这条全局 listener
+      //   早于各页面（批量上架/店铺管理/单品找货）注册，会把 request body 当回复立刻
+      //   resolve 掉 pending → ping 永远拿不到 ok/background_version →
+      //   pluginVersionOk=false → 「一键解析+采集+上架」按钮被永久禁用（点了没反应）。
+      if (typeof d.kind === "string" && d.kind.endsWith(".request")) return;
       const resolver = window.__zhumeng_pending__[d.reqId];
       if (typeof resolver === "function") { delete window.__zhumeng_pending__[d.reqId]; resolver(d); }
     });

@@ -208,7 +208,15 @@ window.OrderListView = {
     };
     const primaryProduct = (row) => (row.products || [])[0] || {};
     const orderRowKey = (row) => `${effectiveStoreIdForOrder(row)}:${row.posting_number || ''}`;
-    const rowCreatedTime = (row) => (row.in_process_at || row.created_at || '').replace('T',' ').slice(0,16) || '-';
+    // Ozon 返回的是 UTC（Z）时间，这里统一转成北京时间（UTC+8）展示
+    const toBeijingTime = (iso) => {
+      if (!iso) return '';
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return String(iso).replace('T', ' ').slice(0, 16);
+      const bj = new Date(d.getTime() + 8 * 3600 * 1000);
+      return bj.toISOString().replace('T', ' ').slice(0, 16);
+    };
+    const rowCreatedTime = (row) => toBeijingTime(row.in_process_at || row.created_at) || '-';
     const rowStatusSubtext = (row) => {
       if (row.status === 'awaiting_packaging') return '已创建';
       if (row.status === 'awaiting_deliver') return '待交给物流';
@@ -296,9 +304,17 @@ window.OrderListView = {
       if (!p) return c ? 100 : 0;
       return Math.round((c - p) / Math.abs(p) * 1000) / 10;
     };
-    const displayedOrders = Vue.computed(() => orders.value
-      .filter((row) => activeTab.value === 'overdue' ? isOverdue(row) : true)
-      .filter(rowMatchesSearch));
+    const displayedOrders = Vue.computed(() => {
+      const filtered = orders.value
+        .filter((row) => activeTab.value === 'overdue' ? isOverdue(row) : true)
+        .filter(rowMatchesSearch);
+      // 多店铺/全部店铺时数据是一次性拉回前端的，这里做前端分页；
+      // 单店铺走服务端分页（offset 已按页切好），不再二次切片。
+      const aggregate = isAllStoresScope() || selectedStoreIds().length > 1;
+      if (!aggregate) return filtered;
+      const start = (pagination.currentPage - 1) * pagination.pageSize;
+      return filtered.slice(start, start + pagination.pageSize);
+    });
     const summaryStats = Vue.computed(() => {
       const current = ordersMetric(kpiRows.value);
       const previous = ordersMetric(previousKpiRows.value);
@@ -341,7 +357,9 @@ window.OrderListView = {
       try {
         const { since, to } = dateRangeBounds();
         const aggregateStoreMode = isAllStoresScope() || storeIds.length > 1;
-        const limit = aggregateStoreMode ? Math.min(200, Math.max(pagination.pageSize, 50)) : pagination.pageSize;
+        // 多店铺/全部店铺：一次性拉满每店最多 200 单，前端按页切片（分页在前端做）；
+        // 单店铺：服务端按 limit/offset 分页。
+        const limit = aggregateStoreMode ? 200 : pagination.pageSize;
         const offset = aggregateStoreMode ? 0 : (pagination.currentPage - 1) * pagination.pageSize;
         const results = await Promise.allSettled(storeIds.map((sid) => axios.post('/api/seller/orders', {
           store_id: sid,
@@ -393,6 +411,16 @@ window.OrderListView = {
         hasFetched.value = true;
         loading.value = false;
       }
+    };
+
+    // 分页控件回调：多店铺/全部店铺走前端切片（无需重拉），单店铺走服务端分页（重拉）
+    const onPageChange = () => {
+      const aggregate = isAllStoresScope() || selectedStoreIds().length > 1;
+      if (!aggregate) fetchOrders('cache');
+    };
+    const onPageSizeChange = () => {
+      pagination.currentPage = 1;
+      onPageChange();
     };
 
     const fetchOrderSummary = async () => {
@@ -833,7 +861,9 @@ window.OrderListView = {
     const fetchShops = async () => {
       try {
         const res = await axios.get('/api/seller/shops');
-        shops.value = res.data.shops || [];
+        // 订单管理只处理 Ozon 店铺：Yandex 店铺（CELbudget 等）走的是 Yandex 凭证，
+        // 若混进 Ozon 拉单会报「Invalid Api-Key」，这里直接过滤掉。
+        shops.value = (res.data.shops || []).filter((shop) => !shop.platform || shop.platform === 'ozon');
       } catch (e) {
         console.warn('订单页拉取店铺列表失败', e.message);
       }
@@ -863,6 +893,7 @@ window.OrderListView = {
       storeScope, storeScopeOptions, onStoreScopeChange,
       detailDrawer, shipDialog,
       fetchOrders, fetchOrderSummary, fetchOrderKpis, refreshOrderDashboard, pullLatestOrders, refreshInProgressOrders,
+      onPageChange, onPageSizeChange, toBeijingTime,
       openSyncWindowDialog, saveSyncWindow, resetSyncWindow, openDetail, openShipDialog, confirmShip, statusTagType, statusText,
       onSelectionChange, orderNote, openNoteDialog, saveNote, exportOrders, batchShip, deadlineInfo,
       openProcurementSource, saveProcurementSource, findSourceForOrder, handleRowAction, cancelOrder,
@@ -1054,7 +1085,7 @@ window.OrderListView = {
           <el-table-column label="商品" min-width="390">
             <template #default="{ row }">
               <div style="display:flex; gap:12px; align-items:center; min-width:0">
-                <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; flex-shrink:0; background:#f1f5f9" fit="cover" preview-teleported :preview-src-list="primaryProduct(row).image ? [primaryProduct(row).image] : []">
+                <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; flex-shrink:0; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="primaryProduct(row).image ? [primaryProduct(row).image] : []">
                   <template #error>
                     <div style="width:58px; height:58px; background:#f1f5f9; display:flex; align-items:center; justify-content:center">
                       <el-icon color="#cbd5e1"><Picture /></el-icon>
@@ -1142,8 +1173,8 @@ window.OrderListView = {
             :total="pagination.total"
             :page-sizes="[20, 50, 100]"
             layout="total, sizes, prev, pager, next"
-            @size-change="() => fetchOrders('cache')"
-            @current-change="() => fetchOrders('cache')"
+            @size-change="onPageSizeChange"
+            @current-change="onPageChange"
           />
         </div>
       </div>
@@ -1237,8 +1268,8 @@ window.OrderListView = {
               <el-descriptions-item label="状态">
                 <el-tag size="small" :type="statusTagType(detailDrawer.order.status)">{{ statusText(detailDrawer.order.status) }}</el-tag>
               </el-descriptions-item>
-              <el-descriptions-item label="下单时间">{{ (detailDrawer.order.in_process_at || '').replace('T',' ').slice(0,19) }}</el-descriptions-item>
-              <el-descriptions-item label="发货截止">{{ (detailDrawer.order.shipment_date || '').replace('T',' ').slice(0,19) }}</el-descriptions-item>
+              <el-descriptions-item label="下单时间">{{ toBeijingTime(detailDrawer.order.in_process_at) }}</el-descriptions-item>
+              <el-descriptions-item label="发货截止">{{ toBeijingTime(detailDrawer.order.shipment_date) }}</el-descriptions-item>
               <el-descriptions-item label="订单总额">¥ {{ Number(detailDrawer.order.total_cny || 0).toFixed(2) }} <span style="color:#999">(₽ {{ Number(detailDrawer.order.total_rub || 0).toFixed(2) }})</span></el-descriptions-item>
               <el-descriptions-item label="配送方式">{{ detailDrawer.order.tpl_integration_type || '-' }}</el-descriptions-item>
             </el-descriptions>
@@ -1247,7 +1278,7 @@ window.OrderListView = {
             <el-table :data="detailDrawer.order.products || []" size="small" border stripe>
               <el-table-column label="图" width="60">
                 <template #default="{ row }">
-                  <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px" fit="cover" preview-teleported />
+                  <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []" />
                 </template>
               </el-table-column>
               <el-table-column label="商品" min-width="220">

@@ -100,7 +100,7 @@ const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.112";
 // 所以不受插件 token 里的「店铺作用域」限制。否则：插件 token 的店铺来自浏览器当时的店铺选择，
 // 用户一旦在店铺切换器里切过店铺（或在别的店铺页面点过授权），已经排队的任务会永远领不到、
 // 也不会被超时捞回，界面上只显示「等待本机插件采集」，完全无从判断。
-const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect"];
+const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect", "ozon-patrol"];
 const WORKER_STORE_SCOPE_EXEMPT_SQL = `(${WORKER_STORE_SCOPE_EXEMPT_KINDS.map((k) => `'${k}'`).join(",")})`;
 // 已停用的采集端（扩展 ID 或 worker 名，逗号分隔，可用环境变量 DISABLED_WORKER_IDS 追加）。
 // 默认拉黑那台已弃用的 Windows 机器上的旧插件副本：它只会上报 run/yandex-research，
@@ -3341,8 +3341,9 @@ function normalizeYandexOrder(order = {}, context = {}) {
     sku: item.id || item.marketSku || "",
     name: item.offerName || "",
     quantity: Number(item.count || 1),
-    price: Number(item.price || item.buyerPrice || 0),
-    price_cny: rubToCny(item.price || item.buyerPrice || 0),
+    price: Number(item.price || 0),
+    price_cny: Number(item.price || 0), // item.price 已是订单币种（CNY）
+    buyer_price_rub: Number(item.buyerPrice || 0), // 买家实付（RUB）
     currency_code: order.currency || "RUB",
     image: item.picture || "",
   }));
@@ -3367,9 +3368,9 @@ function normalizeYandexOrder(order = {}, context = {}) {
     updated_at: order.updatedAt || "",
     shipment_date: order.delivery?.shipments?.[0]?.shipmentDate || order.delivery?.dates?.fromDate || "",
     delivery_date: order.delivery?.dates?.toDate || order.delivery?.dates?.fromDate || "",
-    total: Number(order.itemsTotal || order.buyerItemsTotal || 0),
-    total_rub: Number(order.itemsTotal || order.buyerItemsTotal || 0),
-    total_cny: rubToCny(order.itemsTotal || order.buyerItemsTotal || 0),
+    total: Number(order.itemsTotal || 0),
+    total_rub: Number(order.buyerItemsTotal || 0),
+    total_cny: Number(order.itemsTotal || 0), // itemsTotal 已是订单币种（CNY）
     currency_code: order.currency || "RUB",
     product_count: products.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
     products,
@@ -3392,6 +3393,72 @@ async function fetchYandexOfferMappingsPage(context, { pageToken = "", limit = 1
     items: Array.isArray(result.offerMappings) ? result.offerMappings : [],
     nextPageToken: result.paging?.nextPageToken || payload.paging?.nextPageToken || "",
   };
+}
+
+// Yandex 订单 item 不带图：从商品缓存 / offer-mappings 反查 offer 首图，填回订单商品。
+async function buildYandexOrderImageMap(context, storeId, orders) {
+  const map = new Map();
+  const offerIds = [...new Set((orders || []).flatMap((o) => (o.products || []).map((p) => String(p.offer_id || p.sku || "")).filter(Boolean)))];
+  if (!offerIds.length) return map;
+  const cache = yandexOfferCacheObj(storeId || "__env__");
+  for (const offer of [...(cache.active || []), ...(cache.archived || [])]) {
+    const oid = String(offer?.offer_id || "");
+    const pic = String(offer?.image || (Array.isArray(offer?.images) ? offer.images[0] : "") || "");
+    if (oid && pic && offerIds.includes(oid) && !map.has(oid)) map.set(oid, pic);
+  }
+  const missing = offerIds.filter((id) => !map.has(id));
+  if (missing.length) {
+    try {
+      const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings`, {
+        method: "POST",
+        body: { offerIds: missing.slice(0, 200) },
+        timeoutMs: 60000,
+        apiSecret: context.apiSecret,
+      });
+      for (const m of (resp?.result?.offerMappings || [])) {
+        const o = m?.offer || {};
+        const oid = String(o.offerId || "");
+        const pic = String((Array.isArray(o.pictures) && o.pictures[0]) || (Array.isArray(o.mediaFiles?.pictures) && (o.mediaFiles.pictures[0]?.url || o.mediaFiles.pictures[0])) || "");
+        if (oid && pic) map.set(oid, pic);
+      }
+    } catch (_e) { /* 反查失败不影响订单列表 */ }
+  }
+  return map;
+}
+
+// Yandex 订单利润核算（估算）：收入 = 卖家货值(itemsTotal) + 平台补贴(subsidies)，
+// 成本 = 1688 采购成本 + 平台费率(佣金24%+收单3.8%+提现1.2%+尾程3%) + CEL头程 + 国内5+代贴3。
+// 订单接口不返回采购成本/佣金明细，这里用「商品候选表」的 purchase_cny + cel_fee_cny 估算。
+function enrichYandexOrderProfit(order, costMap) {
+  const items = Array.isArray(order.products) ? order.products : [];
+  const raw = order.raw || {};
+  const subsidiesCny = (Array.isArray(raw.subsidies) ? raw.subsidies : []).reduce((s, x) => s + Number(x.amount || 0), 0);
+  const itemsTotal = Number(order.total || 0) || 0; // itemsTotal 已是订单币种（CNY）
+  const revenueCny = itemsTotal + subsidiesCny;
+  let purchaseCny = 0;
+  let celCny = 0;
+  let costUnknown = false;
+  for (const p of items) {
+    const offerId = String(p.offer_id || p.sku || "");
+    const qty = Number(p.quantity || 1);
+    const c = costMap.get(offerId);
+    if (c === undefined) { costUnknown = true; continue; }
+    purchaseCny += Number(c.purchase || 0) * qty;
+    celCny += Number(c.cel || 0) * qty;
+  }
+  const commission = 24; // 兜底佣金%；将来可按类目（yandex_fbs_shop_map）细分
+  const platformRate = (commission + 3.8 + 1.2 + 3) / 100; // 佣金+收单+提现+尾程
+  const platformFeeCny = itemsTotal * platformRate;
+  const fixedCny = items.length ? 8 : 0; // 国内运费5 + 代贴单3
+  const profitCny = revenueCny - purchaseCny - platformFeeCny - celCny - fixedCny;
+  order.subsidies_cny = Math.round(subsidiesCny * 100) / 100;
+  order.revenue_cny = Math.round(revenueCny * 100) / 100;
+  order.purchase_cny = costUnknown ? null : Math.round(purchaseCny * 100) / 100;
+  order.platform_fee_cny = Math.round(platformFeeCny * 100) / 100;
+  order.cel_fee_cny = Math.round(celCny * 100) / 100;
+  order.profit_cny = costUnknown ? null : Math.round(profitCny * 100) / 100;
+  order.profit_known = !costUnknown;
+  return order;
 }
 
 // ── Yandex 官方卡片评分与改进建议（/v2/businesses/{id}/offer-cards）─────────
@@ -3454,9 +3521,18 @@ function ensureYandexCardsContentCache(context, storeKey, { force = false } = {}
   if (fresh && !force) return cache;
   if (cache.inflight) return cache;
   cache.inflight = true;
-  refreshYandexCardsContentCache(context, storeKey)
-    .catch((error) => console.warn(`[yandex-cards] 刷新失败: ${error.message}`))
-    .finally(() => { cache.inflight = false; });
+  // offer-cards 接口偶发 500（Yandex 侧抖动），失败重试 3 次，避免「官方分」一直为空
+  (async () => {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await refreshYandexCardsContentCache(context, storeKey);
+        return;
+      } catch (error) {
+        console.warn(`[yandex-cards] 刷新失败(第${attempt}次): ${error.message}`);
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, 3000 * attempt));
+      }
+    }
+  })().finally(() => { cache.inflight = false; });
   return cache;
 }
 function summarizeOfficialGrade(score) {
@@ -5407,7 +5483,9 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       limit: pageSize,
       page,
       fromDate: formatDate(from),
-      toDate: formatDate(to),
+      // Yandex 订单接口的 toDate 是「当日 00:00」边界（不含当天晚些时候的订单），
+      // 必须 +1 天才能把「今天下午刚下的单」包含进来。
+      toDate: formatDate(new Date(to.getTime() + 86400e3)),
       fake: false,
     };
     if (activeStatus === "processing" || activeStatus === "awaiting_delivery") query.status = ["PROCESSING", "PENDING"];
@@ -5422,6 +5500,30 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       apiSecret: context.apiSecret,
     });
     let items = (payload.orders || []).map((order) => normalizeYandexOrder(order, context));
+    // 订单接口不带商品图：反查 offer 首图填回，避免列表/详情全是「无图」
+    const orderImageMap = await buildYandexOrderImageMap(context, storeId, items);
+    // 利润核算：反查商品 1688 采购成本（候选表 purchase_cny + cel_fee_cny）
+    const orderOfferIds = [...new Set(items.flatMap((o) => (o.products || []).map((p) => p.offer_id).filter(Boolean)))];
+    const costMap = new Map();
+    if (db && orderOfferIds.length) {
+      try {
+        const costRes = await db.query(
+          "SELECT offer_id, purchase_cny, cel_fee_cny FROM yandex_price_candidates WHERE offer_id = ANY($1::text[])",
+          [orderOfferIds],
+        );
+        for (const row of costRes.rows) {
+          costMap.set(String(row.offer_id), { purchase: Number(row.purchase_cny || 0), cel: Number(row.cel_fee_cny || 0) });
+        }
+      } catch (_e) { /* 候选表不可用时利润显示「待核算」 */ }
+    }
+    for (const order of items) {
+      for (const product of (order.products || [])) {
+        if (!product.image) {
+          product.image = orderImageMap.get(product.offer_id) || orderImageMap.get(product.sku) || "";
+        }
+      }
+      enrichYandexOrderProfit(order, costMap);
+    }
     if (activeStatus === "awaiting_delivery") items = items.filter((item) => String(item.substatus || "").toUpperCase() === "READY_TO_SHIP");
     else if (activeStatus === "processing") items = items.filter((item) => String(item.substatus || "").toUpperCase() !== "READY_TO_SHIP");
     if (q) {
@@ -5447,6 +5549,233 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+// Yandex 订单发货：更新订单状态为 DELIVERY（卖家备货完成后交给物流）
+app.post("/api/yandex/orders/ship", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
+    const orderId = String(req.body?.order_id || req.body?.orderId || "").trim();
+    if (!orderId) return res.status(400).json({ success: false, error: "缺少订单号" });
+    const context = await getYandexMarketContext({ storeId, userId: req.user.id });
+    // Yandex Market Partner API 状态更新体必须是 { order: { status } }，顶层 order 缺省会被拒绝：
+    //   "order must not be null (rejected value: null)"
+    const payload = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/orders/${encodeURIComponent(orderId)}/status`, {
+      method: "PUT",
+      body: { order: { status: "DELIVERY" } },
+      timeoutMs: 60000,
+      apiSecret: context.apiSecret,
+    });
+    const resultOrder = payload?.result?.order || {};
+    res.json({
+      success: true,
+      order_id: orderId,
+      status: payload?.status === "OK" ? "OK" : (payload?.status || "UNKNOWN"),
+      new_status: resultOrder.status || "",
+      raw: payload || null,
+    });
+  } catch (error) {
+    // 返回 JSON 错误（含 Yandex 原始报错），前端才能弹给用户看，而不是 Express 默认的 HTML 错误页
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+// ===== 巡查跟卖（Ozon 被跟卖检测：price_index 扫描）=====
+// 用 Ozon Seller API 的 price_index 判断「卡片上有更低价卖家」（被跟卖）。缓存 10 分钟。
+const ozonPatrolCache = new Map(); // storeKey -> { at, rows, scanning }
+const OZON_PATROL_TTL_MS = 10 * 60 * 1000;
+
+async function scanOzonPatrolStore(store, userId) {
+  const req = (path, body) => callOzonSellerAPI(path, body, { storeId: store.id, userId });
+  const prods = [];
+  let last = "", guard = 0;
+  while (guard++ < 100) {
+    const r = await req("/v3/product/list", { filter: { visibility: "ALL" }, last_id: last, limit: 1000 });
+    const items = r?.result?.items || [];
+    if (!items.length) break;
+    for (const it of items) prods.push({ offer_id: it.offer_id, product_id: it.product_id });
+    last = r?.result?.last_id || items[items.length - 1].product_id || items[items.length - 1].offer_id || "";
+    if (items.length < 1000) break;
+  }
+  const rows = [];
+  const offerIds = prods.map((p) => p.offer_id);
+  for (let i = 0; i < offerIds.length; i += 200) {
+    const chunk = offerIds.slice(i, i + 200);
+    let r = await req("/v5/product/info/prices", { filter: { offer_id: chunk, product_id: [], visibility: "ALL" }, limit: 200, offset: 0 });
+    let items = r?.items || [];
+    // Ozon 价格接口偶发返回空（限流），重试 3 次
+    for (let retry = 0; retry < 3 && !items.length; retry++) {
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+      r = await req("/v5/product/info/prices", { filter: { offer_id: chunk, product_id: [], visibility: "ALL" }, limit: 200, offset: 0 });
+      items = r?.items || [];
+    }
+    for (const it of items) {
+      const pr = it.price || {};
+      const idx = it.price_indexes?.ozon_index_data || {};
+      rows.push({
+        store_id: store.id,
+        store_name: store.name,
+        offer_id: String(it.offer_id || ""),
+        product_id: String(it.product_id || ""),
+        price: Number(pr.price || pr.marketing_seller_price || 0),
+        currency: String(pr.currency_code || ""),
+        min_price_rub: Number(idx.min_price || 0),
+        price_index_value: Number(idx.price_index_value || 0),
+        color: String(it.price_indexes?.color_index || ""),
+      });
+    }
+  }
+  return rows;
+}
+
+app.get("/api/ozon/patrol", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = String(req.query?.store_id || "").trim() || null;
+    const color = String(req.query?.color || "followed").trim().toLowerCase(); // followed|red|yellow|green|all
+    const page = Math.max(1, Number(req.query.page || 1));
+    const pageSize = Math.min(500, Math.max(1, Number(req.query.page_size || 100)));
+    const key = storeId || "__all__";
+    let cache = ozonPatrolCache.get(key);
+    const fresh = cache && Date.now() - cache.at < OZON_PATROL_TTL_MS;
+    if (!fresh) {
+      const storesRes = await db.query(
+        "SELECT id, name, client_id, api_key FROM app_stores WHERE platform='ozon' AND active=TRUE AND user_id=$1" + (storeId ? " AND id=$2" : ""),
+        storeId ? [req.user.id, storeId] : [req.user.id],
+      );
+      const stores = storesRes.rows;
+      if (!stores.length) return res.status(404).json({ success: false, error: "未找到 Ozon 店铺" });
+      const allRows = [];
+      for (const s of stores) {
+        try { allRows.push(...(await scanOzonPatrolStore(s, req.user.id))); } catch (_e) { /* 单店扫描失败跳过 */ }
+      }
+      cache = { at: Date.now(), rows: allRows };
+      ozonPatrolCache.set(key, cache);
+    }
+    const allRows = cache.rows || [];
+    const counts = {
+      all: allRows.length,
+      red: allRows.filter((r) => r.color === "RED").length,
+      yellow: allRows.filter((r) => r.color === "YELLOW").length,
+      green: allRows.filter((r) => r.color === "GREEN").length,
+      no_index: allRows.filter((r) => !r.color || r.color === "WITHOUT_INDEX").length,
+    };
+    let rows = allRows;
+    if (color === "red") rows = rows.filter((r) => r.color === "RED");
+    else if (color === "yellow") rows = rows.filter((r) => r.color === "YELLOW");
+    else if (color === "green") rows = rows.filter((r) => r.color === "GREEN");
+    else if (color === "followed") rows = rows.filter((r) => r.color === "RED" || r.color === "YELLOW");
+    const total = rows.length;
+    const start = (page - 1) * pageSize;
+    const items = rows.slice(start, start + pageSize);
+    // 附加跟卖数（有跟卖的商品显示跟卖卖家数）
+    if (db && items.length) {
+      try {
+        const fcRes = await db.query(
+          "SELECT offer_id, count(*)::int AS n FROM ozon_follow_sellers WHERE user_id=$1 AND offer_id=ANY($2::text[]) GROUP BY offer_id",
+          [req.user.id, items.map((r) => r.offer_id)],
+        );
+        const fcMap = new Map(fcRes.rows.map((r) => [r.offer_id, r.n]));
+        for (const it of items) it.follow_count = fcMap.get(it.offer_id) || 0;
+      } catch (_e) { /* 表不存在时忽略 */ }
+    }
+    res.json({
+      success: true, items, total, page, page_size: pageSize,
+      scanned_at: cache.at,
+      stores: [...new Set(allRows.map((r) => r.store_name))],
+      counts,
+    });
+  } catch (error) { next(error); }
+});
+
+// 巡查跟卖：提交「采集跟卖」任务（插件在浏览器里抓跟卖卖家，回传后入库）
+app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const activeJob = await findActiveDbJobForUser(req.user, { kind: "ozon-patrol" });
+    if (activeJob) {
+      return res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, status: activeJob.status, total: activeJob.total });
+    }
+    // 取商品列表（patrol 缓存，无则现扫）
+    const key = "__all__";
+    let cache = ozonPatrolCache.get(key);
+    if (!cache || Date.now() - cache.at > OZON_PATROL_TTL_MS) {
+      const storesRes = await db.query("SELECT id, name, client_id, api_key FROM app_stores WHERE platform='ozon' AND active=TRUE AND user_id=$1", [req.user.id]);
+      const stores = storesRes.rows;
+      if (!stores.length) return res.status(404).json({ success: false, error: "未找到 Ozon 店铺" });
+      const allRows = [];
+      for (const s of stores) { try { allRows.push(...(await scanOzonPatrolStore(s, req.user.id))); } catch (_e) { /* 单店失败跳过 */ } }
+      cache = { at: Date.now(), rows: allRows };
+      ozonPatrolCache.set(key, cache);
+    }
+    const uniq = [...new Map(cache.rows.map((r) => [String(r.offer_id), r])).values()];
+    const items = uniq.map((r) => ({ offer_id: String(r.offer_id), product_id: String(r.product_id), store_name: r.store_name }));
+    if (!items.length) return res.status(400).json({ success: false, error: "无商品可采集" });
+    const queued = await createQueuedDbJob(req.user, {
+      id: crypto.randomUUID(), kind: "ozon-patrol", storeId: null, total: items.length, phase: "等待插件采集跟卖",
+    }, { items });
+    res.json({ success: true, jobId: queued.id, queued: true, total: items.length });
+  } catch (error) { next(error); }
+});
+
+// 巡查跟卖：一键改价到「市场最低价」（price_index 的 min_price，RUB → 按汇率转 CNY）
+// 注意：该功能已按用户要求暂时禁用（OZON_PATROL_REPRICE_ENABLED=false）
+const OZON_PATROL_REPRICE_ENABLED = false;
+app.post("/api/ozon/patrol/reprice", requireAuth, async (req, res, next) => {
+  if (!OZON_PATROL_REPRICE_ENABLED) {
+    return res.status(403).json({ success: false, error: "该功能已禁用" });
+  }
+  try {
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "请先勾选要改价的商品" });
+    // 按店铺分组
+    const byStore = new Map();
+    for (const it of items) {
+      const storeId = String(it.store_id || "");
+      const offerId = String(it.offer_id || "");
+      const minRub = Number(it.min_price_rub || 0);
+      if (!storeId || !offerId || !(minRub > 0)) continue;
+      if (!byStore.has(storeId)) byStore.set(storeId, []);
+      byStore.get(storeId).push({ offer_id: offerId, min_rub: minRub });
+    }
+    if (!byStore.size) return res.status(400).json({ success: false, error: "没有有效商品" });
+    const results = [];
+    for (const [storeId, list] of byStore) {
+      const prices = list.map((x) => ({
+        offer_id: x.offer_id,
+        price: String(Math.round(rubToCny(x.min_rub) * 100) / 100),
+        currency_code: "CNY",
+      }));
+      try {
+        const r = await callOzonSellerAPI("/v1/product/import/prices", { prices }, { storeId, userId: req.user.id });
+        const respItems = Array.isArray(r?.result) ? r.result : [];
+        const succeeded = respItems.filter((it) => !(it.errors && it.errors.length)).length;
+        const errors = respItems.filter((it) => it.errors && it.errors.length).map((it) => ({
+          offer_id: it.offer_id, message: (it.errors || []).map((e) => e.message || e.code).join("; "),
+        }));
+        results.push({ store_id: storeId, submitted: prices.length, succeeded, errors });
+      } catch (e) {
+        results.push({ store_id: storeId, submitted: prices.length, succeeded: 0, errors: [{ offer_id: "", message: String(e?.message || e) }] });
+      }
+    }
+    // 改价后清掉 patrol 缓存，下次巡查能看到新价
+    for (const key of ozonPatrolCache.keys()) ozonPatrolCache.delete(key);
+    res.json({ success: true, results });
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
+// 巡查跟卖：查询某商品的跟卖卖家列表（SKU/卖家名/价格）
+app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
+  try {
+    const offerId = String(req.query?.offer_id || "").trim();
+    if (!offerId) return res.status(400).json({ success: false, error: "缺少 offer_id" });
+    const r = await db.query(
+      "SELECT follower_sku, follower_name, follower_price FROM ozon_follow_sellers WHERE user_id=$1 AND offer_id=$2 ORDER BY follower_sku",
+      [req.user.id, offerId],
+    );
+    res.json({ success: true, items: r.rows, total: r.rowCount });
+  } catch (error) { next(error); }
 });
 
 // 插件模式核价：把 Yandex 商品图集派给本机采集端（插件），用 1688 官方以图找货返同款。
@@ -11851,7 +12180,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const yesterdayStartISO = yesterdayStart.toISOString();
     const nowISO = now.toISOString();
 
-    // 1. 查所有 active 店铺（业绩对比为 Ozon 维度；Yandex 店铺不走 Ozon 订单聚合）
+    // 1. 查所有 active 店铺（业绩对比为 Ozon 维度 + Yandex 维度分开展示）
     const storesRes = await db.query(
       `SELECT id, name, client_id, api_key, platform
          FROM app_stores
@@ -11859,7 +12188,15 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       [userId],
     );
     const stores = storesRes.rows;
-    if (!stores.length) {
+    // v2.2.9.124: 仪表盘纳入 Yandex 店铺（CELbudget / Three Latte 等），统计订单 GMV + 在售
+    const yandexStoresRes = await db.query(
+      `SELECT id, name, client_id, api_key, campaign_id, platform
+         FROM app_stores
+        WHERE active = TRUE AND user_id = $1 AND platform = 'yandex'`,
+      [userId],
+    );
+    const yandexStores = yandexStoresRes.rows;
+    if (!stores.length && !yandexStores.length) {
       return res.json({ success: true, summary: {}, store_comparison: [], trends: [] });
     }
 
@@ -11938,8 +12275,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const storeData = await Promise.all(stores.map(async (store) => {
       const weekOrders = await fetchStoreOrders(store, weekAgoISO, nowISO, "all");
       const postingTime = (o) => new Date(o.in_process_at || o.created_at || 0).getTime();
-      const todayOrders = weekOrders.filter(o => postingTime(o) >= todayStart.getTime() && postingTime(o) <= now.getTime() + 1000);
-      const yesterdayOrders = weekOrders.filter(o => postingTime(o) >= yesterdayStart.getTime() && postingTime(o) < todayStart.getTime());
+      // v2.2.9.125: 排除已取消订单（不计入订单数/GMV/利润/趋势），仅用于退货率统计
+      const validOrders = weekOrders.filter(o => String(o.status || "") !== "cancelled");
+      const todayOrders = validOrders.filter(o => postingTime(o) >= todayStart.getTime() && postingTime(o) <= now.getTime() + 1000);
+      const yesterdayOrders = validOrders.filter(o => postingTime(o) >= yesterdayStart.getTime() && postingTime(o) < todayStart.getTime());
       const awaitingPkg = weekOrders.filter(o => String(o.status || "") === "awaiting_packaging");
       const awaitingDel = weekOrders.filter(o => String(o.status || "") === "awaiting_deliver");
       const returns = weekOrders.filter(o => String(o.status || "") === "cancelled");
@@ -11971,7 +12310,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         const key = `${d.getMonth() + 1}/${d.getDate()}`;
         dailyBuckets[key] = { orders: 0, gmv: 0 };
       }
-      for (const o of weekOrders) {
+      for (const o of validOrders) {
         const m = calcOrderMetrics(o);
         weeklyGmv += m.gmv;
         weeklyPayout += m.payout;
@@ -11991,7 +12330,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       let weeklyMatchedPayout = 0;
       let matchedCount = 0;
       let unmatchedCount = 0;
-      for (const o of weekOrders) {
+      for (const o of validOrders) {
         for (const pd of (o.products || [])) {
           const oid = pd.offer_id;
           if (!oid) continue;
@@ -12053,7 +12392,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         [userId, store.id],
       );
 
-      const recentOrders = weekOrders.slice(0, 15).map(order => {
+      const recentOrders = validOrders.slice(0, 15).map(order => {
         const metrics = calcOrderMetrics(order);
         const product = order.products?.[0] || {};
         return {
@@ -12116,7 +12455,8 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         _returns7d: returnCount,                      // 7 日 (cancelled + arbitration), 仅用于汇总 return_rate
         weekly_payout: Math.round(weeklyPayout * 100) / 100,
         weekly_profit: Math.round(weeklyProfit * 100) / 100,
-        weekly_orders: weekOrders.length,
+        weekly_orders: validOrders.length,
+        _weekOrdersTotal: weekOrders.length,          // 含取消的 7 日总量，仅用于退货率分母
         weekly_purchase_cost: Math.round(weeklyPurchaseCost * 100) / 100,
         profit_complete: unmatchedCount === 0,
         cost_missing_count: unmatchedCount,
@@ -12130,11 +12470,155 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       };
     }));
 
+    // 4b. Yandex 店铺统计（v2.2.9.124）：订单 GMV（total_cny 已是人民币货值）+ 在售（offer 缓存）
+    const formatYandexDate = (date) => {
+      const dd = String(date.getDate()).padStart(2, "0");
+      const mm = String(date.getMonth() + 1).padStart(2, "0");
+      return `${dd}-${mm}-${date.getFullYear()}`;
+    };
+    // Yandex 订单 creationDate 是「DD-MM-YYYY HH:MM:SS」莫斯科时间(UTC+3)，
+    // new Date() 无法直接解析该格式（会得到 Invalid Date），需手动解析并转为绝对时间。
+    const parseYandexOrderDate = (s) => {
+      const m = String(s || "").trim().match(/^(\d{2})-(\d{2})-(\d{4})[ T](\d{2}):(\d{2}):(\d{2})$/);
+      if (m) {
+        return new Date(Date.UTC(Number(m[3]), Number(m[2]) - 1, Number(m[1]), Number(m[4]), Number(m[5]), Number(m[6])) - 3 * 3600e3);
+      }
+      const fallback = new Date(String(s || ""));
+      return Number.isNaN(fallback.getTime()) ? null : fallback;
+    };
+    const fetchYandexDashboardOrders = async (context) => {
+      const out = [];
+      for (let page = 1; page <= 20; page += 1) {
+        const payload = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/orders`, {
+          method: "GET",
+          query: { limit: 50, page, fromDate: formatYandexDate(weekAgo), toDate: formatYandexDate(new Date(now.getTime() + 86400e3)), fake: false },
+          timeoutMs: 60000,
+          apiSecret: context.apiSecret,
+        });
+        const list = Array.isArray(payload.orders) ? payload.orders : [];
+        out.push(...list.map((o) => normalizeYandexOrder(o, context)));
+        if (list.length < 50) break;
+      }
+      return out;
+    };
+    const yandexStoreData = (await Promise.all(yandexStores.map(async (store) => {
+      let orders = [];
+      let orderError = "";
+      try {
+        const context = await getYandexMarketContext({ storeId: store.id, userId });
+        orders = await fetchYandexDashboardOrders(context);
+      } catch (e) {
+        orderError = String(e.message || "");
+        console.warn(`[dashboard] yandex store=${store.name} orders fetch fail:`, orderError);
+      }
+
+      const orderTime = (o) => {
+        const d = parseYandexOrderDate(o.created_at);
+        return d ? d.getTime() : 0;
+      };
+      // v2.2.9.125: 排除已取消订单（不计入订单数/GMV），仅用于退货率统计
+      const weekOrdersAll = orders.filter((o) => orderTime(o) >= weekAgo.getTime() && orderTime(o) <= now.getTime() + 1000);
+      const validOrders = orders.filter((o) => String(o.status || "") !== "cancelled");
+      const todayOrders = validOrders.filter((o) => orderTime(o) >= todayStart.getTime() && orderTime(o) <= now.getTime() + 1000);
+      const yesterdayOrders = validOrders.filter((o) => orderTime(o) >= yesterdayStart.getTime() && orderTime(o) < todayStart.getTime());
+      const weekOrders = validOrders.filter((o) => orderTime(o) >= weekAgo.getTime() && orderTime(o) <= now.getTime() + 1000);
+      const cancelled = weekOrdersAll.filter((o) => String(o.status || "") === "cancelled");
+      const awaitingPkg = validOrders.filter((o) => String(o.status || "") === "processing");
+      const awaitingDel = validOrders.filter((o) => String(o.status || "") === "awaiting_delivery");
+      const awaiting = awaitingPkg.length + awaitingDel.length;
+      const sumCny = (list) => list.reduce((s, o) => s + Number(o.total_cny || 0), 0);
+      const todayGmv = sumCny(todayOrders);
+      const yesterdayGmv = sumCny(yesterdayOrders);
+      const weeklyGmv = sumCny(weekOrders);
+      const gmvGrowth = yesterdayGmv > 0 ? Math.round(((todayGmv - yesterdayGmv) / yesterdayGmv) * 10000) / 100 : (todayGmv > 0 ? 100 : 0);
+      const orderGrowth = yesterdayOrders.length > 0 ? Math.round(((todayOrders.length - yesterdayOrders.length) / yesterdayOrders.length) * 10000) / 100 : (todayOrders.length > 0 ? 100 : 0);
+
+      // 在售商品：用 offer 缓存（后台循环预热）；缓存未就绪时记 0 并标记需同步
+      const offerCache = yandexOfferCacheObj(store.id);
+      const activeOffers = (offerCache.active || []).filter((o) => String(o.status || "") === "published");
+      const activeProducts = activeOffers.length;
+      const stockWarning = 0; // Yandex FBS 库存通常不追踪，库存预警不适用
+      const offerCacheFresh = offerCache.at > 0 && (now.getTime() - offerCache.at) < 86400e3;
+      // 订单 API 被禁用（如 Three Latte 1ck 测试店）时单独标注，避免误以为是「未同步」
+      const ordersDisabled = /disabled|API_DISABLED/i.test(orderError);
+      const syncStatus = ordersDisabled ? "订单API禁用" : offerCacheFresh ? "已同步" : "需同步";
+
+      const dailyBuckets = {};
+      for (let i = 0; i < 30; i++) {
+        const d = new Date(now.getTime() - i * 86400e3);
+        const key = `${d.getMonth() + 1}/${d.getDate()}`;
+        dailyBuckets[key] = { orders: 0, gmv: 0 };
+      }
+      for (const o of validOrders) {
+        const d = parseYandexOrderDate(o.created_at);
+        if (!d) continue;
+        const key = `${d.getMonth() + 1}/${d.getDate()}`;
+        if (dailyBuckets[key]) {
+          dailyBuckets[key].orders += 1;
+          dailyBuckets[key].gmv += Number(o.total_cny || 0);
+        }
+      }
+
+      const recentOrders = [...validOrders].sort((a, b) => orderTime(b) - orderTime(a)).slice(0, 15).map((o) => {
+        const p = (o.products || [])[0] || {};
+        return {
+          store_name: store.name,
+          posting_number: o.order_id || o.posting_number || "",
+          status: o.status || "",
+          amount_cny: Number(o.total_cny || 0),
+          product_name: p.name || p.offer_id || "",
+          image: p.image || "",
+          created_at: o.created_at || null,
+        };
+      });
+
+      console.log(`[dashboard] yandex store=${store.name} today=¥${todayGmv.toFixed(2)} weekly=¥${weeklyGmv.toFixed(2)} awaiting=${awaiting} active=${activeProducts} sync=${syncStatus}`);
+
+      return {
+        store_id: store.id,
+        store_name: store.name,
+        platform: "yandex",
+        active_products: activeProducts,
+        today_orders: todayOrders.length,
+        awaiting_treatment: awaiting,
+        today_gmv: Math.round(todayGmv * 100) / 100,
+        weekly_gmv: Math.round(weeklyGmv * 100) / 100,
+        return_rate: weekOrdersAll.length > 0 ? Math.round((cancelled.length / weekOrdersAll.length) * 10000) / 100 : 0,
+        sync_status: syncStatus,
+        yesterday_orders: yesterdayOrders.length,
+        yesterday_gmv: Math.round(yesterdayGmv * 100) / 100,
+        gmv_growth: gmvGrowth,
+        order_growth: orderGrowth,
+        awaiting_packaging: awaitingPkg.length,
+        awaiting_deliver: awaitingDel.length,
+        today_returns: 0,
+        arbitration: 0,
+        _returns7d: cancelled.length,
+        weekly_payout: 0,
+        weekly_profit: 0,
+        weekly_orders: weekOrders.length,
+        _weekOrdersTotal: weekOrdersAll.length,          // 含取消的 7 日总量，仅用于退货率分母
+        weekly_purchase_cost: 0,
+        profit_complete: true,
+        cost_missing_count: 0,
+        profit_method: "Yandex 订单（GMV 为人民币货值 itemsTotal）",
+        stock_warning: stockWarning,
+        total_products: activeOffers.length,
+        last_sync: offerCache.at ? new Date(offerCache.at).toISOString() : null,
+        _dailyBuckets: dailyBuckets,
+        _recentOrders: recentOrders,
+        _stockWarnings: [],
+      };
+    })));
+
+    // 合并 Ozon + Yandex，统一汇总与趋势
+    const allStoreData = [...storeData, ...yandexStoreData];
+
     // 5. 汇总
-    const totalTodayGmv = storeData.reduce((s, x) => s + x.today_gmv, 0);
-    const totalYesterdayGmv = storeData.reduce((s, x) => s + x.yesterday_gmv, 0);
-    const totalTodayOrders = storeData.reduce((s, x) => s + x.today_orders, 0);
-    const totalYesterdayOrders = storeData.reduce((s, x) => s + x.yesterday_orders, 0);
+    const totalTodayGmv = allStoreData.reduce((s, x) => s + x.today_gmv, 0);
+    const totalYesterdayGmv = allStoreData.reduce((s, x) => s + x.yesterday_gmv, 0);
+    const totalTodayOrders = allStoreData.reduce((s, x) => s + x.today_orders, 0);
+    const totalYesterdayOrders = allStoreData.reduce((s, x) => s + x.yesterday_orders, 0);
     const summary = {
       today_orders: totalTodayOrders,
       today_gmv: Math.round(totalTodayGmv * 100) / 100,
@@ -12146,22 +12630,22 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       order_growth: totalYesterdayOrders > 0
         ? Math.round(((totalTodayOrders - totalYesterdayOrders) / totalYesterdayOrders) * 10000) / 100
         : (totalTodayOrders > 0 ? 100 : 0),
-      awaiting_packaging: storeData.reduce((s, x) => s + x.awaiting_packaging, 0),
-      awaiting_deliver: storeData.reduce((s, x) => s + x.awaiting_deliver, 0),
-      awaiting_treatment: storeData.reduce((s, x) => s + x.awaiting_treatment, 0),
-      active_products: storeData.reduce((s, x) => s + x.active_products, 0),
-      stock_warning: storeData.reduce((s, x) => s + x.stock_warning, 0),
-      today_returns: storeData.reduce((s, x) => s + x.today_returns, 0),
-      arbitration: storeData.reduce((s, x) => s + x.arbitration, 0),      // v0.5.1 真实争议单
-      weekly_orders: storeData.reduce((s, x) => s + x.weekly_orders, 0),
-      weekly_gmv: Math.round(storeData.reduce((s, x) => s + x.weekly_gmv, 0) * 100) / 100,
-      weekly_payout: Math.round(storeData.reduce((s, x) => s + x.weekly_payout, 0) * 100) / 100,
-      weekly_profit: Math.round(storeData.reduce((s, x) => s + x.weekly_profit, 0) * 100) / 100,
-      profit_complete: storeData.every((item) => item.profit_complete),
-      cost_missing_count: storeData.reduce((sum, item) => sum + item.cost_missing_count, 0),
+      awaiting_packaging: allStoreData.reduce((s, x) => s + x.awaiting_packaging, 0),
+      awaiting_deliver: allStoreData.reduce((s, x) => s + x.awaiting_deliver, 0),
+      awaiting_treatment: allStoreData.reduce((s, x) => s + x.awaiting_treatment, 0),
+      active_products: allStoreData.reduce((s, x) => s + x.active_products, 0),
+      stock_warning: allStoreData.reduce((s, x) => s + x.stock_warning, 0),
+      today_returns: allStoreData.reduce((s, x) => s + x.today_returns, 0),
+      arbitration: allStoreData.reduce((s, x) => s + x.arbitration, 0),      // v0.5.1 真实争议单
+      weekly_orders: allStoreData.reduce((s, x) => s + x.weekly_orders, 0),
+      weekly_gmv: Math.round(allStoreData.reduce((s, x) => s + x.weekly_gmv, 0) * 100) / 100,
+      weekly_payout: Math.round(allStoreData.reduce((s, x) => s + x.weekly_payout, 0) * 100) / 100,
+      weekly_profit: Math.round(allStoreData.reduce((s, x) => s + x.weekly_profit, 0) * 100) / 100,
+      profit_complete: allStoreData.every((item) => item.profit_complete),
+      cost_missing_count: allStoreData.reduce((sum, item) => sum + item.cost_missing_count, 0),
       return_rate: (() => {
-        const totalReturns = storeData.reduce((s, x) => s + (x._returns7d || 0), 0);
-        const totalWeek = storeData.reduce((s, x) => s + x.weekly_orders, 0);
+        const totalReturns = allStoreData.reduce((s, x) => s + (x._returns7d || 0), 0);
+        const totalWeek = allStoreData.reduce((s, x) => s + (x._weekOrdersTotal || 0), 0);
         return totalWeek > 0 ? Math.round((totalReturns / totalWeek) * 10000) / 100 : 0;
       })(),
     };
@@ -12173,7 +12657,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       const dayLabel = `${d.getMonth() + 1}/${d.getDate()}`;
       let dayOrders = 0;
       let dayGmv = 0;
-      for (const sd of storeData) {
+      for (const sd of allStoreData) {
         const bucket = sd._dailyBuckets[dayLabel];
         if (bucket) {
           dayOrders += bucket.orders;
@@ -12197,14 +12681,14 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     console.log(`[dashboard] summary: orders=${summary.today_orders} gmv=¥${summary.today_gmv} profit=¥${summary.weekly_profit} warn=${summary.stock_warning}`);
 
     // 清理内部字段 (_dailyBuckets 不返回给前端)
-    const recentOrders = storeData.flatMap(item => item._recentOrders || [])
+    const recentOrders = allStoreData.flatMap(item => item._recentOrders || [])
       .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0))
       .slice(0, 15);
-    const stockWarnings = storeData.flatMap(item => (item._stockWarnings || []).map(row => ({
+    const stockWarnings = allStoreData.flatMap(item => (item._stockWarnings || []).map(row => ({
       ...row,
       store_name: item.store_name,
     }))).slice(0, 20);
-    const cleanStoreComparison = storeData.map(({ _dailyBuckets, _recentOrders, _stockWarnings, ...rest }) => rest);
+    const cleanStoreComparison = allStoreData.map(({ _dailyBuckets, _recentOrders, _stockWarnings, ...rest }) => rest);
 
     const dashboardPayload = {
       success: true,
@@ -13106,6 +13590,14 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
     if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    // 订单管理只拉 Ozon 单：Yandex 店铺（CELbudget 等）用 Yandex 凭证，走 Ozon API 会报 Invalid Api-Key，直接跳过
+    const storePlatRow = db ? await db.query(
+      "SELECT platform FROM app_stores WHERE id = $1 AND user_id = $2 LIMIT 1",
+      [storeId, req.user.id],
+    ) : { rows: [] };
+    if (storePlatRow.rows?.[0] && String(storePlatRow.rows[0].platform || "").toLowerCase() !== "ozon") {
+      return res.json({ success: true, orders: [], total: 0, has_next: false, source: "cache", skipped: true, reason: "非Ozon店铺" });
+    }
     const rateResult = db ? await db.query(
       `SELECT rate FROM app_exchange_rates
         WHERE base_currency = 'RUB' AND quote_currency = 'CNY'
@@ -17908,6 +18400,27 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
         updated.phase = phase;
         console.log(`[yandex-collect] 回填草稿 ${n} 条（失败 ${failed}）`);
       } catch (e) { console.warn("[yandex-collect] 收尾回填失败:", e?.message || e); }
+    }
+    // 巡查跟卖收尾：把插件回传的跟卖卖家清单全量入库（先清空重建）
+    if (updated && updated.kind === "ozon-patrol" && Array.isArray(updated.results)) {
+      try {
+        const userId = existing.user_id || req.user?.id;
+        await db.query("DELETE FROM ozon_follow_sellers WHERE user_id=$1", [userId]);
+        let n = 0;
+        for (const r of updated.results) {
+          const sellers = Array.isArray(r?.sellers) ? r.sellers : [];
+          for (const s of sellers) {
+            const sku = String(s?.sku || "").trim();
+            if (!sku) continue;
+            await db.query(
+              "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+              [userId, String(r.offer_id || ""), String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || "")],
+            );
+            n += 1;
+          }
+        }
+        console.log(`[ozon-patrol] 跟卖卖家入库 ${n} 条`);
+      } catch (e) { console.warn("[ozon-patrol] 入库失败:", e?.message || e); }
     }
     // 插件精核价收尾：把最后一批结果补齐落库，并把汇总写回 phase（报告页据此展示真实成本分布）
     if (updated && (updated.payload?.marker === PRECISE_JOB_MARKER || updated.payload?.precise === true)) {

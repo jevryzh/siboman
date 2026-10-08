@@ -282,9 +282,14 @@ window.DashboardView = {
             <el-button text size="small" @click="goToStores">管理店铺 →</el-button>
           </div>
           <el-table :data="storeComparison" stripe size="default" style="width: 100%" :header-cell-style="{ background: '#fafafa', fontWeight: 700, color: '#606266', fontSize: '13px' }">
-            <el-table-column prop="store_name" label="店铺" min-width="120" fixed>
+            <el-table-column prop="store_name" label="店铺" min-width="150" fixed>
               <template #default="{row}">
-                <span style="font-weight: 600; color: #409eff">{{ row.store_name }}</span>
+                <div style="display: flex; align-items: center; gap: 6px">
+                  <span style="font-weight: 600; color: #409eff">{{ row.store_name }}</span>
+                  <el-tag size="small" :type="row.platform === 'yandex' ? 'warning' : 'info'" effect="plain">
+                    {{ row.platform === 'yandex' ? 'Yandex' : 'Ozon' }}
+                  </el-tag>
+                </div>
               </template>
             </el-table-column>
             <el-table-column prop="active_products" label="在售" width="80" align="right" />
@@ -315,19 +320,20 @@ window.DashboardView = {
                 <el-tag size="small"
                   :type="row.sync_status === '已同步' ? 'success' : 'warning'"
                   effect="light"
-                  style="cursor: pointer"
-                  @click="syncOneStore(row)">
+                  :style="row.platform === 'yandex' ? {} : { cursor: 'pointer' }"
+                  @click="row.platform === 'yandex' ? null : syncOneStore(row)">
                   {{ row.sync_status }}
                 </el-tag>
               </template>
             </el-table-column>
             <el-table-column label="操作" width="100" align="center" fixed="right">
               <template #default="{row}">
-                <el-button type="primary" size="small" link
+                <el-button v-if="row.platform !== 'yandex'" type="primary" size="small" link
                   :loading="syncingStore === row.store_id"
                   @click="syncOneStore(row)">
                   {{ syncingStore === row.store_id ? '同步中' : '同步' }}
                 </el-button>
+                <span v-else style="color: #c0c4cc; font-size: 12px">—</span>
               </template>
             </el-table-column>
           </el-table>

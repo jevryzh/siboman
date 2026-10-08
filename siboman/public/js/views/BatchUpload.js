@@ -94,6 +94,9 @@ window.BatchUploadView = {
       if (d.kind === 'ready' && !extensionConnected.value) {
         extensionConnected.value = true;
         appendLog('✅ 采集插件已连接', 'success');
+        // v2.2.9.124: ready 只说明桥接在，插件版本仍未知；继续轮询直到拿到 background_version，
+        //   否则 pluginVersionOk 恒为 false，「一键解析+采集+上架」按钮会一直被禁用。
+        if (!installedBackgroundVersion.value && !pollTimer) startPolling();
         return;
       }
       const resolver = window.__zhumeng_pending__[d.reqId];
@@ -355,22 +358,34 @@ window.BatchUploadView = {
 
     const refreshing = Vue.ref(false);
     let pollTimer = null;
+    let pollInFlight = false;
     const startPolling = () => {
-      if (pollTimer) clearInterval(pollTimer);
+      if (pollTimer) return;
       pollTimer = setInterval(async () => {
-        if (extensionConnected.value) { clearInterval(pollTimer); pollTimer = null; return; }
-        const ping = await pingExtension();
-        if (ping) {
-          extensionConnected.value = true;
-          installedBackgroundVersion.value = ping.background_version || ping.version || '';
-          appendLog(`✅ 采集插件已连接 (${formatPluginVersion(ping)})`, 'success');
-          if (compareVersion(installedBackgroundVersion.value, REQUIRED_BACKGROUND_VERSION) < 0) {
-            appendLog(`⚠️ 当前插件 ${installedBackgroundVersion.value || '版本未知'} 低于 v${REQUIRED_BACKGROUND_VERSION}, 请先更新插件后再采集。`, 'error');
+        // v2.2.9.124: 必须「已连接 + 版本已知」才停止轮询。
+        //   桥接的 'ready' 会先把 extensionConnected 置 true，但 MV3 service worker 可能刚被唤醒，
+        //   首次 ping 仍可能返回 ok:false（Receiving end does not exist）。旧逻辑一看到
+        //   extensionConnected 就停表，导致 installedBackgroundVersion 永远为空 →
+        //   pluginVersionOk=false → 「一键解析+采集+上架」按钮被永久禁用（点了没反应）。
+        if (extensionConnected.value && installedBackgroundVersion.value) { clearInterval(pollTimer); pollTimer = null; return; }
+        if (pollInFlight) return;
+        pollInFlight = true;
+        try {
+          const ping = await pingExtension();
+          if (ping) {
+            extensionConnected.value = true;
+            installedBackgroundVersion.value = ping.background_version || ping.version || installedBackgroundVersion.value || '';
+            appendLog(`✅ 采集插件已连接 (${formatPluginVersion(ping)})`, 'success');
+            if (compareVersion(installedBackgroundVersion.value, REQUIRED_BACKGROUND_VERSION) < 0) {
+              appendLog(`⚠️ 当前插件 ${installedBackgroundVersion.value || '版本未知'} 低于 v${REQUIRED_BACKGROUND_VERSION}, 请先更新插件后再采集。`, 'error');
+            }
+            const st = await checkSellerStatus();
+            sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
+            appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
+            clearInterval(pollTimer); pollTimer = null;
           }
-          const st = await checkSellerStatus();
-          sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
-          appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
-          clearInterval(pollTimer); pollTimer = null;
+        } finally {
+          pollInFlight = false;
         }
       }, 2000);
     };
@@ -392,8 +407,11 @@ window.BatchUploadView = {
         const st = await checkSellerStatus();
         sellerTabReady.value = st.ok && (st.seller_connected || st.hasSellerTab);
         appendLog(sellerTabReady.value ? 'seller.ozon.ru 已连接 ✓' : '⚠️ 请先打开并登录 seller.ozon.ru', sellerTabReady.value ? 'success' : 'warn');
-      } else {
-        appendLog('⏳ 等待采集插件注入 (每 3 秒自动检测)...', 'info');
+      }
+      // v2.2.9.124: 只要版本还没拿到就继续轮询。首 ping 可能失败（SW 刚唤醒），
+      //   而桥接的 'ready' 已经把 extensionConnected 置 true，旧逻辑此时不再轮询 → 版本永远为空。
+      if (!installedBackgroundVersion.value) {
+        appendLog('⏳ 等待采集插件上报版本 (每 2 秒自动重试)...', 'info');
         startPolling();
       }
     });
@@ -418,6 +436,9 @@ window.BatchUploadView = {
         appendLog('刷新: 仍未检测到插件, 继续轮询...', 'warn');
         if (!pollTimer) startPolling();
       }
+      // v2.2.9.124: 已连接但版本仍未知（SW 刚被唤醒、首次 ping 失败）时继续轮询补版本，
+      //   否则 pluginVersionOk 一直为 false，一键上架按钮点不动。
+      if (!installedBackgroundVersion.value && !pollTimer) startPolling();
       setTimeout(() => { refreshing.value = false; }, 2000);
     };
 

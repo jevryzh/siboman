@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.122";
+const VERSION = "2.2.9.123";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1409,6 +1409,73 @@ async function runQueuedYandexResearchJob(remoteJob) {
   await completeSourcingJob(job);
 }
 
+// 巡查跟卖任务（kind=ozon-patrol）：逐商品调 Ozon 公开接口 otherOffersFromSellers，抓跟卖卖家列表。
+async function runQueuedOzonPatrolJob(remoteJob) {
+  const payload = remoteJob.payload || {};
+  const rawItems = Array.isArray(payload.items) ? payload.items : [];
+  const job = {
+    id: remoteJob.id,
+    status: "running",
+    phase: "插件已领取，开始采集跟卖卖家",
+    total: rawItems.length,
+    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
+    results: Array.isArray(remoteJob.results) ? remoteJob.results.slice() : [],
+    error: "",
+    cancelRequested: false,
+  };
+  job.processed = Math.min(Math.max(Number(remoteJob.processed || 0), job.results.length), rawItems.length);
+  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取巡查跟卖任务（${rawItems.length} 个商品）。`));
+  await setActiveSourcingJob(job);
+  await reportSourcingProgress(job);
+  const stopCancelMonitor = startSourcingCancelMonitor(job);
+  try {
+    for (let index = job.processed; index < rawItems.length; index += 1) {
+      if (job.cancelRequested) break;
+      const item = rawItems[index] || {};
+      const productId = String(item.product_id || "");
+      const offerId = String(item.offer_id || "");
+      const storeName = String(item.store_name || "");
+      job.phase = `采集跟卖 ${index + 1}/${rawItems.length}`;
+      await reportSourcingProgress(job);
+      try {
+        if (!productId) throw new Error("缺少 product_id");
+        const sellers = await fetchOtherOffersFromSellersInPlugin(productId);
+        job.results.push({ offer_id: offerId, product_id: productId, store_name: storeName, sellers });
+        if (sellers.length) job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家`, "info"));
+      } catch (e) {
+        job.results.push({ offer_id: offerId, product_id: productId, store_name: storeName, sellers: [], error: (e?.message || String(e)).slice(0, 200) });
+        job.logs.push(makeLog(`货号 ${offerId} 采集失败：${(e?.message || String(e)).slice(0, 120)}`, "warn"));
+      }
+      job.processed = index + 1;
+      await reportSourcingProgress(job);
+    }
+  } finally {
+    stopCancelMonitor();
+  }
+  job.status = job.cancelRequested ? "canceled" : "done";
+  job.phase = job.status === "done" ? "已完成，正在收尾" : "已停止";
+  await completeSourcingJob(job);
+}
+
+// 调 Ozon 公开接口，拿某商品卡片上的「其他卖家报价」（跟卖卖家）列表。
+async function fetchOtherOffersFromSellersInPlugin(productId) {
+  const url = `https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=%2Fmodal%2FotherOffersFromSellers%3Fproduct_id%3D${encodeURIComponent(productId)}%26sort%3Dprice%26page_changed%3Dtrue&_mjgd_ts=${Date.now()}`;
+  const resp = await fetch(url, { credentials: "include", cache: "no-store" });
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  const data = await resp.json();
+  const ws = data.widgetStates || {};
+  for (const key of Object.keys(ws)) {
+    if (!key.startsWith("webSellerList")) continue;
+    try {
+      const v = typeof ws[key] === "string" ? JSON.parse(ws[key]) : ws[key];
+      if (Array.isArray(v?.sellers)) {
+        return v.sellers.map((s) => ({ sku: s.sku || "", name: s.name || "", price: s.price?.cardPrice?.price || s.price?.price || "" }));
+      }
+    } catch (_e) { /* 单个 widget 解析失败跳过 */ }
+  }
+  return [];
+}
+
 async function pollSourcingQueueOnce() {
   if (sourcingBusy) return;
   sourcingBusy = true;
@@ -1419,12 +1486,13 @@ async function pollSourcingQueueOnce() {
       : "逐梦插件在线，可领取单品找货任务";
     const data = await erpApi("/api/worker/jobs/next", {
       method: "POST",
-      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research", "yandex-collect"] },
+      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research", "yandex-collect", "ozon-patrol"] },
     });
     if (data.job) {
       console.log(`[SW ${VERSION}] 领取任务: ${data.job.id} kind=${data.job.kind}`);
       if (data.job.kind === "yandex-research") await runQueuedYandexResearchJob(data.job);
       else if (data.job.kind === "yandex-collect") await runQueuedYandexCollectJob(data.job);
+      else if (data.job.kind === "ozon-patrol") await runQueuedOzonPatrolJob(data.job);
       else await runQueuedSourcingJob(data.job);
     }
   } catch (e) {

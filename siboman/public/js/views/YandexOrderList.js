@@ -7,8 +7,11 @@ window.YandexOrderListView = {
     const search = Vue.ref('');
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 20, total: 0 });
     const apiReady = Vue.ref(true);
+    const detailDrawer = Vue.reactive({ visible: false, row: null });
+    const shipping = Vue.reactive({}); // orderId -> bool（发货中）
 
     const notify = {
+      success: (msg) => (window.ElementPlus?.ElMessage || console).success?.(msg),
       warning: (msg) => (window.ElementPlus?.ElMessage || console).warning?.(msg),
       error: (msg) => (window.ElementPlus?.ElMessage || console).error?.(msg),
     };
@@ -44,6 +47,38 @@ window.YandexOrderListView = {
       if (!Number.isFinite(n) || n <= 0) return '-';
       return `${currency} ${n.toFixed(2)}`;
     };
+    // 利润展示：有成本就显示利润，否则「待核算」
+    const profitText = (row) => {
+      if (row?.profit_cny === null || row?.profit_cny === undefined) return '待核算';
+      const n = Number(row.profit_cny);
+      return `¥ ${n.toFixed(2)}`;
+    };
+    const profitColor = (row) => {
+      if (row?.profit_cny === null || row?.profit_cny === undefined) return '#94a3b8';
+      return Number(row.profit_cny) >= 0 ? '#16a34a' : '#dc2626';
+    };
+
+    // Yandex 订单时间（DD-MM-YYYY HH:MM:SS，莫斯科时间 UTC+3）转北京时间展示；
+    // 兼容 ISO（含 T / 时区）与已转好的本地时间。
+    const toBeijing = (s) => {
+      if (!s) return '-';
+      const str = String(s).trim();
+      // 已含 T 或 Z（ISO 形式）：按标准 Date 解析后 +8h
+      if (/[TZ]/i.test(str) || /[+-]\d{2}:?\d{2}$/.test(str)) {
+        const d = new Date(str);
+        if (!Number.isNaN(d.getTime())) {
+          return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+        }
+      }
+      // Yandex 原始格式 DD-MM-YYYY HH:MM:SS（莫斯科时间）
+      const m = str.match(/^(\d{2})-(\d{2})-(\d{4})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+      if (m) {
+        const [, dd, mm, yyyy, hh, mi, ss] = m;
+        const utc = Date.UTC(+yyyy, +mm - 1, +dd, +hh, +mi, +ss) - 3 * 3600 * 1000;
+        return new Date(utc + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
+      }
+      return str;
+    };
 
     // Yandex 多店铺：页内店铺选择（顶栏切换器在订单页隐藏，参照 Ozon 订单页）
     const yandexStores = Vue.ref([]);
@@ -74,6 +109,7 @@ window.YandexOrderListView = {
       try {
         const res = await axios.get('/api/yandex/orders', {
           params: {
+            store_id: currentStoreId.value || undefined,
             status: activeTab.value,
             q: search.value,
             page: pagination.currentPage,
@@ -99,6 +135,37 @@ window.YandexOrderListView = {
       }
     };
 
+    const openDetail = (row) => {
+      detailDrawer.row = row;
+      detailDrawer.visible = true;
+    };
+
+    const shipOrder = async (row) => {
+      const orderId = row.order_id || row.posting_number || '';
+      if (!orderId) return notify.warning('缺少订单号');
+      try {
+        await (window.ElementPlus?.ElMessageBox || { confirm: async () => ({}) }).confirm?.(
+          `确认发货订单 ${orderId}？提交后订单状态将变更为「配送中」。`,
+          '发货确认',
+          { type: 'warning', confirmButtonText: '确认发货', cancelButtonText: '取消' },
+        );
+      } catch (_e) { return; } // 用户取消
+      shipping[orderId] = true;
+      try {
+        const res = await axios.post('/api/yandex/orders/ship', { order_id: orderId, store_id: currentStoreId.value || undefined });
+        if (res.data?.success) {
+          notify.success(`订单 ${orderId} 发货提交成功`);
+          await fetchOrders();
+        } else {
+          notify.error(res.data?.error || '发货失败');
+        }
+      } catch (error) {
+        notify.error(error.response?.data?.error || error.message || '发货失败');
+      } finally {
+        delete shipping[orderId];
+      }
+    };
+
     const resetFilters = () => {
       search.value = '';
       activeTab.value = 'all';
@@ -106,12 +173,13 @@ window.YandexOrderListView = {
       fetchOrders();
     };
 
-    Vue.onMounted(() => { fetchYandexStores(); fetchOrders(); });
+    Vue.onMounted(async () => { await fetchYandexStores(); await fetchOrders(); });
 
     return {
       orders, loading, hasFetched, activeTab, search, pagination, apiReady, statusTabs,
-      statusText, statusTagType, primaryProduct, moneyText, fetchOrders, resetFilters,
+      statusText, statusTagType, primaryProduct, moneyText, profitText, profitColor, toBeijing, fetchOrders, resetFilters,
       yandexStores, currentStoreId, storeContext, changeYandexStore,
+      detailDrawer, openDetail, shipOrder, shipping,
     };
   },
   template: `
@@ -130,7 +198,7 @@ window.YandexOrderListView = {
           <el-button size="large" @click="fetchOrders">
             <el-icon><RefreshRight /></el-icon><span>刷新</span>
           </el-button>
-          <el-button size="large" type="primary" disabled>
+          <el-button size="large" type="primary" :loading="loading" @click="fetchOrders">
             <el-icon><Connection /></el-icon><span>同步 Yandex 订单</span>
           </el-button>
         </div>
@@ -161,7 +229,7 @@ window.YandexOrderListView = {
         element-loading-text="正在读取 Yandex 订单..."
         border
         size="large"
-        :empty-text="hasFetched ? '暂无 Yandex 订单数据；等待 API 接入后可同步。' : '正在读取订单...'"
+        :empty-text="hasFetched ? '暂无 Yandex 订单数据。' : '正在读取订单...'"
         style="border-radius:8px; overflow:hidden">
         <el-table-column type="selection" width="48" />
         <el-table-column label="订单号" min-width="180" fixed="left" show-overflow-tooltip>
@@ -170,7 +238,7 @@ window.YandexOrderListView = {
         <el-table-column label="商品" min-width="320">
           <template #default="{ row }">
             <div style="display:flex; gap:12px; align-items:center; min-width:0">
-              <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; flex-shrink:0" fit="cover" preview-teleported>
+              <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; flex-shrink:0" fit="cover" preview-teleported hide-on-click-modal>
                 <template #error><div style="height:58px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:12px">无图</div></template>
               </el-image>
               <div style="min-width:0">
@@ -184,18 +252,23 @@ window.YandexOrderListView = {
           <template #default="{ row }"><el-tag :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag></template>
         </el-table-column>
         <el-table-column label="订单金额" width="140" align="right">
-          <template #default="{ row }">{{ moneyText(row.total || row.total_rub, row.currency_code || 'RUB') }}</template>
+          <template #default="{ row }">{{ moneyText(row.total, row.currency_code || 'RUB') }}</template>
+        </el-table-column>
+        <el-table-column label="利润(估算)" width="130" align="right">
+          <template #default="{ row }">
+            <span :style="{ color: profitColor(row), fontWeight: 700 }">{{ profitText(row) }}</span>
+          </template>
         </el-table-column>
         <el-table-column label="下单时间" width="180">
-          <template #default="{ row }">{{ (row.created_at || row.in_process_at || '').replace('T',' ').slice(0,19) || '-' }}</template>
+          <template #default="{ row }">{{ toBeijing(row.created_at || row.in_process_at) }}</template>
         </el-table-column>
         <el-table-column label="发货截止" width="180">
-          <template #default="{ row }">{{ (row.shipment_date || row.delivery_date || '').replace('T',' ').slice(0,19) || '-' }}</template>
+          <template #default="{ row }">{{ toBeijing(row.shipment_date || row.delivery_date) }}</template>
         </el-table-column>
         <el-table-column label="操作" width="170" fixed="right">
-          <template #default>
-            <el-button link type="primary" disabled>详情</el-button>
-            <el-button link type="warning" disabled>发货</el-button>
+          <template #default="{ row }">
+            <el-button link type="primary" @click="openDetail(row)">详情</el-button>
+            <el-button v-if="row.status === 'awaiting_delivery' || row.status === 'processing'" link type="warning" :loading="!!shipping[row.order_id || row.posting_number]" @click="shipOrder(row)">发货</el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -210,6 +283,83 @@ window.YandexOrderListView = {
           @size-change="fetchOrders"
           @current-change="fetchOrders" />
       </div>
+
+      <el-drawer v-model="detailDrawer.visible" title="Yandex 订单详情" size="620px" append-to-body destroy-on-close>
+        <template v-if="detailDrawer.row">
+          <el-descriptions :column="1" border size="small">
+            <el-descriptions-item label="订单号"><b>{{ detailDrawer.row.order_id }}</b></el-descriptions-item>
+            <el-descriptions-item label="外部订单号">{{ detailDrawer.row.external_order_id || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="状态">
+              <el-tag :type="statusTagType(detailDrawer.row.status)">{{ statusText(detailDrawer.row.status) }}</el-tag>
+              <span style="margin-left:6px; color:#94a3b8">{{ detailDrawer.row.substatus || detailDrawer.row.status_name || '' }}</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="下单时间">{{ toBeijing(detailDrawer.row.created_at) }}</el-descriptions-item>
+            <el-descriptions-item label="发货截止">{{ toBeijing(detailDrawer.row.shipment_date) }}</el-descriptions-item>
+            <el-descriptions-item label="订单金额">{{ moneyText(detailDrawer.row.total, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="支付方式">{{ detailDrawer.row.raw?.paymentType || detailDrawer.row.raw?.paymentMethod || '-' }}</el-descriptions-item>
+            <el-descriptions-item label="利润(估算)">
+              <span :style="{ color: profitColor(detailDrawer.row), fontWeight: 800 }">{{ profitText(detailDrawer.row) }}</span>
+              <span style="margin-left:8px; font-size:12px; color:#94a3b8">佣金24%+费率估算，未含类目差异</span>
+            </el-descriptions-item>
+          </el-descriptions>
+
+          <el-divider content-position="left">利润明细（估算）</el-divider>
+          <el-descriptions :column="1" border size="small">
+            <el-descriptions-item label="卖家货值">{{ moneyText(detailDrawer.row.total, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="平台补贴">{{ moneyText(detailDrawer.row.subsidies_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="收入合计">{{ moneyText(detailDrawer.row.revenue_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="1688 采购成本">{{ detailDrawer.row.purchase_cny === null || detailDrawer.row.purchase_cny === undefined ? '待核算（缺成本）' : moneyText(detailDrawer.row.purchase_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="平台费率(佣金+收单+提现+尾程)">{{ moneyText(detailDrawer.row.platform_fee_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="CEL 头程">{{ moneyText(detailDrawer.row.cel_fee_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <el-descriptions-item label="国内运费+代贴单">8.00</el-descriptions-item>
+            <el-descriptions-item label="利润">
+              <span :style="{ color: profitColor(detailDrawer.row), fontWeight: 800 }">{{ profitText(detailDrawer.row) }}</span>
+            </el-descriptions-item>
+          </el-descriptions>
+          </el-descriptions>
+
+          <el-divider content-position="left">商品清单 ({{ (detailDrawer.row.products || []).length }})</el-divider>
+          <el-table :data="detailDrawer.row.products || []" size="small" border>
+            <el-table-column label="图" width="60">
+              <template #default="{ row }">
+                <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []">
+                  <template #error><div style="height:40px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:12px">无图</div></template>
+                </el-image>
+              </template>
+            </el-table-column>
+            <el-table-column label="商品" min-width="220" show-overflow-tooltip>
+              <template #default="{ row }">
+                <div>{{ row.name || '-' }}</div>
+                <div style="font-size:12px; color:#94a3b8">货号 {{ row.offer_id || '-' }} · SKU {{ row.sku || '-' }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="数量" width="60" align="center">
+              <template #default="{ row }">×{{ row.quantity || 1 }}</template>
+            </el-table-column>
+            <el-table-column label="单价" width="100" align="right">
+              <template #default="{ row }">{{ moneyText(row.price, detailDrawer.row.currency_code) }}</template>
+            </el-table-column>
+          </el-table>
+
+          <template v-if="detailDrawer.row.raw?.buyer && Object.keys(detailDrawer.row.raw.buyer).length > 1">
+            <el-divider content-position="left">买家</el-divider>
+            <el-descriptions :column="1" border size="small">
+              <el-descriptions-item label="姓名">{{ [detailDrawer.row.raw.buyer.lastName, detailDrawer.row.raw.buyer.firstName, detailDrawer.row.raw.buyer.middleName].filter(Boolean).join(' ') || detailDrawer.row.raw.buyer.type || '-' }}</el-descriptions-item>
+              <el-descriptions-item v-if="detailDrawer.row.raw.buyer.phone" label="电话">{{ detailDrawer.row.raw.buyer.phone }}</el-descriptions-item>
+              <el-descriptions-item v-if="detailDrawer.row.raw.buyer.email" label="邮箱">{{ detailDrawer.row.raw.buyer.email }}</el-descriptions-item>
+            </el-descriptions>
+          </template>
+
+          <template v-if="detailDrawer.row.raw?.delivery">
+            <el-divider content-position="left">配送</el-divider>
+            <el-descriptions :column="1" border size="small">
+              <el-descriptions-item label="方式">{{ detailDrawer.row.raw.delivery.serviceName || detailDrawer.row.raw.delivery.type || '-' }}</el-descriptions-item>
+              <el-descriptions-item v-if="detailDrawer.row.raw.delivery.dates" label="时间窗口">{{ detailDrawer.row.raw.delivery.dates.fromDate }} ~ {{ detailDrawer.row.raw.delivery.dates.toDate }}</el-descriptions-item>
+              <el-descriptions-item v-if="detailDrawer.row.raw.delivery.address" label="地址">{{ detailDrawer.row.raw.delivery.address.region || '' }} {{ detailDrawer.row.raw.delivery.address.street || '' }} {{ detailDrawer.row.raw.delivery.address.house || '' }}</el-descriptions-item>
+            </el-descriptions>
+          </template>
+        </template>
+      </el-drawer>
     </div>
   `,
 };
