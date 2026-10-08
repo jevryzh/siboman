@@ -885,9 +885,123 @@ window.ProductListView = {
       window.removeEventListener('shop-changed', onShopChanged);
     });
 
+    // ===== v2.2.9.126 被跟卖商品 =====
+    // 数据来源：插件「巡查跟卖」采集（Ozon 商品卡片上的其他卖家报价）→ ozon_follow_sellers 表。
+    // 服务端 /api/ozon/followed-products 按 offer_id 聚合，并关联 app_products 补主图/名称/我的售价。
+    const follow = Vue.reactive({
+      visible: false, loading: false, collecting: false,
+      items: [], total: 0, page: 1, pageSize: 50,
+      q: '', storeName: '', minFollowers: 1,
+      summary: { products: 0, followers: 0, scanned_at: null },
+      stores: [],
+    });
+    const followerDrawer = Vue.reactive({ visible: false, offerId: '', name: '', loading: false, items: [] });
+    const parsePriceText = (s) => {
+      if (!s) return 0;
+      const n = String(s).replace(/[^\d.,]/g, '').replace(/\s/g, '').replace(',', '.');
+      return parseFloat(n) || 0;
+    };
+    const fmtTime = (s) => {
+      if (!s) return '-';
+      try {
+        const d = new Date(s);
+        if (Number.isNaN(d.getTime())) return String(s);
+        const p = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+      } catch { return String(s); }
+    };
+    const loadFollowed = async (resetPage = false) => {
+      if (resetPage) follow.page = 1;
+      follow.loading = true;
+      try {
+        const res = await axios.get('/api/ozon/followed-products', {
+          params: {
+            page: follow.page,
+            page_size: follow.pageSize,
+            q: follow.q || undefined,
+            store_name: follow.storeName || undefined,
+            min_followers: follow.minFollowers || 1,
+          },
+        });
+        follow.items = res.data?.items || [];
+        follow.total = Number(res.data?.total || 0);
+        follow.summary = res.data?.summary || follow.summary;
+        follow.stores = res.data?.stores || [];
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '读取被跟卖商品失败');
+      } finally {
+        follow.loading = false;
+      }
+    };
+    const openFollowed = async () => {
+      follow.visible = true;
+      await loadFollowed(true);
+    };
+    const openFollowers = async (row) => {
+      followerDrawer.visible = true;
+      followerDrawer.offerId = row.offer_id;
+      followerDrawer.name = row.name || '';
+      followerDrawer.items = [];
+      followerDrawer.loading = true;
+      try {
+        const res = await axios.get('/api/ozon/follow-sellers', { params: { offer_id: row.offer_id } });
+        const items = res.data?.items || [];
+        items.sort((a, b) => parsePriceText(b.follower_price) - parsePriceText(a.follower_price));
+        followerDrawer.items = items;
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '读取跟卖卖家失败');
+      } finally {
+        followerDrawer.loading = false;
+      }
+    };
+    const copyText = async (text, label = '内容') => {
+      if (!text) return notify.warning('没有可复制的内容');
+      try { await navigator.clipboard.writeText(String(text)); notify.success(`已复制${label}`); }
+      catch { notify.warning('复制失败，请手动复制：' + text); }
+    };
+    const copyAllFollowerSku = async () => {
+      const skus = followerDrawer.items.map((s) => s.follower_sku).filter(Boolean);
+      if (!skus.length) return notify.warning('没有可复制的跟卖 SKU');
+      try { await navigator.clipboard.writeText(skus.join('\n')); notify.success(`已复制 ${skus.length} 个跟卖 SKU`); }
+      catch { notify.warning('复制失败，请手动复制'); }
+    };
+    const collectFollowData = async () => {
+      follow.collecting = true;
+      try {
+        const res = await axios.post('/api/ozon/patrol/collect', {}, { timeout: 300000 });
+        if (res.data?.existing) {
+          notify.warning('已有跟卖采集任务在跑（' + (res.data.status || 'queued') + '），稍后点「刷新」即可');
+        } else {
+          notify.success(`已提交跟卖采集任务（${res.data?.total || '?'} 个商品）。插件会在浏览器后台逐个抓取，完成后自动入库，几分钟后回来点「刷新」。`);
+        }
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '提交采集任务失败');
+      } finally {
+        follow.collecting = false;
+      }
+    };
+    // 跟卖价是买家侧 RUB，我的价是店铺结算币；只有同为 RUB 时才给价差，避免拿人民币和卢布直接相减。
+    const sameCurrency = (row) => String(row.currency_code || '').toUpperCase() === 'RUB';
+    const diffText = (row) => {
+      if (row.min_follower_price === null || row.min_follower_price === undefined) return '-';
+      if (row.my_price === null || row.my_price === undefined) return '-';
+      if (!sameCurrency(row)) return '-';
+      const d = row.min_follower_price - row.my_price;
+      return (d > 0 ? '+' : '') + d.toFixed(0);
+    };
+    const diffColor = (row) => {
+      if (!sameCurrency(row) || row.min_follower_price === null || row.my_price === null) return '#94a3b8';
+      const d = row.min_follower_price - row.my_price;
+      if (d < 0) return '#dc2626';
+      if (d > 0) return '#16a34a';
+      return '#64748b';
+    };
+
     Vue.onMounted(() => fetchShops().finally(() => fetchProducts()));
 
     return {
+      follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
+      copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
       products, loading, syncLoading, saveLoading,
       activeTab, statusTabs, statusCounts, statusTabItems, search, drawer, pagination,
       selectedRows, bulkLoading, bulkStockDialog, selectedWarehouseOptions, selectedStoreWarehouseGroups, storeScope, storeScopeOptions, currentStoreName,
@@ -930,6 +1044,9 @@ window.ProductListView = {
             <el-button size="large" type="success" @click="() => (window.location.hash = '#/collection')">从采集箱新增</el-button>
             <el-button size="large" type="warning" plain @click="exportCsv">
               <el-icon><Download /></el-icon><span>导出筛选结果</span>
+            </el-button>
+            <el-button size="large" type="danger" plain @click="openFollowed">
+              <span>🔍 被跟卖商品</span>
             </el-button>
           </div>
         </div>
@@ -1483,6 +1600,118 @@ window.ProductListView = {
           <el-button type="primary" :loading="bulkPriceDialog.submitting" @click="saveBulkPrices">提交改价</el-button>
         </template>
       </el-dialog>
+
+      <!-- ===== v2.2.9.126 被跟卖商品（插件巡查跟卖采集 → ozon_follow_sellers）===== -->
+      <el-drawer v-model="follow.visible" title="被跟卖商品" size="1180px" append-to-body destroy-on-close>
+        <div style="display:flex; flex-direction:column; gap:12px">
+          <el-alert type="info" :closable="false" show-icon
+            title="数据来自插件「巡查跟卖」采集的 Ozon 商品卡片其他卖家报价"
+            description="列表为空说明还没采集过：点右侧「刷新跟卖数据」提交任务，插件会在浏览器后台逐个抓取，完成后自动入库，几分钟后点「查询」即可看到。跟卖价为买家侧 RUB。" />
+
+          <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
+            <el-select v-model="follow.storeName" clearable placeholder="全部店铺" style="width:210px" @change="loadFollowed(true)">
+              <el-option v-for="s in follow.stores" :key="s.store_name" :label="s.store_name + '（' + s.products + '）'" :value="s.store_name" />
+            </el-select>
+            <el-input v-model="follow.q" clearable placeholder="搜索货号 / 商品名" style="width:260px" @keyup.enter="loadFollowed(true)" />
+            <el-input-number v-model="follow.minFollowers" :min="1" :max="999" style="width:140px" @change="loadFollowed(true)" />
+            <span style="font-size:12px; color:#94a3b8; margin-left:-4px">最少跟卖卖家数</span>
+            <el-button @click="loadFollowed(true)">查询</el-button>
+            <span style="flex:1"></span>
+            <el-button type="primary" plain :loading="follow.collecting" @click="collectFollowData">刷新跟卖数据</el-button>
+          </div>
+
+          <div style="font-size:13px; color:#475569">
+            被跟卖商品 <b style="color:#dc2626">{{ follow.summary.products }}</b> 个 ·
+            跟卖卖家合计 <b>{{ follow.summary.followers }}</b> 条 ·
+            数据时间 {{ fmtTime(follow.summary.scanned_at) }}
+          </div>
+
+          <el-table :data="follow.items" v-loading="follow.loading" border size="small"
+            max-height="calc(100vh - 330px)"
+            empty-text="还没有跟卖数据（点右上「刷新跟卖数据」采集一次）">
+            <el-table-column label="图" width="70">
+              <template #default="{ row }">
+                <el-image :src="row.image" style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; cursor:zoom-in" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []">
+                  <template #error><div style="height:46px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:11px">无图</div></template>
+                </el-image>
+              </template>
+            </el-table-column>
+            <el-table-column label="商品" min-width="260" show-overflow-tooltip>
+              <template #default="{ row }">
+                <div style="font-weight:700; color:#0f172a">{{ row.name || '(本地无该商品信息)' }}</div>
+                <div style="font-size:12px; color:#94a3b8">货号 {{ row.offer_id }} · Ozon SKU {{ row.product_id || '-' }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="店铺" width="130" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.follow_store_name || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="跟卖卖家" width="100" align="center">
+              <template #default="{ row }"><el-tag type="danger" size="small" effect="dark">{{ row.follower_count }}</el-tag></template>
+            </el-table-column>
+            <el-table-column label="最低跟卖价" width="120" align="right">
+              <template #default="{ row }">
+                <span v-if="row.min_follower_price !== null" style="font-weight:700; color:#dc2626">{{ row.min_follower_price }} ₽</span>
+                <span v-else style="color:#c0c4cc">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="我的价" width="110" align="right">
+              <template #default="{ row }">
+                <span v-if="row.my_price !== null">{{ row.my_price }} {{ row.currency_code || '' }}</span>
+                <span v-else style="color:#c0c4cc">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="价差" width="90" align="right">
+              <template #default="{ row }">
+                <span :style="{ color: diffColor(row), fontWeight: 700 }">{{ diffText(row) }}</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="数据时间" width="140">
+              <template #default="{ row }">{{ fmtTime(row.scanned_at) }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="160" fixed="right">
+              <template #default="{ row }">
+                <el-button link type="primary" size="small" @click="openFollowers(row)">跟卖卖家</el-button>
+                <el-button link type="primary" size="small" @click="copyText(row.offer_id, '货号')">复制货号</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+
+          <div style="display:flex; justify-content:flex-end">
+            <el-pagination
+              v-model:current-page="follow.page"
+              v-model:page-size="follow.pageSize"
+              :total="follow.total"
+              :page-sizes="[20, 50, 100, 200]"
+              layout="total, sizes, prev, pager, next"
+              @size-change="loadFollowed(true)"
+              @current-change="loadFollowed(false)" />
+          </div>
+        </div>
+
+        <el-drawer v-model="followerDrawer.visible" title="跟卖卖家列表" size="560px" append-to-body destroy-on-close>
+          <div v-if="followerDrawer.name" style="font-size:13px; color:#475569; margin-bottom:6px">{{ followerDrawer.name }}</div>
+          <div style="font-size:12px; color:#94a3b8; margin-bottom:10px">货号：{{ followerDrawer.offerId }}</div>
+          <div style="margin-bottom:10px">
+            <el-button size="small" @click="copyAllFollowerSku">复制全部跟卖 SKU</el-button>
+          </div>
+          <el-table :data="followerDrawer.items" v-loading="followerDrawer.loading" size="small" border max-height="70vh">
+            <el-table-column label="卖家 SKU" min-width="130">
+              <template #default="{ row }"><span style="font-family:monospace">{{ row.follower_sku }}</span></template>
+            </el-table-column>
+            <el-table-column label="卖家名" min-width="150" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.follower_name || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="售价" width="110" align="right">
+              <template #default="{ row }">{{ row.follower_price || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="80">
+              <template #default="{ row }">
+                <el-button link type="primary" size="small" @click="copyText(row.follower_sku, 'SKU')">复制</el-button>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-drawer>
+      </el-drawer>
     </div>
   `
 };

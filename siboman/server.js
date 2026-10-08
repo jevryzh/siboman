@@ -5786,6 +5786,112 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
+// v2.2.9.126 被跟卖商品列表（商品管理页「被跟卖商品」按钮用）：
+//   ozon_follow_sellers 按 offer_id 聚合，关联 app_products 补主图/名称/我的售价，
+//   并取该商品「最低跟卖价」那一行，方便一眼看出被压到什么价。
+app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const userId = req.user.id;
+    const q = String(req.query?.q || "").trim();
+    const storeName = String(req.query?.store_name || "").trim();
+    const minFollowers = Math.max(1, Math.min(9999, Number(req.query?.min_followers) || 1));
+    const page = Math.max(1, Number(req.query?.page) || 1);
+    const pageSize = Math.min(200, Math.max(1, Number(req.query?.page_size) || 50));
+    // follower_price 是 TEXT（可能是「1 234 ₽」这类带空格/符号的串），统一取数字比较
+    const priceNumSql = "NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric";
+    const rowsResult = await db.query(
+      `WITH agg AS (
+         SELECT fs.offer_id,
+                MAX(fs.product_id) AS product_id,
+                MAX(fs.store_name) AS store_name,
+                COUNT(*)::int AS follower_count,
+                COUNT(DISTINCT fs.follower_sku)::int AS follower_sku_count,
+                MAX(fs.scanned_at) AS scanned_at
+           FROM ozon_follow_sellers fs
+          WHERE fs.user_id = $1
+          GROUP BY fs.offer_id
+         HAVING COUNT(*) >= $2
+       )
+       SELECT a.offer_id,
+              a.product_id,
+              a.store_name AS follow_store_name,
+              a.follower_count,
+              a.follower_sku_count,
+              a.scanned_at,
+              p.name,
+              p.image,
+              p.price AS my_price,
+              p.currency_code,
+              p.store_id,
+              p.status,
+              bp.price_num AS min_follower_price,
+              bp.follower_price AS min_follower_price_text,
+              bp.follower_sku AS min_follower_sku,
+              COUNT(*) OVER()::int AS total_count
+         FROM agg a
+         LEFT JOIN LATERAL (
+           SELECT name, image, price, currency_code, store_id, status
+             FROM app_products
+            WHERE user_id = $1 AND offer_id = a.offer_id
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 1
+         ) p ON TRUE
+         LEFT JOIN LATERAL (
+           SELECT fs.follower_price, fs.follower_sku, ${priceNumSql} AS price_num
+             FROM ozon_follow_sellers fs
+            WHERE fs.user_id = $1 AND fs.offer_id = a.offer_id
+              AND ${priceNumSql} IS NOT NULL
+            ORDER BY ${priceNumSql} ASC
+            LIMIT 1
+         ) bp ON TRUE
+        WHERE ($3 = '' OR a.offer_id ILIKE '%' || $3 || '%' OR COALESCE(p.name,'') ILIKE '%' || $3 || '%')
+          AND ($4 = '' OR a.store_name = $4)
+        ORDER BY a.follower_count DESC, a.offer_id ASC
+        LIMIT $5 OFFSET $6`,
+      [userId, minFollowers, q, storeName, pageSize, (page - 1) * pageSize],
+    );
+    const summaryResult = await db.query(
+      `SELECT COUNT(DISTINCT offer_id)::int AS products,
+              COUNT(*)::int AS followers,
+              MAX(scanned_at) AS scanned_at
+         FROM ozon_follow_sellers WHERE user_id = $1`,
+      [userId],
+    );
+    const storeResult = await db.query(
+      `SELECT store_name, COUNT(DISTINCT offer_id)::int AS products
+         FROM ozon_follow_sellers
+        WHERE user_id = $1 AND COALESCE(store_name,'') <> ''
+        GROUP BY store_name ORDER BY products DESC`,
+      [userId],
+    );
+    const summary = summaryResult.rows[0] || { products: 0, followers: 0, scanned_at: null };
+    const items = rowsResult.rows.map(({ total_count, ...rest }) => ({
+      ...rest,
+      follower_count: Number(rest.follower_count || 0),
+      follower_sku_count: Number(rest.follower_sku_count || 0),
+      my_price: rest.my_price === null || rest.my_price === undefined ? null : Number(rest.my_price),
+      // min_follower_price 是 SQL 里已剥掉 ₽/空格的 numeric；min_follower_price_text 保留原始串给前端展示
+      min_follower_price: rest.min_follower_price === null || rest.min_follower_price === undefined
+        ? null : Number(rest.min_follower_price),
+      min_follower_price_text: rest.min_follower_price_text || "",
+    }));
+    res.json({
+      success: true,
+      items,
+      total: rowsResult.rows[0]?.total_count || 0,
+      page,
+      page_size: pageSize,
+      summary: {
+        products: Number(summary.products || 0),
+        followers: Number(summary.followers || 0),
+        scanned_at: summary.scanned_at || null,
+      },
+      stores: storeResult.rows,
+    });
+  } catch (error) { next(error); }
+});
+
 // 插件模式核价：把 Yandex 商品图集派给本机采集端（插件），用 1688 官方以图找货返同款。
 // 领取/进度/完成复用 worker job 体系（kind=yandex-research），结果留在 job.results 供前端轮询。
 app.post("/api/yandex/research-job", requireAuth, async (req, res, next) => {
