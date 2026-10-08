@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.123";
+const VERSION = "2.2.9.124";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1410,6 +1410,106 @@ async function runQueuedYandexResearchJob(remoteJob) {
 }
 
 // 巡查跟卖任务（kind=ozon-patrol）：逐商品调 Ozon 公开接口 otherOffersFromSellers，抓跟卖卖家列表。
+//
+// v2.2.9.124 关键修复：请求必须发在 www.ozon.ru「页面上下文」里。
+//   之前直接在 service worker 里 fetch，被 Ozon 反爬稳定挡成 HTTP 403（实测 3000+ 个商品全 403、
+//   跟卖数恒为 0，用户看到的就是「就是没数据」）。页面上下文才带对 Origin/Referer/cookie，实测可正常返回。
+//   为免每个商品都开新标签，这里复用同一个 ozon.ru 标签（优先用户已开着的，其次自己建一个，任务结束关掉自己的）。
+let ozonPatrolTabId = null;      // 正在复用的 ozon.ru 标签
+let ozonPatrolOwnedTabId = null; // 我们自己创建的标签（任务结束关掉；用户原有的不动）
+
+function isUsableOzonTab(tab) {
+  return Boolean(tab && tab.id && typeof tab.url === "string" && tab.url.indexOf("https://www.ozon.ru/") === 0);
+}
+
+async function getOrCreateOzonPatrolTab() {
+  if (ozonPatrolTabId) {
+    const cached = await chrome.tabs.get(ozonPatrolTabId).catch(() => null);
+    if (isUsableOzonTab(cached)) return cached;
+    ozonPatrolTabId = null;
+  }
+  const existing = await chrome.tabs.query({ url: "https://www.ozon.ru/*" }).catch(() => []);
+  const reusable = (existing || []).find(isUsableOzonTab);
+  if (reusable) {
+    ozonPatrolTabId = reusable.id;
+    console.log(`[SW ${VERSION}] 巡查跟卖复用已有 ozon.ru 标签 id=${reusable.id}`);
+    return reusable;
+  }
+  const tab = await createTabWithRetry({ url: "https://www.ozon.ru/", active: false }, "打开 ozon.ru 供巡查跟卖");
+  await waitForTabComplete(tab.id, 30000).catch(() => {});
+  ozonPatrolTabId = tab.id;
+  ozonPatrolOwnedTabId = tab.id;
+  console.log(`[SW ${VERSION}] 巡查跟卖新建 ozon.ru 标签 id=${tab.id}`);
+  return tab;
+}
+
+async function closeOwnedOzonPatrolTab() {
+  if (!ozonPatrolOwnedTabId) return;
+  const id = ozonPatrolOwnedTabId;
+  ozonPatrolOwnedTabId = null;
+  if (ozonPatrolTabId === id) ozonPatrolTabId = null;
+  await safeRemoveTab(id).catch(() => {});
+}
+
+// 注入到 ozon.ru 页面里执行 —— 同源 fetch 公开接口。
+// 注意：executeScript 注入的函数只能引用自身函数体内的代码（引用外部函数会 ReferenceError）。
+function extractOtherOffersInPage(productId) {
+  const url = `https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=%2Fmodal%2FotherOffersFromSellers%3Fproduct_id%3D${encodeURIComponent(productId)}%26sort%3Dprice%26page_changed%3Dtrue&_mjgd_ts=${Date.now()}`;
+  return fetch(url, { credentials: "include", cache: "no-store" })
+    .then(function (resp) {
+      if (!resp.ok) return { __error: "HTTP " + resp.status };
+      return resp.json();
+    })
+    .then(function (data) {
+      const ws = (data && data.widgetStates) || {};
+      const keys = Object.keys(ws);
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = keys[i];
+        if (key.indexOf("webSellerList") !== 0) continue;
+        try {
+          const v = typeof ws[key] === "string" ? JSON.parse(ws[key]) : ws[key];
+          if (v && Array.isArray(v.sellers)) {
+            return {
+              sellers: v.sellers.map(function (s) {
+                const price = (s.price && s.price.cardPrice && s.price.cardPrice.price) || (s.price && s.price.price) || "";
+                return { sku: s.sku || "", name: s.name || "", price: price };
+              }),
+            };
+          }
+        } catch (_e) { /* 单个 widget 解析失败跳过 */ }
+      }
+      return { sellers: [] };
+    })
+    .catch(function (e) { return { __error: (e && e.message) || String(e) }; });
+}
+
+// 在 ozon.ru 页面上下文里抓「其他卖家报价」（跟卖卖家）。
+async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
+  const runOn = async (id) => {
+    const [res] = await chrome.scripting.executeScript({
+      target: { tabId: id },
+      func: extractOtherOffersInPage,
+      args: [productId],
+    });
+    const out = res && res.result;
+    if (!out) throw new Error("页面注入无返回（标签页可能没有加载 ozon.ru）");
+    if (out.__error) throw new Error(out.__error);
+    return Array.isArray(out.sellers) ? out.sellers : [];
+  };
+  try {
+    return await runOn(tabId);
+  } catch (firstError) {
+    // 标签可能被导航走/关掉了 → 重建一次再试
+    ozonPatrolTabId = null;
+    const fresh = await getOrCreateOzonPatrolTab();
+    try {
+      return await runOn(fresh.id);
+    } catch (_second) {
+      throw firstError;
+    }
+  }
+}
+
 async function runQueuedOzonPatrolJob(remoteJob) {
   const payload = remoteJob.payload || {};
   const rawItems = Array.isArray(payload.items) ? payload.items : [];
@@ -1428,52 +1528,46 @@ async function runQueuedOzonPatrolJob(remoteJob) {
   await setActiveSourcingJob(job);
   await reportSourcingProgress(job);
   const stopCancelMonitor = startSourcingCancelMonitor(job);
+  let okCount = 0;
+  let errCount = 0;
   try {
+    const patrolTab = await getOrCreateOzonPatrolTab();
     for (let index = job.processed; index < rawItems.length; index += 1) {
       if (job.cancelRequested) break;
       const item = rawItems[index] || {};
       const productId = String(item.product_id || "");
       const offerId = String(item.offer_id || "");
       const storeName = String(item.store_name || "");
-      job.phase = `采集跟卖 ${index + 1}/${rawItems.length}`;
+      job.phase = `采集跟卖 ${index + 1}/${rawItems.length}（有跟卖 ${okCount}）`;
       await reportSourcingProgress(job);
       try {
         if (!productId) throw new Error("缺少 product_id");
-        const sellers = await fetchOtherOffersFromSellersInPlugin(productId);
+        const sellers = await fetchOtherOffersFromSellersInPlugin(productId, patrolTab.id);
         job.results.push({ offer_id: offerId, product_id: productId, store_name: storeName, sellers });
-        if (sellers.length) job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家`, "info"));
+        if (sellers.length) {
+          okCount += 1;
+          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家`, "info"));
+        }
       } catch (e) {
+        errCount += 1;
         job.results.push({ offer_id: offerId, product_id: productId, store_name: storeName, sellers: [], error: (e?.message || String(e)).slice(0, 200) });
         job.logs.push(makeLog(`货号 ${offerId} 采集失败：${(e?.message || String(e)).slice(0, 120)}`, "warn"));
       }
       job.processed = index + 1;
       await reportSourcingProgress(job);
+      // 轻微限速，降低触发 Ozon 风控的概率
+      await sleep(220 + Math.floor(Math.random() * 260));
     }
+    job.logs.push(makeLog(`巡查跟卖采集结束：有跟卖 ${okCount} 个 / 失败 ${errCount} 个（共 ${job.processed}/${rawItems.length}）。`, errCount ? "warn" : "info"));
   } finally {
     stopCancelMonitor();
+    await closeOwnedOzonPatrolTab();
   }
   job.status = job.cancelRequested ? "canceled" : "done";
-  job.phase = job.status === "done" ? "已完成，正在收尾" : "已停止";
+  job.phase = job.status === "done"
+    ? `已完成（有跟卖 ${okCount} 个 / 失败 ${errCount} 个）`
+    : `已停止（有跟卖 ${okCount} 个）`;
   await completeSourcingJob(job);
-}
-
-// 调 Ozon 公开接口，拿某商品卡片上的「其他卖家报价」（跟卖卖家）列表。
-async function fetchOtherOffersFromSellersInPlugin(productId) {
-  const url = `https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=%2Fmodal%2FotherOffersFromSellers%3Fproduct_id%3D${encodeURIComponent(productId)}%26sort%3Dprice%26page_changed%3Dtrue&_mjgd_ts=${Date.now()}`;
-  const resp = await fetch(url, { credentials: "include", cache: "no-store" });
-  if (!resp.ok) throw new Error("HTTP " + resp.status);
-  const data = await resp.json();
-  const ws = data.widgetStates || {};
-  for (const key of Object.keys(ws)) {
-    if (!key.startsWith("webSellerList")) continue;
-    try {
-      const v = typeof ws[key] === "string" ? JSON.parse(ws[key]) : ws[key];
-      if (Array.isArray(v?.sellers)) {
-        return v.sellers.map((s) => ({ sku: s.sku || "", name: s.name || "", price: s.price?.cardPrice?.price || s.price?.price || "" }));
-      }
-    } catch (_e) { /* 单个 widget 解析失败跳过 */ }
-  }
-  return [];
 }
 
 async function pollSourcingQueueOnce() {

@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.123";
-    const PLUGIN_ZIP_VERSION = "2.2.9.123";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.124";
+    const PLUGIN_ZIP_VERSION = "2.2.9.124";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -442,6 +442,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.124 修复巡查跟卖「采不到数据」：请求改成在 www.ozon.ru 页面上下文里发（复用同一个 ozon.ru 标签，不再每个商品开新标签）。此前直接在 service worker 里 fetch，被 Ozon 反爬稳定挡成 HTTP 403，3000+ 个商品全失败、跟卖数恒为 0；现在带对 Origin/Referer/cookie，可正常返回，并加了轻微限速降风控。同时上线「商品管理 → 被跟卖商品」入口。</li>
             <li>✅ v2.2.9.123 新增巡查跟卖采集：插件可领取 kind=ozon-patrol 任务，直接用 Ozon 公开接口抓每个商品的跟卖卖家（SKU/名称/价格）回传 ERP，配合「巡查跟卖」页一键刷新跟卖数据；批量上架/找货流程未调整。</li>
             <li>✅ v2.2.9.122 Yandex 自动上架 10 项体验修复：上架采集标题/图片/属性/包装重量尺寸等采集与校验优化，减少生成缺属性/无图草稿。</li>
             <li>✅ v2.2.9.121 上架采集重量/尺寸改从页面内联 JSON 解析（实测部分 1688 页 window.context 未初始化，导致包装信息取不到）；重量/尺寸三级兜底：window数据 → 内联JSON(productPackInfo/pieceWeightScale) → 页面文本。</li>
