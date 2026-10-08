@@ -5552,7 +5552,10 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       has_next: Boolean(payload.paging?.nextPageToken),
     });
   } catch (error) {
-    next(error);
+    // 返回 JSON 错误（含 Yandex 原始报错）。否则 Express 默认错误页是 HTML，
+    // 前端 axios 解析失败只会提示「读取失败」，用户看到的是没有订单却不知道为什么
+    // （典型：切到 API 被禁用的店铺，如 Three Latte(1ck) campaign 149250394）。
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
   }
 });
 

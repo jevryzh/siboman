@@ -42,6 +42,17 @@ window.YandexOrderListView = {
     }[String(status || '').toLowerCase()] || 'info');
 
     const primaryProduct = (row) => (Array.isArray(row.products) ? row.products[0] : null) || {};
+    // v2.2.9.125: 订单图片放大预览用的图片列表（该订单所有商品的图，主图排第一）
+    const productImages = (row) => {
+      const list = (Array.isArray(row?.products) ? row.products : [])
+        .map((p) => p?.image)
+        .filter(Boolean);
+      if (!list.length) {
+        const single = primaryProduct(row).image || row?.image || '';
+        if (single) list.push(single);
+      }
+      return list;
+    };
     const moneyText = (value, currency = 'RUB') => {
       const n = Number(value || 0);
       if (!Number.isFinite(n) || n <= 0) return '-';
@@ -177,7 +188,7 @@ window.YandexOrderListView = {
 
     return {
       orders, loading, hasFetched, activeTab, search, pagination, apiReady, statusTabs,
-      statusText, statusTagType, primaryProduct, moneyText, profitText, profitColor, toBeijing, fetchOrders, resetFilters,
+      statusText, statusTagType, primaryProduct, productImages, moneyText, profitText, profitColor, toBeijing, fetchOrders, resetFilters,
       yandexStores, currentStoreId, storeContext, changeYandexStore,
       detailDrawer, openDetail, shipOrder, shipping,
     };
@@ -238,7 +249,7 @@ window.YandexOrderListView = {
         <el-table-column label="商品" min-width="320">
           <template #default="{ row }">
             <div style="display:flex; gap:12px; align-items:center; min-width:0">
-              <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; flex-shrink:0" fit="cover" preview-teleported hide-on-click-modal>
+              <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; background:#f1f5f9; flex-shrink:0; cursor:zoom-in" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="productImages(row)">
                 <template #error><div style="height:58px; display:flex; align-items:center; justify-content:center; color:#94a3b8; font-size:12px">无图</div></template>
               </el-image>
               <div style="min-width:0">
@@ -322,7 +333,7 @@ window.YandexOrderListView = {
           <el-table :data="detailDrawer.row.products || []" size="small" border>
             <el-table-column label="图" width="60">
               <template #default="{ row }">
-                <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []">
+                <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px; background:#f1f5f9; cursor:zoom-in" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []">
                   <template #error><div style="height:40px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:12px">无图</div></template>
                 </el-image>
               </template>
