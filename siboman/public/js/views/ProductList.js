@@ -882,6 +882,7 @@ window.ProductListView = {
     window.addEventListener('shop-changed', onShopChanged);
     Vue.onBeforeUnmount(() => {
       clearTimeout(searchTimer);
+      stopFollowPoll();
       window.removeEventListener('shop-changed', onShopChanged);
     });
 
@@ -894,6 +895,9 @@ window.ProductListView = {
       q: '', storeName: '', minFollowers: 1,
       summary: { products: 0, followers: 0, scanned_at: null },
       stores: [],
+      // v2.2.9.127 定向查询：批量粘贴 SKU/货号，只查这些商品，不整店跑
+      batchText: '', batchBusy: false,
+      jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
     });
     const followerDrawer = Vue.reactive({ visible: false, offerId: '', name: '', loading: false, items: [] });
     const parsePriceText = (s) => {
@@ -965,28 +969,116 @@ window.ProductListView = {
       try { await navigator.clipboard.writeText(skus.join('\n')); notify.success(`已复制 ${skus.length} 个跟卖 SKU`); }
       catch { notify.warning('复制失败，请手动复制'); }
     };
+    // 粘贴框里的 token（换行/逗号/空格/分号都能分）
+    const followBatchTokens = Vue.computed(() => [...new Set(
+      String(follow.batchText || '').split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean),
+    )]);
+    let followPollTimer = null;
+    const stopFollowPoll = () => { if (followPollTimer) { clearInterval(followPollTimer); followPollTimer = null; } };
+    const pollFollowJob = (jobId) => {
+      stopFollowPoll();
+      let tries = 0;
+      followPollTimer = setInterval(async () => {
+        tries += 1;
+        try {
+          const st = await axios.get(`/api/jobs/${encodeURIComponent(jobId)}`, { params: { light: 1 } });
+          const job = st.data?.job || {};
+          follow.jobStatus = job.status || '';
+          follow.jobPhase = job.phase || '';
+          follow.jobProcessed = Number(job.processed || 0);
+          follow.jobTotal = Number(job.total || 0);
+          if (['done', 'error', 'canceled'].includes(follow.jobStatus)) {
+            stopFollowPoll();
+            if (follow.jobStatus === 'done') notify.success(`跟卖查询完成：${job.phase || '已完成'}`);
+            else if (follow.jobStatus === 'canceled') notify.warning('跟卖查询已取消');
+            else notify.error('跟卖查询失败：' + (job.error || job.phase || '未知错误'));
+            await loadFollowed(true);
+            return;
+          }
+        } catch (_e) { /* 轮询失败忽略，下一轮再试 */ }
+        if (tries > 900) stopFollowPoll(); // 最多约 1 小时
+      }, 4000);
+    };
+    const ensureCapablePlugin = async () => {
+      try {
+        const st = await axios.get('/api/worker/status');
+        const capable = (st.data?.workers || []).filter((w) => w.online && w.canClaimJobs).length;
+        if (capable === 0) {
+          notify.warning('没检测到「在线且版本达标」的采集插件：请确认浏览器开着 ERP 页面，并在 chrome://extensions 把插件重新加载到最新版。');
+          return false;
+        }
+      } catch (_e) { /* 状态查不到就不拦 */ }
+      return true;
+    };
+    // v2.2.9.127 主入口：只查粘贴框里的 SKU（不整店扫描，快很多）
+    const collectFollowBySkus = async () => {
+      const skus = followBatchTokens.value;
+      if (!skus.length) return notify.warning('请先粘贴要查询的 Ozon SKU 或本地货号（每行一个）');
+      if (skus.length > 2000) return notify.warning(`一次最多 2000 个，当前 ${skus.length} 个`);
+      follow.batchBusy = true;
+      try {
+        await ensureCapablePlugin();
+        const res = await axios.post('/api/ozon/patrol/collect', { skus }, { timeout: 120000 });
+        const d = res.data || {};
+        if (d.existing) {
+          notify.warning(`已有跟卖任务在跑（${d.status || 'queued'}，共 ${d.total || '?'} 个）。可先点「取消当前任务」再提交，或等它跑完。`);
+          follow.jobId = d.jobId || '';
+          follow.jobStatus = d.status || 'running';
+          follow.jobPhase = d.phase || '';
+          follow.jobTotal = Number(d.total || 0);
+          return;
+        }
+        follow.jobId = d.jobId || '';
+        follow.jobStatus = 'queued';
+        follow.jobProcessed = 0;
+        follow.jobTotal = Number(d.total || skus.length);
+        const skipped = Number(d.unresolved || 0);
+        notify.success(`已提交 ${d.total} 个商品的跟卖查询${skipped ? `（${skipped} 个没解析出来已跳过）` : ''}，插件抓取中…`);
+        pollFollowJob(d.jobId);
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '提交跟卖查询失败');
+      } finally {
+        follow.batchBusy = false;
+      }
+    };
+    // 整店采集（慢，3000+ 商品约 25-35 分钟）：保留但降级为次要入口
     const collectFollowData = async () => {
       follow.collecting = true;
       try {
-        // 先看有没有「在线且版本达标」的采集端，避免提交后任务没人领、用户以为又坏了
-        let capableOnline = null;
-        try {
-          const st = await axios.get('/api/worker/status');
-          capableOnline = (st.data?.workers || []).filter((w) => w.online && w.canClaimJobs).length;
-        } catch (_e) { /* 状态查不到就不拦，继续提交 */ }
-        if (capableOnline === 0) {
-          notify.warning('没检测到「在线且版本达标」的采集插件：请确认浏览器开着 ERP 页面、并在 chrome://extensions 把插件重新加载到最新版，再提交。');
-        }
+        if (!(await ensureCapablePlugin())) return;
         const res = await axios.post('/api/ozon/patrol/collect', {}, { timeout: 300000 });
-        if (res.data?.existing) {
-          notify.warning('已有跟卖采集任务在跑（' + (res.data.status || 'queued') + '），稍后点「刷新」即可');
-        } else {
-          notify.success(`已提交跟卖采集任务（${res.data?.total || '?'} 个商品）。插件会在浏览器后台逐个抓取，完成后自动入库，几分钟后回来点「刷新」。`);
+        const d = res.data || {};
+        if (d.existing) {
+          notify.warning(`已有跟卖任务在跑（${d.status || 'queued'}，共 ${d.total || '?'} 个）`);
+          follow.jobId = d.jobId || ''; follow.jobStatus = d.status || 'running';
+          follow.jobTotal = Number(d.total || 0);
+          return;
         }
+        follow.jobId = d.jobId || '';
+        follow.jobStatus = 'queued';
+        follow.jobProcessed = 0;
+        follow.jobTotal = Number(d.total || 0);
+        notify.success(`已提交整店跟卖采集（${d.total || '?'} 个商品），后台跑，约 25-35 分钟，完成后自动入库。`);
+        pollFollowJob(follow.jobId);
       } catch (e) {
         notify.error(e.response?.data?.error || e.message || '提交采集任务失败');
       } finally {
         follow.collecting = false;
+      }
+    };
+    // 已有任务在跑时，允许取消后立刻提交新的定向查询
+    const cancelFollowJob = async () => {
+      if (!follow.jobId) return notify.warning('没有可取消的任务');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm('取消当前跟卖采集任务？已采集的部分结果会保留。', '取消任务', { type: 'warning', confirmButtonText: '取消任务', cancelButtonText: '再等等' });
+      } catch { return; }
+      try {
+        await axios.post(`/api/jobs/${encodeURIComponent(follow.jobId)}/cancel`);
+        notify.success('已请求取消');
+        follow.jobStatus = 'canceled';
+        stopFollowPoll();
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '取消失败');
       }
     };
     // 跟卖价是买家侧 RUB，我的价是店铺结算币；只有同为 RUB 时才给价差，避免拿人民币和卢布直接相减。
@@ -1011,6 +1103,7 @@ window.ProductListView = {
     return {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
+      followBatchTokens, collectFollowBySkus, cancelFollowJob,
       products, loading, syncLoading, saveLoading,
       activeTab, statusTabs, statusCounts, statusTabItems, search, drawer, pagination,
       selectedRows, bulkLoading, bulkStockDialog, selectedWarehouseOptions, selectedStoreWarehouseGroups, storeScope, storeScopeOptions, currentStoreName,
@@ -1613,9 +1706,27 @@ window.ProductListView = {
       <!-- ===== v2.2.9.126 被跟卖商品（插件巡查跟卖采集 → ozon_follow_sellers）===== -->
       <el-drawer v-model="follow.visible" title="被跟卖商品" size="1180px" append-to-body destroy-on-close>
         <div style="display:flex; flex-direction:column; gap:12px">
-          <el-alert type="info" :closable="false" show-icon
-            title="数据来自插件「巡查跟卖」采集的 Ozon 商品卡片其他卖家报价"
-            description="列表为空说明还没采集过：点右侧「刷新跟卖数据」提交任务，插件会在浏览器后台逐个抓取，完成后自动入库，几分钟后点「查询」即可看到。跟卖价为买家侧 RUB。" />
+          <!-- v2.2.9.127 定向查询：只查你粘贴的 SKU，不做整店扫描 -->
+          <div style="border:1px solid #dbeafe; border-radius:10px; padding:14px 16px; background:#f8fbff">
+            <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap">
+              <span style="font-size:14px; font-weight:800; color:#0f172a">批量查询跟卖</span>
+              <el-tag size="small" type="success" effect="plain">推荐</el-tag>
+              <span style="font-size:12px; color:#94a3b8">只查你输入的 SKU，不整店扫描，几十个通常几秒~几十秒出结果</span>
+            </div>
+            <el-input v-model="follow.batchText" type="textarea" :rows="3" spellcheck="false"
+              placeholder="每行一个：Ozon SKU（纯数字）或本地货号 offer_id；逗号/空格/分号分隔也行。例：&#10;3859920996&#10;LZ06-1-3859920996" />
+            <div style="display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap">
+              <el-button type="primary" :loading="follow.batchBusy" @click="collectFollowBySkus">
+                查询这些 SKU 的跟卖（{{ followBatchTokens.length }} 个）
+              </el-button>
+              <el-button v-if="follow.jobId && ['queued','claimed','running'].includes(follow.jobStatus)" @click="cancelFollowJob">取消当前任务</el-button>
+              <span v-if="follow.jobId && ['queued','claimed','running'].includes(follow.jobStatus)" style="font-size:12px; color:#2563eb; font-weight:600">
+                进行中：{{ follow.jobPhase || follow.jobStatus }}（{{ follow.jobProcessed }}/{{ follow.jobTotal }}）
+              </span>
+              <span style="flex:1"></span>
+              <el-button link type="info" :loading="follow.collecting" @click="collectFollowData">整店采集（慢，约 25–35 分钟）</el-button>
+            </div>
+          </div>
 
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
             <el-select v-model="follow.storeName" clearable placeholder="全部店铺" style="width:210px" @change="loadFollowed(true)">
@@ -1624,9 +1735,7 @@ window.ProductListView = {
             <el-input v-model="follow.q" clearable placeholder="搜索货号 / 商品名" style="width:260px" @keyup.enter="loadFollowed(true)" />
             <el-input-number v-model="follow.minFollowers" :min="1" :max="999" style="width:140px" @change="loadFollowed(true)" />
             <span style="font-size:12px; color:#94a3b8; margin-left:-4px">最少跟卖卖家数</span>
-            <el-button @click="loadFollowed(true)">查询</el-button>
-            <span style="flex:1"></span>
-            <el-button type="primary" plain :loading="follow.collecting" @click="collectFollowData">刷新跟卖数据</el-button>
+            <el-button @click="loadFollowed(true)">查询列表</el-button>
           </div>
 
           <div style="font-size:13px; color:#475569">
@@ -1640,11 +1749,11 @@ window.ProductListView = {
             <template #empty>
               <div style="padding:26px 12px; display:flex; flex-direction:column; align-items:center; gap:10px">
                 <div style="font-size:15px; font-weight:800; color:#64748b">还没有跟卖数据</div>
-                <div style="font-size:12px; color:#94a3b8; max-width:560px; line-height:1.8; text-align:center">
-                  跟卖数据要靠插件在浏览器里逐个抓 Ozon 商品卡片上的其他卖家（服务端抓不到）。<br />
-                  点下面按钮提交采集，插件会在后台跑（几千个商品约 25–35 分钟），跑完自动入库，再点「查询」即可。
+                <div style="font-size:12px; color:#94a3b8; max-width:620px; line-height:1.8; text-align:center">
+                  跟卖数据靠插件在浏览器里抓 Ozon 商品卡片上的其他卖家（服务端抓不到）。<br />
+                  把要查的 SKU 粘到上面的「批量查询跟卖」里点按钮即可 —— 几十个 SKU 通常几秒到几十秒就有结果。
                 </div>
-                <el-button type="primary" :loading="follow.collecting" @click="collectFollowData">刷新跟卖数据</el-button>
+                <el-button type="primary" :loading="follow.batchBusy" @click="collectFollowBySkus">查询上面的 SKU（{{ followBatchTokens.length }} 个）</el-button>
               </div>
             </template>
             <el-table-column label="图" width="70">

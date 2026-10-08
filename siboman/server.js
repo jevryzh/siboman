@@ -5701,7 +5701,55 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
     if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
     const activeJob = await findActiveDbJobForUser(req.user, { kind: "ozon-patrol" });
     if (activeJob) {
-      return res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, status: activeJob.status, total: activeJob.total });
+      return res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, status: activeJob.status, total: activeJob.total, phase: activeJob.phase || "" });
+    }
+    // v2.2.9.127 定向采集：body.skus 里有值时只查这些商品，不做整店扫描。
+    //   整店链路要先遍历全部 Ozon 商品（几分钟）再排 3000+ 个采集任务，用户往往只想查自己关心的几十个 SKU。
+    const rawTokens = Array.isArray(req.body?.skus)
+      ? req.body.skus
+      : (typeof req.body?.skus === "string" ? req.body.skus.split(/[\s,，;；]+/) : []);
+    const tokens = [...new Set(rawTokens.map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 2000);
+    if (tokens.length) {
+      // 先把 SKU/货号在本地商品表里解析成 (offer_id, product_id)；解析不到的纯数字直接当 Ozon product_id 用
+      const resolved = await db.query(
+        `SELECT p.offer_id, p.product_id, p.sku, s.name AS store_name
+           FROM app_products p
+           LEFT JOIN app_stores s ON s.id = p.store_id
+          WHERE p.user_id = $1
+            AND (p.offer_id = ANY($2::text[]) OR p.product_id::text = ANY($2::text[]) OR p.sku::text = ANY($2::text[]))`,
+        [req.user.id, tokens],
+      );
+      const byToken = new Map();
+      for (const row of resolved.rows) {
+        const keys = [String(row.offer_id || ""), String(row.product_id || ""), String(row.sku || "")].filter(Boolean);
+        for (const k of keys) if (tokens.includes(k) && !byToken.has(k)) byToken.set(k, row);
+      }
+      const items = [];
+      const seen = new Set();
+      let unresolved = 0;
+      for (const token of tokens) {
+        const hit = byToken.get(token);
+        if (hit) {
+          const key = `${hit.offer_id}|${hit.product_id}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          items.push({ offer_id: String(hit.offer_id || ""), product_id: String(hit.product_id || ""), store_name: String(hit.store_name || "") });
+        } else if (/^\d{5,20}$/.test(token)) {
+          const key = `_raw_${token}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          items.push({ offer_id: token, product_id: token, store_name: "" });
+        } else {
+          unresolved += 1;
+        }
+      }
+      if (!items.length) {
+        return res.status(400).json({ success: false, error: "没解析出可查询的商品：请粘贴 Ozon SKU（纯数字）或本地货号（offer_id）" });
+      }
+      const queuedTargeted = await createQueuedDbJob(req.user, {
+        id: crypto.randomUUID(), kind: "ozon-patrol", storeId: null, total: items.length, phase: "等待插件采集跟卖",
+      }, { items, mode: "targeted" });
+      return res.json({ success: true, jobId: queuedTargeted.id, queued: true, total: items.length, mode: "targeted", unresolved, tokens: tokens.length });
     }
     // 取商品列表（patrol 缓存，无则现扫）
     const key = "__all__";
@@ -18441,6 +18489,35 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
   }
 });
 
+// 巡查跟卖结果落库。抽成函数是因为 /complete 有两个出口：
+//   正常完成走主流程，而「已被取消」的分支原来直接 return，导致用户主动停止任务时
+//   已经抓到的跟卖数据全部丢掉（本次实测：取消后 137 条结果、9 个有跟卖，一条都没入库）。
+async function applyOzonPatrolFollowResults(userId, updated) {
+  if (!userId || !updated || updated.kind !== "ozon-patrol" || !Array.isArray(updated.results)) return 0;
+  const targeted = updated?.payload?.mode === "targeted";
+  // 定向查询只替换本次查到的 offer_id，不清空全表，避免后一次查询把前一次结果抹掉
+  if (!targeted) await db.query("DELETE FROM ozon_follow_sellers WHERE user_id=$1", [userId]);
+  let n = 0;
+  for (const r of updated.results) {
+    const sellers = Array.isArray(r?.sellers) ? r.sellers : [];
+    const offerId = String(r?.offer_id || "");
+    if (targeted && offerId) {
+      await db.query("DELETE FROM ozon_follow_sellers WHERE user_id=$1 AND offer_id=$2", [userId, offerId]);
+    }
+    for (const s of sellers) {
+      const sku = String(s?.sku || "").trim();
+      if (!sku) continue;
+      await db.query(
+        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || "")],
+      );
+      n += 1;
+    }
+  }
+  console.log(`[ozon-patrol] 跟卖卖家入库 ${n} 条（mode=${targeted ? "targeted" : "full"}）`);
+  return n;
+}
+
 app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
   try {
     if (!db) {
@@ -18482,6 +18559,9 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       updates.phase = "已停止";
       if (downloadUrl) updates.downloadUrl = downloadUrl;
       const updated = await updateDbJob(req.params.id, updates);
+      // 取消也要保留已抓到的跟卖数据（原来这里直接 return，数据全丢）
+      await applyOzonPatrolFollowResults(existing.user_id || req.user?.id, updated)
+        .catch((e) => console.warn("[ozon-patrol] 取消分支入库失败:", e?.message || e));
       res.json({ success: true, job: updated, downloadUrl, canceled: true });
       return;
     }
@@ -18528,26 +18608,12 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
         console.log(`[yandex-collect] 回填草稿 ${n} 条（失败 ${failed}）`);
       } catch (e) { console.warn("[yandex-collect] 收尾回填失败:", e?.message || e); }
     }
-    // 巡查跟卖收尾：把插件回传的跟卖卖家清单全量入库（先清空重建）
-    if (updated && updated.kind === "ozon-patrol" && Array.isArray(updated.results)) {
-      try {
-        const userId = existing.user_id || req.user?.id;
-        await db.query("DELETE FROM ozon_follow_sellers WHERE user_id=$1", [userId]);
-        let n = 0;
-        for (const r of updated.results) {
-          const sellers = Array.isArray(r?.sellers) ? r.sellers : [];
-          for (const s of sellers) {
-            const sku = String(s?.sku || "").trim();
-            if (!sku) continue;
-            await db.query(
-              "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-              [userId, String(r.offer_id || ""), String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || "")],
-            );
-            n += 1;
-          }
-        }
-        console.log(`[ozon-patrol] 跟卖卖家入库 ${n} 条`);
-      } catch (e) { console.warn("[ozon-patrol] 入库失败:", e?.message || e); }
+    // 巡查跟卖收尾：把插件回传的跟卖卖家清单入库。
+    //   v2.2.9.127：定向查询（mode=targeted）只替换「本次查到的那些 offer_id」，不清空全表，
+    //   否则用户查完 A 批再查 B 批，A 批的数据会被整表删除抹掉。
+    if (updated && updated.kind === "ozon-patrol") {
+      await applyOzonPatrolFollowResults(existing.user_id || req.user?.id, updated)
+        .catch((e) => console.warn("[ozon-patrol] 入库失败:", e?.message || e));
     }
     // 插件精核价收尾：把最后一批结果补齐落库，并把汇总写回 phase（报告页据此展示真实成本分布）
     if (updated && (updated.payload?.marker === PRECISE_JOB_MARKER || updated.payload?.precise === true)) {
