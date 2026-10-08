@@ -1571,13 +1571,13 @@ window.BatchUploadView = {
         </div>
         <span style="width:1px; height:24px; background:#e2e8f0"></span>
         <span v-if="extensionConnected && !pluginVersionOk" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fef2f2; color:#dc2626; border-radius:14px; font-size:12px; font-weight:600">
-          <span style="width:6px; height:6px; border-radius:50%; background:#ef4444"></span>插件需更新 v{{ installedBackgroundVersion || '未知' }} → v{{ REQUIRED_BACKGROUND_VERSION }}
+          <span style="width:6px; height:6px; border-radius:50%; background:#ef4444"></span>插件版本过低 · 当前 v{{ installedBackgroundVersion || '未检测到' }}（需 ≥ v{{ REQUIRED_BACKGROUND_VERSION }}）
         </span>
         <span v-else-if="pluginVersionOk && sellerTabReady" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#ecfdf5; color:#059669; border-radius:14px; font-size:12px; font-weight:600">
-          <span style="width:6px; height:6px; border-radius:50%; background:#10b981"></span>插件已连接
+          <span style="width:6px; height:6px; border-radius:50%; background:#10b981"></span>插件已连接 v{{ installedBackgroundVersion || '' }}
         </span>
         <span v-else-if="pluginVersionOk && !sellerTabReady" style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fffbeb; color:#d97706; border-radius:14px; font-size:12px; font-weight:600">
-          <span style="width:6px; height:6px; border-radius:50%; background:#f59e0b"></span>插件已装·待登录 seller
+          <span style="width:6px; height:6px; border-radius:50%; background:#f59e0b"></span>插件已装 v{{ installedBackgroundVersion || '' }} · 待登录 seller
         </span>
         <span v-else style="display:flex; align-items:center; gap:6px; padding:4px 10px; background:#fef2f2; color:#dc2626; border-radius:14px; font-size:12px; font-weight:600">
           <span style="width:6px; height:6px; border-radius:50%; background:#ef4444"></span>插件未安装
