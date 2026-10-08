@@ -5710,26 +5710,41 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
       : (typeof req.body?.skus === "string" ? req.body.skus.split(/[\s,，;；]+/) : []);
     const tokens = [...new Set(rawTokens.map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 2000);
     if (tokens.length) {
+      // v2.2.9.128 支持按店铺限定查询范围：同一货号常同时铺在多个店铺（如 HappyFriday / Three Latte），
+      //   不限定时只能取最近更新的那一条，用户会疑惑「为什么查的是别的店的」。
+      const scopeStoreId = String(req.body?.store_id || "").trim();
+      const scopeStoreName = String(req.body?.store_name || "").trim();
       // 先把 SKU/货号在本地商品表里解析成 (offer_id, product_id)；解析不到的纯数字直接当 Ozon product_id 用
       const resolved = await db.query(
-        `SELECT p.offer_id, p.product_id, p.sku, s.name AS store_name
+        `SELECT p.offer_id, p.product_id, p.sku, p.store_id, s.name AS store_name
            FROM app_products p
            LEFT JOIN app_stores s ON s.id = p.store_id
           WHERE p.user_id = $1
-            AND (p.offer_id = ANY($2::text[]) OR p.product_id::text = ANY($2::text[]) OR p.sku::text = ANY($2::text[]))`,
-        [req.user.id, tokens],
+            AND (p.offer_id = ANY($2::text[]) OR p.product_id::text = ANY($2::text[]) OR p.sku::text = ANY($2::text[]))
+            AND ($3 = '' OR p.store_id::text = $3)
+            AND ($4 = '' OR s.name = $4)
+          ORDER BY p.updated_at DESC NULLS LAST`,
+        [req.user.id, tokens, scopeStoreId, scopeStoreName],
       );
       const byToken = new Map();
+      const tokenStores = new Map(); // token -> Set(store_name)：用于提示「同一货号多店都有」
       for (const row of resolved.rows) {
         const keys = [String(row.offer_id || ""), String(row.product_id || ""), String(row.sku || "")].filter(Boolean);
-        for (const k of keys) if (tokens.includes(k) && !byToken.has(k)) byToken.set(k, row);
+        for (const k of keys) {
+          if (!tokens.includes(k)) continue;
+          if (!byToken.has(k)) byToken.set(k, row);
+          if (!tokenStores.has(k)) tokenStores.set(k, new Set());
+          tokenStores.get(k).add(String(row.store_name || ""));
+        }
       }
       const items = [];
       const seen = new Set();
       let unresolved = 0;
+      let multiStore = 0;
       for (const token of tokens) {
         const hit = byToken.get(token);
         if (hit) {
+          if (!scopeStoreId && !scopeStoreName && (tokenStores.get(token)?.size || 0) > 1) multiStore += 1;
           const key = `${hit.offer_id}|${hit.product_id}`;
           if (seen.has(key)) continue;
           seen.add(key);
@@ -5744,12 +5759,17 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
         }
       }
       if (!items.length) {
-        return res.status(400).json({ success: false, error: "没解析出可查询的商品：请粘贴 Ozon SKU（纯数字）或本地货号（offer_id）" });
+        const hint = scopeStoreName ? `（已限定店铺：${scopeStoreName}，该店没有这些货号）` : "";
+        return res.status(400).json({ success: false, error: `没解析出可查询的商品：请粘贴 Ozon SKU（纯数字）或本地货号（offer_id）${hint}` });
       }
       const queuedTargeted = await createQueuedDbJob(req.user, {
         id: crypto.randomUUID(), kind: "ozon-patrol", storeId: null, total: items.length, phase: "等待插件采集跟卖",
-      }, { items, mode: "targeted" });
-      return res.json({ success: true, jobId: queuedTargeted.id, queued: true, total: items.length, mode: "targeted", unresolved, tokens: tokens.length });
+      }, { items, mode: "targeted", scopeStoreName: scopeStoreName || "", scopeStoreId: scopeStoreId || "" });
+      return res.json({
+        success: true, jobId: queuedTargeted.id, queued: true, total: items.length, mode: "targeted",
+        unresolved, tokens: tokens.length, multi_store: multiStore,
+        scoped_store: scopeStoreName || scopeStoreId || "",
+      });
     }
     // 取商品列表（patrol 缓存，无则现扫）
     const key = "__all__";

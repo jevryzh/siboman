@@ -1018,7 +1018,11 @@ window.ProductListView = {
       follow.batchBusy = true;
       try {
         await ensureCapablePlugin();
-        const res = await axios.post('/api/ozon/patrol/collect', { skus }, { timeout: 120000 });
+        const res = await axios.post('/api/ozon/patrol/collect', {
+          skus,
+          // 限定店铺：同一货号常同时铺在多个店铺，不限定会取到别的店的商品
+          store_name: follow.storeName || undefined,
+        }, { timeout: 120000 });
         const d = res.data || {};
         if (d.existing) {
           notify.warning(`已有跟卖任务在跑（${d.status || 'queued'}，共 ${d.total || '?'} 个）。可先点「取消当前任务」再提交，或等它跑完。`);
@@ -1033,7 +1037,11 @@ window.ProductListView = {
         follow.jobProcessed = 0;
         follow.jobTotal = Number(d.total || skus.length);
         const skipped = Number(d.unresolved || 0);
+        const multi = Number(d.multi_store || 0);
         notify.success(`已提交 ${d.total} 个商品的跟卖查询${skipped ? `（${skipped} 个没解析出来已跳过）` : ''}，插件抓取中…`);
+        if (multi > 0) {
+          notify.warning(`有 ${multi} 个货号在多个店铺都有，本次取的是最近更新的那条商品。想只查某个店，请在上方「查询范围」里选中该店铺再查。`);
+        }
         pollFollowJob(d.jobId);
       } catch (e) {
         notify.error(e.response?.data?.error || e.message || '提交跟卖查询失败');
@@ -1716,6 +1724,10 @@ window.ProductListView = {
             <el-input v-model="follow.batchText" type="textarea" :rows="3" spellcheck="false"
               placeholder="每行一个：Ozon SKU（纯数字）或本地货号 offer_id；逗号/空格/分号分隔也行。例：&#10;3859920996&#10;LZ06-1-3859920996" />
             <div style="display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap">
+              <span style="font-size:13px; font-weight:700; color:#334155; white-space:nowrap">查询范围</span>
+              <el-select v-model="follow.storeName" clearable placeholder="全部店铺" style="width:210px" @change="loadFollowed(true)">
+                <el-option v-for="s in follow.stores" :key="s.store_name" :label="s.store_name + '（' + s.products + '）'" :value="s.store_name" />
+              </el-select>
               <el-button type="primary" :loading="follow.batchBusy" @click="collectFollowBySkus">
                 查询这些 SKU 的跟卖（{{ followBatchTokens.length }} 个）
               </el-button>
@@ -1726,16 +1738,17 @@ window.ProductListView = {
               <span style="flex:1"></span>
               <el-button link type="info" :loading="follow.collecting" @click="collectFollowData">整店采集（慢，约 25–35 分钟）</el-button>
             </div>
+            <div style="font-size:12px; color:#94a3b8; margin-top:8px; line-height:1.7">
+              同一货号常同时铺在多个店铺。想只查某个店，先在「查询范围」里选中它 —— 否则可能取到别的店的同名商品。
+            </div>
           </div>
 
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
-            <el-select v-model="follow.storeName" clearable placeholder="全部店铺" style="width:210px" @change="loadFollowed(true)">
-              <el-option v-for="s in follow.stores" :key="s.store_name" :label="s.store_name + '（' + s.products + '）'" :value="s.store_name" />
-            </el-select>
             <el-input v-model="follow.q" clearable placeholder="搜索货号 / 商品名" style="width:260px" @keyup.enter="loadFollowed(true)" />
             <el-input-number v-model="follow.minFollowers" :min="1" :max="999" style="width:140px" @change="loadFollowed(true)" />
             <span style="font-size:12px; color:#94a3b8; margin-left:-4px">最少跟卖卖家数</span>
-            <el-button @click="loadFollowed(true)">查询列表</el-button>
+            <el-button @click="loadFollowed(true)">刷新列表</el-button>
+            <span style="font-size:12px; color:#94a3b8">（列表按上面的「查询范围」店铺筛选）</span>
           </div>
 
           <div style="font-size:13px; color:#475569">
