@@ -1002,11 +1002,22 @@ window.ProductListView = {
     const ensureCapablePlugin = async () => {
       try {
         const st = await axios.get('/api/worker/status');
-        const capable = (st.data?.workers || []).filter((w) => w.online && w.canClaimJobs).length;
-        if (capable === 0) {
-          notify.warning('没检测到「在线且版本达标」的采集插件：请确认浏览器开着 ERP 页面，并在 chrome://extensions 把插件重新加载到最新版。');
-          return false;
+        const workers = st.data?.workers || [];
+        const minVer = workers[0]?.minVersion || '';
+        // 重要：main.js 的 axios 拦截器会自动给 GET 注入 store_id，而 canClaimJobs 里含
+        // storeMatch（店铺要一致）。巡查跟卖任务本身不受店铺限制，所以这里必须用与店铺无关的
+        // canClaimAnyKind；否则哪怕插件在线且版本达标，也会一直误报「没检测到可用插件」。
+        const capable = workers.filter((w) => w.online
+          && (w.canClaimAnyKind !== undefined ? w.canClaimAnyKind : (w.canClaimJobs && w.storeMatch !== false))).length;
+        if (capable > 0) return true;
+        const online = workers.filter((w) => w.online);
+        if (!online.length) {
+          notify.warning('没检测到在线的采集插件：请确认浏览器开着这个 ERP 页面，并在 chrome://extensions 点一下插件的「重新加载」。');
+        } else {
+          const vers = [...new Set(online.map((w) => `v${w.version || '未知'}`))].join('、');
+          notify.warning(`在线插件是 ${vers}，但都低于最低要求${minVer ? ` v${minVer}` : ''}。请到「店铺管理 → 立即下载插件」重新下载，再在 chrome://extensions 重新加载。`);
         }
+        return false;
       } catch (_e) { /* 状态查不到就不拦 */ }
       return true;
     };

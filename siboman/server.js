@@ -18348,6 +18348,14 @@ app.get("/api/worker/status", async (req, res, next) => {
       const yandexCollectTooOld = compareNumericVersion(version, MIN_YANDEX_COLLECT_PLUGIN_VERSION) < 0;
       const blockedByPhase = /预览版|暂不领取|不领取任务|未开启领取任务|低于单品找货最低版本|版本\s*未知/i.test(currentPhase);
       const canClaimJobs = storeMatch && !versionTooOld && !blockedByPhase;
+      // v2.2.9.128：与店铺无关的可用性判定。
+      //   前端「有没有可用采集端」的检查走 /api/worker/status，而 main.js 的 axios 拦截器
+      //   会自动给 GET 注入 store_id，导致 canClaimJobs 里的 storeMatch 恒为 false →
+      //   明明有在线且版本达标的插件，页面却一直提示「没检测到在线且版本达标的采集插件」。
+      //   巡查跟卖等任务本身是 store-scope-exempt，所以这里给一个不受店铺影响的字段。
+      const endpointDisabled = DISABLED_WORKER_IDS.has(String(row.profile_dir || "").trim())
+        || DISABLED_WORKER_IDS.has(String(row.worker_name || "").trim());
+      const canClaimAnyKind = !endpointDisabled && !versionTooOld && !blockedByPhase;
       const currentJob = row.current_job_id && row.job_id ? serializeJob({
         id: row.job_id,
         status: row.job_status,
@@ -18381,6 +18389,7 @@ app.get("/api/worker/status", async (req, res, next) => {
         currentJob,
         currentPhase,
         canClaimJobs,
+        canClaimAnyKind,
         versionTooOld,
         minVersion: MIN_SINGLE_SOURCING_PLUGIN_VERSION,
         // Yandex 自动上架采集能力（老插件领不到 yandex-collect 任务，界面据此给出明确提示）
