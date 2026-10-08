@@ -5858,11 +5858,24 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
          FROM ozon_follow_sellers WHERE user_id = $1`,
       [userId],
     );
+    // 店铺下拉必须列出用户所有在用 Ozon 店铺（含还没采到跟卖数据的，products=0）。
+    // 之前只从 ozon_follow_sellers 里取，采集前表是空的 → 下拉显示 "No data"，让人不知道能不能查。
     const storeResult = await db.query(
-      `SELECT store_name, COUNT(DISTINCT offer_id)::int AS products
-         FROM ozon_follow_sellers
-        WHERE user_id = $1 AND COALESCE(store_name,'') <> ''
-        GROUP BY store_name ORDER BY products DESC`,
+      `WITH counts AS (
+         SELECT store_name, COUNT(DISTINCT offer_id)::int AS products
+           FROM ozon_follow_sellers
+          WHERE user_id = $1 AND COALESCE(store_name,'') <> ''
+          GROUP BY store_name
+       )
+       SELECT s.name AS store_name, COALESCE(c.products, 0)::int AS products
+         FROM app_stores s
+         LEFT JOIN counts c ON c.store_name = s.name
+        WHERE s.user_id = $1 AND s.active = TRUE AND (s.platform IS NULL OR s.platform = 'ozon')
+       UNION
+       SELECT c.store_name, c.products
+         FROM counts c
+        WHERE NOT EXISTS (SELECT 1 FROM app_stores s WHERE s.user_id = $1 AND s.name = c.store_name)
+       ORDER BY products DESC, store_name`,
       [userId],
     );
     const summary = summaryResult.rows[0] || { products: 0, followers: 0, scanned_at: null };

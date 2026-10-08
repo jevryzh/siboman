@@ -968,6 +968,15 @@ window.ProductListView = {
     const collectFollowData = async () => {
       follow.collecting = true;
       try {
+        // 先看有没有「在线且版本达标」的采集端，避免提交后任务没人领、用户以为又坏了
+        let capableOnline = null;
+        try {
+          const st = await axios.get('/api/worker/status');
+          capableOnline = (st.data?.workers || []).filter((w) => w.online && w.canClaimJobs).length;
+        } catch (_e) { /* 状态查不到就不拦，继续提交 */ }
+        if (capableOnline === 0) {
+          notify.warning('没检测到「在线且版本达标」的采集插件：请确认浏览器开着 ERP 页面、并在 chrome://extensions 把插件重新加载到最新版，再提交。');
+        }
         const res = await axios.post('/api/ozon/patrol/collect', {}, { timeout: 300000 });
         if (res.data?.existing) {
           notify.warning('已有跟卖采集任务在跑（' + (res.data.status || 'queued') + '），稍后点「刷新」即可');
@@ -1627,8 +1636,17 @@ window.ProductListView = {
           </div>
 
           <el-table :data="follow.items" v-loading="follow.loading" border size="small"
-            max-height="calc(100vh - 330px)"
-            empty-text="还没有跟卖数据（点右上「刷新跟卖数据」采集一次）">
+            max-height="calc(100vh - 330px)">
+            <template #empty>
+              <div style="padding:26px 12px; display:flex; flex-direction:column; align-items:center; gap:10px">
+                <div style="font-size:15px; font-weight:800; color:#64748b">还没有跟卖数据</div>
+                <div style="font-size:12px; color:#94a3b8; max-width:560px; line-height:1.8; text-align:center">
+                  跟卖数据要靠插件在浏览器里逐个抓 Ozon 商品卡片上的其他卖家（服务端抓不到）。<br />
+                  点下面按钮提交采集，插件会在后台跑（几千个商品约 25–35 分钟），跑完自动入库，再点「查询」即可。
+                </div>
+                <el-button type="primary" :loading="follow.collecting" @click="collectFollowData">刷新跟卖数据</el-button>
+              </div>
+            </template>
             <el-table-column label="图" width="70">
               <template #default="{ row }">
                 <el-image :src="row.image" style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; cursor:zoom-in" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []">
