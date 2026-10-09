@@ -170,6 +170,7 @@ const initApp = () => {
         if (path === '#/screen') return 'data-screen';
         if (path === '#/ranking') return 'market-discovery';
         if (path.includes('dashboard')) return 'dashboard';
+        if (path.includes('sales-funnel') || path.includes('funnel')) return 'sales-funnel';
         if (path.includes('single-sourcing-review')) return 'single-sourcing-review';
         if (path.includes('single-sourcing')) return 'single-sourcing';
         if (path.includes('sourcing')) return 'sourcing';
@@ -268,6 +269,9 @@ const initApp = () => {
             <el-menu-item index="#/image-set-console" @click="openImageSetConsole">
               <el-icon><PictureFilled /></el-icon><span>AI 套图控制台</span>
             </el-menu-item>
+            <el-menu-item index="#/sales-funnel" @click="goTo('#/sales-funnel')">
+              <el-icon><TrendCharts /></el-icon><span>销售漏斗</span>
+            </el-menu-item>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
             </el-menu-item>
@@ -321,6 +325,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'market-discovery'" class="erp-route-page"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
             <div v-else-if="routeName === 'ozon-patrol'" class="erp-route-page"><ozon-patrol-view /></div>
+            <div v-else-if="routeName === 'sales-funnel'" class="erp-route-page"><analytics-funnel-view /></div>
           </el-main>
         </el-container>
       </el-container>
@@ -361,6 +366,7 @@ const initApp = () => {
   register('market-discovery-view', window.MarketDiscoveryView);
   register('store-management-view', window.StoreManagementView);
   register('ozon-patrol-view', window.OzonPatrolView);
+  register('analytics-funnel-view', window.AnalyticsFunnelView);
 
   app.mount('#app');
   setupPluginWorkerKeepAlive();

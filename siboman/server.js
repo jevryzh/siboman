@@ -9645,6 +9645,162 @@ app.post("/api/seller/analytics/bestsellers", requireAuth, async (req, res, next
   } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+// ===== 销售漏斗分析 =====
+// 背景：Ozon 卖家后台的「销售漏斗」是 Premium 专属（点该标签页会弹
+// premium_lite_premium_analytics 订阅引导，列一直卡在加载骨架），
+// 但同样口径的数据可以通过 Seller API /v1/analytics/data 免费取到。
+// 这里把它接进 ERP，免得为了看漏斗去买 Premium。
+const ozonFunnelCache = new Map(); // key -> { at, data }
+const OZON_FUNNEL_TTL_MS = 10 * 60 * 1000;
+// 注意：API 不接受 position_search，搜索位次用 position_category
+const OZON_FUNNEL_METRICS = [
+  "hits_view_search",   // 在搜索结果和目录中的展示次数
+  "hits_view_pdp",      // 商品详情页浏览量
+  "hits_tocart_search", // 从搜索加入购物车
+  "hits_tocart_pdp",    // 从详情页加入购物车
+  "ordered_units",      // 下单件数
+  "revenue",            // 销售额（按销售价格）
+  "position_category",  // 类目中的平均位置
+];
+const r2 = (v) => Math.round(Number(v || 0) * 100) / 100;
+const pctOf = (a, b) => (Number(b) > 0 ? Math.round((Number(a) / Number(b)) * 10000) / 100 : 0);
+
+app.get("/api/ozon/analytics/funnel", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query?.store_id || "").trim();
+    if (!storeId) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const owned = await db.query(
+      "SELECT id, name FROM app_stores WHERE id=$1 AND user_id=$2 AND active=TRUE AND (platform IS NULL OR platform='ozon')",
+      [storeId, req.user.id],
+    );
+    if (!owned.rowCount) return res.status(404).json({ success: false, error: "店铺不存在、已停用或无权限" });
+    const fmtDate = (d) => d.toISOString().slice(0, 10);
+    const to = req.query?.date_to ? new Date(`${String(req.query.date_to)}T00:00:00Z`) : new Date();
+    const from = req.query?.date_from
+      ? new Date(`${String(req.query.date_from)}T00:00:00Z`)
+      : new Date(to.getTime() - 6 * 86400e3);
+    if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) {
+      return res.status(400).json({ success: false, error: "日期格式应为 YYYY-MM-DD" });
+    }
+    if (from > to) return res.status(400).json({ success: false, error: "开始日期不能晚于结束日期" });
+    const days = Math.min(365, Math.round((to - from) / 86400e3) + 1);
+    const withItems = String(req.query?.with_items ?? "1") !== "0";
+    const limit = Math.min(1000, Math.max(1, Number(req.query?.limit) || 100));
+
+    const cacheKey = `funnel:${req.user.id}:${storeId}:${fmtDate(from)}:${fmtDate(to)}:${withItems ? limit : 0}`;
+    const hit = ozonFunnelCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < OZON_FUNNEL_TTL_MS) {
+      return res.json({ ...hit.data, cached: true, ageSeconds: Math.round((Date.now() - hit.at) / 1000) });
+    }
+
+    // Ozon 该接口按秒限流（429），退避重试
+    let payload = null;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        payload = await callOzonSellerAPI("/v1/analytics/data", {
+          date_from: fmtDate(from),
+          date_to: fmtDate(to),
+          metrics: OZON_FUNNEL_METRICS,
+          dimension: ["sku"],
+          limit: withItems ? limit : 1,
+          offset: 0,
+        }, { storeId, userId: req.user.id });
+        break;
+      } catch (e) {
+        if (e?.statusCode === 429 && attempt < 3) {
+          await new Promise((r) => setTimeout(r, 1500 * attempt));
+          continue;
+        }
+        throw e;
+      }
+    }
+    const toObj = (arr) => {
+      const o = {};
+      OZON_FUNNEL_METRICS.forEach((m, i) => { o[m] = Number(arr?.[i] || 0); });
+      return o;
+    };
+    const shape = (v) => {
+      const tocart = v.hits_tocart_search + v.hits_tocart_pdp;
+      return {
+        impressions: v.hits_view_search,
+        pdp_views: v.hits_view_pdp,
+        tocart_search: v.hits_tocart_search,
+        tocart_pdp: v.hits_tocart_pdp,
+        tocart,
+        orders: v.ordered_units,
+        revenue: r2(v.revenue),
+        position_category: r2(v.position_category),
+      };
+    };
+    const totalsRaw = toObj(payload?.result?.totals);
+    const totals = shape(totalsRaw);
+    const conversion = {
+      view_rate: pctOf(totals.pdp_views, totals.impressions),   // 展示 → 详情
+      cart_rate: pctOf(totals.tocart, totals.pdp_views),       // 详情 → 加购
+      order_rate: pctOf(totals.orders, totals.tocart),         // 加购 → 下单
+      cr: pctOf(totals.orders, totals.impressions),            // 展示 → 下单（整体转化）
+    };
+
+    let items = [];
+    if (withItems) {
+      items = (payload?.result?.data || []).map((row) => {
+        const sku = String(row?.dimensions?.[0]?.id || "");
+        const v = toObj(row?.metrics);
+        const t = shape(v);
+        return {
+          sku,
+          name: String(row?.dimensions?.[0]?.name || ""),
+          ...t,
+          view_rate: pctOf(t.pdp_views, t.impressions),
+          cart_rate: pctOf(t.tocart, t.pdp_views),
+          order_rate: pctOf(t.orders, t.tocart),
+        };
+      }).sort((a, b) => b.impressions - a.impressions || b.revenue - a.revenue);
+      // 补本地商品的货号/主图，方便和其他页面对上
+      const skus = items.map((x) => x.sku).filter(Boolean);
+      if (skus.length) {
+        const local = await db.query(
+          `SELECT sku::text AS sku, offer_id, name, image, price, currency_code
+             FROM app_products WHERE user_id=$1 AND store_id=$2 AND sku::text = ANY($3::text[])`,
+          [req.user.id, storeId, skus],
+        );
+        const map = new Map(local.rows.map((x) => [String(x.sku), x]));
+        items = items.map((x) => {
+          const p = map.get(x.sku);
+          return p
+            ? { ...x, offer_id: p.offer_id, local_name: p.name, image: p.image, price: p.price === null ? null : Number(p.price), currency_code: p.currency_code }
+            : { ...x, offer_id: "", local_name: "", image: "", price: null, currency_code: "" };
+        });
+      }
+    }
+
+    const data = {
+      success: true,
+      store_id: storeId,
+      store_name: owned.rows[0].name,
+      date_from: fmtDate(from),
+      date_to: fmtDate(to),
+      days,
+      metrics_order: OZON_FUNNEL_METRICS,
+      totals,
+      conversion,
+      items,
+      item_count: items.length,
+      generated_at: new Date().toISOString(),
+    };
+    // 超限清理
+    if (ozonFunnelCache.size > 300) {
+      const oldest = [...ozonFunnelCache.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, 150).map(([k]) => k);
+      for (const k of oldest) ozonFunnelCache.delete(k);
+    }
+    ozonFunnelCache.set(cacheKey, { at: Date.now(), data });
+    res.json(data);
+  } catch (error) {
+    res.status(error.statusCode || 500).json({ success: false, error: error.message });
+  }
+});
+
 app.post("/api/sourcing/overview", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {
