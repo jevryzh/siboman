@@ -14,7 +14,7 @@
   if (window.__zhumengFunnelPanelInjected) return;
   window.__zhumengFunnelPanelInjected = true;
 
-  const VERSION = "2.2.9.125";
+  const VERSION = "2.2.9.126";
   const HOST_ID = "__zhumeng_funnel_host";
 
   const fmtInt = (v) => Number(v || 0).toLocaleString("zh-CN");
@@ -26,7 +26,20 @@
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   };
 
-  const state = { open: false, loading: false, days: 7, data: null, error: "" };
+  const state = { open: false, loading: false, days: 7, data: null, error: "", ozonClientId: "" };
+
+  // 读取「当前登录的 Ozon 账号」= company_id，也就是 ERP 里的店铺 Client-Id。
+  // 内容脚本跑在 isolated world，读不到页面的 window.__companyId，
+  // 但 localStorage 和 document.cookie 是跨 world 共享的，所以从这两处取。
+  function detectCompanyId() {
+    try {
+      const v = JSON.parse(localStorage.getItem("vuex") || "{}");
+      const id = v && v.user && v.user.contentId;
+      if (id) return String(id);
+    } catch (_e) { /* 忽略 */ }
+    const m = document.cookie.match(/(?:^|;\s*)sc_company_id=([^;]+)/);
+    return m ? decodeURIComponent(m[1]) : "";
+  }
 
   function send(action, payload) {
     return new Promise((resolve) => {
@@ -41,7 +54,13 @@
 
   async function load() {
     state.loading = true; state.error = ""; render();
-    const resp = await send("erpFunnel", { dateFrom: dayStr(state.days - 1), dateTo: dayStr(0), limit: 200 });
+    state.ozonClientId = detectCompanyId();
+    const resp = await send("erpFunnel", {
+      ozonClientId: state.ozonClientId,
+      dateFrom: dayStr(state.days - 1),
+      dateTo: dayStr(0),
+      limit: 200,
+    });
     state.loading = false;
     if (resp?.ok && resp.data?.success) { state.data = resp.data; state.error = ""; }
     else { state.data = null; state.error = resp?.error || resp?.data?.error || "取数失败"; }
@@ -73,7 +92,8 @@
     // 头部
     const head = el("div", "display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap");
     head.appendChild(el("div", "font-size:15px;font-weight:800;color:#0f172a", "📉 销售漏斗"));
-    if (d?.store_name) head.appendChild(el("span", "font-size:12px;color:#64748b;background:#f1f5f9;padding:2px 8px;border-radius:10px", d.store_name));
+    if (d?.store_name) head.appendChild(el("span", "font-size:12px;color:#0f766e;background:#ccfbf1;padding:2px 8px;border-radius:10px;font-weight:700", "本页账号 → " + d.store_name));
+    if (state.ozonClientId) head.appendChild(el("span", "font-size:11px;color:#94a3b8", "Client-Id " + state.ozonClientId));
     if (d) head.appendChild(el("span", "font-size:11px;color:#94a3b8", `${d.date_from} ~ ${d.date_to}`));
     head.appendChild(el("span", "flex:1"));
     const refresh = el("button", "background:#409eff;color:#fff;border:none;border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer", "刷新");
@@ -172,8 +192,8 @@
 
     panel.appendChild(el("div", "font-size:11px;color:#94a3b8;line-height:1.7;margin-top:2px",
       "数据来自 Ozon Seller API /v1/analytics/data（不依赖 Premium）。插件 " + VERSION + "。"));
-    panel.appendChild(el("div", "font-size:11px;color:#e6a23c;line-height:1.7;margin-top:4px",
-      "显示的是「ERP 顶栏选中的店铺」。若与左下角 Ozon 账号不一致，请到 ERP 顶栏切到对应店铺 —— 切完插件会自动带上新店铺。"));
+    panel.appendChild(el("div", "font-size:11px;color:#94a3b8;line-height:1.7;margin-top:4px",
+      "自动跟随本页登录的 Ozon 账号（按 Client-Id 匹配 ERP 店铺）；若提示「ERP 里没有对应店铺」，请先在「店铺管理」添加该账号。"));
   }
 
   function mount() {

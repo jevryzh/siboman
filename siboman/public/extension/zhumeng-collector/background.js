@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.125";
+const VERSION = "2.2.9.126";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5391,6 +5391,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const qs = new URLSearchParams();
         if (msg.dateFrom) qs.set("date_from", String(msg.dateFrom));
         if (msg.dateTo) qs.set("date_to", String(msg.dateTo));
+        // 面板带上「当前登录的 Ozon company_id」，让 ERP 反查对应店铺 —— 面板跟随当前登录账号
+        if (msg.ozonClientId) qs.set("ozon_client_id", String(msg.ozonClientId));
         qs.set("limit", String(Math.min(500, Math.max(1, Number(msg.limit) || 200))));
         const data = await erpApi(`/api/ozon/analytics/funnel?${qs.toString()}`);
         sendResponse({ ok: true, data });

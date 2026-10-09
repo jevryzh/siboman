@@ -44,8 +44,8 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.125";
-    const PLUGIN_ZIP_VERSION = "2.2.9.125";
+    const PLUGIN_MANIFEST_VERSION = "2.2.9.126";
+    const PLUGIN_ZIP_VERSION = "2.2.9.126";
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -442,6 +442,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>✅ v2.2.9.126 销售漏斗面板改为「跟随当前登录的 Ozon 账号」：从页面 localStorage.vuex / cookie sc_company_id 读出 company_id（= 店铺 Client-Id）带给 ERP，反查对应店铺。以前面板固定在 ERP 顶栏选中的店铺，会出现「页面登录 Three Latte、面板却显示 Yulanfang」的错位。</li>
             <li>✅ v2.2.9.125 新增「销售漏斗」面板：在 seller.ozon.ru 后台分析页右下角注入浮层，直接显示 展示 → 详情浏览 → 加购 → 下单 漏斗、转化率、销售额与按 SKU 明细。Ozon 后台的销售漏斗是 Premium 专属（会弹订阅引导、列卡在加载骨架），这里走 Seller API /v1/analytics/data 免订阅取数；插件 token 只能读自己店铺。同时 ERP 侧新增独立页面「销售漏斗」。</li>
             <li>✅ v2.2.9.124 修复巡查跟卖「采不到数据」：请求改成在 www.ozon.ru 页面上下文里发（复用同一个 ozon.ru 标签，不再每个商品开新标签）。此前直接在 service worker 里 fetch，被 Ozon 反爬稳定挡成 HTTP 403，3000+ 个商品全失败、跟卖数恒为 0；现在带对 Origin/Referer/cookie，可正常返回，并加了轻微限速降风控。同时上线「商品管理 → 被跟卖商品」入口。</li>
             <li>✅ v2.2.9.123 新增巡查跟卖采集：插件可领取 kind=ozon-patrol 任务，直接用 Ozon 公开接口抓每个商品的跟卖卖家（SKU/名称/价格）回传 ERP，配合「巡查跟卖」页一键刷新跟卖数据；批量上架/找货流程未调整。</li>
