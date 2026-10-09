@@ -19,7 +19,7 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.1.0";
+  const VERSION = "1.1.1";
   const HOST_ID = "__ozon_funnel_host";
 
   // snake_case 指标名 → 接口返回的 camelCase 字段名
@@ -237,9 +237,13 @@
     const panel = host.shadowRoot.getElementById("of-panel");
     if (!panel) return;
     panel.innerHTML = "";
-    panel.setAttribute("style", state.maximized
+    // 注意：setAttribute("style") 会整体覆盖内联样式，所以 display 必须一起写进来。
+    //   之前把 display 只在按钮回调里设，随后 render() 一覆盖就被冲掉 →
+    //   「收起」点了没反应、面板关不上。
+    const pos = state.maximized
       ? "position:fixed;left:0;top:0;width:100vw;height:100vh;max-width:100vw;max-height:100vh;overflow:auto;background:#f0f2f5;padding:14px 18px;border-radius:0;box-shadow:none;z-index:1"
-      : "position:fixed;right:18px;bottom:62px;z-index:1;width:780px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)");
+      : "position:fixed;right:18px;bottom:62px;z-index:1;width:780px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)";
+    panel.setAttribute("style", `display:${state.open ? "block" : "none"};` + pos);
 
     // 头部
     const head = el("div", "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px");
@@ -250,7 +254,10 @@
     head.appendChild(btn("刷新", false, load));
     head.appendChild(btn(state.maximized ? "🗗 还原" : "⛶ 最大化", false, () => { state.maximized = !state.maximized; render(); }, "横向铺满整个屏幕"));
     head.appendChild(btn("导出 CSV", false, exportCsv));
-    head.appendChild(btn("收起", false, () => { state.open = false; render(); }));
+    head.appendChild(btn("收起", false, () => {
+      if (window.__ozonFunnelToggle__) window.__ozonFunnelToggle__(false);
+      else { state.open = false; render(); }
+    }, "收起面板（快捷键 Esc）"));
     panel.appendChild(head);
 
     // 日期
@@ -357,13 +364,22 @@
       <div id="of-panel" style="display:none"></div>
     `;
     document.documentElement.appendChild(host);
-    const b = root.getElementById("of-btn");
-    b.addEventListener("click", () => {
-      state.open = !state.open;
-      root.getElementById("of-panel").style.display = state.open ? "block" : "none";
-      b.textContent = state.open ? "📊 收起数据面板" : "📊 Ozon 我的商品销售";
+
+    // 折叠/展开统一走这里：改 state 后交给 render() 写 display，避免两处样式打架
+    const toggle = (next) => {
+      state.open = next === undefined ? !state.open : Boolean(next);
+      const b = root.getElementById("of-btn");
+      if (b) b.textContent = state.open ? "📊 收起数据面板" : "📊 Ozon 我的商品销售";
       if (state.open && !state.data) load(); else render();
-    });
+    };
+    window.__ozonFunnelToggle__ = toggle;
+
+    root.getElementById("of-btn").addEventListener("click", () => toggle());
+
+    // 最大化铺满时不好找按钮，支持 Esc 收起
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && state.open) toggle(false);
+    }, true);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount, { once: true });
