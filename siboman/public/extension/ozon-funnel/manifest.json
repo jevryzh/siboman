@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Ozon 销售漏斗",
+  "version": "1.0.0",
+  "description": "在 Ozon 卖家后台直接查看「我的商品销售 → 销售漏斗」那几列（搜索位次 / 展示次数 / 商品卡片访问量 / 加购转化率 / 已订购），不依赖 Premium，独立使用、无需配置密钥。",
+  "host_permissions": [
+    "https://seller.ozon.ru/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://seller.ozon.ru/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

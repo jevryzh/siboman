@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.126";
+const VERSION = "2.2.9.127";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5382,26 +5382,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // v2.2.9.125: seller.ozon.ru 后台注入的「销售漏斗」面板取数。
-  //   面板脚本发消息到这里，由 SW 带着 worker token 调 ERP（SW 的 fetch 不受页面 CORS 限制）。
-  //   ERP 侧只放行 GET /api/ozon/analytics/funnel，且 store_id 强制用 token 里的店铺作用域。
-  if (msg.action === "erpFunnel") {
-    (async () => {
-      try {
-        const qs = new URLSearchParams();
-        if (msg.dateFrom) qs.set("date_from", String(msg.dateFrom));
-        if (msg.dateTo) qs.set("date_to", String(msg.dateTo));
-        // 面板带上「当前登录的 Ozon company_id」，让 ERP 反查对应店铺 —— 面板跟随当前登录账号
-        if (msg.ozonClientId) qs.set("ozon_client_id", String(msg.ozonClientId));
-        qs.set("limit", String(Math.min(500, Math.max(1, Number(msg.limit) || 200))));
-        const data = await erpApi(`/api/ozon/analytics/funnel?${qs.toString()}`);
-        sendResponse({ ok: true, data });
-      } catch (e) {
-        sendResponse({ ok: false, error: (e && e.message) || String(e), version: VERSION });
-      }
-    })();
-    return true;
-  }
+  // v2.2.9.127: 原「销售漏斗面板」已按用户要求拆成独立插件（public/extension/ozon-funnel），
+  //   它直接用页面会话调 Ozon 自己的接口，不再经过本插件 / ERP。这里对应处理器一并移除。
 
   if (msg.action === "collectSkus") {
     const skus = msg.skus || [];
