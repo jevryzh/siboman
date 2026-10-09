@@ -56,6 +56,9 @@ POST /api/site/seller-analytics/charts/v3/table/by_sku   按 SKU 明细
 页面右下角出现 **「📊 Ozon 我的商品销售」** 按钮，点开即可：
 
 - 日期：今天 / 昨天 / 近 7 / 14 / 28 / 30 天
+  - **口径与 Ozon 后台一致**：「近 N 天」= 截止**昨天**的 N 个完整天，**不含今天**（今天数据不完整）。
+    实测 Three Latte 在 2026-10-09：后台 7 天 = 10-02~10-08 → 14 单；含今天会变成 15 单。
+    要看今天的数据，点「今天」。
 - **指标组切换**：数据概览(9) / 销售漏斗(12) / 全部指标(18)
 - 总计卡：当前组前 6 个指标的区间总计
 - 明细表：商品主图 + 商品名 + **货号 / SKU**，逐列列出指标；顶部有「总计和平均值」冻结行，**点表头可排序**
@@ -80,6 +83,9 @@ POST /api/site/seller-analytics/charts/v3/table/by_sku   按 SKU 明细
 **拿不到的**（接口直接 400，属真·会员专属）：`price_index`、`drr`、`days_in_promo`、`last_stock`、`stockout_days`、`reviews_count`、`rating`、`recommended_supply`、`returns`、`cancellations` 等。
 
 ## 已知坑（改代码时注意）
+
+**日期区间千万别用 `today-(N-1) ~ today`**：Ozon 的「7 天」是 `today-N ~ today-1`（不含今天），
+含了今天数字就比后台大（实测多出今天的 3 单，14 → 15）。
 
 请求头 `x-o3-language` 只接受 `zh-Hans` / `ru` / `en`。传 `zh-CN` 这类后端不认的值时，接口照样返回 200，
 但 `productInfo` 里的 `name` / `article` / `image` 会**全部变成空字符串** —— 表格看起来就是「商品那列什么都没有」。

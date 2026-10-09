@@ -19,7 +19,7 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.1.1";
+  const VERSION = "1.1.2";
   const HOST_ID = "__ozon_funnel_host";
 
   // snake_case 指标名 → 接口返回的 camelCase 字段名
@@ -56,9 +56,12 @@
     },
     funnel: {
       label: "销售漏斗",
+      // 列顺序对齐 Ozon 后台「销售漏斗」标签页：
+      //   位置 → 展示次数 → 商品卡片访问量 → 卡片加购转化率 → 搜索加购转化率
+      //   → 转化 → 总访问/加购 → 已订购件数 → 已订购金额(销售价) → 已订购金额(最低价)
       metrics: ["search_position", "search_views", "pdp_views", "conv_pdp_views_to_cart", "hits_pdp_to_cart",
         "conv_search_views_to_cart", "hits_search_to_cart", "total_views", "conv_total_views_to_cart",
-        "total_hits_to_cart", "ordered_units", "revenue"],
+        "total_hits_to_cart", "ordered_units", "revenue", "sold_revenue"],
     },
     all: { label: "全部指标", metrics: Object.keys(METRIC_DEFS) },
   };
@@ -90,11 +93,17 @@
     return m ? decodeURIComponent(m[1]) : "";
   }
 
+  // 区间口径必须和 Ozon 后台一致：后台的「7 天 / 28 天」是「截止到昨天」的 N 个完整天，
+  //   **不含今天**（今天数据不完整）。实测 Three Latte 在 2026-10-09：
+  //     后台 7 天 = 10-02~10-08 → revenue 7354 / soldRevenue 7242 / orderedUnits 14
+  //     含今天的 10-03~10-09 → revenue 7751 / soldRevenue 7673 / orderedUnits 15（多了今天的 3 单）
+  //   之前用 today-(N-1) ~ today，所以数字总比后台大。
   function periodRange() {
-    const to = new Date();
-    if (state.days === "today") return { from: to, to };
-    if (state.days === "yesterday") { const y = shiftDate(to, -1); return { from: y, to: y }; }
-    return { from: shiftDate(to, -(Number(state.days) - 1)), to };
+    const today = new Date();
+    if (state.days === "today") return { from: today, to: today };
+    const yesterday = shiftDate(today, -1);
+    if (state.days === "yesterday") return { from: yesterday, to: yesterday };
+    return { from: shiftDate(today, -Number(state.days)), to: yesterday };
   }
 
   async function callApi(path, body) {
@@ -299,7 +308,8 @@
     const ms = currentMetrics();
     const rows = sortedItems();
     const wrap = el("div", `max-height:${state.maximized ? "calc(100vh - 300px)" : "52vh"};overflow:auto;font-size:12px`);
-    const gridCols = "minmax(240px,1.6fr) " + ms.map(() => "104px").join(" ");
+    // 列宽收窄到 88px：销售漏斗组有 13 列，最大化时刚好能整屏放下不用横向滚
+    const gridCols = "minmax(184px,1.5fr) " + ms.map(() => "86px").join(" ");
     const th = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:6px 4px;border-bottom:1px solid #eef2f7;position:sticky;top:0;background:#fff;z-index:2`);
     th.appendChild(el("span", "color:#94a3b8;font-weight:700", "商品"));
     ms.forEach((m) => {
@@ -343,9 +353,16 @@
       wrap.appendChild(tr);
     });
     panel.appendChild(wrap);
+    // 列多到放不下时给个显式提示，免得以为「列少了」
+    requestAnimationFrame(() => {
+      if (wrap.scrollWidth > wrap.clientWidth + 4) {
+        panel.appendChild(el("div", "font-size:11px;color:#e6a23c;margin-top:6px",
+          `← 表格可左右滚动，共 ${ms.length} 列 →`));
+      }
+    });
 
     panel.appendChild(el("div", "font-size:11px;color:#c0c4cc;margin-top:8px;line-height:1.6",
-      `数据取自 Ozon 后台同款接口（页面会话），未伪造任何会员状态。price_index / drr / 评分 / 评价数 / 退货 等接口会拒绝，属真·会员专属。v${VERSION}`));
+      `区间口径与 Ozon 后台一致：N 天 = 截止昨天的 N 个完整天（不含今天），要看今天请点「今天」。数据取自 Ozon 后台同款接口（页面会话），未伪造任何会员状态。v${VERSION}`));
   }
 
   function mount() {
