@@ -22,7 +22,7 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.2.0";
+  const VERSION = "1.3.1";
   const HOST_ID = "__ozon_funnel_host";
 
   const PAGE_SIZE = 50;      // 接口 limit 上限 50
@@ -123,9 +123,9 @@
   }
 
   // 区间口径必须和 Ozon 后台一致：后台的「7 天 / 28 天」是「截止到昨天」的 N 个完整天，
-  //   **不含今天**（今天数据不完整）。实测 Three Latte 在 2026-10-09：
-  //     后台 7 天 = 10-02~10-08 → revenue 7354 / soldRevenue 7242 / orderedUnits 14
-  //     含今天的 10-03~10-09 → 7751 / 7673 / 15（多了今天的 3 单）
+  //   **不含今天**（今天数据不完整）。实测（2026-10-09）：
+  //     后台 7 天 = 10-02~10-08 → 14 单；含今天的 10-03~10-09 → 15 单（多算今天的）
+  
   function periodRange() {
     const today = new Date();
     if (state.days === "today") return { from: today, to: today };
@@ -144,7 +144,7 @@
         "x-o3-company-id": state.ozonClientId,
         "x-o3-app-name": "seller-ui",
         // 只能是 zh-Hans / ru / en：传 zh-CN 后端不认，productInfo 的
-        // name / article / image 会全部返回空字符串（踩过）
+        // name / article / image 会全部返回空字符串（血泪教训，别改）
         "x-o3-language": "zh-Hans",
         "x-o3-page-type": "analytics_graph",
       },
@@ -334,6 +334,39 @@
     return b;
   }
 
+  // ===== 商品图 hover 放大 =====
+  // 商品缩略图 hover 自动放大（产品需求：所有列表页都要有）
+  let zoomEl = null;
+  const ZOOM_SIZE = 260;
+
+  function showZoom(src, name, evt) {
+    if (!zoomEl || !src) return;
+    const im = zoomEl.querySelector("img");
+    if (im.getAttribute("src") !== src) im.setAttribute("src", src);
+    zoomEl.querySelector(".ofz-cap").textContent = name || "";
+    zoomEl.style.display = "block";
+    moveZoom(evt);
+  }
+
+  function moveZoom(evt) {
+    if (!zoomEl || zoomEl.style.display === "none" || !evt) return;
+    const pad = 14;
+    const w = ZOOM_SIZE;
+    const h = zoomEl.offsetHeight || ZOOM_SIZE + 30;
+    // 默认放光标左边（别挡住鼠标），左边放不下就换右边；再统一收进视口
+    let x = evt.clientX - w - pad;
+    if (x < pad) x = evt.clientX + pad;
+    if (x + w > window.innerWidth - pad) x = Math.max(pad, window.innerWidth - w - pad);
+    let y = evt.clientY - h / 2;
+    y = Math.max(pad, Math.min(y, window.innerHeight - h - pad));
+    zoomEl.style.left = `${Math.round(x)}px`;
+    zoomEl.style.top = `${Math.round(y)}px`;
+  }
+
+  function hideZoom() {
+    if (zoomEl) zoomEl.style.display = "none";
+  }
+
   let statusNode = null;
   function updateStatus() {
     if (!statusNode || !state.data) return;
@@ -351,6 +384,7 @@
     if (!panel) return;
     panel.innerHTML = "";
     statusNode = null;
+    hideZoom();
     // setAttribute("style") 会整体覆盖内联样式，display 必须一起写，否则「收起」会被冲掉
     const pos = state.maximized
       ? "position:fixed;left:0;top:0;width:100vw;height:100vh;max-width:100vw;max-height:100vh;overflow:auto;background:#f0f2f5;padding:14px 18px;border-radius:0;box-shadow:none;z-index:1"
@@ -494,9 +528,15 @@
       const tr = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:5px 4px;border-bottom:1px solid #f8fafc;align-items:center`);
       const cell = el("div", "display:flex;gap:8px;align-items:center;min-width:0");
       const img = document.createElement("img");
-      img.setAttribute("style", "width:34px;height:34px;border-radius:5px;object-fit:cover;flex-shrink:0;background:#e2e8f0;border:1px solid #eef2f7");
+      img.setAttribute("style", "width:34px;height:34px;border-radius:5px;object-fit:cover;flex-shrink:0;background:#e2e8f0;border:1px solid #eef2f7;cursor:zoom-in");
       if (r.image) { img.src = r.image; img.loading = "lazy"; }
       img.title = r.name || r.sku;
+      // 鼠标悬停自动放大
+      if (r.image) {
+        img.addEventListener("mouseenter", (e) => showZoom(r.image, r.name || r.sku, e));
+        img.addEventListener("mousemove", moveZoom);
+        img.addEventListener("mouseleave", hideZoom);
+      }
       cell.appendChild(img);
       const txt = el("div", "min-width:0;line-height:1.35");
       txt.appendChild(el("div", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#0f172a;font-weight:700", r.name || r.sku));
@@ -542,15 +582,21 @@
         #of-btn{position:fixed;right:18px;bottom:18px;z-index:2;background:linear-gradient(135deg,#0ea5e9,#0369a1);color:#fff;border:none;border-radius:20px;padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 12px rgba(3,105,161,.4)}
         #of-panel{position:fixed;right:18px;bottom:62px;z-index:1;width:800px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)}
         #of-panel,#of-panel *{box-sizing:border-box}
+        #of-zoom{position:fixed;left:0;top:0;z-index:9;display:none;pointer-events:none;background:#fff;border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;box-shadow:0 14px 44px rgba(15,23,42,.3)}
+        #of-zoom img{display:block;width:260px;height:260px;object-fit:contain;background:#f8fafc}
+        #of-zoom .ofz-cap{font-size:11px;color:#334155;padding:6px 9px;line-height:1.45;max-width:260px;border-top:1px solid #eef2f7}
       </style>
       <button id="of-btn">📊 Ozon 我的商品销售</button>
       <div id="of-panel" style="display:none"></div>
+      <div id="of-zoom"><img alt=""><div class="ofz-cap"></div></div>
     `;
     document.documentElement.appendChild(host);
+    zoomEl = root.getElementById("of-zoom");
 
     // 折叠/展开统一走这里：改 state 后交给 render() 写 display，避免两处样式打架
     const toggle = (next) => {
       state.open = next === undefined ? !state.open : Boolean(next);
+      if (!state.open) hideZoom();
       const b = root.getElementById("of-btn");
       if (b) b.textContent = state.open ? "📊 收起数据面板" : "📊 Ozon 我的商品销售";
       if (state.open && !state.data) load(); else render();
