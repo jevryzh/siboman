@@ -23,7 +23,7 @@ POST {origin}/api/site/seller-analytics/charts/v3/table/by_sku   按 SKU 明细
 2. cookie `sc_company_id`
 3. 页面主世界的 `window.__companyId`（内容脚本读不到，isolated world）
 
-## 免费可用的 18 个指标
+## 免费可用的 20 个指标
 
 探测方式：对每个候选名词单独发一次 `by_sku`，看返回 200 还是 400。
 
@@ -33,7 +33,12 @@ discount_share_of_median_price
 conv_views_to_order  total_views  total_hits_to_cart  conv_total_views_to_cart
 pdp_views  hits_pdp_to_cart  conv_pdp_views_to_cart
 search_position  search_views  hits_search_to_cart  conv_search_views_to_cart
+cancelled_units  returned_units          # ← 后补的：取消数量 / 退货数量
 ```
+
+⚠️ 全是**件级**（units）。订单级（posting）的取消数这个接口**没有**：
+`cancelled_orders` / `cancellations` / `cancel_orders` / `orders_cancelled` / `cancel_count` 等
+候选名要么 400，要么 200 但返回空对象 `{}`（等于没这个字段）。
 
 注意：Ozon 后台内部接口用的是**短名**，和公开 Seller API（`/v1/analytics/data`）完全不同。
 公开 API 的 `hits_view_search` / `position_category` / `conv_tocart_pdp` 在这边一律 400。
@@ -42,6 +47,31 @@ search_position  search_views  hits_search_to_cart  conv_search_views_to_cart
 **真·会员专属（400，拿不到）**：`price_index`、`drr`、`days_in_promo`、`days_in_trafarets`、
 `last_stock`、`stockout_days`、`reviews_count`、`rating`、`recommended_supply`、`returns`、
 `cancellations`、`gmv`、`profit`、`commission`、`ctr`、`favorites` 等 44 个。
+
+## 订单级数量（取消订单 / 已送达订单）
+
+分析接口只有件级，订单级要单独问卖家后台的 posting-service（**同样只需页面会话，不需要 Api-Key**）：
+
+```
+POST {origin}/api/posting-service/v2/fbs/posting/count/by-status-alias
+body: {
+  company_id: "<company_id>",          // ⚠️ 必须放 body，只放 header 会 403 Failed to get body company ID
+  processed_at_from: "2026-10-02T00:00:00+08:00",
+  processed_at_to:   "2026-10-08T23:59:59+08:00",
+  status_alias: ["cancelled", "delivered", ...]
+}
+→ {"result":[{"status_alias":"cancelled","count":0}, ...]}
+```
+
+合法状态别名（接口把允许值直接列在 400 报错里）：
+`awaiting_packaging` `awaiting_deliver` `arbitration` `delivering` `delivered` `cancelled`
+`driver_pickup` `not_accepted` `client_arbitration` `acceptance_in_progress`
+`awaiting_registration` `sent_by_seller`
+
+时间用**浏览器本地时区**：Ozon 用 cookie `x-o3-timezone` 跟随本地（实测 `-480` = UTC+8），
+所以 `localTzSuffix()` 拼的是 `+08:00`。
+
+订单页路径是 `/app/postings/fbs`（`/app/orders` 是 404）。
 
 ## 接口硬限制
 

@@ -22,7 +22,7 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.3.1";
+  const VERSION = "1.4.0";
   const HOST_ID = "__ozon_funnel_host";
 
   const PAGE_SIZE = 50;      // 接口 limit 上限 50
@@ -41,6 +41,8 @@
     sold_revenue: { label: "已订购金额(最低价)", fmt: "money" },
     ordered_units: { label: "已订购件数", fmt: "int" },
     delivered_units: { label: "已送达件数", fmt: "int" },
+    cancelled_units: { label: "取消数量", fmt: "int" },
+    returned_units: { label: "退货数量", fmt: "int" },
     avg_price: { label: "平均价格", fmt: "money" },
     avg_sold_price: { label: "平均实付价", fmt: "money" },
     discount_share_of_median_price: { label: "相对中位价折扣", fmt: "pct" },
@@ -61,8 +63,8 @@
   const GROUPS = {
     overview: {
       label: "数据概览",
-      metrics: ["revenue", "sold_revenue", "ordered_units", "delivered_units", "avg_price", "avg_sold_price",
-        "total_views", "conv_views_to_order", "discount_share_of_median_price"],
+      metrics: ["revenue", "sold_revenue", "ordered_units", "delivered_units", "cancelled_units", "returned_units",
+        "avg_price", "avg_sold_price", "total_views", "conv_views_to_order", "discount_share_of_median_price"],
     },
     funnel: {
       label: "销售漏斗",
@@ -75,11 +77,17 @@
   };
   const ALL_METRICS = Object.keys(METRIC_DEFS);
 
+  // 订单（posting）状态别名 —— 接口把合法值直接列在 400 报错里拿到的
+  const ORDER_STATUS_ALIASES = ["awaiting_packaging", "awaiting_deliver", "arbitration", "delivering",
+    "delivered", "cancelled", "driver_pickup", "not_accepted", "client_arbitration",
+    "acceptance_in_progress", "awaiting_registration", "sent_by_seller"];
+
   const state = {
     open: false, loading: false, loadingMore: false, exhausted: false,
     data: null, totals: null, error: "", ozonClientId: "",
     sortKey: "revenue", sortDir: "desc", maximized: false,
     group: "funnel", days: 7, search: "", showCols: false,
+    orderStats: null,  // 订单级汇总（取消订单数 / 总订单数）
     colOrder: {},      // { groupKey: [metric,...] } 用户自定义列序
     status: "",
   };
@@ -171,6 +179,49 @@
     return row;
   };
 
+  // 浏览器时区（Ozon 用 cookie x-o3-timezone 跟随本地时区，实测 -480 = UTC+8）
+  function localTzSuffix() {
+    const off = -new Date().getTimezoneOffset();      // 分钟，东为正
+    const sign = off >= 0 ? "+" : "-";
+    const a = Math.abs(off);
+    return `${sign}${String(Math.floor(a / 60)).padStart(2, "0")}:${String(a % 60).padStart(2, "0")}`;
+  }
+
+  // 订单级汇总：分析接口只有「件」级取消，订单级要单独问 posting-service。
+  //   body 里必须带 company_id（只给请求头会 403 Failed to get body company ID）
+  async function loadOrderStats(dateFrom, dateTo) {
+    const tz = localTzSuffix();
+    const r = await fetch(`${location.origin}/api/posting-service/v2/fbs/posting/count/by-status-alias`, {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "x-o3-company-id": state.ozonClientId,
+        "x-o3-app-name": "seller-ui",
+        "x-o3-language": "zh-Hans",
+        "x-o3-page-type": "analytics_graph",
+      },
+      body: JSON.stringify({
+        company_id: state.ozonClientId,
+        processed_at_from: `${dateFrom}T00:00:00${tz}`,
+        processed_at_to: `${dateTo}T23:59:59${tz}`,
+        status_alias: ORDER_STATUS_ALIASES,
+      }),
+    });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const rows = j?.result || [];
+    const map = Object.fromEntries(rows.map((x) => [x.status_alias, Number(x.count || 0)]));
+    return {
+      cancelled: map.cancelled || 0,
+      delivered: map.delivered || 0,
+      notAccepted: map.not_accepted || 0,
+      total: rows.reduce((a, x) => a + Number(x.count || 0), 0),
+      byStatus: map,
+    };
+  }
+
   let loadGen = 0;
 
   async function load() {
@@ -211,9 +262,13 @@
       return out;
     };
     try {
-      const totals = await callApi("/api/site/seller-analytics/charts/v3/table/totals", { ...base, metrics: ALL_METRICS });
+      const [totals, orderStats] = await Promise.all([
+        callApi("/api/site/seller-analytics/charts/v3/table/totals", { ...base, metrics: ALL_METRICS }),
+        loadOrderStats(fmtDate(from), fmtDate(to)).catch(() => null),
+      ]);
       if (gen !== loadGen) return;
       state.totals = totals?.metrics || null;
+      state.orderStats = orderStats;
 
       const first = await fetchPages(0, INITIAL_PAGES);
       if (gen !== loadGen) return;
@@ -334,6 +389,39 @@
     return b;
   }
 
+  // ===== 复制到剪贴板 =====
+  function copyText(text, btnEl) {
+    const done = () => {
+      if (!btnEl) return;
+      const old = btnEl.textContent;
+      btnEl.textContent = "✓";
+      btnEl.style.color = "#16a34a";
+      setTimeout(() => { btnEl.textContent = old; btnEl.style.color = ""; }, 1200);
+    };
+    const fallback = () => {
+      try {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        ta.setAttribute("style", "position:fixed;left:-9999px;top:0");
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        done();
+      } catch (_e) { /* 复制不了就算了 */ }
+    };
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(fallback);
+        return;
+      }
+    } catch (_e) { /* 走 fallback */ }
+    fallback();
+  }
+
+  // 拖拽排序时正在拖的指标（dragover 期间不重渲染，落位在 drop 里做）
+  let dragMetric = null;
+
   // ===== 商品图 hover 放大 =====
   // 商品缩略图 hover 自动放大（产品需求：所有列表页都要有）
   let zoomEl = null;
@@ -394,6 +482,7 @@
     // ── 头部 ──
     const head = el("div", "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px");
     head.appendChild(el("span", "font-size:15px;font-weight:800;color:#0f172a", "📊 Ozon 我的商品销售"));
+    head.appendChild(el("span", "font-size:10px;color:#0369a1;background:#e0f2fe;border:1px solid #bae6fd;padding:1px 6px;border-radius:8px;font-weight:700", "v" + VERSION));
     if (state.ozonClientId) head.appendChild(el("span", "font-size:11px;color:#0f766e;background:#ccfbf1;padding:2px 7px;border-radius:10px;font-weight:700", "账号 " + state.ozonClientId));
     head.appendChild(el("span", "flex:1"));
     head.appendChild(btn("刷新", false, load));
@@ -430,21 +519,68 @@
       "自定义列的先后顺序（会自动记住）"));
     panel.appendChild(groups);
 
-    // ── 列设置面板 ──
+    // ── 列设置面板（支持拖拽排序，◀ ▶ 作为备用）──
     if (state.showCols) {
       const box = el("div", "background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px;margin-bottom:8px");
-      box.appendChild(el("div", "font-size:11px;color:#94a3b8;margin-bottom:6px", "用 ◀ ▶ 调整列的位置（按当前指标组记忆，会持久保存）"));
+      box.appendChild(el("div", "font-size:11px;color:#94a3b8;margin-bottom:6px", "🖱 直接拖动标签调整列的位置（也可以用 ◀ ▶）；按当前指标组记忆，会持久保存"));
       const listBox = el("div", "display:flex;flex-wrap:wrap;gap:6px");
-      currentMetrics().forEach((m, i, arr) => {
-        const chip = el("span", "display:inline-flex;align-items:center;gap:3px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:2px 6px;font-size:12px;color:#334155");
+      const metrics = currentMetrics();
+      metrics.forEach((m, i) => {
+        const chip = el("span", "display:inline-flex;align-items:center;gap:3px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:2px 6px;font-size:12px;color:#334155;user-select:none");
+        chip.draggable = true;
+        chip.style.cursor = "grab";
+        chip.title = "按住拖动可调整顺序";
+        const grip = el("span", "color:#cbd5e1;font-size:11px;cursor:grab", "⠿");
+        chip.appendChild(grip);
         chip.appendChild(el("span", "color:#94a3b8;font-size:10px;min-width:14px", String(i + 1)));
         chip.appendChild(el("span", "", METRIC_DEFS[m].label));
         const left = btn("◀", false, () => moveCol(m, -1), "左移");
         const right = btn("▶", false, () => moveCol(m, 1), "右移");
         left.style.padding = right.style.padding = "0 5px";
         if (i === 0) left.disabled = true;
-        if (i === arr.length - 1) right.disabled = true;
+        if (i === metrics.length - 1) right.disabled = true;
         chip.appendChild(left); chip.appendChild(right);
+
+        // ── 拖拽排序 ──
+        // 注意：dragover 里绝对不能再 render()，否则被拖的元素被销毁，拖拽会中断。
+        //   所以拖拽过程中只做高亮，真正落位在 drop 里。
+        chip.addEventListener("dragstart", (e) => {
+          dragMetric = m;
+          chip.style.opacity = "0.35";
+          try { e.dataTransfer.setData("text/plain", m); e.dataTransfer.effectAllowed = "move"; } catch (_e) { /* 忽略 */ }
+        });
+        chip.addEventListener("dragend", () => {
+          dragMetric = null;
+          chip.style.opacity = "";
+          chip.style.boxShadow = "";
+        });
+        chip.addEventListener("dragover", (e) => {
+          if (!dragMetric || dragMetric === m) return;
+          e.preventDefault();
+          try { e.dataTransfer.dropEffect = "move"; } catch (_e) { /* 忽略 */ }
+          const r = chip.getBoundingClientRect();
+          const after = e.clientX > r.left + r.width / 2;
+          chip.style.boxShadow = after ? "inset -3px 0 0 #0ea5e9" : "inset 3px 0 0 #0ea5e9";
+        });
+        chip.addEventListener("dragleave", () => { chip.style.boxShadow = ""; });
+        chip.addEventListener("drop", (e) => {
+          e.preventDefault();
+          chip.style.boxShadow = "";
+          if (!dragMetric || dragMetric === m) return;
+          const list = [...currentMetrics()];
+          const from = list.indexOf(dragMetric);
+          if (from < 0) return;
+          list.splice(from, 1);
+          let to = list.indexOf(m);
+          const r = chip.getBoundingClientRect();
+          if (e.clientX > r.left + r.width / 2) to += 1;   // 落在右半边 → 插到它后面
+          list.splice(to, 0, dragMetric);
+          state.colOrder = { ...state.colOrder, [state.group]: list };
+          savePrefs();
+          dragMetric = null;
+          render();
+        });
+
         listBox.appendChild(chip);
       });
       box.appendChild(listBox);
@@ -489,6 +625,19 @@
       grid.appendChild(c);
     });
     panel.appendChild(grid);
+
+    // 订单级汇总：分析接口只有「件」级取消，订单级来自 posting-service
+    if (state.orderStats) {
+      const o = state.orderStats;
+      const line = el("div", "display:flex;flex-wrap:wrap;gap:14px;align-items:center;background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:7px 11px;margin-bottom:10px;font-size:12px");
+      line.appendChild(el("span", "color:#94a3b8", "订单汇总（按下单时间）："));
+      line.appendChild(el("span", "color:#dc2626;font-weight:800", `取消订单 ${o.cancelled} 单`));
+      line.appendChild(el("span", "color:#16a34a", `已送达 ${o.delivered} 单`));
+      if (o.notAccepted) line.appendChild(el("span", "color:#e6a23c", `未受理 ${o.notAccepted} 单`));
+      line.appendChild(el("span", "color:#475569;font-weight:700", `总订单 ${o.total} 单`));
+      line.appendChild(el("span", "color:#c0c4cc;font-size:11px", "订单数按单据计，与上面的件数不是一回事"));
+      panel.appendChild(line);
+    }
 
     // ── 明细表 ──
     const ms = currentMetrics();
@@ -538,9 +687,25 @@
         img.addEventListener("mouseleave", hideZoom);
       }
       cell.appendChild(img);
-      const txt = el("div", "min-width:0;line-height:1.35");
+      const txt = el("div", "min-width:0;line-height:1.35;flex:1");
       txt.appendChild(el("div", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#0f172a;font-weight:700", r.name || r.sku));
-      txt.appendChild(el("div", "font-size:10px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", `货号 ${r.article || "—"} · SKU ${r.sku}`));
+      // 货号 + 一键复制（没有货号就复制 SKU）
+      const meta = el("div", "display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b;min-width:0");
+      const copyVal = r.article || r.sku || "";
+      const art = el("span", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap", `货号 ${r.article || "—"}`);
+      art.title = copyVal;
+      meta.appendChild(art);
+      const cp = el("button",
+        "flex-shrink:0;border:1px solid #e2e8f0;background:#fff;color:#64748b;border-radius:4px;padding:0 4px;font-size:10px;line-height:14px;cursor:pointer",
+        "⧉");
+      cp.title = copyVal ? `复制货号：${copyVal}` : "没有货号";
+      cp.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        if (copyVal) copyText(copyVal, cp);
+      });
+      meta.appendChild(cp);
+      meta.appendChild(el("span", "color:#94a3b8;flex-shrink:0", `· ${r.sku}`));
+      txt.appendChild(meta);
       cell.appendChild(txt);
       tr.appendChild(cell);
       ms.forEach((m) => {
