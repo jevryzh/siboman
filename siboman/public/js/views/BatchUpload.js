@@ -71,7 +71,7 @@ window.BatchUploadView = {
     const PROTO_VAL = "zhumeng-v1";
     // v2.2.9.124: 与服务端 MIN_SINGLE_SOURCING_PLUGIN_VERSION 对齐（统一 2.2.9.123），
     //   否则前端显示「插件已连接」而服务端拒绝派任务，提示会自相矛盾。
-    const REQUIRED_BACKGROUND_VERSION = "2.2.9.124";
+    const REQUIRED_BACKGROUND_VERSION = "2.2.9.125";
     const extensionConnected = Vue.ref(false);
     const sellerTabReady = Vue.ref(false);
     const installedBackgroundVersion = Vue.ref('');

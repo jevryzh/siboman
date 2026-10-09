@@ -96,11 +96,11 @@ const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS
 //   Chrome 不会自动更新已解压扩展，旧副本会静默用老逻辑干活（表现时好时坏）。
 //   服务端在这里做唯一闸门：低于该版本的采集端只能心跳、不能领取任何任务，
 //   并在 ERP 插件状态里显示「版本过低」，倒逼所有副本更新到同一版。
-const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.124";
+const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.125";
 // 全店精核价最低插件版本（统一到同一版，旧副本不再领取精核价任务）
-const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.124";
+const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.125";
 // Yandex 自动上架采集（kind=yandex-collect）最低插件版本（统一到同一版）
-const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.124";
+const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.125";
 // 采集类任务只在 1688 侧完成（开页面读标题/图/SKU/重量），不使用任何店铺凭据，
 // 所以不受插件 token 里的「店铺作用域」限制。否则：插件 token 的店铺来自浏览器当时的店铺选择，
 // 用户一旦在店铺切换器里切过店铺（或在别的店铺页面点过授权），已经排队的任务会永远领不到、
@@ -1534,6 +1534,23 @@ function enforceScopedWorkerAccess(req, res) {
     pathName === "/api/worker/jobs/next" ||
     /^\/api\/worker\/jobs\/[^/]+\/(?:progress|complete)$/.test(pathName);
   if (workerPathAllowed && hasScopedWorkerScope(req.user, "worker:poll")) return true;
+
+  // 插件在 seller.ozon.ru 后台注入的「销售漏斗」面板：允许读漏斗数据。
+  //   只放行 GET /api/ozon/analytics/funnel，并把 store_id 强制替换成 token 里的店铺作用域，
+  //   避免插件 token 越权读取其他店铺的分析数据。
+  if (method === "GET" && pathName === "/api/ozon/analytics/funnel" && hasScopedWorkerScope(req.user, "worker:poll")) {
+    if (!tokenStoreId) {
+      res.status(403).json({ success: false, code: "TOKEN_STORE_REQUIRED", error: "插件 token 缺少店铺作用域。" });
+      return false;
+    }
+    const wantedStoreId = String(req.query?.store_id || "").split(",")[0].trim();
+    if (wantedStoreId && wantedStoreId !== tokenStoreId) {
+      res.status(403).json({ success: false, code: "STORE_SCOPE_DENIED", error: "插件 token 无权访问该店铺。" });
+      return false;
+    }
+    req.query.store_id = tokenStoreId;
+    return true;
+  }
 
   res.status(403).json({
     success: false,

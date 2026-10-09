@@ -416,7 +416,14 @@ function setupPluginWorkerKeepAlive() {
   });
   const refresh = async () => {
     try {
-      const resp = await fetch("/api/worker/plugin-token", { credentials: "include", headers: { Accept: "application/json" } });
+      // v2.2.9.125: 带上当前店铺 —— worker token 里的店铺作用域决定插件能读哪家店的数据
+      //   （seller.ozon.ru 后台注入的「销售漏斗」面板走这个 token 取数，只放行该店）。
+      //   不传 store_id 的话 token 没有店铺作用域，面板会报「插件 token 缺少店铺作用域」。
+      const sid = localStorage.getItem("currentStoreId") || "";
+      const url = sid
+        ? `/api/worker/plugin-token?store_id=${encodeURIComponent(sid)}`
+        : "/api/worker/plugin-token";
+      const resp = await fetch(url, { credentials: "include", headers: { Accept: "application/json" } });
       if (!resp.ok) return null;
       const data = await resp.json();
       if (!data?.token) return null;
@@ -428,6 +435,8 @@ function setupPluginWorkerKeepAlive() {
     window.__zhumeng_keepalive_started__ = true;
     setTimeout(refresh, 1200);
     setInterval(refresh, 8 * 60 * 1000);
+    // 切店铺后立刻用新店铺重新签发 token，避免插件还拿着旧店铺的作用域
+    window.addEventListener("shop-changed", () => { setTimeout(refresh, 300); });
   }
   window.__zhumengRefreshWorkerAuth__ = refresh;   // 页面可按需立即续期（如刚提交采集任务）
 }
