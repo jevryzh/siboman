@@ -2,6 +2,8 @@
 
 在 Ozon 卖家后台直接查看「我的分析 → 我的商品销售」的数据，**不需要 Premium**，独立安装使用，不需要配置任何密钥、不需要服务端。
 
+**支持域名**：`seller.ozon.ru` / `seller.ozonru.cn`（Ozon Seller 中国）/ `seller.ozon.kz`。接口一律用 `location.origin` 拼，换域名不用改代码。
+
 支持 **18 个免费可用指标**，按 Ozon 自己的分组切换：**数据概览(9) / 销售漏斗(12) / 全部指标(18)**。
 
 ## 为什么需要它
@@ -64,7 +66,10 @@ POST /api/site/seller-analytics/charts/v3/table/by_sku   按 SKU 明细
 - 明细表：商品主图 + 商品名 + **货号 / SKU**，逐列列出指标；顶部有「总计和平均值」冻结行，**点表头可排序**
 - **⛶ 最大化**：横向铺满整屏（长表格用），再点「🗗 还原」回到右下角浮层
 - **收起**：点面板右上角「收起」、或再点右下角悬浮按钮、或按 **Esc**，三种方式都能折叠
-- 「导出 CSV」：导出**当前指标组**的全部列，带 BOM，Excel 直接打开
+- **🔍 搜索框**：按**货号 / SKU / 商品名**即时过滤（部分匹配），清空即恢复
+- **⚙ 调整列序**：用 ◀ ▶ 调整每列的先后位置，按指标组分别记忆并持久保存；可「恢复默认列序」
+- 「导出 CSV」：导出**当前筛选结果 × 当前指标组**的全部列，带 BOM，Excel 直接打开
+- 列序 / 指标组 / 天数会自动记住（存在 `chrome.storage.local`）
 
 ## 免费可用的 18 个指标
 
@@ -81,6 +86,14 @@ POST /api/site/seller-analytics/charts/v3/table/by_sku   按 SKU 明细
 | `hits_search_to_cart` / `conv_search_views_to_cart` | 搜索加购次数 / 搜索→加购转化率 |
 
 **拿不到的**（接口直接 400，属真·会员专属）：`price_index`、`drr`、`days_in_promo`、`last_stock`、`stockout_days`、`reviews_count`、`rating`、`recommended_supply`、`returns`、`cancellations` 等。
+
+## 已知限制
+
+- 这张表**最多 1000 行**：接口硬限制 `offset must be < 1000`，超了直接 HTTP 400。
+  面板会显示「已加载 1000 条（接口上限 1000 行）」。搜索和导出都作用于已加载的全部 1000 行。
+- 表格 DOM 只渲染前 400 行（再多会卡），但**搜索和导出用全量**，面板里会写明。
+- 接口不支持按货号/SKU 服务端过滤（`query`/`search`/`sku`/`article` 各种参数都试过，返回不变），
+  所以搜索是在本地对已加载行做的。
 
 ## 已知坑（改代码时注意）
 

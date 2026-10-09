@@ -1,14 +1,17 @@
 /**
  * Ozon 我的商品销售 / 销售漏斗（独立插件）
  *
+ * 支持域名：seller.ozon.ru / seller.ozonru.cn / seller.ozon.kz
+ *   —— 接口一律用 location.origin 拼，所以换域名不用改代码。
+ *
  * 背景：「我的分析 → 我的商品销售」里不少列被前端标成 Premium 专属，
  *      免费号点「销售漏斗」标签只会弹订阅引导，列停在加载骨架。
  *      但这些列的数据其实由 Ozon 自己的接口提供，免费号直接就能拿到。
  *
  * 本插件不做任何"伪造会员状态"的事（那类做法违反 ToS、会被风控盯上，
  * 而且正是它把你页面弹回销售漏斗的）。它只用当前登录会话读 Ozon 自己返回的真实数据：
- *   POST /api/site/seller-analytics/charts/v3/table/totals   → 总计与平均值
- *   POST /api/site/seller-analytics/charts/v3/table/by_sku   → 按 SKU 明细
+ *   POST {origin}/api/site/seller-analytics/charts/v3/table/totals   → 总计与平均值
+ *   POST {origin}/api/site/seller-analytics/charts/v3/table/by_sku   → 按 SKU 明细
  * 关键请求头 x-o3-company-id = 当前登录账号的 company_id（= 店铺 Client-Id）。
  *
  * METRIC_DEFS 里的 18 个指标是逐个探测出来的可用集合；其余（price_index / drr /
@@ -19,8 +22,15 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.1.2";
+  const VERSION = "1.2.0";
   const HOST_ID = "__ozon_funnel_host";
+
+  const PAGE_SIZE = 50;      // 接口 limit 上限 50
+  const INITIAL_PAGES = 8;   // 先快速拉 400 条渲染，剩下的后台补
+  const BATCH_PAGES = 12;    // 后台每批 600 条
+  // 接口硬限制 offset 必须 < 1000（实测超了直接 HTTP 400），所以这张表最多 1000 行
+  const MAX_PAGES = 20;      // 20 × 50 = offset 0..950
+  const RENDER_MAX = 400;    // 表格最多渲染这么多行（搜索/导出仍用全量）
 
   // snake_case 指标名 → 接口返回的 camelCase 字段名
   const respKey = (m) => m.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
@@ -56,9 +66,7 @@
     },
     funnel: {
       label: "销售漏斗",
-      // 列顺序对齐 Ozon 后台「销售漏斗」标签页：
-      //   位置 → 展示次数 → 商品卡片访问量 → 卡片加购转化率 → 搜索加购转化率
-      //   → 转化 → 总访问/加购 → 已订购件数 → 已订购金额(销售价) → 已订购金额(最低价)
+      // 列顺序对齐 Ozon 后台「销售漏斗」标签页
       metrics: ["search_position", "search_views", "pdp_views", "conv_pdp_views_to_cart", "hits_pdp_to_cart",
         "conv_search_views_to_cart", "hits_search_to_cart", "total_views", "conv_total_views_to_cart",
         "total_hits_to_cart", "ordered_units", "revenue", "sold_revenue"],
@@ -68,9 +76,30 @@
   const ALL_METRICS = Object.keys(METRIC_DEFS);
 
   const state = {
-    open: false, loading: false, days: 7, data: null, totals: null, error: "",
-    ozonClientId: "", sortKey: "revenue", sortDir: "desc", maximized: false, group: "funnel",
+    open: false, loading: false, loadingMore: false, exhausted: false,
+    data: null, totals: null, error: "", ozonClientId: "",
+    sortKey: "revenue", sortDir: "desc", maximized: false,
+    group: "funnel", days: 7, search: "", showCols: false,
+    colOrder: {},      // { groupKey: [metric,...] } 用户自定义列序
+    status: "",
   };
+
+  // ===== 偏好持久化（列序 / 分组 / 天数）=====
+  function loadPrefs() {
+    try {
+      chrome.storage.local.get(["ozfPrefs"], (r) => {
+        const p = r && r.ozfPrefs;
+        if (!p) return;
+        if (p.colOrder && typeof p.colOrder === "object") state.colOrder = p.colOrder;
+        if (p.group && GROUPS[p.group]) state.group = p.group;
+        if (p.days !== undefined) state.days = p.days;
+        render();
+      });
+    } catch (_e) { /* 无 storage 权限时静默 */ }
+  }
+  function savePrefs() {
+    try { chrome.storage.local.set({ ozfPrefs: { colOrder: state.colOrder, group: state.group, days: state.days } }); } catch (_e) { /* 忽略 */ }
+  }
 
   // ===== 工具 =====
   const pad = (n) => String(n).padStart(2, "0");
@@ -96,8 +125,7 @@
   // 区间口径必须和 Ozon 后台一致：后台的「7 天 / 28 天」是「截止到昨天」的 N 个完整天，
   //   **不含今天**（今天数据不完整）。实测 Three Latte 在 2026-10-09：
   //     后台 7 天 = 10-02~10-08 → revenue 7354 / soldRevenue 7242 / orderedUnits 14
-  //     含今天的 10-03~10-09 → revenue 7751 / soldRevenue 7673 / orderedUnits 15（多了今天的 3 单）
-  //   之前用 today-(N-1) ~ today，所以数字总比后台大。
+  //     含今天的 10-03~10-09 → 7751 / 7673 / 15（多了今天的 3 单）
   function periodRange() {
     const today = new Date();
     if (state.days === "today") return { from: today, to: today };
@@ -107,7 +135,7 @@
   }
 
   async function callApi(path, body) {
-    const resp = await fetch(`https://seller.ozon.ru${path}`, {
+    const resp = await fetch(`${location.origin}${path}`, {
       method: "POST",
       credentials: "include",
       headers: {
@@ -132,14 +160,28 @@
     return data || {};
   }
 
+  const mapRow = (it) => {
+    const row = {
+      sku: String(it?.productInfo?.sku || ""),
+      name: it?.productInfo?.name || "",
+      article: it?.productInfo?.article || "",
+      image: it?.productInfo?.image || "",
+    };
+    for (const m of ALL_METRICS) row[respKey(m)] = it?.metrics?.[respKey(m)];
+    return row;
+  };
+
+  let loadGen = 0;
+
   async function load() {
     state.ozonClientId = detectCompanyId();
-    state.loading = true;
-    state.error = "";
+    const gen = ++loadGen;                       // 让上一次没跑完的加载自动作废
+    state.loading = true; state.error = ""; state.data = null; state.totals = null;
+    state.loadingMore = false; state.exhausted = false;
     render();
     if (!state.ozonClientId) {
       state.loading = false;
-      state.error = "读不到当前登录的 Ozon 账号（company_id）。请确认已登录 seller.ozon.ru 后刷新页面。";
+      state.error = "读不到当前登录的 Ozon 账号（company_id）。请确认已登录卖家后台后刷新页面。";
       render();
       return;
     }
@@ -150,53 +192,105 @@
       current_period: { date_from: fmtDate(from), date_to: fmtDate(to) },
       filters: { desc_type_ids: [], category_3_ids: [], category_2_ids: [] },
     };
-    const PAGE_SIZE = 50;   // 接口 limit 上限 50
-    const PAGE_MAX = 8;
+    const bySkuBody = (offset) => ({
+      ...base,
+      previous_period: { date_from: fmtDate(prevFrom), date_to: fmtDate(prevTo) },
+      limit: String(PAGE_SIZE),
+      offset: String(offset),
+      metrics: ALL_METRICS,
+      sort: { key: "revenue_sort", order: "desc" },
+    });
+    const fetchPages = async (startPage, pageCount) => {
+      const out = [];
+      for (let i = 0; i < pageCount; i += 1) {
+        const r = await callApi("/api/site/seller-analytics/charts/v3/table/by_sku", bySkuBody((startPage + i) * PAGE_SIZE));
+        const items = r?.items || [];
+        out.push(...items);
+        if (items.length < PAGE_SIZE) { state.exhausted = true; break; }
+      }
+      return out;
+    };
     try {
       const totals = await callApi("/api/site/seller-analytics/charts/v3/table/totals", { ...base, metrics: ALL_METRICS });
-      const raw = [];
-      for (let page = 0; page < PAGE_MAX; page += 1) {
-        const r = await callApi("/api/site/seller-analytics/charts/v3/table/by_sku", {
-          ...base,
-          previous_period: { date_from: fmtDate(prevFrom), date_to: fmtDate(prevTo) },
-          limit: String(PAGE_SIZE),
-          offset: String(page * PAGE_SIZE),
-          metrics: ALL_METRICS,
-          sort: { key: "revenue_sort", order: "desc" },
-        });
-        const items = r?.items || [];
-        raw.push(...items);
-        if (items.length < PAGE_SIZE) break;
-      }
+      if (gen !== loadGen) return;
       state.totals = totals?.metrics || null;
-      state.data = {
-        date_from: fmtDate(from),
-        date_to: fmtDate(to),
-        items: raw.map((it) => {
-          const row = {
-            sku: String(it?.productInfo?.sku || ""),
-            name: it?.productInfo?.name || "",
-            article: it?.productInfo?.article || "",
-            image: it?.productInfo?.image || "",
-          };
-          for (const m of ALL_METRICS) row[respKey(m)] = it?.metrics?.[respKey(m)];
-          return row;
-        }),
-      };
-    } catch (e) {
-      state.error = e?.message || String(e);
-      state.data = null;
-      state.totals = null;
-    } finally {
+
+      const first = await fetchPages(0, INITIAL_PAGES);
+      if (gen !== loadGen) return;
+      state.data = { date_from: fmtDate(from), date_to: fmtDate(to), items: first.map(mapRow) };
       state.loading = false;
+      state.loadingMore = !state.exhausted;
+      render();
+
+      // 后台把剩下的补齐，搜索/导出就能覆盖全店，而不是只有头 400 条。
+      // 这一步失败绝不能影响已经加载好的数据（之前没 try 住，offset 过界时
+      // 抛 400 直接把整份数据清空了）。
+      let page = INITIAL_PAGES;
+      while (!state.exhausted && page < MAX_PAGES) {
+        let more;
+        try {
+          more = await fetchPages(page, BATCH_PAGES);
+        } catch (_e) {
+          state.status = "backend-failed";
+          break;
+        }
+        if (gen !== loadGen) return;
+        if (!more.length) break;
+        state.data.items.push(...more.map(mapRow));
+        page += BATCH_PAGES;
+        updateStatus();
+      }
+      state.loadingMore = false;
+      updateStatus();
+    } catch (e) {
+      if (gen !== loadGen) return;
+      state.error = e?.message || String(e);
+      state.data = null; state.totals = null; state.loading = false; state.loadingMore = false;
       render();
     }
   }
 
-  function currentMetrics() { return GROUPS[state.group]?.metrics || ALL_METRICS; }
+  // ===== 当前列 =====
+  function currentMetrics() {
+    const def = GROUPS[state.group]?.metrics || ALL_METRICS;
+    const custom = state.colOrder?.[state.group];
+    if (!Array.isArray(custom) || !custom.length) return def;
+    // 自定义里可能少了新增指标，末尾补齐；已不存在的过滤掉
+    const kept = custom.filter((m) => def.includes(m));
+    const missing = def.filter((m) => !kept.includes(m));
+    return [...kept, ...missing];
+  }
 
-  function sortedItems() {
-    const list = [...(state.data?.items || [])];
+  function moveCol(metric, dir) {
+    const list = [...currentMetrics()];
+    const i = list.indexOf(metric);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    state.colOrder = { ...state.colOrder, [state.group]: list };
+    savePrefs();
+    render();
+  }
+  function resetCols() {
+    const next = { ...state.colOrder };
+    delete next[state.group];
+    state.colOrder = next;
+    savePrefs();
+    render();
+  }
+
+  // ===== 搜索 + 排序 =====
+  function filteredRows() {
+    const q = state.search.trim().toLowerCase();
+    let list = state.data?.items || [];
+    if (q) {
+      list = list.filter((r) =>
+        String(r.article || "").toLowerCase().includes(q)
+        || String(r.sku || "").toLowerCase().includes(q)
+        || String(r.name || "").toLowerCase().includes(q));
+    } else {
+      list = [...list];
+    }
     const k = state.sortKey;
     const dir = state.sortDir === "asc" ? 1 : -1;
     list.sort((a, b) => (n0(a[k]) - n0(b[k])) * dir || n0(b.revenue) - n0(a.revenue));
@@ -204,7 +298,7 @@
   }
 
   function exportCsv() {
-    const rows = sortedItems();
+    const rows = filteredRows();
     if (!rows.length) return;
     const ms = currentMetrics();
     const head = ["Ozon SKU", "货号", "商品名", ...ms.map((m) => METRIC_DEFS[m].label)];
@@ -218,7 +312,7 @@
     const csv = "\ufeff" + [head, ...body].map((x) => x.join(",")).join("\n");
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
-    a.download = `Ozon_${GROUPS[state.group].label}_${state.data.date_from}_${state.data.date_to}.csv`;
+    a.download = `Ozon_${GROUPS[state.group].label}_${state.data.date_from}_${state.data.date_to}${state.search ? "_筛选" : ""}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
   }
@@ -240,50 +334,108 @@
     return b;
   }
 
+  let statusNode = null;
+  function updateStatus() {
+    if (!statusNode || !state.data) return;
+    const n = state.data.items.length;
+    if (state.loadingMore) { statusNode.textContent = `已加载 ${n} 条，后台补齐中…`; return; }
+    if (state.exhausted) { statusNode.textContent = `已加载全部 ${n} 条`; return; }
+    // 没加载完又停了 —— 接口 offset 上限 1000，这张表最多 1000 行
+    statusNode.textContent = `已加载 ${n} 条（接口上限 1000 行）`;
+  }
+
   function render() {
     const host = document.getElementById(HOST_ID);
     if (!host) return;
     const panel = host.shadowRoot.getElementById("of-panel");
     if (!panel) return;
     panel.innerHTML = "";
-    // 注意：setAttribute("style") 会整体覆盖内联样式，所以 display 必须一起写进来。
-    //   之前把 display 只在按钮回调里设，随后 render() 一覆盖就被冲掉 →
-    //   「收起」点了没反应、面板关不上。
+    statusNode = null;
+    // setAttribute("style") 会整体覆盖内联样式，display 必须一起写，否则「收起」会被冲掉
     const pos = state.maximized
       ? "position:fixed;left:0;top:0;width:100vw;height:100vh;max-width:100vw;max-height:100vh;overflow:auto;background:#f0f2f5;padding:14px 18px;border-radius:0;box-shadow:none;z-index:1"
-      : "position:fixed;right:18px;bottom:62px;z-index:1;width:780px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)";
+      : "position:fixed;right:18px;bottom:62px;z-index:1;width:800px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)";
     panel.setAttribute("style", `display:${state.open ? "block" : "none"};` + pos);
 
-    // 头部
+    // ── 头部 ──
     const head = el("div", "display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px");
     head.appendChild(el("span", "font-size:15px;font-weight:800;color:#0f172a", "📊 Ozon 我的商品销售"));
     if (state.ozonClientId) head.appendChild(el("span", "font-size:11px;color:#0f766e;background:#ccfbf1;padding:2px 7px;border-radius:10px;font-weight:700", "账号 " + state.ozonClientId));
-    if (state.data) head.appendChild(el("span", "font-size:11px;color:#94a3b8", `${state.data.date_from} ~ ${state.data.date_to} · ${state.data.items.length} 个 SKU`));
     head.appendChild(el("span", "flex:1"));
     head.appendChild(btn("刷新", false, load));
     head.appendChild(btn(state.maximized ? "🗗 还原" : "⛶ 最大化", false, () => { state.maximized = !state.maximized; render(); }, "横向铺满整个屏幕"));
-    head.appendChild(btn("导出 CSV", false, exportCsv));
+    head.appendChild(btn("导出 CSV", false, exportCsv, "导出当前筛选结果"));
     head.appendChild(btn("收起", false, () => {
       if (window.__ozonFunnelToggle__) window.__ozonFunnelToggle__(false);
       else { state.open = false; render(); }
     }, "收起面板（快捷键 Esc）"));
     panel.appendChild(head);
 
-    // 日期
+    // ── 日期 ──
     const bar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px");
     [["today", "今天"], ["yesterday", "昨天"], [7, "近7天"], [14, "近14天"], [28, "近28天"], [30, "近30天"]].forEach(([v, label]) => {
-      bar.appendChild(btn(label, state.days === v, () => { state.days = v; load(); }));
+      bar.appendChild(btn(label, state.days === v, () => { state.days = v; savePrefs(); load(); }));
     });
+    if (state.data) {
+      bar.appendChild(el("span", "font-size:11px;color:#94a3b8", `${state.data.date_from} ~ ${state.data.date_to}`));
+      statusNode = el("span", "font-size:11px;color:#0ea5e9", "");
+      bar.appendChild(statusNode);
+      updateStatus();
+    }
     panel.appendChild(bar);
 
-    // 指标分组
-    const groups = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px");
+    // ── 指标分组 + 列设置 ──
+    const groups = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px");
     groups.appendChild(el("span", "font-size:11px;color:#94a3b8", "指标组："));
     for (const [key, g] of Object.entries(GROUPS)) {
-      groups.appendChild(btn(`${g.label}(${g.metrics.length})`, state.group === key, () => { state.group = key; render(); }));
+      groups.appendChild(btn(`${g.label}(${g.metrics.length})`, state.group === key, () => {
+        state.group = key; state.showCols = false; savePrefs(); render();
+      }));
     }
-    groups.appendChild(el("span", "font-size:11px;color:#c0c4cc", `· 免费可用共 ${ALL_METRICS.length} 个指标`));
+    groups.appendChild(btn(state.showCols ? "▴ 收起列设置" : "⚙ 调整列序", state.showCols, () => { state.showCols = !state.showCols; render(); },
+      "自定义列的先后顺序（会自动记住）"));
     panel.appendChild(groups);
+
+    // ── 列设置面板 ──
+    if (state.showCols) {
+      const box = el("div", "background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:8px 10px;margin-bottom:8px");
+      box.appendChild(el("div", "font-size:11px;color:#94a3b8;margin-bottom:6px", "用 ◀ ▶ 调整列的位置（按当前指标组记忆，会持久保存）"));
+      const listBox = el("div", "display:flex;flex-wrap:wrap;gap:6px");
+      currentMetrics().forEach((m, i, arr) => {
+        const chip = el("span", "display:inline-flex;align-items:center;gap:3px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:6px;padding:2px 6px;font-size:12px;color:#334155");
+        chip.appendChild(el("span", "color:#94a3b8;font-size:10px;min-width:14px", String(i + 1)));
+        chip.appendChild(el("span", "", METRIC_DEFS[m].label));
+        const left = btn("◀", false, () => moveCol(m, -1), "左移");
+        const right = btn("▶", false, () => moveCol(m, 1), "右移");
+        left.style.padding = right.style.padding = "0 5px";
+        if (i === 0) left.disabled = true;
+        if (i === arr.length - 1) right.disabled = true;
+        chip.appendChild(left); chip.appendChild(right);
+        listBox.appendChild(chip);
+      });
+      box.appendChild(listBox);
+      const acts = el("div", "margin-top:8px");
+      acts.appendChild(btn("恢复默认列序", false, resetCols));
+      box.appendChild(acts);
+      panel.appendChild(box);
+    }
+
+    // ── 搜索框 ──
+    const searchBar = el("div", "display:flex;gap:6px;align-items:center;margin-bottom:10px");
+    const input = document.createElement("input");
+    input.type = "search";
+    input.placeholder = "🔍 搜货号 / SKU / 商品名（支持部分匹配）";
+    input.value = state.search;
+    input.setAttribute("style", "flex:1;border:1px solid #dbeafe;border-radius:6px;padding:5px 9px;font-size:12px;outline:none;background:#fff;color:#0f172a");
+    let timer = null;
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => { state.search = input.value; render(); }, 220);
+    });
+    input.addEventListener("keydown", (e) => { if (e.key === "Escape") { input.value = ""; state.search = ""; render(); } });
+    searchBar.appendChild(input);
+    if (state.search) searchBar.appendChild(btn("清空", false, () => { state.search = ""; render(); }));
+    panel.appendChild(searchBar);
 
     if (state.loading) { panel.appendChild(el("div", "padding:30px;text-align:center;color:#94a3b8;font-size:13px", "加载中…")); return; }
     if (state.error) {
@@ -292,7 +444,7 @@
     }
     if (!state.data) return;
 
-    // 总计卡：取当前分组前 6 个指标
+    // ── 总计卡 ──
     const t = state.totals || {};
     const grid = el("div", "display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px");
     currentMetrics().slice(0, 6).forEach((m) => {
@@ -304,14 +456,15 @@
     });
     panel.appendChild(grid);
 
-    // 明细表
+    // ── 明细表 ──
     const ms = currentMetrics();
-    const rows = sortedItems();
-    const wrap = el("div", `max-height:${state.maximized ? "calc(100vh - 300px)" : "52vh"};overflow:auto;font-size:12px`);
-    // 列宽收窄到 88px：销售漏斗组有 13 列，最大化时刚好能整屏放下不用横向滚
+    const rows = filteredRows();
+    const shown = rows.slice(0, RENDER_MAX);
+    const wrap = el("div", `max-height:${state.maximized ? "calc(100vh - 330px)" : "50vh"};overflow:auto;font-size:12px`);
+    // 列宽 86px：销售漏斗组 13 列在最大化时刚好整屏放下不横向滚
     const gridCols = "minmax(184px,1.5fr) " + ms.map(() => "86px").join(" ");
     const th = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:6px 4px;border-bottom:1px solid #eef2f7;position:sticky;top:0;background:#fff;z-index:2`);
-    th.appendChild(el("span", "color:#94a3b8;font-weight:700", "商品"));
+    th.appendChild(el("span", "color:#94a3b8;font-weight:700", state.search ? `商品（匹配 ${rows.length}）` : `商品（${state.data.items.length}）`));
     ms.forEach((m) => {
       const key = respKey(m);
       const active = state.sortKey === key;
@@ -331,8 +484,13 @@
     ms.forEach((m) => totalRow.appendChild(el("span", "text-align:right;color:#0f172a", fmtBy(METRIC_DEFS[m].fmt, t[respKey(m)]))));
     wrap.appendChild(totalRow);
 
-    if (!rows.length) wrap.appendChild(el("div", "padding:16px;text-align:center;color:#c0c4cc", "所选区间没有数据"));
-    rows.forEach((r) => {
+    if (!shown.length) {
+      wrap.appendChild(el("div", "padding:16px;text-align:center;color:#c0c4cc",
+        state.search
+          ? `没找到匹配「${state.search}」的商品` + (state.loadingMore ? "（数据还在加载，稍等一下）" : "")
+          : "所选区间没有数据"));
+    }
+    shown.forEach((r) => {
       const tr = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:5px 4px;border-bottom:1px solid #f8fafc;align-items:center`);
       const cell = el("div", "display:flex;gap:8px;align-items:center;min-width:0");
       const img = document.createElement("img");
@@ -353,16 +511,24 @@
       wrap.appendChild(tr);
     });
     panel.appendChild(wrap);
-    // 列多到放不下时给个显式提示，免得以为「列少了」
+    if (rows.length > shown.length) {
+      panel.appendChild(el("div", "font-size:11px;color:#e6a23c;margin-top:6px", `表格只渲染前 ${RENDER_MAX} 行（共 ${rows.length} 行）；搜索和「导出 CSV」用的是全部数据。`));
+    }
     requestAnimationFrame(() => {
       if (wrap.scrollWidth > wrap.clientWidth + 4) {
-        panel.appendChild(el("div", "font-size:11px;color:#e6a23c;margin-top:6px",
-          `← 表格可左右滚动，共 ${ms.length} 列 →`));
+        panel.appendChild(el("div", "font-size:11px;color:#e6a23c;margin-top:6px", `← 表格可左右滚动，共 ${ms.length} 列 →`));
       }
     });
 
     panel.appendChild(el("div", "font-size:11px;color:#c0c4cc;margin-top:8px;line-height:1.6",
-      `区间口径与 Ozon 后台一致：N 天 = 截止昨天的 N 个完整天（不含今天），要看今天请点「今天」。数据取自 Ozon 后台同款接口（页面会话），未伪造任何会员状态。v${VERSION}`));
+      `区间口径与 Ozon 后台一致：N 天 = 截止昨天的 N 个完整天（不含今天）。列序/分组/天数会自动记住。数据取自 Ozon 同款接口（页面会话），未伪造任何会员状态。v${VERSION}`));
+  }
+
+  // ===== 挂载 =====
+  function looksLikeConsole() {
+    const p = location.pathname || "";
+    if (p.startsWith("/app") || p.startsWith("/seller")) return true;
+    return Boolean(detectCompanyId());   // 中国站的营销落地页没有 vuex/cookie，就不注入
   }
 
   function mount() {
@@ -374,7 +540,7 @@
     root.innerHTML = `
       <style>
         #of-btn{position:fixed;right:18px;bottom:18px;z-index:2;background:linear-gradient(135deg,#0ea5e9,#0369a1);color:#fff;border:none;border-radius:20px;padding:8px 14px;font-size:13px;font-weight:700;cursor:pointer;box-shadow:0 4px 12px rgba(3,105,161,.4)}
-        #of-panel{position:fixed;right:18px;bottom:62px;z-index:1;width:780px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)}
+        #of-panel{position:fixed;right:18px;bottom:62px;z-index:1;width:800px;max-width:94vw;max-height:82vh;overflow:auto;background:#f0f2f5;border-radius:12px;padding:12px;box-shadow:0 10px 40px rgba(0,0,0,.22)}
         #of-panel,#of-panel *{box-sizing:border-box}
       </style>
       <button id="of-btn">📊 Ozon 我的商品销售</button>
@@ -390,15 +556,22 @@
       if (state.open && !state.data) load(); else render();
     };
     window.__ozonFunnelToggle__ = toggle;
-
     root.getElementById("of-btn").addEventListener("click", () => toggle());
-
-    // 最大化铺满时不好找按钮，支持 Esc 收起
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && state.open) toggle(false);
+      if (e.key === "Escape" && state.open && !state.search) toggle(false);
     }, true);
+
+    loadPrefs();
   }
 
-  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", mount, { once: true });
-  else mount();
+  // 营销落地页不注入；控制台可能晚一点才写好 vuex，所以重试几次
+  let tries = 0;
+  const tryMount = () => {
+    if (document.getElementById(HOST_ID)) return;
+    if (looksLikeConsole()) { mount(); return; }
+    tries += 1;
+    if (tries <= 10) setTimeout(tryMount, 1500);
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", tryMount, { once: true });
+  else tryMount();
 })();
