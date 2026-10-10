@@ -121,9 +121,49 @@ body: {
 
 ## 打包
 
+### 开发版（自己维护/内部测试用，代码可读）
+
 ```bash
 cd siboman/public/extension/ozon-funnel
 zip -qr ../ozon-funnel.zip manifest.json content.js README.md   # 显式列出，别用 .
 ```
 
 **别用 `zip -r ../ozon-funnel.zip .`** —— 会把本文件也打进去。
+
+### 混淆发布版（对外分发用）
+
+```bash
+npm run build:ext:release
+# 等价于 node scripts/build-extension-release.mjs
+```
+
+产出：
+- `public/extension/ozon-funnel/dist/`（混淆后的解压目录，已 gitignore）
+- `public/extension/ozon-funnel.release.zip`（对外分发的安装包）
+
+脚本的取舍：
+- 压缩 + 混淆都由 `javascript-obfuscator` 完成
+- `stringArray` + `base64` + `splitStrings`：接口路径、请求头名收进字符串数组
+- **`transformObjectKeys` 单独开不够**：与 `stringArrayThreshold:1` + `splitStrings`
+  组合时，对象字面量的 key（如 `"x-o3-company-id"`）会漏出来。所以源码里请求头一律用
+  **计算属性名**构造（`h["x-o3-company-id"] = ...`），不依赖混淆配置，确定性隐藏。
+- 脚本末尾有**自检**：混淆后若还能 grep 到 `seller-analytics` / `posting-service` /
+  `x-o3-company-id` 就直接报错，防止以后配置回退导致泄露。
+- **故意不开 `debugProtection`**：它会让开发者工具卡死，而卖家本来就要用 F12 看后台。
+- `selfDefending` 开着：改一行或格式化一下就崩，显著抬高「读一遍再改写」的成本。
+
+实测（v1.4.0）：源码 33.5 KB → 混淆后 95.8 KB（2.9×）；
+装进真实 Chrome 跑通，面板注入 / 1000 行数据 / 订单汇总 / 400 个复制按钮全部正常，无报错。
+
+### ⚠️ 混淆不是防护
+
+代码一定在用户机器上，混淆只提高门槛，**挡不住抓包**（F12 一看请求就知道调了哪个接口）。
+真想防住「复制 zip 就能用」，只能上**服务端授权校验**；否则靠持续更新 + 商店合规。
+
+## 发布检查清单
+
+- [ ] `node --check public/extension/ozon-funnel/content.js`
+- [ ] `npm run build:ext:release`（自检会拦字符串泄露）
+- [ ] 装混淆版到 Chrome 实测一次（面板能出数、无 console 报错）
+- [ ] 确认发布 zip 里**只有** `manifest.json` / `content.js` / `README.md`
+- [ ] 对外只发 `ozon-funnel.release.zip`；开发版 `ozon-funnel.zip` 别外传

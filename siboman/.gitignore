@@ -10,3 +10,6 @@ docs/handoff/
 .DS_Store
 npm-debug.log*
 *.log
+
+# 混淆发布版的中间产物（用 scripts/build-extension-release.mjs 生成）
+public/extension/ozon-funnel/dist/

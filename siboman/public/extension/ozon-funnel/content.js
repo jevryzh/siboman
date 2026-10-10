@@ -1,21 +1,10 @@
 /**
- * Ozon 我的商品销售 / 销售漏斗（独立插件）
+ * Ozon 我的商品销售 —— 卖家后台数据面板
  *
- * 支持域名：seller.ozon.ru / seller.ozonru.cn / seller.ozon.kz
- *   —— 接口一律用 location.origin 拼，所以换域名不用改代码。
+ * 原理、接口清单、指标探测结果、踩过的坑，全部记在 DEV-NOTES.md（不随发布包）。
+ * 这里刻意不写实现细节：发布出去的是混淆版，源码注释越少越好。
  *
- * 背景：「我的分析 → 我的商品销售」里不少列被前端标成 Premium 专属，
- *      免费号点「销售漏斗」标签只会弹订阅引导，列停在加载骨架。
- *      但这些列的数据其实由 Ozon 自己的接口提供，免费号直接就能拿到。
- *
- * 本插件不做任何"伪造会员状态"的事（那类做法违反 ToS、会被风控盯上，
- * 而且正是它把你页面弹回销售漏斗的）。它只用当前登录会话读 Ozon 自己返回的真实数据：
- *   POST {origin}/api/site/seller-analytics/charts/v3/table/totals   → 总计与平均值
- *   POST {origin}/api/site/seller-analytics/charts/v3/table/by_sku   → 按 SKU 明细
- * 关键请求头 x-o3-company-id = 当前登录账号的 company_id（= 店铺 Client-Id）。
- *
- * METRIC_DEFS 里的 18 个指标是逐个探测出来的可用集合；其余（price_index / drr /
- * reviews_count / rating / returns 等）接口直接 400，属真·会员专属，拿不到。
+ * 发布流程：node scripts/build-extension-release.mjs
  */
 (function () {
   "use strict";
@@ -142,20 +131,28 @@
     return { from: shiftDate(today, -Number(state.days)), to: yesterday };
   }
 
+  // 请求头统一在这里构造。
+  //   不用对象字面量的 key，而是用计算属性名 —— 否则混淆后 key 会原样留在代码里
+  //   （transformObjectKeys 和 stringArrayThreshold/splitStrings 组合时并不稳定），
+  //   写成 [] 赋值后，这些字符串一定会被收进混淆器的字符串数组。
+  function apiHeaders(extra) {
+    const h = {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    };
+    h["x-o3-company-id"] = state.ozonClientId;
+    h["x-o3-app-name"] = "seller-ui";
+    h["x-o3-language"] = "zh-Hans";
+    h["x-o3-page-type"] = "analytics_graph";
+    if (extra) for (const k of Object.keys(extra)) h[k] = extra[k];
+    return h;
+  }
+
   async function callApi(path, body) {
     const resp = await fetch(`${location.origin}${path}`, {
       method: "POST",
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "x-o3-company-id": state.ozonClientId,
-        "x-o3-app-name": "seller-ui",
-        // 只能是 zh-Hans / ru / en：传 zh-CN 后端不认，productInfo 的
-        // name / article / image 会全部返回空字符串（血泪教训，别改）
-        "x-o3-language": "zh-Hans",
-        "x-o3-page-type": "analytics_graph",
-      },
+      headers: apiHeaders(),
       body: JSON.stringify(body),
     });
     const text = await resp.text();
@@ -194,14 +191,7 @@
     const r = await fetch(`${location.origin}/api/posting-service/v2/fbs/posting/count/by-status-alias`, {
       method: "POST",
       credentials: "include",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "x-o3-company-id": state.ozonClientId,
-        "x-o3-app-name": "seller-ui",
-        "x-o3-language": "zh-Hans",
-        "x-o3-page-type": "analytics_graph",
-      },
+      headers: apiHeaders(),
       body: JSON.stringify({
         company_id: state.ozonClientId,
         processed_at_from: `${dateFrom}T00:00:00${tz}`,
