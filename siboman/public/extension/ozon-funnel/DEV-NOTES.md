@@ -73,6 +73,70 @@ body: {
 
 订单页路径是 `/app/postings/fbs`（`/app/orders` 是 404）。
 
+## 搜索可见性 / 查词排位（两块新功能）
+
+### 主接口（免费可用）
+
+```
+POST {origin}/api/search-query-analytics/v1/cjm/get-seller-analytics
+body: { seller_id, period_from, period_to, count_total_items, page_number, items_per_page,
+        sort_by, sort_direction, filters: { categories: [], search: "" } }
+→ { skus: [...], totalNumberOfItems, totalPagesCount }
+```
+支持服务端搜索（`filters.search`）、排序、真分页（有总数，每页最多 500）。
+
+列定义可以问接口要：`GET /v1/cjm/get-seller-analytics-table-headers?seller_id=`，
+返回每列的 key / metricType / premium / hints。
+
+**8 列里 4 列是真·Premium 锁**（服务端直接返回空字符串，`premium.lockMode = "FULL"`）：
+`uniqueViewUsers`、`searchPosition`、`queryCtrInteract`、`queryCtrOrder`。
+免费能拿到的是：`visibility`（可见度）、`uniqueSearchUsers`（曾搜索人数）、
+`uniqueOrdersCount`（订购件数）、`gmv`（订购金额）。
+
+### 查词排位接口（免费，能拿到位置）
+
+```
+POST {origin}/api/search-query-analytics/v2/external/explanation_by_id
+body: { sellerId, query, skus: [], uuid: <地区>, sortOption: { headerKey, direction },
+        itemsPerPage, pageNumber, onlyCurSellerItems, applicationScope: "SCOPE_BIG_OZON" }
+→ { headers: [...], items: [...], totalNumberOfItems, totalPagesCount, categories }
+```
+返回 13 列（位置 / 商品 / 综合分数 / 状态 / CPC 出价 / CPO 出价 / 匹配度 / 评价 / 价格 …）。
+单元格结构：`items[].values[colIndex].values[0]` → 要么 `label.value`，要么 `itemInfo`（商品卡）。
+
+配套：
+- `GET /v1/get-dates?seller_id=` → 可用区间
+- `POST /v1/external/available_locations {sellerId, prefix}` → 地区列表
+- `POST /v1/external/explain_suggest {sellerId, skus, filter}` → 搜索词建议
+- `GET /v1/get-seller-premium-status?company_id=` → 会员状态
+
+### ⚠️⚠️ 这个接口最大的坑：`403 {"code":7,"message":"no premium"}`
+
+它**几乎总是和会员无关**，而是**日期区间不对**。实测（2026-10-10）：
+
+| 请求区间 | 结果 |
+|---|---|
+| 2026-10-02 ~ 2026-10-08 | ✅ 200 |
+| 2026-10-03 ~ 2026-10-08 | ❌ 403 no premium |
+| 2026-10-04 ~ 2026-10-08 | ❌ 403 |
+| 2026-10-01 ~ 2026-10-07 | ❌ 403 |
+| 2026-09-25 ~ 2026-10-01 | ❌ 403 |
+
+也就是说**只认一个固定长度的窗口**（当时是 7 天），而且必须**整体落在可用区间内**。
+排查时踩了两个连环坑：
+1. 只把结束日往前截（7 天截成 6 天）→ 照样 403。**必须整体平移，保持跨度不变。**
+2. 一度以为是请求头 `x-o3-page-type` 的问题 —— 实测传 `analytics-search` /
+   `analytics_graph` / `analytics` / 不传，结果完全一样，**与请求头无关**。
+
+现在的做法（`svClampRange`）：
+- `GET /v1/get-dates` 拿到 `actual.to`
+- 算出最后一个可用本地日：该日 `23:59:59.999`（本地）≤ `actual.to`（注意不能直接把
+  `period_to` 设成 `actual.to` 本身，那也会被拒）
+- 若请求区间超出，**整体左移相同天数**（保持跨度），而不是截断
+
+另外注意：这两个模块**必须先 `detectCompanyId()`**。原来只有「我的商品销售」的 `load()` 里赋值，
+直接切到搜索可见性时 `x-o3-company-id` 是空的 → 同样 403。
+
 ## 接口硬限制
 
 | 限制 | 表现 | 处理 |

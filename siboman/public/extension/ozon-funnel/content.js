@@ -11,7 +11,7 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.4.0";
+  const VERSION = "1.5.0";
   const HOST_ID = "__ozon_funnel_host";
 
   const PAGE_SIZE = 50;      // 接口 limit 上限 50
@@ -76,7 +76,10 @@
     data: null, totals: null, error: "", ozonClientId: "",
     sortKey: "revenue", sortDir: "desc", maximized: false,
     group: "funnel", days: 7, search: "", showCols: false,
+    mode: "sales",     // sales=我的商品销售 / visibility=搜索可见性 / rank=查词排位
     orderStats: null,  // 订单级汇总（取消订单数 / 总订单数）
+    sv: { loading: false, data: null, error: "", page: 0, perPage: 50, sortBy: "METRICS_TYPE_UNIQUE_SEARCH_USERS", sortDir: "DESCENDING", search: "", category: "", meta: null },
+    rk: { loading: false, data: null, error: "", query: "", uuid: "", onlyMine: false, page: 1, perPage: 36, locations: [], sortKey: "position", sortDir: "asc" },
     colOrder: {},      // { groupKey: [metric,...] } 用户自定义列序
     status: "",
   };
@@ -90,12 +93,13 @@
         if (p.colOrder && typeof p.colOrder === "object") state.colOrder = p.colOrder;
         if (p.group && GROUPS[p.group]) state.group = p.group;
         if (p.days !== undefined) state.days = p.days;
+        if (p.mode && ["sales", "visibility", "rank"].includes(p.mode)) state.mode = p.mode;
         render();
       });
     } catch (_e) { /* 无 storage 权限时静默 */ }
   }
   function savePrefs() {
-    try { chrome.storage.local.set({ ozfPrefs: { colOrder: state.colOrder, group: state.group, days: state.days } }); } catch (_e) { /* 忽略 */ }
+    try { chrome.storage.local.set({ ozfPrefs: { colOrder: state.colOrder, group: state.group, days: state.days, mode: state.mode } }); } catch (_e) { /* 忽略 */ }
   }
 
   // ===== 工具 =====
@@ -135,24 +139,28 @@
   //   不用对象字面量的 key，而是用计算属性名 —— 否则混淆后 key 会原样留在代码里
   //   （transformObjectKeys 和 stringArrayThreshold/splitStrings 组合时并不稳定），
   //   写成 [] 赋值后，这些字符串一定会被收进混淆器的字符串数组。
-  function apiHeaders(extra) {
+  // pageType 必须和接口所属页面一致：
+  //   analytics_graph  → 我的商品销售 / 销售漏斗
+  //   analytics-search → 搜索可见性 / 查词排位
+  //   传错会返回 403 {"message":"no premium"} —— 极难排查的误导性报错。
+  function apiHeaders(extra, pageType) {
     const h = {
       "Content-Type": "application/json",
-      Accept: "application/json",
+      Accept: "application/json, text/plain, */*",
     };
     h["x-o3-company-id"] = state.ozonClientId;
     h["x-o3-app-name"] = "seller-ui";
     h["x-o3-language"] = "zh-Hans";
-    h["x-o3-page-type"] = "analytics_graph";
+    h["x-o3-page-type"] = pageType || "analytics_graph";
     if (extra) for (const k of Object.keys(extra)) h[k] = extra[k];
     return h;
   }
 
-  async function callApi(path, body) {
+  async function callApi(path, body, pageType) {
     const resp = await fetch(`${location.origin}${path}`, {
       method: "POST",
       credentials: "include",
-      headers: apiHeaders(),
+      headers: apiHeaders(null, pageType),
       body: JSON.stringify(body),
     });
     const text = await resp.text();
@@ -484,6 +492,16 @@
     }, "收起面板（快捷键 Esc）"));
     panel.appendChild(head);
 
+    // ── 模式切换：我的商品销售 / 搜索可见性 / 查词排位 ──
+    const modeBar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px");
+    [["sales", "📈 我的商品销售"], ["visibility", "🔎 搜索可见性"], ["rank", "🎯 查词排位"]].forEach(([k, label]) => {
+      modeBar.appendChild(btn(label, state.mode === k, () => { state.mode = k; savePrefs(); render(); }));
+    });
+    panel.appendChild(modeBar);
+
+    if (state.mode === "visibility") return renderVisibility(panel);
+    if (state.mode === "rank") return renderRank(panel);
+
     // ── 日期 ──
     const bar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px");
     [["today", "今天"], ["yesterday", "昨天"], [7, "近7天"], [14, "近14天"], [28, "近28天"], [30, "近30天"]].forEach(([v, label]) => {
@@ -717,6 +735,463 @@
 
     panel.appendChild(el("div", "font-size:11px;color:#c0c4cc;margin-top:8px;line-height:1.6",
       `区间口径与 Ozon 后台一致：N 天 = 截止昨天的 N 个完整天（不含今天）。列序/分组/天数会自动记住。数据取自 Ozon 同款接口（页面会话），未伪造任何会员状态。v${VERSION}`));
+  }
+
+  // ===================================================================
+  // 搜索可见性（分析 → 搜索可见性 → 我的商品）
+  //   主接口 POST /api/search-query-analytics/v1/cjm/get-seller-analytics
+  //   免费可用；8 列里 4 列是真·Premium 锁（服务端直接返回空字符串）
+  // ===================================================================
+  const SV_API = "/api/search-query-analytics/v1/cjm/get-seller-analytics";
+  const SV_META_API = "/api/search-query-analytics/v1/cjm/get-seller-analytics-table-headers";
+  const SV_COLUMNS = [
+    { key: "visibility", label: "商品可见度", metric: "", locked: false },
+    { key: "uniqueSearchUsers", label: "多少位买家曾搜索", metric: "METRICS_TYPE_UNIQUE_SEARCH_USERS", locked: false },
+    { key: "uniqueViewUsers", label: "多少位买家已看到", metric: "METRICS_TYPE_UNIQUE_VIEW_USERS", locked: true },
+    { key: "searchPosition", label: "搜索结果中的位置", metric: "METRICS_TYPE_SEARCH_POSITION", locked: true },
+    { key: "queryCtrInteract", label: "搜索→卡片转化率", metric: "METRICS_TYPE_QUERY_CTR_INTERACT", locked: true },
+    { key: "queryCtrOrder", label: "搜索→订单转化率", metric: "METRICS_TYPE_QUERY_CTR_ORDER", locked: true },
+    { key: "uniqueOrdersCount", label: "订购商品件数", metric: "METRICS_TYPE_UNIQUE_ORDERS_COUNT", locked: false },
+    { key: "gmv", label: "订购金额", metric: "METRICS_TYPE_GMV", locked: false },
+  ];
+
+  async function svGet(path) {
+    const resp = await fetch(`${location.origin}${path}`, { credentials: "include", headers: apiHeaders(null, "analytics-search") });
+    const text = await resp.text();
+    let data = null;
+    try { data = JSON.parse(text); } catch (_e) { /* 非 JSON */ }
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}：${data?.message || data?.error?.detail || text.slice(0, 160)}`);
+    return data || {};
+  }
+
+  // 搜索可见性有独立的可用区间（get-dates）。
+  //   ⚠️ 区间超出可用范围时，接口返回 403 {"message":"no premium"} ——
+  //   极具误导性，其实是「数据还没到那天」，不是没会员（实测已确认）。
+  //   而且必须按**整天**钳制：period_to 取窗口末端那个时刻本身也会被拒，
+  //   必须让当天的 23:59:59.999（本地）≤ 窗口末端。
+  //   例：窗口 to = 2026-10-09T00:00:00Z（= 本地 10-09 08:00）
+  //       → 最后可用的一天是 10-08（其 23:59:59.999 本地 = 10-08T15:59:59.999Z）
+  function maxUsableLocalDay(availToIso) {
+    const limit = new Date(availToIso).getTime();
+    let d = new Date(availToIso);
+    for (let i = 0; i < 5; i += 1) {
+      const day = fmtDate(d);
+      if (new Date(`${day}T23:59:59.999`).getTime() <= limit) return day;
+      d = shiftDate(d, -1);
+    }
+    return fmtDate(d);
+  }
+
+  async function svClampRange(fromStr, toStr) {
+    const st = state.sv;
+    if (!st.avail) {
+      try {
+        const j = await svGet(`/api/search-query-analytics/v1/get-dates?seller_id=${encodeURIComponent(state.ozonClientId)}`);
+        st.avail = { from: j?.actual?.from || "", to: j?.actual?.to || "" };
+      } catch (_e) { st.avail = { from: "", to: "" }; }
+    }
+    let fromDay = fromStr;
+    let toDay = toStr;
+    let clamped = false;
+    // ⚠️ 关键：这个接口只认**固定长度**的窗口（当前是 7 天）。
+    //   区间超出可用范围时必须整体**后移**，不能只把结束日往前截 ——
+    //   截成 6 天会照样 403 no premium（实测 10-03~10-08 全被拒，
+    //   而 10-02~10-08 正常）。所以按原跨度平移。
+    const spanDays = Math.max(0, Math.round((new Date(toStr) - new Date(fromStr)) / 86400e3));
+    if (st.avail.to) {
+      const maxDay = maxUsableLocalDay(st.avail.to);
+      if (toDay > maxDay) {
+        const delta = Math.round((new Date(toDay) - new Date(maxDay)) / 86400e3);
+        toDay = maxDay;
+        fromDay = fmtDate(shiftDate(new Date(fromDay), -delta));
+        clamped = true;
+      }
+    }
+    if (st.avail.from) {
+      const minDay = fmtDate(new Date(st.avail.from));
+      if (fromDay < minDay) { fromDay = minDay; toDay = fmtDate(shiftDate(new Date(fromDay), spanDays)); clamped = true; }
+    }
+    if (fromDay > toDay) fromDay = toDay;
+    return { fromIso: localDayIso(fromDay, false), toIso: localDayIso(toDay, true), fromDay, toDay, clamped };
+  }
+
+  // 本地 00:00:00 ~ 23:59:59.999 转成 UTC ISO（Ozon 就是这么传的）
+  function localDayIso(dateStr, endOfDay) {
+    const d = new Date(`${dateStr}T${endOfDay ? "23:59:59.999" : "00:00:00"}`);
+    return d.toISOString();
+  }
+
+  function svRange() {
+    const { from, to } = periodRange();
+    return { from: fmtDate(from), to: fmtDate(to) };
+  }
+
+  async function loadVisibility(page) {
+    const st = state.sv;
+    state.ozonClientId = detectCompanyId();   // 直接进这个模式时也要先取账号，否则请求头为空 → 403
+    if (!state.ozonClientId) { st.error = "读不到当前登录的 Ozon 账号（company_id），请确认已登录后刷新页面。"; render(); return; }
+    const target = page === undefined ? st.page : page;
+    st.loading = true; st.error = ""; render();
+    try {
+      const { from, to } = svRange();
+      const rng = await svClampRange(from, to);
+      st.clamped = rng.clamped;
+      st.effFrom = rng.fromDay; st.effTo = rng.toDay;
+      const j = await callApi(SV_API, {
+        seller_id: state.ozonClientId,
+        period_from: rng.fromIso,
+        period_to: rng.toIso,
+        count_total_items: true,
+        page_number: String(target),
+        items_per_page: String(st.perPage),
+        sort_by: st.sortBy,
+        sort_direction: st.sortDir,
+        filters: { categories: [], search: st.search || "" },
+      }, "analytics-search");
+      st.data = j;
+      st.page = target;
+    } catch (e) {
+      const msg = e?.message || String(e);
+      st.error = /no premium/i.test(msg)
+        ? `${msg}\n\n提示：这个 403 有迷惑性，实测是「日期超出 Ozon 可用范围」导致的，不是真没会员。已自动按可用范围收窄，若仍报错请点其它日期区间。`
+        : msg;
+      st.data = null;
+    }
+    st.loading = false;
+    render();
+  }
+
+  function svVal(row, key) {
+    if (key === "visibility") {
+      const v = row.visibility || {};
+      return v.value ? `${v.value}${v.label ? " " + v.label : ""}` : "—";
+    }
+    const f = row[key];
+    if (!f || typeof f !== "object") return "—";
+    const val = f.value || "";
+    const d = f.delta && f.delta !== "—" ? ` (${f.delta})` : "";
+    return (val || "—") + d;
+  }
+
+  function renderVisibility(panel) {
+    const st = state.sv;
+
+    // 日期 + 搜索
+    const bar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px");
+    [["today", "今天"], ["yesterday", "昨天"], [7, "近7天"], [14, "近14天"], [28, "近28天"], [30, "近30天"]].forEach(([v, label]) => {
+      bar.appendChild(btn(label, state.days === v, () => { state.days = v; savePrefs(); loadVisibility(0); }));
+    });
+    bar.appendChild(btn("刷新", false, () => loadVisibility(st.page)));
+    bar.appendChild(btn("导出 CSV", false, exportVisibilityCsv));
+    panel.appendChild(bar);
+
+    const srch = el("div", "display:flex;gap:6px;align-items:center;margin-bottom:10px");
+    const input = document.createElement("input");
+    input.type = "search";
+    input.placeholder = "🔍 搜商品名称 / 货号 / SKU（服务端搜索）";
+    input.value = st.search;
+    input.setAttribute("style", "flex:1;border:1px solid #dbeafe;border-radius:6px;padding:5px 9px;font-size:12px;outline:none;background:#fff;color:#0f172a");
+    let t1 = null;
+    input.addEventListener("input", () => {
+      clearTimeout(t1);
+      t1 = setTimeout(() => { st.search = input.value; loadVisibility(0); }, 350);
+    });
+    srch.appendChild(input);
+    if (st.search) srch.appendChild(btn("清空", false, () => { st.search = ""; loadVisibility(0); }));
+    panel.appendChild(srch);
+
+    if (st.loading) { panel.appendChild(el("div", "padding:30px;text-align:center;color:#94a3b8;font-size:13px", "加载中…")); return; }
+    if (st.error) { panel.appendChild(el("div", "background:#fef2f2;border-radius:8px;padding:12px;font-size:12px;color:#b91c1c;line-height:1.7;word-break:break-all", st.error)); return; }
+    if (!st.data) {
+      panel.appendChild(el("div", "padding:24px;text-align:center;color:#94a3b8;font-size:13px", "点「刷新」加载搜索可见性数据"));
+      return;
+    }
+
+    const rows = st.data.skus || [];
+    const total = Number(st.data.totalNumberOfItems || rows.length);
+    const pages = Number(st.data.totalPagesCount || 1);
+    const info = el("div", "font-size:11px;color:#64748b;margin-bottom:8px");
+    const availNote = st.avail?.to ? ` · 数据可用至 ${maxUsableLocalDay(st.avail.to)}` : "";
+    info.textContent = `共 ${total} 个商品 · 第 ${st.page + 1}/${pages} 页 · ${st.effFrom || svRange().from} ~ ${st.effTo || svRange().to}${availNote}${st.clamped ? "（已按可用范围收窄）" : ""}`;
+    panel.appendChild(info);
+
+    // 表
+    const ms = SV_COLUMNS;
+    const gridCols = "minmax(230px,1.4fr) " + ms.map(() => "112px").join(" ");
+    const wrap = el("div", `max-height:${state.maximized ? "calc(100vh - 340px)" : "46vh"};overflow:auto;font-size:12px`);
+    const th = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:6px 4px;border-bottom:1px solid #eef2f7;position:sticky;top:0;background:#fff;z-index:2`);
+    th.appendChild(el("span", "color:#94a3b8;font-weight:700", "商品（SKU / 货号 / 状态）"));
+    ms.forEach((c) => {
+      const active = st.sortBy === c.metric && c.metric;
+      const lbl = c.label + (active ? (st.sortDir === "DESCENDING" ? " ↓" : " ↑") : "");
+      const s = el("span", `text-align:right;font-weight:700;cursor:${c.metric ? "pointer" : "default"};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:${c.locked ? "#cbd5e1" : (active ? "#0ea5e9" : "#94a3b8")}`, lbl);
+      s.title = c.locked ? "该列需要 Premium（服务端不返回）" : (c.metric ? "点击排序" : "");
+      if (c.metric) {
+        s.onclick = () => {
+          if (st.sortBy === c.metric) st.sortDir = st.sortDir === "DESCENDING" ? "ASCENDING" : "DESCENDING";
+          else { st.sortBy = c.metric; st.sortDir = "DESCENDING"; }
+          loadVisibility(0);
+        };
+      }
+      th.appendChild(s);
+    });
+    wrap.appendChild(th);
+
+    if (!rows.length) wrap.appendChild(el("div", "padding:16px;text-align:center;color:#c0c4cc", st.search ? `没找到匹配「${st.search}」的商品` : "所选区间没有数据"));
+    rows.forEach((r) => {
+      const tr = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:5px 4px;border-bottom:1px solid #f8fafc;align-items:center`);
+      const cell = el("div", "display:flex;gap:8px;align-items:center;min-width:0");
+      const img = document.createElement("img");
+      img.setAttribute("style", "width:34px;height:34px;border-radius:5px;object-fit:cover;flex-shrink:0;background:#e2e8f0;border:1px solid #eef2f7;cursor:zoom-in");
+      if (r.pictureUrl) {
+        img.src = r.pictureUrl; img.loading = "lazy";
+        img.addEventListener("mouseenter", (e) => showZoom(r.pictureUrl, r.name || r.sku, e));
+        img.addEventListener("mousemove", moveZoom);
+        img.addEventListener("mouseleave", hideZoom);
+      }
+      cell.appendChild(img);
+      const txt = el("div", "min-width:0;line-height:1.35;flex:1");
+      txt.appendChild(el("div", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#0f172a;font-weight:700", r.name || r.sku));
+      const meta = el("div", "display:flex;align-items:center;gap:4px;font-size:10px;color:#64748b;min-width:0");
+      const copyVal = r.article || r.sku || "";
+      meta.appendChild(el("span", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap", `货号 ${r.article || "—"}`));
+      const cp = el("button", "flex-shrink:0;border:1px solid #e2e8f0;background:#fff;color:#64748b;border-radius:4px;padding:0 4px;font-size:10px;line-height:14px;cursor:pointer", "⧉");
+      cp.title = `复制货号：${copyVal}`;
+      cp.addEventListener("click", (ev) => { ev.stopPropagation(); if (copyVal) copyText(copyVal, cp); });
+      meta.appendChild(cp);
+      meta.appendChild(el("span", "color:#94a3b8;flex-shrink:0", `· ${r.sku} · ${r.sellStatus || ""}`));
+      txt.appendChild(meta);
+      cell.appendChild(txt);
+      tr.appendChild(cell);
+      ms.forEach((c) => {
+        if (c.locked) {
+          tr.appendChild(el("span", "text-align:right;color:#cbd5e1;font-size:11px", "需 Premium"));
+        } else {
+          const v = svVal(r, c.key);
+          const color = c.key === "gmv" ? "#0f766e" : (c.key === "visibility" ? "#0369a1" : "#475569");
+          tr.appendChild(el("span", `text-align:right;color:${color};font-weight:${c.key === "gmv" ? 700 : 400};overflow:hidden;text-overflow:ellipsis;white-space:nowrap`, v));
+        }
+      });
+      wrap.appendChild(tr);
+    });
+    panel.appendChild(wrap);
+
+    // 翻页
+    const pager = el("div", "display:flex;gap:6px;align-items:center;justify-content:center;margin-top:8px");
+    pager.appendChild(btn("⏮ 首页", false, () => loadVisibility(0)));
+    pager.appendChild(btn("◀ 上一页", false, () => loadVisibility(Math.max(0, st.page - 1))));
+    pager.appendChild(el("span", "font-size:12px;color:#475569", `${st.page + 1} / ${pages}`));
+    pager.appendChild(btn("下一页 ▶", false, () => loadVisibility(Math.min(pages - 1, st.page + 1))));
+    pager.appendChild(btn("末页 ⏭", false, () => loadVisibility(pages - 1)));
+    panel.appendChild(pager);
+
+    panel.appendChild(el("div", "font-size:11px;color:#c0c4cc;margin-top:8px;line-height:1.6",
+      `数据源与 Ozon「分析 → 搜索可见性 → 我的商品」同一接口。其中「已看到人数 / 搜索位置 / 两个转化率」Ozon 服务端只对 Premium 返回，免费号拿不到（不是本插件的问题）。v${VERSION}`));
+  }
+
+  function exportVisibilityCsv() {
+    const st = state.sv;
+    const rows = st.data?.skus || [];
+    if (!rows.length) return;
+    const ms = SV_COLUMNS;
+    const head = ["Ozon SKU", "货号", "商品名", "状态", ...ms.map((c) => c.label)];
+    const body = rows.map((r) => [
+      r.sku, r.article, String(r.name || "").replace(/[\r\n,]/g, " "), r.sellStatus || "",
+      ...ms.map((c) => (c.locked ? "" : svVal(r, c.key).replace(/[\r\n,]/g, " "))),
+    ]);
+    const csv = "\ufeff" + [head, ...body].map((x) => x.join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    a.download = `Ozon_搜索可见性_${st.effFrom || svRange().from}_${st.effTo || svRange().to}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  // ===================================================================
+  // 查词排位（分析 → 搜索可见性 → 什么影响搜索结果中的位置）
+  //   POST /api/search-query-analytics/v2/external/explanation_by_id
+  //   这个是免费的，能拿到「搜索结果中的位置」
+  // ===================================================================
+  async function loadLocations() {
+    const rk = state.rk;
+    state.ozonClientId = detectCompanyId();
+    try {
+      const j = await callApi("/api/search-query-analytics/v1/external/available_locations", { sellerId: state.ozonClientId, prefix: "" }, "analytics-search");
+      rk.locations = j?.defaultLocations || [];
+      if (!rk.uuid && rk.locations[0]) rk.uuid = rk.locations[0].uuid;
+    } catch (_e) { rk.locations = []; }
+    render();
+  }
+
+  async function loadRank(page) {
+    const rk = state.rk;
+    state.ozonClientId = detectCompanyId();
+    if (!state.ozonClientId) { rk.error = "读不到当前登录的 Ozon 账号（company_id），请确认已登录后刷新页面。"; render(); return; }
+    if (!rk.query.trim()) { rk.error = "请先填搜索词"; render(); return; }
+    const target = page === undefined ? rk.page : page;
+    rk.loading = true; rk.error = ""; render();
+    try {
+      const j = await callApi("/api/search-query-analytics/v2/external/explanation_by_id", {
+        sellerId: state.ozonClientId,
+        query: rk.query,
+        skus: [],
+        uuid: rk.uuid,
+        sortOption: { headerKey: rk.sortKey || "position", direction: rk.sortDir === "desc" ? "SortDirectionDescending" : "SortDirectionAscending" },
+        itemsPerPage: String(rk.perPage),
+        pageNumber: String(target),
+        onlyCurSellerItems: !!rk.onlyMine,
+        applicationScope: "SCOPE_BIG_OZON",
+      }, "analytics-search");
+      rk.data = j;
+      rk.page = target;
+    } catch (e) {
+      rk.error = e?.message || String(e);
+      rk.data = null;
+    }
+    rk.loading = false;
+    render();
+  }
+
+  // 排位表的一格：可能是 label.value，也可能是 itemInfo（商品卡）
+  function rkCell(cell) {
+    const v = cell?.values?.[0];
+    if (!v) return { text: "—" };
+    if (v.itemInfo) return { text: v.itemInfo.name || v.itemInfo.sku || "—", info: v.itemInfo };
+    if (v.label) return { text: v.label.value || "—", sub: v.label.subvalue || "" };
+    return { text: "—" };
+  }
+
+  function renderRank(panel) {
+    const rk = state.rk;
+
+    // 输入区
+    const bar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:8px");
+    const q = document.createElement("input");
+    q.type = "search";
+    q.placeholder = "🔍 输入搜索词（例如 сумка женская）";
+    q.value = rk.query;
+    q.setAttribute("style", "flex:1;min-width:220px;border:1px solid #dbeafe;border-radius:6px;padding:5px 9px;font-size:12px;outline:none;background:#fff;color:#0f172a");
+    q.addEventListener("input", () => { rk.query = q.value; });
+    q.addEventListener("keydown", (e) => { if (e.key === "Enter") loadRank(1); });
+    bar.appendChild(q);
+
+    const sel = document.createElement("select");
+    sel.setAttribute("style", "border:1px solid #dbeafe;border-radius:6px;padding:5px 8px;font-size:12px;background:#fff;color:#0f172a;max-width:200px");
+    if (!rk.locations.length) sel.appendChild(new Option("（地区加载中…）", ""));
+    rk.locations.forEach((l) => sel.appendChild(new Option(l.title, l.uuid)));
+    sel.value = rk.uuid;
+    sel.addEventListener("change", () => { rk.uuid = sel.value; });
+    bar.appendChild(sel);
+
+    const mine = document.createElement("label");
+    mine.setAttribute("style", "display:flex;align-items:center;gap:4px;font-size:12px;color:#475569;cursor:pointer");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = !!rk.onlyMine;
+    cb.addEventListener("change", () => { rk.onlyMine = cb.checked; });
+    mine.appendChild(cb); mine.appendChild(el("span", "", "只看我的商品"));
+    bar.appendChild(mine);
+
+    bar.appendChild(btn("显示结果", true, () => loadRank(1)));
+    if (rk.data) bar.appendChild(btn("导出 CSV", false, exportRankCsv));
+    panel.appendChild(bar);
+    if (!rk.locations.length) loadLocations();
+
+    if (rk.loading) { panel.appendChild(el("div", "padding:30px;text-align:center;color:#94a3b8;font-size:13px", "查询中…")); return; }
+    if (rk.error) { panel.appendChild(el("div", "background:#fef2f2;border-radius:8px;padding:12px;font-size:12px;color:#b91c1c;line-height:1.7;word-break:break-all", rk.error)); return; }
+    if (!rk.data) {
+      panel.appendChild(el("div", "padding:24px;text-align:center;color:#94a3b8;font-size:13px", "输入一个搜索词，看你的商品在搜索结果里排第几"));
+      return;
+    }
+
+    const headers = rk.data.headers || [];
+    const items = rk.data.items || [];
+    const total = Number(rk.data.totalNumberOfItems || items.length);
+    const pages = Number(rk.data.totalPagesCount || 1);
+    const cat = rk.data.categories?.[0]?.name || "";
+    panel.appendChild(el("div", "font-size:11px;color:#64748b;margin-bottom:8px",
+      `「${rk.query}」${cat ? " · 类目「" + cat + "」" : ""} · 共 ${total} 个结果 · 第 ${rk.page}/${pages} 页${rk.onlyMine ? " · 只看我的" : ""}`));
+
+    const wrap = el("div", `max-height:${state.maximized ? "calc(100vh - 330px)" : "46vh"};overflow:auto;font-size:12px`);
+    const widths = headers.map((h) => Math.min(160, Math.max(84, Number(h.styles?.width || 120))));
+    const gridCols = widths.map((w) => w + "px").join(" ");
+    const th = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:6px 4px;border-bottom:1px solid #eef2f7;position:sticky;top:0;background:#fff;z-index:2;min-width:max-content`);
+    headers.forEach((h) => {
+      const active = rk.sortKey === h.key;
+      const s = el("span", `font-weight:700;color:${active ? "#0ea5e9" : "#94a3b8"};cursor:${h.isSortable ? "pointer" : "default"};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:${h.styles?.horizontalAlignment === "right" ? "right" : "left"}`,
+        h.title + (active ? (rk.sortDir === "desc" ? " ↓" : " ↑") : ""));
+      s.title = h.subtitle ? `${h.title}（${h.subtitle}）` : h.title;
+      if (h.isSortable) {
+        s.onclick = () => {
+          if (rk.sortKey === h.key) rk.sortDir = rk.sortDir === "desc" ? "asc" : "desc";
+          else { rk.sortKey = h.key; rk.sortDir = "asc"; }
+          loadRank(1);
+        };
+      }
+      th.appendChild(s);
+    });
+    wrap.appendChild(th);
+
+    if (!items.length) wrap.appendChild(el("div", "padding:16px;text-align:center;color:#c0c4cc", "没有查到结果"));
+    items.forEach((it) => {
+      const mineRow = it.isCurSellerItem;
+      const tr = el("div", `display:grid;grid-template-columns:${gridCols};gap:6px;padding:5px 4px;border-bottom:1px solid #f8fafc;align-items:center;min-width:max-content;${mineRow ? "background:#f0fdf4;" : ""}`);
+      headers.forEach((h, i) => {
+        const c = rkCell(it.values?.[i]);
+        if (c.info) {
+          const cell = el("div", "display:flex;gap:8px;align-items:center;min-width:0");
+          const img = document.createElement("img");
+          img.setAttribute("style", "width:32px;height:32px;border-radius:5px;object-fit:cover;flex-shrink:0;background:#e2e8f0;border:1px solid #eef2f7;cursor:zoom-in");
+          if (c.info.pictureUrl) {
+            img.src = c.info.pictureUrl; img.loading = "lazy";
+            img.addEventListener("mouseenter", (e) => showZoom(c.info.pictureUrl, c.info.name || c.info.sku, e));
+            img.addEventListener("mousemove", moveZoom);
+            img.addEventListener("mouseleave", hideZoom);
+          }
+          cell.appendChild(img);
+          const txt = el("div", "min-width:0;line-height:1.3");
+          txt.appendChild(el("div", "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#0f172a;font-weight:700;font-size:11px", c.info.name || c.info.sku));
+          txt.appendChild(el("div", "font-size:10px;color:#64748b;overflow:hidden;text-overflow:ellipsis;white-space:nowrap",
+            `${c.info.sellerName || ""}${mineRow ? " · 我的商品" : ""} · SKU ${c.info.sku || ""}`));
+          cell.appendChild(txt);
+          tr.appendChild(cell);
+        } else {
+          const right = h.styles?.horizontalAlignment === "right";
+          const strong = /位置|分数/.test(h.title);
+          tr.appendChild(el("span", `color:${strong ? "#0f172a" : "#475569"};font-weight:${strong ? 800 : 400};overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:${right ? "right" : "left"}`, c.text));
+        }
+      });
+      wrap.appendChild(tr);
+    });
+    panel.appendChild(wrap);
+
+    const pager = el("div", "display:flex;gap:6px;align-items:center;justify-content:center;margin-top:8px");
+    pager.appendChild(btn("⏮ 首页", false, () => loadRank(1)));
+    pager.appendChild(btn("◀ 上一页", false, () => loadRank(Math.max(1, rk.page - 1))));
+    pager.appendChild(el("span", "font-size:12px;color:#475569", `${rk.page} / ${pages}`));
+    pager.appendChild(btn("下一页 ▶", false, () => loadRank(Math.min(pages, rk.page + 1))));
+    pager.appendChild(btn("末页 ⏭", false, () => loadRank(pages)));
+    panel.appendChild(pager);
+
+    panel.appendChild(el("div", "font-size:11px;color:#c0c4cc;margin-top:8px;line-height:1.6",
+      `数据源与 Ozon「分析 → 搜索可见性 → 什么影响搜索结果中的位置」同一接口。绿色行 = 你自己的商品。v${VERSION}`));
+  }
+
+  function exportRankCsv() {
+    const rk = state.rk;
+    const headers = rk.data?.headers || [];
+    const items = rk.data?.items || [];
+    if (!items.length) return;
+    const head = headers.map((h) => h.title);
+    const body = items.map((it) => headers.map((h, i) => {
+      const c = rkCell(it.values?.[i]);
+      return c.info ? `${c.info.name} (SKU ${c.info.sku} / ${c.info.sellerName})`.replace(/[\r\n,]/g, " ") : String(c.text).replace(/[\r\n,]/g, " ");
+    }));
+    const csv = "\ufeff" + [head, ...body].map((x) => x.join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+    a.download = `Ozon_查词排位_${String(rk.query).slice(0, 20)}.csv`;
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 
   // ===== 挂载 =====
