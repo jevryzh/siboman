@@ -1002,11 +1002,11 @@ window.ProductListView = {
         const rows = [];
         for (const p of (d.by_product || [])) {
           for (const x of p.skus) {
-            rows.push([p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, p.my_price_rub, x.sku, String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price]);
+            rows.push([p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, x.sku, String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price]);
           }
         }
         if (!rows.length) return notify.warning('没有找到「比我低价」的跟卖 SKU');
-        const head = ['我的货号', '商品名', '我的价(CNY)', '我的价(₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价'];
+        const head = ['我的货号', '商品名', '我的价(我店铺报价₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价'];
         const csv = '\ufeff' + [head, ...rows].map((r) => r.join(',')).join('\n');
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -1980,7 +1980,7 @@ window.ProductListView = {
               <el-radio-button value="not_lower">没人比我低（{{ classCount('not_lower') }}）</el-radio-button>
               <el-radio-button value="unknown">价格未知（{{ classCount('unknown') }}）</el-radio-button>
             </el-radio-group>
-            <span style="font-size:12px; color:#94a3b8">比价取自 Ozon 的竞品最低价（与你同币种），不受汇率影响</span>
+            <span style="font-size:12px; color:#94a3b8">「我的价」= 你在该商品卡片上的自家报价（卢布），与跟卖价同币种；不需要商品在商品库里</span>
           </div>
 
           <div style="font-size:13px; color:#475569">
@@ -2022,20 +2022,22 @@ window.ProductListView = {
             <el-table-column label="跟卖卖家" width="100" align="center">
               <template #default="{ row }"><el-tag type="danger" size="small" effect="dark">{{ row.follower_count }}</el-tag></template>
             </el-table-column>
-            <el-table-column label="分类" width="110" align="center">
+            <el-table-column label="分类" width="130" align="center">
               <template #default="{ row }">
                 <el-tag :type="classTag(row).type" size="small" effect="plain">{{ classTag(row).text }}</el-tag>
+                <div v-if="row.lower_count" style="font-size:10px; color:#dc2626">{{ row.lower_count }} 个比我低</div>
               </template>
             </el-table-column>
-            <el-table-column label="我的价" width="110" align="right">
+            <el-table-column label="我的价(我店铺报价)" width="130" align="right">
               <template #default="{ row }">
-                <span v-if="row.my_price !== null" style="font-weight:700">{{ row.my_price }} {{ row.my_currency || '' }}</span>
+                <span v-if="row.my_price !== null" style="font-weight:700">{{ row.my_price }} ₽</span>
                 <span v-else style="color:#c0c4cc">-</span>
+                <div v-if="row.my_price_source === 'db'" style="font-size:10px; color:#f59e0b">卡片上没认到自家店，用的是库里价折算</div>
               </template>
             </el-table-column>
-            <el-table-column label="竞品最低价" width="120" align="right">
+            <el-table-column label="别人最低价" width="110" align="right">
               <template #default="{ row }">
-                <span v-if="row.rival_min_price !== null" style="font-weight:700; color:#dc2626">{{ row.rival_min_price }} {{ row.rival_currency || '' }}</span>
+                <span v-if="row.rival_min_price !== null" style="font-weight:700; color:#dc2626">{{ row.rival_min_price }} ₽</span>
                 <span v-else style="color:#c0c4cc">-</span>
               </template>
             </el-table-column>

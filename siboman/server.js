@@ -6134,9 +6134,15 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
   // 2) 我的 Ozon 售价（卢布，实时取 + 缓存）
   if (products.length) await fetchFollowPriceInfo(userId, products);
 
-  // 3) 这些商品的跟卖行，用来算「比我低价的卖家有几个」
+  // 3) 这些商品的跟卖行。
+  //    ⚠️ 这里**故意不排除**自家店群 —— 因为「我的价」正是从自家店铺在这张卡片上的
+  //    那个报价读出来的：Ozon 的卖家列表里没有「这是我」的标记（字段只有
+  //    sku/id/name/link/price/...），只能靠「排除店铺」名单里的店名认亲。
+  //    两拨人在内存里分开：自家 → 定我的价；其它 → 展示与比价。
+  //    好处：全同一币种(RUB)、不需要商品在自己商品库里、不用汇率换算。
   const offerIds = products.map((p) => p.offer_id);
-  const perOffer = new Map();
+  const perOffer = new Map();      // 别人的报价（已去掉自家店群）
+  const mineByOffer = new Map();   // 自家店群在这张卡片上的报价
   if (offerIds.length) {
     const fsResult = await db.query(
       `SELECT fs.offer_id,
@@ -6146,54 +6152,76 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
               ${priceNumSql} AS price_num
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
-          AND fs.offer_id = ANY($2::text[])
-          AND NOT EXISTS (
-            SELECT 1 FROM unnest($3::text[]) e
-             WHERE btrim(e) <> ''
-               AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
-          )`,
-      [userId, offerIds, excludeSellers],
+          AND fs.offer_id = ANY($2::text[])`,
+      [userId, offerIds],
     );
+    const exclSet = new Set(excludeSellers.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
+    const isMine = (name) => exclSet.has(String(name || "").trim().toLowerCase());
     for (const r of fsResult.rows) {
-      if (!perOffer.has(r.offer_id)) perOffer.set(r.offer_id, []);
-      perOffer.get(r.offer_id).push(r);
+      const box = isMine(r.follower_name) ? mineByOffer : perOffer;
+      if (!box.has(r.offer_id)) box.set(r.offer_id, []);
+      box.get(r.offer_id).push(r);
     }
   }
 
-  // 4) 分类：有比我低价的 / 没有比我低价的 / 拿不到价
-  //    比价口径：Ozon external_index_data.min_price_in_seller（竞品最低价，卖家币种）
-  //             对比 price.price（我的售价，卖家币种）—— 同币种，不碰汇率。
-  //    另外保留跟卖行的卢布价统计（仅供展示，不参与分类，因为币种不同）。
+  // 4) 分类：比我低价 / 没人比我低 / 价格未知
+  //    比价口径（v2.2.9.130 改）：
+  //      「我的价」= 自家店铺在这张卡片上的最低报价（RUB）
+  //      跟卖价     = 同一张卡片上其他卖家的报价（RUB）→ 同币种直接比
+  //    以前是拿 app_products.price(CNY) 折汇率去比卢布，而且**必须商品在库里**才算得出来；
+  //    现在只要这张卡片上有我自家店铺的报价就算得出来，与商品库无关。
+  //    卡片上认不出自家店时才退回库里价格（并标明来源）。
+  const fxRate = RUB_CNY_RATE > 0 ? RUB_CNY_RATE : 0.0862;
+  const num = (v) => (v === null || v === undefined || v === "" ? null : Number(v));
   const items = products.map((p) => {
     const list = perOffer.get(p.offer_id) || [];
+    const mine = mineByOffer.get(p.offer_id) || [];
     const info = p.price_info || {};
-    const myPrice = info.my_price === undefined ? null : info.my_price;
-    const rivalMin = info.rival_min === undefined ? null : info.rival_min;
+
+    // 我的价：优先卡片上自家店铺的最低价
+    let myPrice = null;
+    for (const m of mine) {
+      const n = num(m.price_num);
+      if (n !== null && (myPrice === null || n < myPrice)) myPrice = n;
+    }
+    let myPriceSource = myPrice !== null ? "card" : "";
+    const dbCny = info.my_price === undefined ? null : info.my_price;
+    const dbRub = dbCny !== null ? Math.round((dbCny / fxRate) * 100) / 100 : null;
+    if (myPrice === null && dbRub !== null) { myPrice = dbRub; myPriceSource = "db"; }
+
     let minPrice = null;
     let minPriceText = "";
     let maxPrice = null;
+    let lowerCount = 0;
+    let rivalMin = null;
     for (const r of list) {
-      const n = r.price_num === null || r.price_num === undefined ? null : Number(r.price_num);
+      const n = num(r.price_num);
       if (n === null) continue;
       if (minPrice === null || n < minPrice) { minPrice = n; minPriceText = r.follower_price || ""; }
       if (maxPrice === null || n > maxPrice) maxPrice = n;
+      if (rivalMin === null || n < rivalMin) rivalMin = n;
+      if (myPrice !== null && n < myPrice) lowerCount += 1;
     }
-    const cls = (myPrice !== null && rivalMin !== null) ? (rivalMin < myPrice ? "lower" : "not_lower") : "unknown";
+    const cls = myPrice === null ? "unknown" : (lowerCount > 0 ? "lower" : "not_lower");
     return {
       ...p,
       follower_count: Number(p.follower_count || 0),
       follower_sku_count: Number(p.follower_sku_count || 0),
       local_price: p.local_price === null || p.local_price === undefined ? null : Number(p.local_price),
-      // 我的价 / 竞品最低价（都是卖家币种）
+      // 我的价（RUB，卡片口径）与来源
       my_price: myPrice,
-      my_currency: info.my_currency || "",
+      my_price_source: myPriceSource,
+      my_currency: "RUB",
+      // 库里的结算币价格（仅作参考，不参与比价）
+      my_price_cny: dbCny,
+      // 别人最低价（RUB）与差多少个卖家
       rival_min_price: rivalMin,
-      rival_currency: info.rival_currency || "",
+      rival_currency: "RUB",
+      lower_count: lowerCount,
       price_gap: (myPrice !== null && rivalMin !== null) ? Math.round((rivalMin - myPrice) * 100) / 100 : null,
       price_index_color: info.index_color || "",
       ozon_index_color: info.ozon_index_color || "",
-      // 跟卖行的卢布价（仅展示）
-      follower_priced_count: list.filter((r) => r.price_num !== null && r.price_num !== undefined).length,
+      follower_priced_count: list.filter((r) => num(r.price_num) !== null).length,
       min_follower_price: minPrice,
       min_follower_price_text: minPriceText,
       max_follower_price: maxPrice,
@@ -6203,7 +6231,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
 
   const classCounts = { lower: 0, not_lower: 0, unknown: 0 };
   for (const it of items) classCounts[it.price_class] += 1;
-  return { products, perOffer, items, classCounts };
+  return { products, perOffer, mineByOffer, items, classCounts };
 }
 
 app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
@@ -6315,19 +6343,20 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
     const warnNoExclude = excludeSellers.length === 0;
 
     const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers });
-    const rate = RUB_CNY_RATE > 0 ? RUB_CNY_RATE : 0.0862;
     const byProduct = [];
     const allSkus = [];
     const seen = new Set();
+    let noPriceCount = 0;
     for (const it of bundle.items) {
+      // v2.2.9.130：「我的价」= 自家店铺在这张卡片上的报价（RUB），
+      //   与跟卖价同币种，直接比 —— 不再折算汇率，也不再要求商品在自己商品库里。
       const myPrice = it.my_price === null || it.my_price === undefined ? null : Number(it.my_price);
-      if (myPrice === null) continue;
-      const myPriceRub = Math.round((myPrice / rate) * 100) / 100;
+      if (myPrice === null) { noPriceCount += 1; continue; }
       const list = bundle.perOffer.get(it.offer_id) || [];
       const skus = [];
       for (const r of list) {
         const n = r.price_num === null || r.price_num === undefined ? null : Number(r.price_num);
-        if (n === null || n >= myPriceRub) continue;         // 只留比我低的
+        if (n === null || n >= myPrice) continue;            // 只留比我低的
         const sku = String(r.follower_sku || "").trim();
         if (!sku) continue;
         skus.push({ sku, name: r.follower_name || "", price: r.follower_price || "", price_num: n });
@@ -6339,7 +6368,8 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
           name: it.name || "",
           sku: it.product_id || "",
           my_price: myPrice,
-          my_price_rub: myPriceRub,
+          my_price_source: it.my_price_source || "",
+          lower_count: skus.length,
           count: skus.length,
           skus,
         });
@@ -6347,7 +6377,8 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
     }
     res.json({
       success: true,
-      rub_cny_rate: rate,
+      price_basis: "card",
+      no_price_products: noPriceCount,
       exclude_sellers: excludeSellers,
       warn_no_exclude: warnNoExclude,
       product_count: byProduct.length,
