@@ -1188,6 +1188,8 @@ window.ProductListView = {
         follow.jobStatus = 'queued';
         follow.jobProcessed = 0;
         follow.jobTotal = Number(d.total || skus.length);
+        // v2.2.9.128：立刻唤醒插件去领取，别干等 30 秒 alarm 轮询
+        try { window.__zhumeng_send__?.('pollNow.request', {}, 5000); } catch (_e) { /* 插件不在也没关系，靠轮询兜底 */ }
         const skipped = Number(d.unresolved || 0);
         const multi = Number(d.multi_store || 0);
         notify.success(`已提交 ${d.total} 个商品的跟卖查询${skipped ? `（${skipped} 个没解析出来已跳过）` : ''}，插件抓取中…`);

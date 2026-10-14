@@ -414,6 +414,10 @@ function setupPluginWorkerKeepAlive() {
       resolve(null);
     }, timeoutMs);
   });
+  // v2.2.9.128: 暴露给各页面用 —— 提交任务后立刻唤醒插件来领取，
+  //   否则要等插件的 30 秒 alarm 轮询，用户会以为「卡住了」。
+  try { window.__zhumeng_send__ = sendToExtension; } catch (_e) { /* 忽略 */ }
+
   const refresh = async () => {
     try {
       // v2.2.9.125: 带上当前店铺 —— worker token 里的店铺作用域决定插件能读哪家店的数据

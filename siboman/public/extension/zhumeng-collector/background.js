@@ -5349,6 +5349,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return;
   }
 
+  // v2.2.9.128: ERP 提交任务后立刻来领取，不用等 30 秒 alarm 轮询
+  if (msg.action === "pollNow") {
+    pollSourcingQueueOnce()
+      .then(() => sendResponse({ ok: true, version: VERSION }))
+      .catch((e) => sendResponse({ ok: false, version: VERSION, error: e.message || String(e) }));
+    return true;
+  }
+
   if (msg.action === "diagnose") {
     (async () => {
       const diag = { version: VERSION, timestamp: new Date().toISOString() };

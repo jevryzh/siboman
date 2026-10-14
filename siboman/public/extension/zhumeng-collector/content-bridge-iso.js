@@ -54,6 +54,17 @@
       return;
     }
 
+    // v2.2.9.128: ERP 提交任务后立刻叫醒后台去领取，省掉最多 30 秒的 alarm 等待
+    if (kind === "pollNow.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "pollNow" });
+        replyToMain(reqId, "pollNow.response", resp || { ok: true });
+      } catch (e) {
+        replyToMain(reqId, "pollNow.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
     if (kind === "status.request") {
       try {
         const resp = await chrome.runtime.sendMessage({ action: "checkStatus" });
