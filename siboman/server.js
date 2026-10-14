@@ -5948,7 +5948,8 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       [req.user.id, offerId, excludeSellers],
     );
     // 我的价 / 竞品最低价（实时取，带缓存）—— 用来标出「比我低」的卖家
-    let myPrice = null;
+    let myPrice = null;      // 我的售价（卖家币种，国内店是 CNY）
+    let myPriceRub = null;   // 同一价格折算成卢布（跟卖价是买家侧 RUB，必须同币种才能比）
     let rivalMin = null;
     let priceInfo = null;
     try {
@@ -5965,6 +5966,10 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
         myPrice = info.my_price === undefined ? null : info.my_price;
         rivalMin = info.rival_min === undefined ? null : info.rival_min;
         priceInfo = info;
+        // ⚠️ 跟卖价是买家侧 RUB，我的价是卖家币种（国内店 CNY）——
+        //    直接相减等于没比。用 ERP 的汇率折算成卢布再比。
+        const rate = RUB_CNY_RATE > 0 ? RUB_CNY_RATE : 0.0862;
+        if (myPrice !== null && rate > 0) myPriceRub = Math.round((myPrice / rate) * 100) / 100;
       }
     } catch (_e) { /* 取不到价不影响列表 */ }
     const items = r.rows.map((x) => ({
@@ -5973,13 +5978,17 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       follower_price: x.follower_price,
       price_num: x.price_num === null || x.price_num === undefined ? null : Number(x.price_num),
       excluded: !!x.excluded,
-      lower_than_my: myPrice !== null && x.price_num !== null && x.price_num !== undefined && Number(x.price_num) < myPrice,
+      lower_than_my: myPriceRub !== null && x.price_num !== null && x.price_num !== undefined
+        && Number(x.price_num) < myPriceRub,
     }));
     res.json({
       success: true,
       items,
       total: items.length,
       my_price: myPrice,
+      my_price_rub: myPriceRub,
+      rub_cny_rate: RUB_CNY_RATE,
+      rival_min: rivalMin,
       exclude_sellers: excludeSellers,
       excluded_count: items.filter((i) => i.excluded).length,
       lower_count: items.filter((i) => i.lower_than_my).length,

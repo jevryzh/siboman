@@ -906,8 +906,9 @@ window.ProductListView = {
     const followerDrawer = Vue.reactive({
       visible: false, offerId: '', name: '', loading: false, items: [],
       // v1.5：排除标记 / 比我低标记 / 我的价
-      myPrice: null, myCurrency: '', rivalMin: null, rivalCurrency: '',
-      excludedCount: 0, lowerCount: 0, hideExcluded: false,
+      myPrice: null, myCurrency: '', myPriceRub: null, rubCnyRate: null,
+      rivalMin: null, rivalCurrency: '',
+      excludedCount: 0, lowerCount: 0, hideExcluded: false, onlyLower: false,
     });
     const parsePriceText = (s) => {
       if (!s) return 0;
@@ -969,7 +970,34 @@ window.ProductListView = {
       return { type: 'info', text: '价格未知' };
     };
     const followerRows = Vue.computed(() => (followerDrawer.items || [])
-      .filter((x) => !followerDrawer.hideExcluded || !x.excluded));
+      .filter((x) => !followerDrawer.hideExcluded || !x.excluded)
+      .filter((x) => !followerDrawer.onlyLower || x.lower_than_my));
+    // 一键复制「比我低价」的卖家 SKU —— 比价已折算到同一币种（见 /api/ozon/follow-sellers）
+    const copyLowerFollowerSku = async () => {
+      const skus = (followerDrawer.items || []).filter((x) => x.lower_than_my && !x.excluded && x.follower_sku)
+        .map((x) => x.follower_sku);
+      if (!skus.length) return notify.warning('没有「比我低价」的卖家');
+      try { await navigator.clipboard.writeText(skus.join('\n')); notify.success(`已复制 ${skus.length} 个「比我低」的卖家 SKU`); }
+      catch { notify.warning('复制失败，请手动复制'); }
+    };
+    // 导出当前筛选结果（含卖家名/售价/是否比我低/是否已排除）
+    const exportFollowerCsv = () => {
+      const rows = followerRows.value || [];
+      if (!rows.length) return notify.warning('没有可导出的行');
+      const head = ['卖家SKU', '卖家名', '售价', '售价(数值)', '比我低', '已排除'];
+      const body = rows.map((x) => [
+        x.follower_sku || '', String(x.follower_name || '').replace(/[,\r\n]/g, ' '),
+        x.follower_price || '', x.price_num ?? '',
+        x.lower_than_my ? '是' : '', x.excluded ? '是' : '',
+      ]);
+      const csv = '\ufeff' + [head, ...body].map((r) => r.join(',')).join('\n');
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+      a.download = `跟卖卖家_${followerDrawer.offerId || ''}_${rows.length}条.csv`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      notify.success(`已导出 ${rows.length} 条`);
+    };
     const openFollowed = async () => {
       follow.visible = true;
       await loadFollowed(true);
@@ -990,7 +1018,8 @@ window.ProductListView = {
           || (parsePriceText(b.follower_price) - parsePriceText(a.follower_price)));
         followerDrawer.items = items;
         followerDrawer.myPrice = res.data?.my_price ?? null;
-        followerDrawer.myCurrency = '';
+        followerDrawer.myPriceRub = res.data?.my_price_rub ?? null;
+        followerDrawer.rubCnyRate = res.data?.rub_cny_rate ?? null;
         followerDrawer.rivalMin = res.data?.rival_min ?? null;
         followerDrawer.excludedCount = Number(res.data?.excluded_count || 0);
         followerDrawer.lowerCount = items.filter((x) => x.lower_than_my).length;
@@ -1164,6 +1193,7 @@ window.ProductListView = {
     return {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
       saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows,
+      copyLowerFollowerSku, exportFollowerCsv,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
       followBatchTokens, collectFollowBySkus, cancelFollowJob,
       products, loading, syncLoading, saveLoading,
@@ -1932,14 +1962,26 @@ window.ProductListView = {
         <el-drawer v-model="followerDrawer.visible" title="跟卖卖家列表" size="560px" append-to-body destroy-on-close>
           <div v-if="followerDrawer.name" style="font-size:13px; color:#475569; margin-bottom:6px">{{ followerDrawer.name }}</div>
           <div style="font-size:12px; color:#94a3b8; margin-bottom:6px">货号：{{ followerDrawer.offerId }}</div>
-          <div style="font-size:12px; color:#475569; margin-bottom:10px; line-height:1.8">
-            <span v-if="followerDrawer.myPrice !== null">我的价 <b>{{ followerDrawer.myPrice }}</b> · </span>
-            共 {{ followerDrawer.items.length }} 个卖家
-            <span v-if="followerDrawer.lowerCount" style="color:#dc2626; font-weight:700"> · 比我低 {{ followerDrawer.lowerCount }} 个</span>
+          <div style="font-size:12px; color:#475569; margin-bottom:6px; line-height:1.9">
+            <span v-if="followerDrawer.myPrice !== null">
+              我的价 <b>{{ followerDrawer.myPrice }} CNY</b>
+              <span v-if="followerDrawer.myPriceRub" style="color:#64748b">（≈ {{ followerDrawer.myPriceRub }} ₽，按汇率 {{ followerDrawer.rubCnyRate }}）</span>
+              ·
+            </span>
+            共 <b>{{ followerDrawer.items.length }}</b> 个卖家
+            <span style="color:#dc2626; font-weight:700"> · 比我低 {{ followerDrawer.lowerCount }} 个</span>
             <span v-if="followerDrawer.excludedCount" style="color:#b45309"> · 已在排除名单里 {{ followerDrawer.excludedCount }} 个</span>
+          </div>
+          <div style="font-size:11px; color:#94a3b8; margin-bottom:10px">
+            跟卖价是买家侧卢布，我的价是店铺结算币；这里已按汇率折算到卢布后比较，避免拿人民币和卢布直接相减。
           </div>
           <div style="margin-bottom:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
             <el-button size="small" @click="copyAllFollowerSku">复制全部跟卖 SKU</el-button>
+            <el-button size="small" type="danger" plain :disabled="!followerDrawer.lowerCount" @click="copyLowerFollowerSku">
+              复制「比我低价」SKU（{{ followerDrawer.lowerCount }}）
+            </el-button>
+            <el-button size="small" @click="exportFollowerCsv">导出 CSV</el-button>
+            <el-checkbox v-model="followerDrawer.onlyLower" size="small">只看比我低价（{{ followerDrawer.lowerCount }}）</el-checkbox>
             <el-checkbox v-model="followerDrawer.hideExcluded" size="small">隐藏已排除的卖家</el-checkbox>
           </div>
           <el-table :data="followerRows" v-loading="followerDrawer.loading" size="small" border max-height="70vh">
