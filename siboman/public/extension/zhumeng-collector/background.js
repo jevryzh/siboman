@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.127";
+const VERSION = "2.2.9.128";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1419,17 +1419,50 @@ let ozonPatrolTabId = null;      // 正在复用的 ozon.ru 标签
 let ozonPatrolOwnedTabId = null; // 我们自己创建的标签（任务结束关掉；用户原有的不动）
 
 function isUsableOzonTab(tab) {
-  return Boolean(tab && tab.id && typeof tab.url === "string" && tab.url.indexOf("https://www.ozon.ru/") === 0);
+  if (!tab || !tab.id || typeof tab.url !== "string") return false;
+  if (tab.url.indexOf("https://www.ozon.ru/") !== 0) return false;
+  // ⚠️ 被 Chrome「内存节省」丢弃的标签页不能注入 ——
+  //   此时 executeScript 会抛出极具误导性的
+  //   "Cannot access contents of the page. Extension manifest must request
+  //    permission to access the respective host."（其实是 unloaded 不是没权限，
+  //   chrome.permissions.contains 同时返回 true）。
+  //   之前只判断 URL，复用到被丢弃的标签就必然失败。
+  if (tab.discarded) return false;
+  if (tab.status && tab.status !== "complete") return false;
+  return true;
+}
+
+// 被丢弃/未加载的 ozon 标签先唤醒（重新加载并等它跑完），再拿去注入
+async function reviveOzonTab(tab) {
+  if (!tab || !tab.id) return null;
+  if (!tab.discarded && tab.status !== "unloaded" && tab.status !== "loading") return tab;
+  try {
+    await chrome.tabs.reload(tab.id, { bypassCache: false });
+    await waitForTabComplete(tab.id, 30000).catch(() => {});
+  } catch (_e) { /* 失败就交给上层新建标签 */ }
+  return await chrome.tabs.get(tab.id).catch(() => null);
 }
 
 async function getOrCreateOzonPatrolTab() {
   if (ozonPatrolTabId) {
-    const cached = await chrome.tabs.get(ozonPatrolTabId).catch(() => null);
+    let cached = await chrome.tabs.get(ozonPatrolTabId).catch(() => null);
+    if (cached && !isUsableOzonTab(cached)
+        && typeof cached.url === "string" && cached.url.indexOf("https://www.ozon.ru/") === 0) {
+      cached = await reviveOzonTab(cached);   // 被丢弃 → 唤醒后还能用
+    }
     if (isUsableOzonTab(cached)) return cached;
     ozonPatrolTabId = null;
   }
   const existing = await chrome.tabs.query({ url: "https://www.ozon.ru/*" }).catch(() => []);
-  const reusable = (existing || []).find(isUsableOzonTab);
+  // 先找现成可用的；没有的话，从同域标签里挑一个唤醒（多半是被内存节省丢弃了）
+  let reusable = (existing || []).find(isUsableOzonTab);
+  if (!reusable) {
+    const candidate = (existing || []).find((t) => t && t.id && typeof t.url === "string" && t.url.indexOf("https://www.ozon.ru/") === 0);
+    if (candidate) {
+      const revived = await reviveOzonTab(candidate);
+      if (isUsableOzonTab(revived)) reusable = revived;
+    }
+  }
   if (reusable) {
     ozonPatrolTabId = reusable.id;
     console.log(`[SW ${VERSION}] 巡查跟卖复用已有 ozon.ru 标签 id=${reusable.id}`);
@@ -1486,6 +1519,13 @@ function extractOtherOffersInPage(productId) {
 // 在 ozon.ru 页面上下文里抓「其他卖家报价」（跟卖卖家）。
 async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
   const runOn = async (id) => {
+    // 注入前兜一层：被 Chrome 丢弃的标签必须唤醒，否则报的是误导性的「权限不足」
+    const t = await chrome.tabs.get(id).catch(() => null);
+    if (!t) throw new Error("标签页已关闭");
+    if (t.discarded || t.status === "unloaded" || t.status === "loading") {
+      const revived = await reviveOzonTab(t);
+      if (!isUsableOzonTab(revived)) throw new Error("ozon.ru 标签未能唤醒，请手动打开一次 www.ozon.ru 后重试");
+    }
     const [res] = await chrome.scripting.executeScript({
       target: { tabId: id },
       func: extractOtherOffersInPage,

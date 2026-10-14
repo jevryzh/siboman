@@ -5783,7 +5783,17 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
           const key = `${hit.offer_id}|${hit.product_id}`;
           if (seen.has(key)) continue;
           seen.add(key);
-          items.push({ offer_id: String(hit.offer_id || ""), product_id: String(hit.product_id || ""), store_name: String(hit.store_name || "") });
+          // ⚠️ 巡查跟卖抓的是 Ozon 公开页 /modal/otherOffersFromSellers?product_id=X，
+          //   这里的 X 必须是 **SKU**（公开商品 id），不是 app_products.product_id。
+          //   实测同一商品：传 SKU 5639775451 → HTTP 200 / 86 个卖家；
+          //   传库里的 product_id 6157731775 → HTTP 404 / 0 个卖家。
+          //   历史数据能采到，是因为当时 offer_id 本身就是 SKU。所以这里优先用 sku。
+          items.push({
+            offer_id: String(hit.offer_id || ""),
+            product_id: String(hit.sku || hit.product_id || ""),
+            sku: String(hit.sku || ""),
+            store_name: String(hit.store_name || ""),
+          });
         } else if (/^\d{5,20}$/.test(token)) {
           const key = `_raw_${token}`;
           if (seen.has(key)) continue;
