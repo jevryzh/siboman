@@ -1767,6 +1767,16 @@ async function initDatabase() {
         UNIQUE(user_id, client_id)
       );
 
+      -- v1.5 多账号隔离：出图服务是外部无状态的，任务没有归属字段。
+      --   这里记下「这个 serviceJobId 是哪个用户创建的」，列表/详情据此过滤，
+      --   否则任何登录用户都能看到别人家的出图任务。
+      CREATE TABLE IF NOT EXISTS app_image_set_jobs (
+        service_job_id TEXT PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_image_set_jobs_user ON app_image_set_jobs (user_id);
+
       CREATE TABLE IF NOT EXISTS app_jobs (
         id UUID PRIMARY KEY,
         user_id UUID REFERENCES app_users(id) ON DELETE SET NULL,
@@ -3150,6 +3160,27 @@ async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, 
 }
 
 async function getYandexMarketContext({ storeId = null, userId = null, refresh = false } = {}) {
+  // ⚠️ 多账号隔离（v1.5）：
+  //   以前不传 storeId 时会回退到**环境变量里的全局 Yandex 凭据**，
+  //   那是 eason 的账号 → 任何登录用户只要不带 store_id 就能读到别人家的
+  //   Yandex 商品/仓库/报价隔离区数据。
+  //   现在：只要传了 userId，就只认他自己名下的 Yandex 店；自己一个都没有就报错，
+  //   绝不回退到全局。不传 userId 的内部调用（后台任务）才允许走环境变量。
+  if (!storeId && userId && db) {
+    const own = await db.query(
+      `SELECT id FROM app_stores
+        WHERE user_id = $1 AND platform = 'yandex' AND active = TRUE
+        ORDER BY (name LIKE '%(在用)%') DESC, updated_at DESC NULLS LAST, created_at ASC
+        LIMIT 1`,
+      [userId],
+    );
+    if (own.rowCount) storeId = own.rows[0].id;
+    else {
+      const error = new Error("你还没有添加 Yandex 店铺，请先在「店铺管理」里添加并授权后再使用。");
+      error.statusCode = 404;
+      throw error;
+    }
+  }
   const cacheKey = storeId || "__env__";
   const cached = yandexMarketContextByStore.get(cacheKey);
   if (!refresh && cached) return cached;
@@ -8105,6 +8136,25 @@ app.get("/api/yandex/listing/categories", requireAuth, async (req, res, next) =>
 const IMAGE_SET_URL = String(process.env.IMAGE_SET_URL || "http://127.0.0.1:5190").replace(/\/+$/, "");
 const IMAGE_SET_KEY = String(process.env.IMAGE_SET_API_KEY || "");
 
+// 记下出图任务归属（外部服务没有 owner 字段，只能 ERP 自己记）
+async function rememberImageSetJob(serviceJobId, userId) {
+  if (!db || !serviceJobId || !userId) return;
+  try {
+    await db.query(
+      `INSERT INTO app_image_set_jobs (service_job_id, user_id) VALUES ($1, $2)
+       ON CONFLICT (service_job_id) DO UPDATE SET user_id = EXCLUDED.user_id`,
+      [String(serviceJobId), userId],
+    );
+  } catch (e) { console.warn(`[image-set] 记录任务归属失败: ${e.message}`); }
+}
+
+// 当前用户创建过的出图任务 id 集合
+async function ownedImageSetJobIds(userId) {
+  if (!db) return new Set();
+  const r = await db.query("SELECT service_job_id FROM app_image_set_jobs WHERE user_id = $1", [userId]);
+  return new Set(r.rows.map((x) => String(x.service_job_id)));
+}
+
 async function callImageSetService(method, apiPath, body, timeoutMs = 60000) {
   const resp = await fetch(`${IMAGE_SET_URL}${apiPath}`, {
     method,
@@ -8131,7 +8181,8 @@ app.post("/api/ozon/ai-image-set", requireAuth, async (req, res, next) => {
   try {
     const itemId = String(req.body?.itemId || req.body?.collectItemId || "").trim();
     if (!itemId) return res.status(400).json({ success: false, error: "itemId 必填" });
-    const r = await db.query(`SELECT id, title, ozon_sku, main_image, images FROM collect_items WHERE id=$1`, [itemId]);
+    // v1.5 隔离：必须带 user_id，否则换个 id 就能读别人的采集商品
+    const r = await db.query(`SELECT id, title, ozon_sku, main_image, images FROM collect_items WHERE id=$1 AND user_id=$2`, [itemId, req.user.id]);
     const row = r.rows?.[0];
     if (!row) return res.status(404).json({ success: false, error: "采集商品不存在" });
     const imgs = Array.isArray(row.images) ? row.images : [];
@@ -8156,18 +8207,23 @@ app.post("/api/ozon/ai-image-set/:jobId/apply", requireAuth, async (req, res, ne
   try {
     const itemId = String(req.body?.itemId || req.body?.collectItemId || "").trim();
     if (!itemId) return res.status(400).json({ success: false, error: "itemId 必填" });
+    // v1.5 隔离：先确认这个出图任务是自己建的
+    const owned = await ownedImageSetJobIds(req.user.id);
+    if (!owned.has(String(req.params.jobId))) {
+      return res.status(404).json({ success: false, error: "任务不存在或无权限" });
+    }
     const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.jobId)}`);
     const images = (out.payload?.job?.images || []).filter((x) => x.ok && x.url);
     if (!images.length) return res.status(400).json({ success: false, error: "该任务还没有成功的图" });
     const mainUrl = (images.find((x) => x.key === "main") || images[0]).url;
-    const r0 = await db.query(`SELECT images FROM collect_items WHERE id=$1`, [itemId]);
+    const r0 = await db.query(`SELECT images FROM collect_items WHERE id=$1 AND user_id=$2`, [itemId, req.user.id]);
     if (!r0.rows?.length) return res.status(404).json({ success: false, error: "采集商品不存在" });
     const oldImages = Array.isArray(r0.rows[0].images) ? r0.rows[0].images : [];
     const list = req.body?.mode === "main-only"
       ? [mainUrl, ...oldImages.filter((u) => u !== mainUrl)]
       : [...new Set([mainUrl, ...images.map((x) => x.url), ...oldImages])];
-    await db.query(`UPDATE collect_items SET images=$2::jsonb, main_image=$3, updated_at=now() WHERE id=$1`,
-      [itemId, JSON.stringify(list.slice(0, 30)), mainUrl]);
+    await db.query(`UPDATE collect_items SET images=$2::jsonb, main_image=$3, updated_at=now() WHERE id=$1 AND user_id=$4`,
+      [itemId, JSON.stringify(list.slice(0, 30)), mainUrl, req.user.id]);
     res.json({ success: true, itemId, count: list.length, mainImage: mainUrl, images: list.slice(0, 10) });
   } catch (error) { next(error); }
 });
@@ -8183,6 +8239,9 @@ app.get("/api/image-set/health", requireAuth, async (req, res, next) => {
 app.post("/api/image-set/jobs", requireAuth, async (req, res, next) => {
   try {
     const out = await callImageSetService("POST", "/jobs", req.body || {});
+    // v1.5 隔离：记下这个任务是谁建的，列表/详情据此过滤
+    const jid = out.payload?.jobId || out.payload?.id;
+    if (out.status < 400 && jid) await rememberImageSetJob(jid, req.user.id);
     res.status(out.status).json(out.payload);
   } catch (error) { next(error); }
 });
@@ -8211,12 +8270,23 @@ app.post("/api/image-set/upload", requireAuth, express.raw({ type: () => true, l
 app.get("/api/image-set/jobs", requireAuth, async (req, res, next) => {
   try {
     const out = await callImageSetService("GET", "/jobs");
+    // v1.5 隔离：出图服务没有 owner 字段，只能按 ERP 侧记录的归属过滤，
+    //   否则任何登录用户都能看到别人家的出图任务。
+    const owned = await ownedImageSetJobIds(req.user.id);
+    if (out.payload && Array.isArray(out.payload.jobs)) {
+      out.payload = { ...out.payload, jobs: out.payload.jobs.filter((j) => owned.has(String(j.id))) };
+      out.payload.count = out.payload.jobs.length;
+    }
     res.status(out.status).json(out.payload);
   } catch (error) { next(error); }
 });
 
 app.get("/api/image-set/jobs/:id", requireAuth, async (req, res, next) => {
   try {
+    const owned = await ownedImageSetJobIds(req.user.id);
+    if (!owned.has(String(req.params.id))) {
+      return res.status(404).json({ ok: false, error: "任务不存在或无权限" });
+    }
     const out = await callImageSetService("GET", `/jobs/${encodeURIComponent(req.params.id)}`);
     res.status(out.status).json(out.payload);
   } catch (error) { next(error); }
@@ -8224,6 +8294,10 @@ app.get("/api/image-set/jobs/:id", requireAuth, async (req, res, next) => {
 
 app.post("/api/image-set/jobs/:id/cancel", requireAuth, async (req, res, next) => {
   try {
+    const owned = await ownedImageSetJobIds(req.user.id);
+    if (!owned.has(String(req.params.id))) {
+      return res.status(404).json({ ok: false, error: "任务不存在或无权限" });
+    }
     const out = await callImageSetService("POST", `/jobs/${encodeURIComponent(req.params.id)}/cancel`, {});
     res.status(out.status).json(out.payload);
   } catch (error) { next(error); }
@@ -25288,6 +25362,18 @@ if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/")) return next();
   res.sendFile(path.join(PUBLIC_DIR, "index.html"), { cacheControl: false, headers: { "Cache-Control": "no-cache, no-store, must-revalidate" } });
+});
+
+// v1.5 统一错误返回。
+//   以前路由里 next(error) 落到 Express 默认处理器，返回的是 HTML 错误页，
+//   前端 axios 解析 JSON 时报 "Unexpected token '<'" —— 真正的原因完全看不到。
+//   现在统一返回 { success:false, error }，并尊重 err.statusCode（比如 404「没有店铺」）。
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = Number(err?.statusCode || err?.status || 500);
+  const message = String(err?.message || "服务器内部错误");
+  if (status >= 500) console.error(`[error] ${req.method} ${req.originalUrl}:`, err?.stack || message);
+  res.status(status).json({ success: false, error: message });
 });
 
 if (process.argv[1] === __filename) {
