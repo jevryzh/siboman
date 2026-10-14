@@ -903,6 +903,26 @@ window.ProductListView = {
       batchText: '', batchBusy: false,
       jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
     });
+    // v1.5 缩略图悬浮放大（列表图太小看不清；不依赖任何组件库）
+    const zoom = Vue.reactive({ visible: false, src: '', title: '', x: 0, y: 0 });
+    const moveZoom = (ev) => {
+      const SIZE = 320, PAD = 16;
+      let x = Number(ev?.clientX || 0) + PAD;
+      let y = Number(ev?.clientY || 0) + PAD;
+      if (x + SIZE > window.innerWidth - 8) x = Number(ev?.clientX || 0) - SIZE - PAD;
+      if (y + SIZE > window.innerHeight - 8) y = Math.max(8, window.innerHeight - SIZE - 8);
+      zoom.x = Math.max(8, x);
+      zoom.y = Math.max(8, y);
+    };
+    const showZoom = (src, title, ev) => {
+      if (!src) return;
+      zoom.src = String(src);
+      zoom.title = title || '';
+      zoom.visible = true;
+      moveZoom(ev);
+    };
+    const hideZoom = () => { zoom.visible = false; };
+
     const followerDrawer = Vue.reactive({
       visible: false, offerId: '', name: '', loading: false, items: [],
       // v1.5：排除标记 / 比我低标记 / 我的价
@@ -949,6 +969,56 @@ window.ProductListView = {
         follow.loading = false;
       }
     };
+    // v1.5 一键复制「比我低价」的跟卖 SKU（会带上排除名单，自家店群不算）
+    const lowerBusy = Vue.ref(false);
+    const fetchLowerSkus = async () => {
+      const res = await axios.get('/api/ozon/followed-products/lower-skus', {
+        params: {
+          q: follow.q || undefined,
+          store_name: follow.storeName || undefined,
+          min_followers: follow.minFollowers || 1,
+          exclude_sellers: follow.excludeSellers || undefined,
+        },
+      });
+      return res.data || {};
+    };
+    const copyLowerSkus = async () => {
+      lowerBusy.value = true;
+      try {
+        const d = await fetchLowerSkus();
+        const skus = d.skus || [];
+        if (!skus.length) return notify.warning('没有找到「比我低价」的跟卖 SKU');
+        await navigator.clipboard.writeText(skus.join('\n'));
+        notify.success(`已复制 ${skus.length} 个「比我低价」的跟卖 SKU（涉及 ${d.product_count} 个商品）`
+          + (d.warn_no_exclude ? '｜提醒：还没设置排除店铺，自家店群可能也在里面' : ''));
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '获取失败');
+      } finally { lowerBusy.value = false; }
+    };
+    const exportLowerSkusCsv = async () => {
+      lowerBusy.value = true;
+      try {
+        const d = await fetchLowerSkus();
+        const rows = [];
+        for (const p of (d.by_product || [])) {
+          for (const x of p.skus) {
+            rows.push([p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, p.my_price_rub, x.sku, String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price]);
+          }
+        }
+        if (!rows.length) return notify.warning('没有找到「比我低价」的跟卖 SKU');
+        const head = ['我的货号', '商品名', '我的价(CNY)', '我的价(₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价'];
+        const csv = '\ufeff' + [head, ...rows].map((r) => r.join(',')).join('\n');
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+        a.download = `比我低价的跟卖SKU_${rows.length}条.csv`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+        notify.success(`已导出 ${rows.length} 条`);
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '导出失败');
+      } finally { lowerBusy.value = false; }
+    };
+
     // v1.5 排除店铺：保存 + 一键填我的店铺 + 分类计数/标签
     const saveFollowExclude = () => {
       try { localStorage.setItem('followExcludeSellers', follow.excludeSellers || ''); } catch (_e) { /* 忽略 */ }
@@ -1194,6 +1264,7 @@ window.ProductListView = {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
       saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows,
       copyLowerFollowerSku, exportFollowerCsv,
+      zoom, showZoom, moveZoom, hideZoom, lowerBusy, copyLowerSkus, exportLowerSkusCsv,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
       followBatchTokens, collectFollowBySkus, cancelFollowJob,
       products, loading, syncLoading, saveLoading,
@@ -1853,6 +1924,11 @@ window.ProductListView = {
             <el-input-number v-model="follow.minFollowers" :min="1" :max="999" style="width:140px" @change="loadFollowed(true)" />
             <span style="font-size:12px; color:#94a3b8; margin-left:-4px">最少跟卖卖家数</span>
             <el-button @click="loadFollowed(true)">刷新列表</el-button>
+            <!-- v1.5 一键复制：不用再一个个点进「跟卖卖家」看 -->
+            <el-button type="danger" plain :loading="lowerBusy" @click="copyLowerSkus">
+              复制比我低价的跟卖 SKU
+            </el-button>
+            <el-button plain :loading="lowerBusy" @click="exportLowerSkusCsv">导出这些 SKU</el-button>
             <span style="font-size:12px; color:#94a3b8">（列表按上面的「查询范围」店铺筛选）</span>
           </div>
 
@@ -1888,9 +1964,11 @@ window.ProductListView = {
             </template>
             <el-table-column label="图" width="70">
               <template #default="{ row }">
+                <span style="display:inline-block" @mouseenter="showZoom(row.image, row.name || row.offer_id, $event)" @mousemove="moveZoom" @mouseleave="hideZoom">
                 <el-image :src="row.image" style="width:46px; height:46px; border-radius:6px; background:#f1f5f9; cursor:zoom-in" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []">
                   <template #error><div style="height:46px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:11px">无图</div></template>
                 </el-image>
+                </span>
               </template>
             </el-table-column>
             <el-table-column label="商品" min-width="260" show-overflow-tooltip>
@@ -2006,6 +2084,12 @@ window.ProductListView = {
           </el-table>
         </el-drawer>
       </el-drawer>
+
+      <!-- v1.5 缩略图悬浮放大 -->
+      <div v-if="zoom.visible" :style="{ position: 'fixed', left: zoom.x + 'px', top: zoom.y + 'px', zIndex: 3000, pointerEvents: 'none' }">
+        <img :src="zoom.src" style="width:320px; height:320px; object-fit:contain; background:#fff; border:1px solid #e2e8f0; border-radius:10px; box-shadow:0 12px 34px rgba(15,23,42,.24)" />
+        <div v-if="zoom.title" style="margin-top:4px; max-width:320px; font-size:12px; color:#475569; background:rgba(255,255,255,.96); border:1px solid #e2e8f0; border-radius:6px; padding:4px 8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ zoom.title }}</div>
+      </div>
     </div>
   `
 };
