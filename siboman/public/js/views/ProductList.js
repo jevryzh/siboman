@@ -932,6 +932,7 @@ window.ProductListView = {
       visible: false, offerId: '', name: '', loading: false, items: [],
       // v1.5：排除标记 / 比我低标记 / 我的价
       myPrice: null, myCurrency: '', myPriceRub: null, rubCnyRate: null,
+      myPriceSource: '', listPriceText: '',
       rivalMin: null, rivalCurrency: '',
       excludedCount: 0, lowerCount: 0, hideExcluded: false, onlyLower: false,
     });
@@ -1100,6 +1101,8 @@ window.ProductListView = {
         followerDrawer.items = items;
         followerDrawer.myPrice = res.data?.my_price ?? null;
         followerDrawer.myPriceRub = res.data?.my_price_rub ?? null;
+        followerDrawer.myPriceSource = res.data?.my_price_source || '';
+        followerDrawer.listPriceText = res.data?.list_price_text || '';
         followerDrawer.rubCnyRate = res.data?.rub_cny_rate ?? null;
         followerDrawer.rivalMin = res.data?.rival_min ?? null;
         followerDrawer.excludedCount = Number(res.data?.excluded_count || 0);
@@ -2137,9 +2140,11 @@ window.ProductListView = {
           <div v-if="followerDrawer.name" style="font-size:13px; color:#475569; margin-bottom:6px">{{ followerDrawer.name }}</div>
           <div style="font-size:12px; color:#94a3b8; margin-bottom:6px">货号：{{ followerDrawer.offerId }}</div>
           <div style="font-size:12px; color:#475569; margin-bottom:6px; line-height:1.9">
-            <span v-if="followerDrawer.myPrice !== null">
-              我的价 <b>{{ followerDrawer.myPrice }} CNY</b>
-              <span v-if="followerDrawer.myPriceRub" style="color:#64748b">（≈ {{ followerDrawer.myPriceRub }} ₽，按汇率 {{ followerDrawer.rubCnyRate }}）</span>
+            <span v-if="followerDrawer.myPriceRub !== null">
+              我的价
+              <b v-if="followerDrawer.myPriceSource === 'card-price'">{{ followerDrawer.myPriceRub }} ₽</b>
+              <b v-else>{{ followerDrawer.myPrice }} CNY（≈ {{ followerDrawer.myPriceRub }} ₽）</b>
+              <span v-if="followerDrawer.myPriceSource === 'card-price'" style="color:#16a34a">（Ozon 卡片绿标价{{ followerDrawer.listPriceText ? '，常规 ' + followerDrawer.listPriceText : '' }}）</span>
               ·
             </span>
             共 <b>{{ followerDrawer.items.length }}</b> 个卖家
@@ -2147,7 +2152,7 @@ window.ProductListView = {
             <span v-if="followerDrawer.excludedCount" style="color:#b45309"> · 已在排除名单里 {{ followerDrawer.excludedCount }} 个</span>
           </div>
           <div style="font-size:11px; color:#94a3b8; margin-bottom:10px">
-            跟卖价是买家侧卢布，我的价是店铺结算币；这里已按汇率折算到卢布后比较，避免拿人民币和卢布直接相减。
+            我的价取自 Ozon 商品页上的绿标价（与跟卖价同为卢布，直接比较）；只有卡片上取不到时才回退库里价折汇率 —— 与列表页同一套口径。
           </div>
           <div style="margin-bottom:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
             <el-button size="small" @click="copyAllFollowerSku">复制全部跟卖 SKU</el-button>

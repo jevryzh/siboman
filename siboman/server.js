@@ -6033,6 +6033,8 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       `SELECT fs.follower_sku,
               COALESCE(fs.follower_name,'') AS follower_name,
               COALESCE(fs.follower_image,'') AS follower_image,
+              COALESCE(fs.card_price,'') AS card_price,
+              COALESCE(fs.list_price,'') AS list_price,
               fs.follower_price,
               NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric AS price_num,
               EXISTS (
@@ -6046,11 +6048,23 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
                  fs.follower_sku`,
       [req.user.id, offerId, excludeSellers],
     );
-    // 我的价 / 竞品最低价（实时取，带缓存）—— 用来标出「比我低」的卖家
-    let myPrice = null;      // 我的售价（卖家币种，国内店是 CNY）
-    let myPriceRub = null;   // 同一价格折算成卢布（跟卖价是买家侧 RUB，必须同币种才能比）
+    // 「我的价」——必须和列表页用**同一套口径**，否则列表说「6 个比我低」、
+    //   抽屉却说「比我低 0 个」（用户踩过）。
+    //   ⓪ 卡片绿标价（跟卖采集时一起存下来的 card_price / list_price）—— 同币种(RUB)直接比
+    //   ① 卡片上认不出时才退回 Ozon 价格接口（卖家币种 CNY）折汇率
+    const grabRub = (t) => {
+      const m = String(t || "").replace(/[^\d]/g, "");
+      return m ? Number(m) : null;
+    };
+    let myPrice = null;      // 卖家币种价（仅兜底路径用）
+    let myPriceRub = null;   // 比价用的卢布价
+    let myPriceSource = "";
     let rivalMin = null;
     let priceInfo = null;
+    for (const row of r.rows) {
+      const n = grabRub(row.card_price) ?? grabRub(row.list_price);
+      if (n !== null) { myPriceRub = n; myPriceSource = "card-price"; break; }
+    }
     try {
       const prod = await db.query(
         `SELECT store_id, offer_id FROM app_products
@@ -6068,7 +6082,10 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
         // ⚠️ 跟卖价是买家侧 RUB，我的价是卖家币种（国内店 CNY）——
         //    直接相减等于没比。用 ERP 的汇率折算成卢布再比。
         const rate = RUB_CNY_RATE > 0 ? RUB_CNY_RATE : 0.0862;
-        if (myPrice !== null && rate > 0) myPriceRub = Math.round((myPrice / rate) * 100) / 100;
+        if (myPriceRub === null && myPrice !== null && rate > 0) {
+          myPriceRub = Math.round((myPrice / rate) * 100) / 100;
+          myPriceSource = "db";
+        }
       }
     } catch (_e) { /* 取不到价不影响列表 */ }
     const items = r.rows.map((x) => ({
@@ -6087,6 +6104,9 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       total: items.length,
       my_price: myPrice,
       my_price_rub: myPriceRub,
+      my_price_source: myPriceSource,
+      card_price_text: (r.rows[0] && r.rows[0].card_price) || '',
+      list_price_text: (r.rows[0] && r.rows[0].list_price) || '',
       rub_cny_rate: RUB_CNY_RATE,
       rival_min: rivalMin,
       exclude_sellers: excludeSellers,
