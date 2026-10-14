@@ -6113,7 +6113,8 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
             p.price AS local_price,
             p.currency_code,
             p.store_id,
-            p.status
+            p.status,
+            ms.name AS my_store_name
        FROM agg a
        LEFT JOIN LATERAL (
          SELECT name, image, price, currency_code, store_id, status, offer_id
@@ -6123,6 +6124,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
           ORDER BY updated_at DESC NULLS LAST
           LIMIT 1
        ) p ON TRUE
+       LEFT JOIN app_stores ms ON ms.id = p.store_id
       WHERE ($4 = '' OR a.offer_id ILIKE '%' || $4 || '%' OR COALESCE(p.name,'') ILIKE '%' || $4 || '%')
         AND ($5 = '' OR a.store_name = $5 OR EXISTS (
               SELECT 1 FROM app_stores s WHERE s.id = p.store_id AND s.name = $5))
@@ -6178,16 +6180,39 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
     const mine = mineByOffer.get(p.offer_id) || [];
     const info = p.price_info || {};
 
-    // 我的价：优先卡片上自家店铺的最低价
-    let myPrice = null;
-    for (const m of mine) {
-      const n = num(m.price_num);
-      if (n !== null && (myPrice === null || n < myPrice)) myPrice = n;
-    }
-    let myPriceSource = myPrice !== null ? "card" : "";
+    // 「我的价」按优先级确定，并把来源标出来：
+    //   ① card-store：**按提交的 SKU 查到的归属店铺**，在卡片上找到它自己的报价。
+    //      最精确 —— 同一张卡片上你可能有好几个店在卖，必须取“这一个商品所属的那个店”，
+    //      而不是把自家所有店的报价混起来取最低。
+    //   ② db        ：卡片上找不到该店铺（例如你正是卡片**主卖家**，
+    //      而 Ozon 的接口叫 otherOffersFromSellers，**不含主卖家**）
+    //      → 退回库里该商品的价折算成卢布。
+    //   ③ card-group：库里根本没有这个商品 → 在卡片上按“排除店铺名单”认自家店，取最低。
+    //      （这样没有任何商品库也能算）
     const dbCny = info.my_price === undefined ? null : info.my_price;
     const dbRub = dbCny !== null ? Math.round((dbCny / fxRate) * 100) / 100 : null;
+    let myPrice = null;
+    let myPriceSource = "";
+    const myStoreName = String(p.my_store_name || "").trim().toLowerCase();
+    const allRows = mine.concat(list);
+    if (myStoreName) {
+      let best = null;
+      for (const r of allRows) {
+        if (String(r.follower_name || "").trim().toLowerCase() !== myStoreName) continue;
+        const n = num(r.price_num);
+        if (n !== null && (best === null || n < best)) best = n;
+      }
+      if (best !== null) { myPrice = best; myPriceSource = "card-store"; }
+    }
     if (myPrice === null && dbRub !== null) { myPrice = dbRub; myPriceSource = "db"; }
+    if (myPrice === null) {
+      let best = null;
+      for (const m of mine) {
+        const n = num(m.price_num);
+        if (n !== null && (best === null || n < best)) best = n;
+      }
+      if (best !== null) { myPrice = best; myPriceSource = "card-group"; }
+    }
 
     let minPrice = null;
     let minPriceText = "";
@@ -6211,6 +6236,12 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
       // 我的价（RUB，卡片口径）与来源
       my_price: myPrice,
       my_price_source: myPriceSource,
+      my_store_name: p.my_store_name || '',
+      // 自家店群在这张卡片上各自报了多少（便于核对"取的是哪个店"）
+      my_group_prices: mine
+        .map((m) => ({ name: m.follower_name || '', price: m.price_num === null || m.price_num === undefined ? null : Number(m.price_num), text: m.follower_price || '' }))
+        .filter((x) => x.price !== null)
+        .sort((a, b) => a.price - b.price),
       my_currency: "RUB",
       // 库里的结算币价格（仅作参考，不参与比价）
       my_price_cny: dbCny,

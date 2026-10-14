@@ -2028,11 +2028,27 @@ window.ProductListView = {
                 <div v-if="row.lower_count" style="font-size:10px; color:#dc2626">{{ row.lower_count }} 个比我低</div>
               </template>
             </el-table-column>
-            <el-table-column label="我的价(我店铺报价)" width="130" align="right">
+            <el-table-column label="我的价(我店铺报价)" width="150" align="right">
               <template #default="{ row }">
                 <span v-if="row.my_price !== null" style="font-weight:700">{{ row.my_price }} ₽</span>
                 <span v-else style="color:#c0c4cc">-</span>
-                <div v-if="row.my_price_source === 'db'" style="font-size:10px; color:#f59e0b">卡片上没认到自家店，用的是库里价折算</div>
+                <div v-if="row.my_price_source === 'card-store'" style="font-size:10px; color:#16a34a">
+                  {{ row.my_store_name || '我的店铺' }} 在卡片上的报价
+                </div>
+                <div v-else-if="row.my_price_source === 'db'" style="font-size:10px; color:#f59e0b">
+                  卡片上没找到「{{ row.my_store_name || '我的店铺' }}」（可能是主卖家），用的是库里价折算
+                </div>
+                <div v-else-if="row.my_price_source === 'card-group'" style="font-size:10px; color:#94a3b8">
+                  库里没这商品，取自家店群最低
+                </div>
+              </template>
+            </el-table-column>
+            <el-table-column label="我店群在卡片上的报价" width="180" align="right">
+              <template #default="{ row }">
+                <div v-for="g in (row.my_group_prices || [])" :key="g.name" style="font-size:11px; color:#64748b">
+                  {{ g.name }} <span style="font-family:monospace">{{ g.price }} ₽</span>
+                </div>
+                <span v-if="!(row.my_group_prices || []).length" style="color:#c0c4cc">-</span>
               </template>
             </el-table-column>
             <el-table-column label="别人最低价" width="110" align="right">
