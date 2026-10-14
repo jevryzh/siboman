@@ -2047,7 +2047,10 @@ window.ProductListView = {
               <template #default="{ row }">
                 <span v-if="row.my_price !== null" style="font-weight:700">{{ row.my_price }} ₽</span>
                 <span v-else style="color:#c0c4cc">-</span>
-                <div v-if="row.my_price_source === 'card-store'" style="font-size:10px; color:#16a34a">
+                <div v-if="row.my_price_source === 'card-price'" style="font-size:10px; color:#16a34a">
+                  Ozon 商品页绿标价<span v-if="row.list_price_text">（常规 {{ row.list_price_text }}）</span>
+                </div>
+                <div v-else-if="row.my_price_source === 'card-store'" style="font-size:10px; color:#16a34a">
                   {{ row.my_store_name || '我的店铺' }} 在卡片上的报价
                 </div>
                 <div v-else-if="row.my_price_source === 'db'" style="font-size:10px; color:#f59e0b">

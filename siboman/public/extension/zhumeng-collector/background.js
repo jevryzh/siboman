@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.128";
+const VERSION = "2.2.9.131";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1486,6 +1486,36 @@ async function closeOwnedOzonPatrolTab() {
 
 // 注入到 ozon.ru 页面里执行 —— 同源 fetch 公开接口。
 // 注意：executeScript 注入的函数只能引用自身函数体内的代码（引用外部函数会 ReferenceError）。
+// 抓「卡片主价」—— Ozon 商品页的 webPrice widget 就是页面上显示的那个价：
+//   cardPrice = 绿标价（Ozon 卡价，用户说的"售价绿标"）
+//   price     = 常规价
+// 以前「我的价」是拿商品库里的 CNY 价折汇率算的，跟页面上实际显示的差不少
+// （实测库里的价折出来 464 ₽，页面上绿标是 429 ₽、常规 457 ₽）。直接读页面最准，
+// 而且不依赖商品在没在自己商品库里。
+function extractCardPriceInPage(productId) {
+  const url = `https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=${encodeURIComponent("/product/" + productId + "/")}&_mjgd_ts=${Date.now()}`;
+  return fetch(url, { credentials: "include", cache: "no-store" })
+    .then(function (resp) {
+      if (!resp.ok) return { __error: "HTTP " + resp.status };
+      return resp.json();
+    })
+    .then(function (data) {
+      const ws = (data && data.widgetStates) || {};
+      const keys = Object.keys(ws);
+      for (let i = 0; i < keys.length; i += 1) {
+        if (keys[i].indexOf("webPrice") !== 0) continue;
+        try {
+          const v = typeof ws[keys[i]] === "string" ? JSON.parse(ws[keys[i]]) : ws[keys[i]];
+          if (v && (v.cardPrice || v.price)) {
+            return { cardPrice: v.cardPrice || "", price: v.price || "", originalPrice: v.originalPrice || "" };
+          }
+        } catch (_e) { /* 跳过解析失败的 widget */ }
+      }
+      return { cardPrice: "", price: "", originalPrice: "" };
+    })
+    .catch(function (e) { return { __error: (e && e.message) || String(e) }; });
+}
+
 function extractOtherOffersInPage(productId) {
   const url = `https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=%2Fmodal%2FotherOffersFromSellers%3Fproduct_id%3D${encodeURIComponent(productId)}%26sort%3Dprice%26page_changed%3Dtrue&_mjgd_ts=${Date.now()}`;
   return fetch(url, { credentials: "include", cache: "no-store" })
@@ -1516,6 +1546,65 @@ function extractOtherOffersInPage(productId) {
     .catch(function (e) { return { __error: (e && e.message) || String(e) }; });
 }
 
+// 卖家列表 + 卡片主价，一次注入全抓回来（v2.2.9.131）。
+//   ⚠️ 必须**完全自包含**：executeScript 注入的函数只能引用自身函数体内的代码，
+//   引用外面的函数会 ReferenceError，表现为「页面注入无返回」。
+function extractFollowBundleInPage(productId) {
+  const pick = function (data) {
+    const ws = (data && data.widgetStates) || {};
+    const keys = Object.keys(ws);
+    // ① 卖家列表
+    let sellers = [];
+    for (let i = 0; i < keys.length; i += 1) {
+      if (keys[i].indexOf("webSellerList") !== 0) continue;
+      try {
+        const v = typeof ws[keys[i]] === "string" ? JSON.parse(ws[keys[i]]) : ws[keys[i]];
+        if (v && Array.isArray(v.sellers)) {
+          sellers = v.sellers.map(function (s) {
+            const price = (s.price && s.price.cardPrice && s.price.cardPrice.price) || (s.price && s.price.price) || "";
+            return { sku: s.sku || "", name: s.name || "", price: price };
+          });
+          break;
+        }
+      } catch (_e) { /* 单个 widget 解析失败跳过 */ }
+    }
+    // ② 卡片主价（绿标 cardPrice / 常规 price）
+    let cardPrice = "", listPrice = "", originalPrice = "";
+    for (let i = 0; i < keys.length; i += 1) {
+      if (keys[i].indexOf("webPrice") !== 0) continue;
+      try {
+        const v = typeof ws[keys[i]] === "string" ? JSON.parse(ws[keys[i]]) : ws[keys[i]];
+        if (v && (v.cardPrice || v.price)) {
+          cardPrice = v.cardPrice || "";
+          listPrice = v.price || "";
+          originalPrice = v.originalPrice || "";
+          break;
+        }
+      } catch (_e) { /* 跳过 */ }
+    }
+    return { sellers: sellers, cardPrice: cardPrice, listPrice: listPrice, originalPrice: originalPrice };
+  };
+  const ts = Date.now();
+  const modalUrl = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
+    + encodeURIComponent("/modal/otherOffersFromSellers?product_id=" + productId + "&sort=price&page_changed=true")
+    + "&_mjgd_ts=" + ts;
+  const pageUrl = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
+    + encodeURIComponent("/product/" + productId + "/") + "&_mjgd_ts=" + ts;
+  return Promise.all([
+    fetch(modalUrl, { credentials: "include", cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+    fetch(pageUrl, { credentials: "include", cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+  ]).then(function (pair) {
+    const a = pick(pair[0]);
+    const b = pick(pair[1]);
+    return {
+      sellers: a.sellers,
+      cardPrice: a.cardPrice || b.cardPrice || "",
+      listPrice: a.listPrice || b.listPrice || "",
+      originalPrice: a.originalPrice || b.originalPrice || "",
+    };
+  });
+}
+
 // 在 ozon.ru 页面上下文里抓「其他卖家报价」（跟卖卖家）。
 async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
   const runOn = async (id) => {
@@ -1528,13 +1617,19 @@ async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
     }
     const [res] = await chrome.scripting.executeScript({
       target: { tabId: id },
-      func: extractOtherOffersInPage,
+      func: extractFollowBundleInPage,
       args: [productId],
     });
     const out = res && res.result;
     if (!out) throw new Error("页面注入无返回（标签页可能没有加载 ozon.ru）");
     if (out.__error) throw new Error(out.__error);
-    return Array.isArray(out.sellers) ? out.sellers : [];
+    // v2.2.9.131 连同「卡片主价」一起返回，供 ERP 计算「比我低价」
+    return {
+      sellers: Array.isArray(out.sellers) ? out.sellers : [],
+      cardPrice: out.cardPrice || "",
+      listPrice: out.listPrice || "",
+      originalPrice: out.originalPrice || "",
+    };
   };
   try {
     return await runOn(tabId);
@@ -1582,11 +1677,20 @@ async function runQueuedOzonPatrolJob(remoteJob) {
       await reportSourcingProgress(job);
       try {
         if (!productId) throw new Error("缺少 product_id");
-        const sellers = await fetchOtherOffersFromSellersInPlugin(productId, patrolTab.id);
-        job.results.push({ offer_id: offerId, product_id: productId, store_name: storeName, sellers });
+        const bundle = await fetchOtherOffersFromSellersInPlugin(productId, patrolTab.id);
+        const sellers = bundle.sellers || [];
+        job.results.push({
+          offer_id: offerId,
+          product_id: productId,
+          store_name: storeName,
+          sellers,
+          card_price: bundle.cardPrice || "",
+          list_price: bundle.listPrice || "",
+          original_price: bundle.originalPrice || "",
+        });
         if (sellers.length) {
           okCount += 1;
-          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家`, "info"));
+          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家（卡片价 ${bundle.cardPrice || bundle.listPrice || "-"}）`, "info"));
         }
       } catch (e) {
         errCount += 1;

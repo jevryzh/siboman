@@ -104,7 +104,7 @@ const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.127";
 //   ② 抓跟卖接口要的是 SKU 而不是库里的 product_id → 整批 HTTP 404。
 // 多台机器同时在线时谁先轮询谁领任务，旧版会把任务抢走并跑成 0 结果，
 // 所以这里让低于此版本的采集端**看不到** ozon-patrol 任务（只卡这一类，不影响其它任务）。
-const MIN_PATROL_PLUGIN_VERSION = "2.2.9.128";
+const MIN_PATROL_PLUGIN_VERSION = "2.2.9.131";
 // Yandex 自动上架采集（kind=yandex-collect）最低插件版本（统一到同一版）
 const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.127";
 // 采集类任务只在 1688 侧完成（开页面读标题/图/SKU/重量），不使用任何店铺凭据，
@@ -1776,6 +1776,13 @@ async function initDatabase() {
       -- v1.5 多账号隔离：出图服务是外部无状态的，任务没有归属字段。
       --   这里记下「这个 serviceJobId 是哪个用户创建的」，列表/详情据此过滤，
       --   否则任何登录用户都能看到别人家的出图任务。
+      -- v2.2.9.131 跟卖采集时顺手带回来的「卡片主价」（Ozon 商品页 webPrice widget）
+      --   card_price = 绿标价（Ozon 卡价）、list_price = 常规价。
+      --   以前「我的价」是拿库里的 CNY 价折汇率算的，和页面上实际显示的对不上
+      --   （实测折出来 464 ₽，页面绿标 429 ₽ / 常规 457 ₽）。直接存页面价最准。
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS card_price TEXT DEFAULT '';
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS list_price TEXT DEFAULT '';
+
       CREATE TABLE IF NOT EXISTS app_image_set_jobs (
         service_job_id TEXT PRIMARY KEY,
         user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -5823,8 +5830,14 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
           //   实测同一商品：传 SKU 5639775451 → HTTP 200 / 86 个卖家；
           //   传库里的 product_id 6157731775 → HTTP 404 / 0 个卖家。
           //   历史数据能采到，是因为当时 offer_id 本身就是 SKU。所以这里优先用 sku。
+          // ⚠️ 存储键用**用户粘贴的那个 token**，不要用库里解析出来的真实 offer_id。
+          //   否则同一个商品会裂成两条：之前按 SKU 查的存成 5639775451，
+          //   后来解析到商品库存成 jz-260624fwg3-4736604207-18，列表就出现两行，
+          //   而且卡片价只挂在其中一条上（表现为「我的价还是老口径」）。
+          //   真实货号另存 my_offer_id 备查；比价/展示都跟着 token 走。
           items.push({
-            offer_id: String(hit.offer_id || ""),
+            offer_id: token,
+            my_offer_id: String(hit.offer_id || ""),
             product_id: String(hit.sku || hit.product_id || ""),
             sku: String(hit.sku || ""),
             store_name: String(hit.store_name || ""),
@@ -6145,18 +6158,26 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
   const offerIds = products.map((p) => p.offer_id);
   const perOffer = new Map();      // 别人的报价（已去掉自家店群）
   const mineByOffer = new Map();   // 自家店群在这张卡片上的报价
+  const cardPriceByOffer = new Map();  // 卡片主价（绿标/常规）
   if (offerIds.length) {
     const fsResult = await db.query(
       `SELECT fs.offer_id,
               COALESCE(fs.follower_name,'') AS follower_name,
               fs.follower_sku,
               fs.follower_price,
+              COALESCE(fs.card_price,'') AS card_price,
+              COALESCE(fs.list_price,'') AS list_price,
               ${priceNumSql} AS price_num
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
           AND fs.offer_id = ANY($2::text[])`,
       [userId, offerIds],
     );
+    for (const r of fsResult.rows) {
+      if (!cardPriceByOffer.has(r.offer_id) && (r.card_price || r.list_price)) {
+        cardPriceByOffer.set(r.offer_id, { card: r.card_price || "", list: r.list_price || "" });
+      }
+    }
     const exclSet = new Set(excludeSellers.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
     const isMine = (name) => exclSet.has(String(name || "").trim().toLowerCase());
     for (const r of fsResult.rows) {
@@ -6193,9 +6214,21 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
     const dbRub = dbCny !== null ? Math.round((dbCny / fxRate) * 100) / 100 : null;
     let myPrice = null;
     let myPriceSource = "";
+    //   ⓪ card-price：**Ozon 商品页上显示的那个价**（webPrice widget 的 cardPrice=绿标 /
+    //      price=常规）。这是用户实际看到的售价，最准，而且不依赖商品库。
+    //      实测 5639775451：页面绿标 429 ₽、常规 457 ₽；而库里 CNY 价折出来是 464 ₽，对不上。
+    const cardP = cardPriceByOffer.get(p.offer_id) || null;
+    const parseRub = (t) => {
+      const m = String(t || "").replace(/[^\d]/g, "");
+      return m ? Number(m) : null;
+    };
+    if (cardP) {
+      const n = parseRub(cardP.card) ?? parseRub(cardP.list);
+      if (n !== null) { myPrice = n; myPriceSource = "card-price"; }
+    }
     const myStoreName = String(p.my_store_name || "").trim().toLowerCase();
     const allRows = mine.concat(list);
-    if (myStoreName) {
+    if (myPrice === null && myStoreName) {
       let best = null;
       for (const r of allRows) {
         if (String(r.follower_name || "").trim().toLowerCase() !== myStoreName) continue;
@@ -6237,6 +6270,8 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
       my_price: myPrice,
       my_price_source: myPriceSource,
       my_store_name: p.my_store_name || '',
+      card_price_text: cardP ? (cardP.card || cardP.list) : '',
+      list_price_text: cardP ? cardP.list : '',
       // 自家店群在这张卡片上各自报了多少（便于核对"取的是哪个店"）
       my_group_prices: mine
         .map((m) => ({ name: m.follower_name || '', price: m.price_num === null || m.price_num === undefined ? null : Number(m.price_num), text: m.follower_price || '' }))
@@ -19204,12 +19239,14 @@ async function applyOzonPatrolFollowResults(userId, updated) {
     if (targeted && offerId) {
       await db.query("DELETE FROM ozon_follow_sellers WHERE user_id=$1 AND offer_id=$2", [userId, offerId]);
     }
+    const cardPrice = String(r?.card_price || "").trim();
+    const listPrice = String(r?.list_price || "").trim();
     for (const s of sellers) {
       const sku = String(s?.sku || "").trim();
       if (!sku) continue;
       await db.query(
-        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || "")],
+        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || ""), cardPrice, listPrice],
       );
       n += 1;
     }
