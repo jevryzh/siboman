@@ -99,6 +99,12 @@ const PLUGIN_WORKER_TOKEN_TTL_MS = Number(process.env.PLUGIN_WORKER_TOKEN_TTL_MS
 const MIN_SINGLE_SOURCING_PLUGIN_VERSION = "2.2.9.127";
 // 全店精核价最低插件版本（统一到同一版，旧副本不再领取精核价任务）
 const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.127";
+// 巡查跟卖（含「查跟卖」）最低版本：2.2.9.128 修了两个致命 bug ——
+//   ① 复用被 Chrome「内存节省」丢弃的标签页 → executeScript 报权限错，跟卖恒为 0；
+//   ② 抓跟卖接口要的是 SKU 而不是库里的 product_id → 整批 HTTP 404。
+// 多台机器同时在线时谁先轮询谁领任务，旧版会把任务抢走并跑成 0 结果，
+// 所以这里让低于此版本的采集端**看不到** ozon-patrol 任务（只卡这一类，不影响其它任务）。
+const MIN_PATROL_PLUGIN_VERSION = "2.2.9.128";
 // Yandex 自动上架采集（kind=yandex-collect）最低插件版本（统一到同一版）
 const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.127";
 // 采集类任务只在 1688 侧完成（开页面读标题/图/SKU/重量），不使用任何店铺凭据，
@@ -18861,6 +18867,7 @@ app.post("/api/worker/jobs/next", async (req, res, next) => {
     const job = await claimNextDbJob(req.user, workerName, {
       kinds,
       canClaimPrecise: compareNumericVersion(workerVersion, MIN_PRECISE_PRICING_PLUGIN_VERSION) >= 0,
+      canClaimPatrol: compareNumericVersion(workerVersion, MIN_PATROL_PLUGIN_VERSION) >= 0,
     });
     if (job) console.log("[jobs/next] CLAIMED kind=", job.kind, "status=", job.status);
     if (job) {
@@ -24119,6 +24126,8 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
   // 全店精核价（marker=precise-1688）必须用新版插件：旧版会把 "10件起 ¥3.2" 读成 10，价格全错。
   // 多台机器同时在线时，谁先轮询谁领任务 → 版本不够的采集端直接看不到这类任务，避免抢单跑错。
   const canClaimPrecise = options.canClaimPrecise !== false;
+  // 版本不够的采集端不发放巡查跟卖任务，免得把任务抢走跑成 0 结果（见 MIN_PATROL_PLUGIN_VERSION 注释）
+  const canClaimPatrol = options.canClaimPatrol !== false;
   // 超时任务重新领取 — 插件掉线后 claimed/running 任务在 reclaim 窗口内自动被续跑（对齐生产旧版机制）。
   // 守卫：
   //   ① 排除服务器侧收尾阶段（服务器 AI 审核/生成 Excel），避免 complete 处理中被抢单重复执行；
@@ -24134,6 +24143,7 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
          AND (cardinality($2::text[]) = 0 OR j.kind = ANY($2::text[]))
           AND ($3::uuid IS NULL OR j.store_id = $3::uuid OR j.kind IN ${WORKER_STORE_SCOPE_EXEMPT_SQL})
           AND ($6::boolean OR COALESCE(j.payload->>'marker', '') <> 'precise-1688')
+          AND ($7::boolean OR j.kind <> 'ozon-patrol')
           AND (
             j.status = 'queued'
             OR (
@@ -24155,7 +24165,7 @@ async function claimNextDbJob(user, workerName = "", options = {}) {
          j.created_at ASC
        LIMIT 1
        FOR UPDATE SKIP LOCKED`,
-      [user?.id || "", kinds, tokenStoreId || null, reclaimMs, heartbeatOnlineMs, canClaimPrecise],
+      [user?.id || "", kinds, tokenStoreId || null, reclaimMs, heartbeatOnlineMs, canClaimPrecise, canClaimPatrol],
     );
     if (!selected.rowCount) {
       await client.query("COMMIT");

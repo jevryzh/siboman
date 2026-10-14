@@ -427,7 +427,18 @@ function setupPluginWorkerKeepAlive() {
       const url = sid
         ? `/api/worker/plugin-token?store_id=${encodeURIComponent(sid)}`
         : "/api/worker/plugin-token";
-      const resp = await fetch(url, { credentials: "include", headers: { Accept: "application/json" } });
+      let resp = await fetch(url, { credentials: "include", headers: { Accept: "application/json" } });
+      // v2.2.9.129 换账号登录后的坑：
+      //   localStorage.currentStoreId 是**上一个账号**选的店铺，这个浏览器里不会自动清。
+      //   带着别人的 store_id 去签 token，服务端会 404「店铺不存在、已停用或无权限」，
+      //   于是 token 一直签不出来 → 插件继续用旧账号的 token →
+      //   新账号（如 jindiao）的跟卖任务永远没人领取，界面一直「等待采集端领取」。
+      //   这里失败就退一步：清掉这个失效的店铺 id，改成不带 store_id 再签一次。
+      //   （店铺作用域只影响 seller.ozon.ru 里的销售漏斗面板，不影响采集任务。）
+      if (!resp.ok && sid) {
+        try { localStorage.removeItem("currentStoreId"); } catch (_e) { /* 忽略 */ }
+        resp = await fetch("/api/worker/plugin-token", { credentials: "include", headers: { Accept: "application/json" } });
+      }
       if (!resp.ok) return null;
       const data = await resp.json();
       if (!data?.token) return null;
