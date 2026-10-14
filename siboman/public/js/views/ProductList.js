@@ -893,13 +893,22 @@ window.ProductListView = {
       visible: false, loading: false, collecting: false,
       items: [], total: 0, page: 1, pageSize: 50,
       q: '', storeName: '', minFollowers: 1,
-      summary: { products: 0, followers: 0, scanned_at: null },
+      summary: { products: 0, followers: 0, scanned_at: null, excluded_followers: 0, class_counts: { lower: 0, not_lower: 0, unknown: 0 } },
       stores: [],
+      // v1.5：排除店铺（卖家名）—— 把自己店群剔掉，免得自家店被算成跟卖。
+      //        存 localStorage，免得每次重开都重填。
+      excludeSellers: (() => { try { return localStorage.getItem('followExcludeSellers') || ''; } catch (_e) { return ''; } })(),
+      priceClass: 'all',
       // v2.2.9.127 定向查询：批量粘贴 SKU/货号，只查这些商品，不整店跑
       batchText: '', batchBusy: false,
       jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
     });
-    const followerDrawer = Vue.reactive({ visible: false, offerId: '', name: '', loading: false, items: [] });
+    const followerDrawer = Vue.reactive({
+      visible: false, offerId: '', name: '', loading: false, items: [],
+      // v1.5：排除标记 / 比我低标记 / 我的价
+      myPrice: null, myCurrency: '', rivalMin: null, rivalCurrency: '',
+      excludedCount: 0, lowerCount: 0, hideExcluded: false,
+    });
     const parsePriceText = (s) => {
       if (!s) return 0;
       const n = String(s).replace(/[^\d.,]/g, '').replace(/\s/g, '').replace(',', '.');
@@ -925,6 +934,8 @@ window.ProductListView = {
             q: follow.q || undefined,
             store_name: follow.storeName || undefined,
             min_followers: follow.minFollowers || 1,
+            exclude_sellers: follow.excludeSellers || undefined,
+            price_class: follow.priceClass || 'all',
           },
         });
         follow.items = res.data?.items || [];
@@ -937,6 +948,28 @@ window.ProductListView = {
         follow.loading = false;
       }
     };
+    // v1.5 排除店铺：保存 + 一键填我的店铺 + 分类计数/标签
+    const saveFollowExclude = () => {
+      try { localStorage.setItem('followExcludeSellers', follow.excludeSellers || ''); } catch (_e) { /* 忽略 */ }
+      loadFollowed(true);
+    };
+    const fillMyStoresAsExclude = () => {
+      const names = (follow.stores || []).map((x) => x.store_name).filter(Boolean);
+      if (!names.length) return notify.warning('还没读到店铺列表');
+      const cur = String(follow.excludeSellers || '').split(/[,，;；\r\n]+/).map((x) => x.trim()).filter(Boolean);
+      const merged = [...new Set([...cur, ...names])];
+      follow.excludeSellers = merged.join(',');
+      saveFollowExclude();
+      notify.success(`已填入 ${names.length} 个店铺`);
+    };
+    const classCount = (k) => Number(follow.summary?.class_counts?.[k] || 0);
+    const classTag = (row) => {
+      if (row.price_class === 'lower') return { type: 'danger', text: '有比我低价' };
+      if (row.price_class === 'not_lower') return { type: 'success', text: '没人比我低' };
+      return { type: 'info', text: '价格未知' };
+    };
+    const followerRows = Vue.computed(() => (followerDrawer.items || [])
+      .filter((x) => !followerDrawer.hideExcluded || !x.excluded));
     const openFollowed = async () => {
       follow.visible = true;
       await loadFollowed(true);
@@ -948,10 +981,19 @@ window.ProductListView = {
       followerDrawer.items = [];
       followerDrawer.loading = true;
       try {
-        const res = await axios.get('/api/ozon/follow-sellers', { params: { offer_id: row.offer_id } });
+        const res = await axios.get('/api/ozon/follow-sellers', {
+          params: { offer_id: row.offer_id, exclude_sellers: follow.excludeSellers || undefined },
+        });
         const items = res.data?.items || [];
-        items.sort((a, b) => parsePriceText(b.follower_price) - parsePriceText(a.follower_price));
+        // 比我低的排前面，再按价格从高到低
+        items.sort((a, b) => (Number(b.lower_than_my) - Number(a.lower_than_my))
+          || (parsePriceText(b.follower_price) - parsePriceText(a.follower_price)));
         followerDrawer.items = items;
+        followerDrawer.myPrice = res.data?.my_price ?? null;
+        followerDrawer.myCurrency = '';
+        followerDrawer.rivalMin = res.data?.rival_min ?? null;
+        followerDrawer.excludedCount = Number(res.data?.excluded_count || 0);
+        followerDrawer.lowerCount = items.filter((x) => x.lower_than_my).length;
       } catch (e) {
         notify.error(e.response?.data?.error || e.message || '读取跟卖卖家失败');
       } finally {
@@ -1121,6 +1163,7 @@ window.ProductListView = {
 
     return {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
+      saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
       followBatchTokens, collectFollowBySkus, cancelFollowJob,
       products, loading, syncLoading, saveLoading,
@@ -1754,12 +1797,45 @@ window.ProductListView = {
             </div>
           </div>
 
+          <!-- v1.5 排除店铺：按卖家名把自己店群剔掉，否则自家店会被算成跟卖 -->
+          <div style="border:1px solid #fde68a; border-radius:10px; padding:12px 14px; background:#fffbeb">
+            <div style="display:flex; gap:12px; align-items:flex-start; flex-wrap:wrap">
+              <div style="flex:1; min-width:320px">
+                <div style="font-size:13px; font-weight:800; color:#92400e; margin-bottom:6px">
+                  排除店铺（卖家名）
+                  <span style="font-weight:400; color:#b45309; margin-left:6px">逗号或换行分隔，不分大小写。把自己店群都填进来，避免把自家店当成跟卖踢掉。</span>
+                </div>
+                <el-input v-model="follow.excludeSellers" type="textarea" :rows="2" spellcheck="false"
+                  placeholder="例：Xiami Official Store,Three Latte,Eight middle" />
+              </div>
+              <div style="display:flex; flex-direction:column; gap:6px">
+                <el-button size="small" @click="fillMyStoresAsExclude">一键填入我的店铺</el-button>
+                <el-button size="small" type="primary" plain @click="saveFollowExclude">应用</el-button>
+              </div>
+            </div>
+            <div v-if="follow.summary.excluded_followers" style="font-size:12px; color:#b45309; margin-top:8px">
+              已按排除名单剔掉 <b>{{ follow.summary.excluded_followers }}</b> 条跟卖记录
+            </div>
+          </div>
+
           <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center">
             <el-input v-model="follow.q" clearable placeholder="搜索货号 / 商品名" style="width:260px" @keyup.enter="loadFollowed(true)" />
             <el-input-number v-model="follow.minFollowers" :min="1" :max="999" style="width:140px" @change="loadFollowed(true)" />
             <span style="font-size:12px; color:#94a3b8; margin-left:-4px">最少跟卖卖家数</span>
             <el-button @click="loadFollowed(true)">刷新列表</el-button>
             <span style="font-size:12px; color:#94a3b8">（列表按上面的「查询范围」店铺筛选）</span>
+          </div>
+
+          <!-- v1.5 分类：按「有没人比我低价」划分（比价用 Ozon 的竞品最低价，同币种） -->
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+            <span style="font-size:13px; font-weight:700; color:#334155; white-space:nowrap">分类</span>
+            <el-radio-group v-model="follow.priceClass" size="small" @change="loadFollowed(true)">
+              <el-radio-button value="all">全部</el-radio-button>
+              <el-radio-button value="lower">有比我低价（{{ classCount('lower') }}）</el-radio-button>
+              <el-radio-button value="not_lower">没人比我低（{{ classCount('not_lower') }}）</el-radio-button>
+              <el-radio-button value="unknown">价格未知（{{ classCount('unknown') }}）</el-radio-button>
+            </el-radio-group>
+            <span style="font-size:12px; color:#94a3b8">比价取自 Ozon 的竞品最低价（与你同币种），不受汇率影响</span>
           </div>
 
           <div style="font-size:13px; color:#475569">
@@ -1799,21 +1875,35 @@ window.ProductListView = {
             <el-table-column label="跟卖卖家" width="100" align="center">
               <template #default="{ row }"><el-tag type="danger" size="small" effect="dark">{{ row.follower_count }}</el-tag></template>
             </el-table-column>
-            <el-table-column label="最低跟卖价" width="120" align="right">
+            <el-table-column label="分类" width="110" align="center">
               <template #default="{ row }">
-                <span v-if="row.min_follower_price !== null" style="font-weight:700; color:#dc2626">{{ row.min_follower_price }} ₽</span>
-                <span v-else style="color:#c0c4cc">-</span>
+                <el-tag :type="classTag(row).type" size="small" effect="plain">{{ classTag(row).text }}</el-tag>
               </template>
             </el-table-column>
             <el-table-column label="我的价" width="110" align="right">
               <template #default="{ row }">
-                <span v-if="row.my_price !== null">{{ row.my_price }} {{ row.currency_code || '' }}</span>
+                <span v-if="row.my_price !== null" style="font-weight:700">{{ row.my_price }} {{ row.my_currency || '' }}</span>
                 <span v-else style="color:#c0c4cc">-</span>
               </template>
             </el-table-column>
-            <el-table-column label="价差" width="90" align="right">
+            <el-table-column label="竞品最低价" width="120" align="right">
               <template #default="{ row }">
-                <span :style="{ color: diffColor(row), fontWeight: 700 }">{{ diffText(row) }}</span>
+                <span v-if="row.rival_min_price !== null" style="font-weight:700; color:#dc2626">{{ row.rival_min_price }} {{ row.rival_currency || '' }}</span>
+                <span v-else style="color:#c0c4cc">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="价差" width="100" align="right">
+              <template #default="{ row }">
+                <span v-if="row.price_gap !== null" :style="{ color: row.price_gap < 0 ? '#dc2626' : '#16a34a', fontWeight: 700 }">
+                  {{ row.price_gap > 0 ? '+' : '' }}{{ row.price_gap }}
+                </span>
+                <span v-else style="color:#c0c4cc">-</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="最低跟卖价(买家币种)" width="150" align="right">
+              <template #default="{ row }">
+                <span v-if="row.min_follower_price !== null" style="color:#64748b">{{ row.min_follower_price }} ₽</span>
+                <span v-else style="color:#c0c4cc">-</span>
               </template>
             </el-table-column>
             <el-table-column label="数据时间" width="140">
@@ -1841,16 +1931,27 @@ window.ProductListView = {
 
         <el-drawer v-model="followerDrawer.visible" title="跟卖卖家列表" size="560px" append-to-body destroy-on-close>
           <div v-if="followerDrawer.name" style="font-size:13px; color:#475569; margin-bottom:6px">{{ followerDrawer.name }}</div>
-          <div style="font-size:12px; color:#94a3b8; margin-bottom:10px">货号：{{ followerDrawer.offerId }}</div>
-          <div style="margin-bottom:10px">
-            <el-button size="small" @click="copyAllFollowerSku">复制全部跟卖 SKU</el-button>
+          <div style="font-size:12px; color:#94a3b8; margin-bottom:6px">货号：{{ followerDrawer.offerId }}</div>
+          <div style="font-size:12px; color:#475569; margin-bottom:10px; line-height:1.8">
+            <span v-if="followerDrawer.myPrice !== null">我的价 <b>{{ followerDrawer.myPrice }}</b> · </span>
+            共 {{ followerDrawer.items.length }} 个卖家
+            <span v-if="followerDrawer.lowerCount" style="color:#dc2626; font-weight:700"> · 比我低 {{ followerDrawer.lowerCount }} 个</span>
+            <span v-if="followerDrawer.excludedCount" style="color:#b45309"> · 已在排除名单里 {{ followerDrawer.excludedCount }} 个</span>
           </div>
-          <el-table :data="followerDrawer.items" v-loading="followerDrawer.loading" size="small" border max-height="70vh">
+          <div style="margin-bottom:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+            <el-button size="small" @click="copyAllFollowerSku">复制全部跟卖 SKU</el-button>
+            <el-checkbox v-model="followerDrawer.hideExcluded" size="small">隐藏已排除的卖家</el-checkbox>
+          </div>
+          <el-table :data="followerRows" v-loading="followerDrawer.loading" size="small" border max-height="70vh">
             <el-table-column label="卖家 SKU" min-width="130">
               <template #default="{ row }"><span style="font-family:monospace">{{ row.follower_sku }}</span></template>
             </el-table-column>
-            <el-table-column label="卖家名" min-width="150" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.follower_name || '-' }}</template>
+            <el-table-column label="卖家名" min-width="170" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span :style="{ color: row.excluded ? '#b45309' : '#0f172a' }">{{ row.follower_name || '-' }}</span>
+                <el-tag v-if="row.excluded" size="small" type="warning" effect="plain" style="margin-left:4px">已排除</el-tag>
+                <el-tag v-if="row.lower_than_my" size="small" type="danger" effect="dark" style="margin-left:4px">比我低</el-tag>
+              </template>
             </el-table-column>
             <el-table-column label="售价" width="110" align="right">
               <template #default="{ row }">{{ row.follower_price || '-' }}</template>

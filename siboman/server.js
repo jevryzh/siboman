@@ -5846,21 +5846,146 @@ app.post("/api/ozon/patrol/reprice", requireAuth, async (req, res, next) => {
 });
 
 // 巡查跟卖：查询某商品的跟卖卖家列表（SKU/卖家名/价格）
+// 取「我的价 + 竞品最低价」—— 被跟卖比价用。
+//   ⚠️ 为什么不能拿库里的价格比：app_products.price 是 CNY（11269/11269 全是），
+//      跟卖价是买家侧 RUB，直接比没有意义；app_exchange_rates 还是空表。
+//   ✅ 正解：Ozon /v5/product/info/prices 对每个商品直接返回
+//      price_indexes.external_index_data = {
+//        min_price / min_price_currency           竞品最低价（买家币种，RUB）
+//        min_price_in_seller / _currency          竞品最低价（卖家自己的币种，CNY）← 用它比
+//        price_index_value / price_index_color     Ozon 自己的价格指数
+//      }
+//      以及 price.price / price.currency_code = 我的售价（卖家币种）。
+//      同币种比较，不碰汇率，权威且稳。
+//   带 10 分钟内存缓存，避免翻页反复打 Ozon。
+const followPriceCache = new Map(); // `${storeId}:${offerId}` -> { at, info }
+
+const toNumOrNull = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+async function fetchFollowPriceInfo(userId, products) {
+  const now = Date.now();
+  const TTL = 10 * 60 * 1000;
+  const need = [];
+  for (const p of products) {
+    if (!p.my_offer_id || !p.store_id) { p.price_info = null; continue; }
+    const k = `${p.store_id}:${p.my_offer_id}`;
+    const hit = followPriceCache.get(k);
+    if (hit && now - hit.at < TTL) { p.price_info = hit.info; continue; }
+    need.push({ key: k, storeId: p.store_id, offerId: p.my_offer_id, row: p });
+  }
+  const byStore = new Map();
+  for (const n of need) {
+    if (!byStore.has(n.storeId)) byStore.set(n.storeId, []);
+    byStore.get(n.storeId).push(n);
+  }
+  for (const [storeId, list] of byStore) {
+    for (let i = 0; i < list.length; i += 200) {
+      const chunk = list.slice(i, i + 200);
+      let map = new Map();
+      try {
+        const r = await callOzonSellerAPI("/v5/product/info/prices", {
+          filter: { offer_id: chunk.map((x) => x.offerId), product_id: [], visibility: "ALL" },
+          limit: chunk.length,
+          offset: 0,
+        }, { storeId, userId });
+        map = new Map((r?.items || []).map((x) => [x.offer_id, x]));
+      } catch (e) {
+        console.warn(`[followed-products] 取 Ozon 价格失败 store=${storeId}: ${e.message}`);
+      }
+      for (const c of chunk) {
+        const it = map.get(c.offerId) || {};
+        const po = it.price || {};
+        const ext = it.price_indexes?.external_index_data || {};
+        const oz = it.price_indexes?.ozon_index_data || {};
+        const info = {
+          my_price: toNumOrNull(po.price),
+          my_currency: po.currency_code || "",
+          my_marketing_price: toNumOrNull(po.marketing_seller_price),
+          // 竞品最低价，优先用「卖家自己的币种」那一组，才能和 my_price 直接比
+          rival_min: toNumOrNull(ext.min_price_in_seller),
+          rival_currency: ext.min_price_in_seller_currency || "",
+          rival_min_buyer: toNumOrNull(ext.min_price),
+          rival_min_buyer_currency: ext.min_price_currency || "",
+          index_value: Number(ext.price_index_value) || 0,
+          index_color: ext.price_index_color || "",
+          ozon_index_color: oz.color_index || "",
+        };
+        followPriceCache.set(c.key, { at: now, info });
+        c.row.price_info = info;
+      }
+    }
+  }
+  if (followPriceCache.size > 5000) {
+    for (const [k, v] of followPriceCache) if (v.at < now - TTL) followPriceCache.delete(k);
+  }
+}
+
 app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
   try {
     const offerId = String(req.query?.offer_id || "").trim();
     if (!offerId) return res.status(400).json({ success: false, error: "缺少 offer_id" });
+    // ⚠️ 只能按逗号/分号/换行分，**绝不能按空格** ——
+    //    店铺名自带空格（"Xiami Official Store"），按空格分会把它拆成三个词，排除直接失效。
+    const excludeSellers = [...new Set(String(req.query?.exclude_sellers || "")
+      .split(/[,，;；\r\n]+/).map((s) => s.trim()).filter(Boolean))].slice(0, 300);
     const r = await db.query(
-      "SELECT follower_sku, follower_name, follower_price FROM ozon_follow_sellers WHERE user_id=$1 AND offer_id=$2 ORDER BY follower_sku",
-      [req.user.id, offerId],
+      `SELECT fs.follower_sku,
+              COALESCE(fs.follower_name,'') AS follower_name,
+              fs.follower_price,
+              NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric AS price_num,
+              EXISTS (
+                SELECT 1 FROM unnest($3::text[]) e
+                 WHERE btrim(e) <> ''
+                   AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
+              ) AS excluded
+         FROM ozon_follow_sellers fs
+        WHERE fs.user_id = $1 AND fs.offer_id = $2
+        ORDER BY NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric ASC NULLS LAST,
+                 fs.follower_sku`,
+      [req.user.id, offerId, excludeSellers],
     );
-    res.json({ success: true, items: r.rows, total: r.rowCount });
+    // 我的价 / 竞品最低价（实时取，带缓存）—— 用来标出「比我低」的卖家
+    let myPrice = null;
+    let rivalMin = null;
+    let priceInfo = null;
+    try {
+      const prod = await db.query(
+        `SELECT store_id, offer_id FROM app_products
+          WHERE user_id = $1 AND (offer_id = $2 OR sku::text = $2)
+          ORDER BY updated_at DESC NULLS LAST LIMIT 1`,
+        [req.user.id, offerId],
+      );
+      if (prod.rowCount && prod.rows[0].store_id && prod.rows[0].offer_id) {
+        const holder = [{ my_offer_id: prod.rows[0].offer_id, store_id: prod.rows[0].store_id }];
+        await fetchFollowPriceInfo(req.user.id, holder);
+        const info = holder[0].price_info || {};
+        myPrice = info.my_price === undefined ? null : info.my_price;
+        rivalMin = info.rival_min === undefined ? null : info.rival_min;
+        priceInfo = info;
+      }
+    } catch (_e) { /* 取不到价不影响列表 */ }
+    const items = r.rows.map((x) => ({
+      follower_sku: x.follower_sku,
+      follower_name: x.follower_name,
+      follower_price: x.follower_price,
+      price_num: x.price_num === null || x.price_num === undefined ? null : Number(x.price_num),
+      excluded: !!x.excluded,
+      lower_than_my: myPrice !== null && x.price_num !== null && x.price_num !== undefined && Number(x.price_num) < myPrice,
+    }));
+    res.json({
+      success: true,
+      items,
+      total: items.length,
+      my_price: myPrice,
+      exclude_sellers: excludeSellers,
+      excluded_count: items.filter((i) => i.excluded).length,
+      lower_count: items.filter((i) => i.lower_than_my).length,
+    });
   } catch (error) { next(error); }
 });
-
-// v2.2.9.126 被跟卖商品列表（商品管理页「被跟卖商品」按钮用）：
-//   ozon_follow_sellers 按 offer_id 聚合，关联 app_products 补主图/名称/我的售价，
-//   并取该商品「最低跟卖价」那一行，方便一眼看出被压到什么价。
 app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
   try {
     if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
@@ -5870,20 +5995,37 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
     const minFollowers = Math.max(1, Math.min(9999, Number(req.query?.min_followers) || 1));
     const page = Math.max(1, Number(req.query?.page) || 1);
     const pageSize = Math.min(200, Math.max(1, Number(req.query?.page_size) || 50));
-    // follower_price 是 TEXT（可能是「1 234 ₽」这类带空格/符号的串），统一取数字比较
+    // 排除店铺 = 按「卖家名」把自家店群从跟卖里剔掉（逗号/空格/分号/换行都能分，大小写不敏感）
+    // ⚠️ 只能按逗号/分号/换行分，**绝不能按空格** ——
+    //    店铺名自带空格（"Xiami Official Store"），按空格分会把它拆成三个词，排除直接失效。
+    const excludeSellers = [...new Set(String(req.query?.exclude_sellers || "")
+      .split(/[,，;；\r\n]+/).map((s) => s.trim()).filter(Boolean))].slice(0, 300);
+    const priceClass = ["all", "lower", "not_lower", "unknown"].includes(String(req.query?.price_class || ""))
+      ? String(req.query.price_class) : "all";
     const priceNumSql = "NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric";
+
+    // 1) 被跟卖商品（排除店铺已生效）—— 先不分页，分类要在内存里算完再切页
     const rowsResult = await db.query(
-      `WITH agg AS (
-         SELECT fs.offer_id,
-                MAX(fs.product_id) AS product_id,
-                MAX(fs.store_name) AS store_name,
-                COUNT(*)::int AS follower_count,
-                COUNT(DISTINCT fs.follower_sku)::int AS follower_sku_count,
-                MAX(fs.scanned_at) AS scanned_at
+      `WITH valid AS (
+         SELECT fs.*
            FROM ozon_follow_sellers fs
           WHERE fs.user_id = $1
-          GROUP BY fs.offer_id
-         HAVING COUNT(*) >= $2
+            AND NOT EXISTS (
+              SELECT 1 FROM unnest($2::text[]) e
+               WHERE btrim(e) <> ''
+                 AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
+            )
+       ),
+       agg AS (
+         SELECT v.offer_id,
+                MAX(v.product_id) AS product_id,
+                MAX(v.store_name) AS store_name,
+                COUNT(*)::int AS follower_count,
+                COUNT(DISTINCT v.follower_sku)::int AS follower_sku_count,
+                MAX(v.scanned_at) AS scanned_at
+           FROM valid v
+          GROUP BY v.offer_id
+         HAVING COUNT(*) >= $3
        )
        SELECT a.offer_id,
               a.product_id,
@@ -5891,47 +6033,121 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
               a.follower_count,
               a.follower_sku_count,
               a.scanned_at,
+              p.offer_id AS my_offer_id,
               p.name,
               p.image,
-              p.price AS my_price,
+              p.price AS local_price,
               p.currency_code,
               p.store_id,
-              p.status,
-              bp.price_num AS min_follower_price,
-              bp.follower_price AS min_follower_price_text,
-              bp.follower_sku AS min_follower_sku,
-              COUNT(*) OVER()::int AS total_count
+              p.status
          FROM agg a
          LEFT JOIN LATERAL (
-           SELECT name, image, price, currency_code, store_id, status
+           SELECT name, image, price, currency_code, store_id, status, offer_id
              FROM app_products
-            WHERE user_id = $1 AND offer_id = a.offer_id
+            WHERE user_id = $1
+              AND (offer_id = a.offer_id OR sku::text = a.offer_id)
             ORDER BY updated_at DESC NULLS LAST
             LIMIT 1
          ) p ON TRUE
-         LEFT JOIN LATERAL (
-           SELECT fs.follower_price, fs.follower_sku, ${priceNumSql} AS price_num
-             FROM ozon_follow_sellers fs
-            WHERE fs.user_id = $1 AND fs.offer_id = a.offer_id
-              AND ${priceNumSql} IS NOT NULL
-            ORDER BY ${priceNumSql} ASC
-            LIMIT 1
-         ) bp ON TRUE
-        WHERE ($3 = '' OR a.offer_id ILIKE '%' || $3 || '%' OR COALESCE(p.name,'') ILIKE '%' || $3 || '%')
-          AND ($4 = '' OR a.store_name = $4)
-        ORDER BY a.follower_count DESC, a.offer_id ASC
-        LIMIT $5 OFFSET $6`,
-      [userId, minFollowers, q, storeName, pageSize, (page - 1) * pageSize],
+        WHERE ($4 = '' OR a.offer_id ILIKE '%' || $4 || '%' OR COALESCE(p.name,'') ILIKE '%' || $4 || '%')
+          AND ($5 = '' OR a.store_name = $5 OR EXISTS (
+                SELECT 1 FROM app_stores s WHERE s.id = p.store_id AND s.name = $5))
+        ORDER BY a.follower_count DESC, a.offer_id ASC`,
+      [userId, excludeSellers, minFollowers, q, storeName],
     );
+    const products = rowsResult.rows;
+
+    // 2) 我的 Ozon 售价（卢布，实时取 + 缓存）
+    if (products.length) await fetchFollowPriceInfo(userId, products);
+
+    // 3) 这些商品的跟卖行，用来算「比我低价的卖家有几个」
+    const offerIds = products.map((p) => p.offer_id);
+    const perOffer = new Map();
+    if (offerIds.length) {
+      const fsResult = await db.query(
+        `SELECT fs.offer_id,
+                COALESCE(fs.follower_name,'') AS follower_name,
+                fs.follower_sku,
+                fs.follower_price,
+                ${priceNumSql} AS price_num
+           FROM ozon_follow_sellers fs
+          WHERE fs.user_id = $1
+            AND fs.offer_id = ANY($2::text[])
+            AND NOT EXISTS (
+              SELECT 1 FROM unnest($3::text[]) e
+               WHERE btrim(e) <> ''
+                 AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
+            )`,
+        [userId, offerIds, excludeSellers],
+      );
+      for (const r of fsResult.rows) {
+        if (!perOffer.has(r.offer_id)) perOffer.set(r.offer_id, []);
+        perOffer.get(r.offer_id).push(r);
+      }
+    }
+
+    // 4) 分类：有比我低价的 / 没有比我低价的 / 拿不到价
+    //    比价口径：Ozon external_index_data.min_price_in_seller（竞品最低价，卖家币种）
+    //             对比 price.price（我的售价，卖家币种）—— 同币种，不碰汇率。
+    //    另外保留跟卖行的卢布价统计（仅供展示，不参与分类，因为币种不同）。
+    const items = products.map((p) => {
+      const list = perOffer.get(p.offer_id) || [];
+      const info = p.price_info || {};
+      const myPrice = info.my_price === undefined ? null : info.my_price;
+      const rivalMin = info.rival_min === undefined ? null : info.rival_min;
+      let minPrice = null;
+      let minPriceText = "";
+      let maxPrice = null;
+      for (const r of list) {
+        const n = r.price_num === null || r.price_num === undefined ? null : Number(r.price_num);
+        if (n === null) continue;
+        if (minPrice === null || n < minPrice) { minPrice = n; minPriceText = r.follower_price || ""; }
+        if (maxPrice === null || n > maxPrice) maxPrice = n;
+      }
+      const cls = (myPrice !== null && rivalMin !== null) ? (rivalMin < myPrice ? "lower" : "not_lower") : "unknown";
+      return {
+        ...p,
+        follower_count: Number(p.follower_count || 0),
+        follower_sku_count: Number(p.follower_sku_count || 0),
+        local_price: p.local_price === null || p.local_price === undefined ? null : Number(p.local_price),
+        // 我的价 / 竞品最低价（都是卖家币种）
+        my_price: myPrice,
+        my_currency: info.my_currency || "",
+        rival_min_price: rivalMin,
+        rival_currency: info.rival_currency || "",
+        price_gap: (myPrice !== null && rivalMin !== null) ? Math.round((rivalMin - myPrice) * 100) / 100 : null,
+        price_index_color: info.index_color || "",
+        ozon_index_color: info.ozon_index_color || "",
+        // 跟卖行的卢布价（仅展示）
+        follower_priced_count: list.filter((r) => r.price_num !== null && r.price_num !== undefined).length,
+        min_follower_price: minPrice,
+        min_follower_price_text: minPriceText,
+        max_follower_price: maxPrice,
+        price_class: cls,
+      };
+    });
+
+    const classCounts = { lower: 0, not_lower: 0, unknown: 0 };
+    for (const it of items) classCounts[it.price_class] += 1;
+    const filtered = priceClass === "all" ? items : items.filter((it) => it.price_class === priceClass);
+    const total = filtered.length;
+    const pageItems = filtered.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize);
+
+    // 5) 汇总（排除店铺后重新算）
     const summaryResult = await db.query(
-      `SELECT COUNT(DISTINCT offer_id)::int AS products,
+      `SELECT COUNT(DISTINCT fs.offer_id)::int AS products,
               COUNT(*)::int AS followers,
-              MAX(scanned_at) AS scanned_at
-         FROM ozon_follow_sellers WHERE user_id = $1`,
-      [userId],
+              MAX(fs.scanned_at) AS scanned_at
+         FROM ozon_follow_sellers fs
+        WHERE fs.user_id = $1
+          AND NOT EXISTS (
+            SELECT 1 FROM unnest($2::text[]) e
+             WHERE btrim(e) <> ''
+               AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
+          )`,
+      [userId, excludeSellers],
     );
-    // 店铺下拉必须列出用户所有在用 Ozon 店铺（含还没采到跟卖数据的，products=0）。
-    // 之前只从 ozon_follow_sellers 里取，采集前表是空的 → 下拉显示 "No data"，让人不知道能不能查。
+    // 店铺下拉必须列出用户所有在用 Ozon 店铺（含还没采到跟卖数据的）
     const storeResult = await db.query(
       `WITH counts AS (
          SELECT store_name, COUNT(DISTINCT offer_id)::int AS products
@@ -5950,35 +6166,38 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
        ORDER BY products DESC, store_name`,
       [userId],
     );
+    // 被排除掉的卖家名（给前端提示「已排除多少条」）
+    const exclStat = await db.query(
+      `SELECT COUNT(*)::int AS excluded
+         FROM ozon_follow_sellers fs
+        WHERE fs.user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM unnest($2::text[]) e
+             WHERE btrim(e) <> ''
+               AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
+          )`,
+      [userId, excludeSellers],
+    );
     const summary = summaryResult.rows[0] || { products: 0, followers: 0, scanned_at: null };
-    const items = rowsResult.rows.map(({ total_count, ...rest }) => ({
-      ...rest,
-      follower_count: Number(rest.follower_count || 0),
-      follower_sku_count: Number(rest.follower_sku_count || 0),
-      my_price: rest.my_price === null || rest.my_price === undefined ? null : Number(rest.my_price),
-      // min_follower_price 是 SQL 里已剥掉 ₽/空格的 numeric；min_follower_price_text 保留原始串给前端展示
-      min_follower_price: rest.min_follower_price === null || rest.min_follower_price === undefined
-        ? null : Number(rest.min_follower_price),
-      min_follower_price_text: rest.min_follower_price_text || "",
-    }));
     res.json({
       success: true,
-      items,
-      total: rowsResult.rows[0]?.total_count || 0,
+      items: pageItems,
+      total,
       page,
       page_size: pageSize,
       summary: {
         products: Number(summary.products || 0),
         followers: Number(summary.followers || 0),
         scanned_at: summary.scanned_at || null,
+        excluded_followers: Number(exclStat.rows[0]?.excluded || 0),
+        class_counts: classCounts,
       },
+      price_class: priceClass,
+      exclude_sellers: excludeSellers,
       stores: storeResult.rows,
     });
   } catch (error) { next(error); }
 });
-
-// 插件模式核价：把 Yandex 商品图集派给本机采集端（插件），用 1688 官方以图找货返同款。
-// 领取/进度/完成复用 worker job 体系（kind=yandex-research），结果留在 job.results 供前端轮询。
 app.post("/api/yandex/research-job", requireAuth, async (req, res, next) => {
   try {
     if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
