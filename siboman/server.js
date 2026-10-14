@@ -104,7 +104,7 @@ const MIN_PRECISE_PRICING_PLUGIN_VERSION = "2.2.9.127";
 //   ② 抓跟卖接口要的是 SKU 而不是库里的 product_id → 整批 HTTP 404。
 // 多台机器同时在线时谁先轮询谁领任务，旧版会把任务抢走并跑成 0 结果，
 // 所以这里让低于此版本的采集端**看不到** ozon-patrol 任务（只卡这一类，不影响其它任务）。
-const MIN_PATROL_PLUGIN_VERSION = "2.2.9.131";
+const MIN_PATROL_PLUGIN_VERSION = "2.2.9.132";
 // Yandex 自动上架采集（kind=yandex-collect）最低插件版本（统一到同一版）
 const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.127";
 // 采集类任务只在 1688 侧完成（开页面读标题/图/SKU/重量），不使用任何店铺凭据，
@@ -1780,6 +1780,15 @@ async function initDatabase() {
       --   card_price = 绿标价（Ozon 卡价）、list_price = 常规价。
       --   以前「我的价」是拿库里的 CNY 价折汇率算的，和页面上实际显示的对不上
       --   （实测折出来 464 ₽，页面绿标 429 ₽ / 常规 457 ₽）。直接存页面价最准。
+      -- v2.2.9.132 查询批次：每提交一次跟卖查询就是一个批次（用 job id 标记）。
+      --   以前定向查询是「只替换本次查到的 offer_id，其余保留」，导致列表里
+      --   新旧数据混在一起，用户分不清哪些是这次的。有了批次就能默认只看最新一次。
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS query_batch TEXT DEFAULT '';
+      -- v2.2.9.132 商品名/图片、卖家图片：都从 Ozon 卡片上抓，这样这个功能**完全不依赖**
+      --   自己的商品库（以前库里没有就显示「本地无该商品信息」，还要靠 app_products 关联）
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_name TEXT DEFAULT '';
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_image TEXT DEFAULT '';
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS follower_image TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS card_price TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS list_price TEXT DEFAULT '';
 
@@ -6023,6 +6032,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
     const r = await db.query(
       `SELECT fs.follower_sku,
               COALESCE(fs.follower_name,'') AS follower_name,
+              COALESCE(fs.follower_image,'') AS follower_image,
               fs.follower_price,
               NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric AS price_num,
               EXISTS (
@@ -6065,6 +6075,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       follower_sku: x.follower_sku,
       follower_name: x.follower_name,
       follower_price: x.follower_price,
+      follower_image: x.follower_image || '',
       price_num: x.price_num === null || x.price_num === undefined ? null : Number(x.price_num),
       excluded: !!x.excluded,
       lower_than_my: myPriceRub !== null && x.price_num !== null && x.price_num !== undefined
@@ -6089,7 +6100,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
 //     products  原始行（含实时取到的我的价 price_info）
 //     perOffer  offer_id -> 该商品的跟卖行（已排除自家店群）
 //     items     分类好的商品（含 price_class）
-async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers = 1, excludeSellers = [] }) {
+async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers = 1, excludeSellers = [], batchId = "" }) {
   const priceNumSql = "NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric";
 
   const rowsResult = await db.query(
@@ -6097,6 +6108,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
        SELECT fs.*
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
+          AND ($6 = '' OR COALESCE(fs.query_batch,'') = $6)
           AND NOT EXISTS (
             SELECT 1 FROM unnest($2::text[]) e
              WHERE btrim(e) <> ''
@@ -6142,7 +6154,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
         AND ($5 = '' OR a.store_name = $5 OR EXISTS (
               SELECT 1 FROM app_stores s WHERE s.id = p.store_id AND s.name = $5))
       ORDER BY a.follower_count DESC, a.offer_id ASC`,
-    [userId, excludeSellers, minFollowers, q, storeName],
+    [userId, excludeSellers, minFollowers, q, storeName, batchId],
   );
   const products = rowsResult.rows;
 
@@ -6167,15 +6179,23 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
               fs.follower_price,
               COALESCE(fs.card_price,'') AS card_price,
               COALESCE(fs.list_price,'') AS list_price,
+              COALESCE(fs.product_name,'') AS card_product_name,
+              COALESCE(fs.product_image,'') AS card_product_image,
               ${priceNumSql} AS price_num
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
-          AND fs.offer_id = ANY($2::text[])`,
-      [userId, offerIds],
+          AND fs.offer_id = ANY($2::text[])
+          AND ($3 = '' OR COALESCE(fs.query_batch,'') = $3)`,
+      [userId, offerIds, batchId],
     );
     for (const r of fsResult.rows) {
       if (!cardPriceByOffer.has(r.offer_id) && (r.card_price || r.list_price)) {
-        cardPriceByOffer.set(r.offer_id, { card: r.card_price || "", list: r.list_price || "" });
+        cardPriceByOffer.set(r.offer_id, {
+          card: r.card_price || "",
+          list: r.list_price || "",
+          name: r.card_product_name || "",
+          image: r.card_product_image || "",
+        });
       }
     }
     const exclSet = new Set(excludeSellers.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
@@ -6263,6 +6283,11 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
     const cls = myPrice === null ? "unknown" : (lowerCount > 0 ? "lower" : "not_lower");
     return {
       ...p,
+      // v2.2.9.132 商品名/图优先用**卡片上抓到的**，这样不在自己商品库里也能正常显示
+      //   （以前库里没有就显示「本地无该商品信息」，还得靠 app_products 关联）
+      name: (cardP && cardP.name) ? cardP.name : (p.name || ''),
+      image: (cardP && cardP.image) ? cardP.image : (p.image || ''),
+      from_card: Boolean(cardP && (cardP.name || cardP.image)),
       follower_count: Number(p.follower_count || 0),
       follower_sku_count: Number(p.follower_sku_count || 0),
       local_price: p.local_price === null || p.local_price === undefined ? null : Number(p.local_price),
@@ -6300,6 +6325,18 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
   return { products, perOffer, mineByOffer, items, classCounts };
 }
 
+// v2.2.9.132 取该用户最近一次跟卖查询的批次 id（没有批次数据时返回 ''，即不筛选）
+async function latestFollowBatchId(userId) {
+  if (!db) return "";
+  const r = await db.query(
+    `SELECT query_batch FROM ozon_follow_sellers
+      WHERE user_id = $1 AND COALESCE(query_batch,'') <> ''
+      ORDER BY scanned_at DESC LIMIT 1`,
+    [userId],
+  );
+  return String(r.rows[0]?.query_batch || "");
+}
+
 app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
   try {
     if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
@@ -6318,7 +6355,11 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
       ? String(req.query.price_class) : "all";
     const priceNumSql = "NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric";
 
-    const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers });
+    // 批次：默认只看最新一次查询（用户要求「每次都按最新查询的结果来」），
+    //   batch=all 才显示全部历史。
+    const batchMode = String(req.query?.batch || "latest").trim();
+    const batchId = batchMode === "all" ? "" : await latestFollowBatchId(userId);
+    const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers, batchId });
     const items = bundle.items;
     const classCounts = bundle.classCounts;
 
@@ -6333,12 +6374,13 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
               MAX(fs.scanned_at) AS scanned_at
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
+          AND ($3 = '' OR COALESCE(fs.query_batch,'') = $3)
           AND NOT EXISTS (
             SELECT 1 FROM unnest($2::text[]) e
              WHERE btrim(e) <> ''
                AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
           )`,
-      [userId, excludeSellers],
+      [userId, excludeSellers, batchId],
     );
     // 店铺下拉必须列出用户所有在用 Ozon 店铺（含还没采到跟卖数据的）
     const storeResult = await db.query(
@@ -6386,6 +6428,8 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
         class_counts: classCounts,
       },
       price_class: priceClass,
+      batch_mode: batchMode,
+      batch_id: batchId,
       exclude_sellers: excludeSellers,
       stores: storeResult.rows,
     });
@@ -6408,7 +6452,9 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
     // 没填排除店铺时明确提醒：否则自家店群会被当成跟卖一起复制出来
     const warnNoExclude = excludeSellers.length === 0;
 
-    const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers });
+    const batchMode = String(req.query?.batch || "latest").trim();
+    const batchId = batchMode === "all" ? "" : await latestFollowBatchId(userId);
+    const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers, batchId });
     const byProduct = [];
     const allSkus = [];
     const seen = new Set();
@@ -6432,6 +6478,8 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
         byProduct.push({
           offer_id: it.offer_id,
           name: it.name || "",
+          image: it.image || "",
+          my_product_standard: myPrice,   // 我查的这个商品就是「我」的基准价
           sku: it.product_id || "",
           my_price: myPrice,
           my_price_source: it.my_price_source || "",
@@ -19241,12 +19289,15 @@ async function applyOzonPatrolFollowResults(userId, updated) {
     }
     const cardPrice = String(r?.card_price || "").trim();
     const listPrice = String(r?.list_price || "").trim();
+    const queryBatch = String(updated?.payload?.queryBatch || updated?.id || "").trim();
+    const productName = String(r?.product_name || "").trim();
+    const productImage = String(r?.product_image || "").trim();
     for (const s of sellers) {
       const sku = String(s?.sku || "").trim();
       if (!sku) continue;
       await db.query(
-        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || ""), cardPrice, listPrice],
+        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price, query_batch, product_name, product_image, follower_image) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || ""), cardPrice, listPrice, queryBatch, productName, productImage, String(s.image || "")],
       );
       n += 1;
     }

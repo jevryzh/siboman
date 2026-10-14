@@ -902,6 +902,8 @@ window.ProductListView = {
       //        存 localStorage，免得每次重开都重填。
       excludeSellers: (() => { try { return localStorage.getItem('followExcludeSellers') || ''; } catch (_e) { return ''; } })(),
       priceClass: 'all',
+      // v2.2.9.132 批次：默认只看最新一次查询的结果，可切「全部」
+      batch: (() => { try { return localStorage.getItem('followBatchMode') || 'latest'; } catch (_e) { return 'latest'; } })(),
       // v2.2.9.127 定向查询：批量粘贴 SKU/货号，只查这些商品，不整店跑
       batchText: '', batchBusy: false,
       jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
@@ -960,6 +962,7 @@ window.ProductListView = {
             min_followers: follow.minFollowers || 1,
             exclude_sellers: follow.excludeSellers || undefined,
             price_class: follow.priceClass || 'all',
+            batch: follow.batch || 'latest',
           },
         });
         follow.items = res.data?.items || [];
@@ -1023,6 +1026,11 @@ window.ProductListView = {
     };
 
     // v1.5 排除店铺：保存 + 一键填我的店铺 + 分类计数/标签
+    const setFollowBatch = (v) => {
+      follow.batch = v;
+      try { localStorage.setItem('followBatchMode', v); } catch (_e) { /* 忽略 */ }
+      loadFollowed(true);
+    };
     const saveFollowExclude = () => {
       try { localStorage.setItem('followExcludeSellers', follow.excludeSellers || ''); } catch (_e) { /* 忽略 */ }
       loadFollowed(true);
@@ -1304,7 +1312,7 @@ window.ProductListView = {
 
     return {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
-      saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows,
+      saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows, setFollowBatch,
       copyLowerFollowerSku, exportFollowerCsv,
       zoom, showZoom, moveZoom, hideZoom, lowerBusy, copyLowerSkus, exportLowerSkusCsv,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
@@ -1974,6 +1982,16 @@ window.ProductListView = {
             <span style="font-size:12px; color:#94a3b8">（列表按上面的「查询范围」店铺筛选）</span>
           </div>
 
+          <!-- v2.2.9.132 查询范围：默认只看最新一次查询，避免新旧数据混在一起 -->
+          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
+            <span style="font-size:13px; font-weight:700; color:#334155; white-space:nowrap">查询范围</span>
+            <el-radio-group :model-value="follow.batch" size="small" @change="setFollowBatch">
+              <el-radio-button value="latest">只看最新一次查询</el-radio-button>
+              <el-radio-button value="all">全部（含之前查的）</el-radio-button>
+            </el-radio-group>
+            <span style="font-size:12px; color:#94a3b8">默认只显示最近一次提交的结果，避免分不清哪批是这次的</span>
+          </div>
+
           <!-- v1.5 分类：按「有没人比我低价」划分（比价用 Ozon 的竞品最低价，同币种） -->
           <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap">
             <span style="font-size:13px; font-weight:700; color:#334155; white-space:nowrap">分类</span>
@@ -2027,7 +2045,10 @@ window.ProductListView = {
             </el-table-column>
             <el-table-column label="商品" min-width="260" show-overflow-tooltip>
               <template #default="{ row }">
-                <div style="font-weight:700; color:#0f172a">{{ row.name || '(本地无该商品信息)' }}</div>
+                <div style="font-weight:700; color:#0f172a">
+                  {{ row.name || '(卡片上没抓到商品名)' }}
+                  <el-tag v-if="row.from_card" size="small" type="success" effect="plain" style="margin-left:4px">卡片</el-tag>
+                </div>
                 <div style="font-size:12px; color:#94a3b8">货号 {{ row.offer_id }} · Ozon SKU {{ row.product_id || '-' }}</div>
               </template>
             </el-table-column>
@@ -2138,6 +2159,14 @@ window.ProductListView = {
             <el-checkbox v-model="followerDrawer.hideExcluded" size="small">隐藏已排除的卖家</el-checkbox>
           </div>
           <el-table :data="followerRows" v-loading="followerDrawer.loading" size="small" border max-height="70vh">
+            <el-table-column label="图" width="60">
+              <template #default="{ row }">
+                <el-image v-if="row.follower_image" :src="row.follower_image" style="width:38px; height:38px; border-radius:5px; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="[row.follower_image]">
+                  <template #error><div style="height:38px; display:flex; align-items:center; justify-content:center; color:#cbd5e1; font-size:10px">无图</div></template>
+                </el-image>
+                <span v-else style="color:#cbd5e1; font-size:11px">-</span>
+              </template>
+            </el-table-column>
             <el-table-column label="卖家 SKU" min-width="130">
               <template #default="{ row }"><span style="font-family:monospace">{{ row.follower_sku }}</span></template>
             </el-table-column>

@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.131";
+const VERSION = "2.2.9.132";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1562,13 +1562,40 @@ function extractFollowBundleInPage(productId) {
         if (v && Array.isArray(v.sellers)) {
           sellers = v.sellers.map(function (s) {
             const price = (s.price && s.price.cardPrice && s.price.cardPrice.price) || (s.price && s.price.price) || "";
-            return { sku: s.sku || "", name: s.name || "", price: price };
+            return {
+              sku: s.sku || "",
+              name: s.name || "",
+              price: price,
+              // v2.2.9.132 卖家自己的商品图 + 商品链接，页面上直接展示
+              image: s.coverImage || "",
+              productLink: s.productLink || "",
+              sellerId: s.id || "",
+            };
           });
           break;
         }
       } catch (_e) { /* 单个 widget 解析失败跳过 */ }
     }
-    // ② 卡片主价（绿标 cardPrice / 常规 price）
+    // ② 商品名 + 主图（这样不依赖自己的商品库也能显示商品）
+    let productName = "", productImage = "";
+    for (let i = 0; i < keys.length; i += 1) {
+      if (keys[i].indexOf("webProductHeading") !== 0) continue;
+      try {
+        const v = typeof ws[keys[i]] === "string" ? JSON.parse(ws[keys[i]]) : ws[keys[i]];
+        if (v && v.title) { productName = String(v.title).trim(); break; }
+      } catch (_e) { /* 跳过 */ }
+    }
+    for (let i = 0; i < keys.length; i += 1) {
+      if (keys[i].indexOf("webGallery") !== 0) continue;
+      try {
+        const v = typeof ws[keys[i]] === "string" ? JSON.parse(ws[keys[i]]) : ws[keys[i]];
+        if (v && (v.coverImage || (Array.isArray(v.images) && v.images[0]))) {
+          productImage = v.coverImage || (v.images[0] && (v.images[0].src || v.images[0])) || "";
+          break;
+        }
+      } catch (_e) { /* 跳过 */ }
+    }
+    // ③ 卡片主价（绿标 cardPrice / 常规 price）
     let cardPrice = "", listPrice = "", originalPrice = "";
     for (let i = 0; i < keys.length; i += 1) {
       if (keys[i].indexOf("webPrice") !== 0) continue;
@@ -1582,7 +1609,14 @@ function extractFollowBundleInPage(productId) {
         }
       } catch (_e) { /* 跳过 */ }
     }
-    return { sellers: sellers, cardPrice: cardPrice, listPrice: listPrice, originalPrice: originalPrice };
+    return {
+      sellers: sellers,
+      cardPrice: cardPrice,
+      listPrice: listPrice,
+      originalPrice: originalPrice,
+      productName: productName,
+      productImage: productImage,
+    };
   };
   const ts = Date.now();
   const modalUrl = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
@@ -1601,6 +1635,8 @@ function extractFollowBundleInPage(productId) {
       cardPrice: a.cardPrice || b.cardPrice || "",
       listPrice: a.listPrice || b.listPrice || "",
       originalPrice: a.originalPrice || b.originalPrice || "",
+      productName: b.productName || "",
+      productImage: b.productImage || "",
     };
   });
 }
@@ -1629,6 +1665,8 @@ async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
       cardPrice: out.cardPrice || "",
       listPrice: out.listPrice || "",
       originalPrice: out.originalPrice || "",
+      productName: out.productName || "",
+      productImage: out.productImage || "",
     };
   };
   try {
@@ -1687,6 +1725,8 @@ async function runQueuedOzonPatrolJob(remoteJob) {
           card_price: bundle.cardPrice || "",
           list_price: bundle.listPrice || "",
           original_price: bundle.originalPrice || "",
+          product_name: bundle.productName || "",
+          product_image: bundle.productImage || "",
         });
         if (sellers.length) {
           okCount += 1;
