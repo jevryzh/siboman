@@ -2175,11 +2175,17 @@ window.ProductListView = {
             <el-table-column label="卖家 SKU" min-width="130">
               <template #default="{ row }"><span style="font-family:monospace">{{ row.follower_sku }}</span></template>
             </el-table-column>
-            <el-table-column label="卖家名" min-width="170" show-overflow-tooltip>
+            <!-- ⚠️ 这一列**不能加 show-overflow-tooltip**：它会给单元格加
+                 overflow:hidden + 单行省略号，把行内的「比我低 / 已排除」标签直接裁掉
+                 （数据是对的、排序也对，就是看不见标签 —— 用户反馈过）。
+                 所以标签单独放一行用 block 渲染，永远可见。 -->
+            <el-table-column label="卖家名" min-width="150">
               <template #default="{ row }">
-                <span :style="{ color: row.excluded ? '#b45309' : '#0f172a' }">{{ row.follower_name || '-' }}</span>
-                <el-tag v-if="row.excluded" size="small" type="warning" effect="plain" style="margin-left:4px">已排除</el-tag>
-                <el-tag v-if="row.lower_than_my" size="small" type="danger" effect="dark" style="margin-left:4px">比我低</el-tag>
+                <div :style="{ color: row.excluded ? '#b45309' : '#0f172a', wordBreak: 'break-all' }">{{ row.follower_name || '-' }}</div>
+                <div v-if="row.lower_than_my || row.excluded" style="margin-top:2px; display:flex; gap:4px; flex-wrap:wrap">
+                  <el-tag v-if="row.lower_than_my" size="small" type="danger" effect="dark">比我低</el-tag>
+                  <el-tag v-if="row.excluded" size="small" type="warning" effect="plain">已排除</el-tag>
+                </div>
               </template>
             </el-table-column>
             <el-table-column label="售价" width="110" align="right">
