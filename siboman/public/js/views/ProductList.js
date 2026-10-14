@@ -1111,8 +1111,23 @@ window.ProductListView = {
       catch { notify.warning('复制失败，请手动复制'); }
     };
     // 粘贴框里的 token（换行/逗号/空格/分号都能分）
+    // v2.2.9.129 支持直接粘**整条 Ozon 商品链接**（以前只认纯数字 SKU，
+    //   粘链接会被服务端判成「解析不出」直接丢掉）。这里从链接里抠出 SKU。
+    //   这样「查跟卖」可以查任意 Ozon 商品，不要求商品在自己商品库里。
+    const extractFollowToken = (raw) => {
+      const t = String(raw || '').trim().replace(/[)\]】>，,;；]+$/, '');
+      if (!t) return '';
+      if (/^\d{5,20}$/.test(t)) return t;              // 纯 SKU 直接用
+      // 只有确认是 Ozon 链接才抠数字 —— 本地货号（jz-260624fwg3-4736604207-18）
+      // 里也带数字，按「取最后一段」会抠成 4736604207，那就查错商品了。
+      if (/^https?:\/\//i.test(t) || /ozon\.ru\//i.test(t)) {
+        const ms = t.match(/\d{5,20}/g);
+        if (ms && ms.length) return ms[ms.length - 1];
+      }
+      return t;
+    };
     const followBatchTokens = Vue.computed(() => [...new Set(
-      String(follow.batchText || '').split(/[\s,，;；]+/).map((s) => s.trim()).filter(Boolean),
+      String(follow.batchText || '').split(/[\s,，;；]+/).map(extractFollowToken).filter(Boolean),
     )]);
     let followPollTimer = null;
     const stopFollowPoll = () => { if (followPollTimer) { clearInterval(followPollTimer); followPollTimer = null; } };
@@ -1198,7 +1213,8 @@ window.ProductListView = {
         }, { timeout: 120000 });
         const d = res.data || {};
         if (d.existing) {
-          notify.warning(`已有跟卖任务在跑（${d.status || 'queued'}，共 ${d.total || '?'} 个）。可先点「取消当前任务」再提交，或等它跑完。`);
+          notify.info(`这批 SKU 已经在查询中了（${d.status || 'queued'}，共 ${d.total || '?'} 个），本次直接复用该任务。想查别的 SKU 可以继续提交，多个任务会并行排队。`);
+
           follow.jobId = d.jobId || '';
           follow.jobStatus = d.status || 'running';
           follow.jobPhase = d.phase || '';
@@ -1900,7 +1916,7 @@ window.ProductListView = {
               <span style="font-size:12px; color:#94a3b8">只查你输入的 SKU，不整店扫描，几十个通常几秒~几十秒出结果</span>
             </div>
             <el-input v-model="follow.batchText" type="textarea" :rows="3" spellcheck="false"
-              placeholder="每行一个：Ozon SKU（纯数字）或本地货号 offer_id；逗号/空格/分号分隔也行。例：&#10;3859920996&#10;LZ06-1-3859920996" />
+              placeholder="每行一条：Ozon 商品链接、SKU（纯数字）或本地货号都可以；逗号/空格/分号分隔也行。&#10;https://www.ozon.ru/product/pryazha-kid-moher-belyy-4-motka-5618810078/&#10;3859920996" />
             <div style="display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap">
               <span style="font-size:13px; font-weight:700; color:#334155; white-space:nowrap">查询范围</span>
               <el-select v-model="follow.storeName" clearable placeholder="全部店铺" style="width:210px" @change="loadFollowed(true)">

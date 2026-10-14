@@ -5734,16 +5734,45 @@ app.get("/api/ozon/patrol", requireAuth, async (req, res, next) => {
 app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
   try {
     if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
-    const activeJob = await findActiveDbJobForUser(req.user, { kind: "ozon-patrol" });
-    if (activeJob) {
-      return res.json({ success: true, jobId: activeJob.id, queued: activeJob.status === "queued", existing: true, status: activeJob.status, total: activeJob.total, phase: activeJob.phase || "" });
-    }
     // v2.2.9.127 定向采集：body.skus 里有值时只查这些商品，不做整店扫描。
     //   整店链路要先遍历全部 Ozon 商品（几分钟）再排 3000+ 个采集任务，用户往往只想查自己关心的几十个 SKU。
     const rawTokens = Array.isArray(req.body?.skus)
       ? req.body.skus
       : (typeof req.body?.skus === "string" ? req.body.skus.split(/[\s,，;；]+/) : []);
     const tokens = [...new Set(rawTokens.map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 2000);
+    // v2.2.9.129 「查跟卖」探针模式：只查不落库（查的是任意商品，不是自己的）
+    const probe = req.body?.probe === true;
+    // v2.2.9.129 允许**多个跟卖任务并发**。
+    //   以前只要有任务在跑就直接复用旧的（existing:true），想同时查几批 SKU 会被挡住；
+    //   多个账号（如 eason / jindiao）各自的任务本来也互不影响，不该被人为串行化。
+    //   现在只有「SKU 集合完全一样」时才复用，防止重复点按钮产生一堆重复任务。
+    const activePatrols = await db.query(
+      `SELECT id, status, total, phase, payload
+         FROM app_jobs
+        WHERE user_id = $1 AND kind = 'ozon-patrol'
+          AND status IN ('queued','claimed','running','exporting')
+        ORDER BY updated_at DESC LIMIT 20`,
+      [req.user.id],
+    );
+    if (tokens.length) {
+      const wantKey = [...tokens].sort().join("|");
+      const dup = activePatrols.rows.find((j) => {
+        if (Boolean(j.payload?.probe) !== probe) return false;   // 探针和自己的跟卖任务分开算
+        const saved = Array.isArray(j.payload?.reqTokens) ? j.payload.reqTokens : null;
+        const its = Array.isArray(j.payload?.items) ? j.payload.items : [];
+        const key = saved
+          ? [...saved.map((x) => String(x))].sort().join("|")
+          : [...new Set(its.map((x) => String(x.offer_id || x.product_id || "")).filter(Boolean))].sort().join("|");
+        return key && key === wantKey;
+      });
+      if (dup) {
+        return res.json({ success: true, jobId: dup.id, queued: dup.status === "queued", existing: true, status: dup.status, total: dup.total, phase: dup.phase || "" });
+      }
+    } else if (activePatrols.rows.length) {
+      // 整店扫描很重（3000+ 商品）且没有 SKU 集合可比 → 仍然复用，避免开出好几个整店任务
+      const j = activePatrols.rows[0];
+      return res.json({ success: true, jobId: j.id, queued: j.status === "queued", existing: true, status: j.status, total: j.total, phase: j.phase || "" });
+    }
     if (tokens.length) {
       // v2.2.9.128 支持按店铺限定查询范围：同一货号常同时铺在多个店铺（如 HappyFriday / Three Latte），
       //   不限定时只能取最近更新的那一条，用户会疑惑「为什么查的是别的店的」。
@@ -5809,7 +5838,7 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
       }
       const queuedTargeted = await createQueuedDbJob(req.user, {
         id: crypto.randomUUID(), kind: "ozon-patrol", storeId: null, total: items.length, phase: "等待插件采集跟卖",
-      }, { items, mode: "targeted", scopeStoreName: scopeStoreName || "", scopeStoreId: scopeStoreId || "" });
+      }, { items, mode: "targeted", reqTokens: tokens, probe, scopeStoreName: scopeStoreName || "", scopeStoreId: scopeStoreId || "" });
       return res.json({
         success: true, jobId: queuedTargeted.id, queued: true, total: items.length, mode: "targeted",
         unresolved, tokens: tokens.length, multi_store: multiStore,
@@ -19089,6 +19118,13 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
 //   已经抓到的跟卖数据全部丢掉（本次实测：取消后 137 条结果、9 个有跟卖，一条都没入库）。
 async function applyOzonPatrolFollowResults(userId, updated) {
   if (!userId || !updated || updated.kind !== "ozon-patrol" || !Array.isArray(updated.results)) return 0;
+  // 「查跟卖」是探针模式：查的是**任意 Ozon 商品**（多半不在自己商品库里），
+  //   只把卖家列表回给前端看，不写 ozon_follow_sellers —— 否则会把别人的商品
+  //   灌进「被跟卖商品」列表里，全是「本地无该商品信息」。
+  if (updated?.payload?.probe) {
+    console.log(`[ozon-patrol] 探针模式（查跟卖），跳过入库`);
+    return 0;
+  }
   const targeted = updated?.payload?.mode === "targeted";
   // 定向查询只替换本次查到的 offer_id，不清空全表，避免后一次查询把前一次结果抹掉
   if (!targeted) await db.query("DELETE FROM ozon_follow_sellers WHERE user_id=$1", [userId]);
