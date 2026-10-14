@@ -1130,7 +1130,28 @@ window.ProductListView = {
           follow.jobTotal = Number(job.total || 0);
           if (['done', 'error', 'canceled'].includes(follow.jobStatus)) {
             stopFollowPoll();
-            if (follow.jobStatus === 'done') notify.success(`跟卖查询完成：${job.phase || '已完成'}`);
+            if (follow.jobStatus === 'done') {
+              // v2.2.9.128：以前只要是 done 就弹绿色「已完成」—— 哪怕逐个商品全失败了，
+              //   用户看到成功提示却拿不到数据，根本不知道发生了什么。
+              //   这里把结果拉出来，有失败就如实报错并说明原因。
+              let failed = 0; let okCount = 0; let firstErr = '';
+              try {
+                const full = await axios.get(`/api/jobs/${encodeURIComponent(jobId)}`);
+                const results = full.data?.job?.results || [];
+                for (const r of results) {
+                  if (r && r.error) { failed += 1; if (!firstErr) firstErr = String(r.error); }
+                  else okCount += 1;
+                }
+              } catch (_e) { /* 拉不到就按原样提示 */ }
+              if (failed && !okCount) {
+                notify.error(`跟卖查询失败（${failed} 个商品全部失败）：${firstErr.slice(0, 120)}`, 12000);
+                follow.jobPhase = `失败：${firstErr.slice(0, 80)}`;
+              } else if (failed) {
+                notify.warning(`跟卖查询部分完成：成功 ${okCount} 个 / 失败 ${failed} 个。首个错误：${firstErr.slice(0, 90)}`, 10000);
+              } else {
+                notify.success(`跟卖查询完成：抓到 ${okCount} 个商品的跟卖数据`);
+              }
+            }
             else if (follow.jobStatus === 'canceled') notify.warning('跟卖查询已取消');
             else notify.error('跟卖查询失败：' + (job.error || job.phase || '未知错误'));
             await loadFollowed(true);
