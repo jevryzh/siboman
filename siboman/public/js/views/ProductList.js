@@ -72,6 +72,9 @@ window.ProductListView = {
       success: (msg) => (window.ElementPlus?.ElMessage || console).success?.(msg),
       warning: (msg) => (window.ElementPlus?.ElMessage || console).warning?.(msg),
       error: (msg) => (window.ElementPlus?.ElMessage || console).error?.(msg),
+      // v2.2.9.130：补上 info。之前只声明了三个，代码里调 notify.info 直接抛
+      //   TypeError: notify.info is not a function，整段逻辑中断。
+      info: (msg) => (window.ElementPlus?.ElMessage || console).info?.(msg) || (window.ElementPlus?.ElMessage || console).success?.(msg),
     };
 
     const statusTabs = [
@@ -1982,6 +1985,18 @@ window.ProductListView = {
             </el-radio-group>
             <span style="font-size:12px; color:#94a3b8">「我的价」= 你在该商品卡片上的自家报价（卢布），与跟卖价同币种；不需要商品在商品库里</span>
           </div>
+
+          <el-alert
+            v-if="!follow.excludeSellers && classCount('unknown') > 0"
+            type="warning" :closable="false" show-icon style="margin-bottom:2px">
+            <template #title>
+              还有 {{ classCount('unknown') }} 个商品算不出「谁比你低」：<b>没有设置「排除店铺（卖家名）」</b>。
+            </template>
+            <div style="font-size:12px; line-height:1.8">
+              Ozon 的商品卡片上<b>没有「这是我」的标记</b>，系统只能靠店名认出哪个卖家是你（同时也是卡片主卖家时不在“其他卖家”列表里）。
+              请把你自己的 Ozon 店名填进上面的黄色输入框并点「应用」，就能算出你和别人的价差。
+            </div>
+          </el-alert>
 
           <div style="font-size:13px; color:#475569">
             被跟卖商品 <b style="color:#dc2626">{{ follow.summary.products }}</b> 个 ·
