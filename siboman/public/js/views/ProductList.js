@@ -904,6 +904,8 @@ window.ProductListView = {
       priceClass: 'all',
       // v2.2.9.132 批次：默认只看最新一次查询的结果，可切「全部」
       batch: (() => { try { return localStorage.getItem('followBatchMode') || 'latest'; } catch (_e) { return 'latest'; } })(),
+      selected: [],        // v2.2.9.133 批量删除用
+      deleting: false,
       // v2.2.9.127 定向查询：批量粘贴 SKU/货号，只查这些商品，不整店跑
       batchText: '', batchBusy: false,
       jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
@@ -933,6 +935,7 @@ window.ProductListView = {
       // v1.5：排除标记 / 比我低标记 / 我的价
       myPrice: null, myCurrency: '', myPriceRub: null, rubCnyRate: null,
       myPriceSource: '', listPriceText: '',
+      selected: [], deleting: false,   // v2.2.9.133
       rivalMin: null, rivalCurrency: '',
       excludedCount: 0, lowerCount: 0, hideExcluded: false, onlyLower: false,
     });
@@ -1027,6 +1030,37 @@ window.ProductListView = {
     };
 
     // v1.5 排除店铺：保存 + 一键填我的店铺 + 分类计数/标签
+    // v2.2.9.133 批量删除：查出来的跟卖里偶尔混进别的商品，删掉即可（软删，可恢复）
+    const deleteSelectedProducts = async () => {
+      const ids = (follow.selected || []).map((r) => r.offer_id).filter(Boolean);
+      if (!ids.length) return notify.warning('请先勾选要删除的商品');
+      try {
+        await confirmBox(`确定删除所选的 ${ids.length} 个商品及其跟卖数据吗？\n（软删除，可在「恢复已删除」里找回）`);
+      } catch (_e) { return; }
+      follow.deleting = true;
+      try {
+        const res = await axios.post('/api/ozon/followed-products/delete', { offer_ids: ids });
+        notify.success(`已删除 ${res.data?.products || ids.length} 个商品（${res.data?.deleted || 0} 条跟卖记录）`);
+        follow.selected = [];
+        await loadFollowed(true);
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '删除失败');
+      } finally { follow.deleting = false; }
+    };
+    const restoreDeletedProducts = async () => {
+      try { await confirmBox('恢复所有已删除的商品和跟卖数据？'); } catch (_e) { return; }
+      try {
+        const res = await axios.post('/api/ozon/followed-products/restore', { offer_ids: [] });
+        notify.success(`已恢复 ${res.data?.restored || 0} 条跟卖记录`);
+        await loadFollowed(true);
+      } catch (e) { notify.error(e.response?.data?.error || e.message || '恢复失败'); }
+    };
+    const confirmBox = (msg) => {
+      const EP = window.ElementPlus;
+      if (EP?.ElMessageBox?.confirm) return EP.ElMessageBox.confirm(msg, '请确认', { type: 'warning' });
+      return window.confirm(msg) ? Promise.resolve() : Promise.reject(new Error('cancel'));
+    };
+
     const setFollowBatch = (v) => {
       follow.batch = v;
       try { localStorage.setItem('followBatchMode', v); } catch (_e) { /* 忽略 */ }
@@ -1056,13 +1090,32 @@ window.ProductListView = {
       .filter((x) => !followerDrawer.onlyLower || x.lower_than_my));
     // 一键复制「比我低价」的卖家 SKU —— 比价已折算到同一币种（见 /api/ozon/follow-sellers）
     const copyLowerFollowerSku = async () => {
-      const skus = (followerDrawer.items || []).filter((x) => x.lower_than_my && !x.excluded && x.follower_sku)
+      const skus = followerRows.value.filter((x) => x.lower_than_my && !x.excluded && x.follower_sku)
         .map((x) => x.follower_sku);
       if (!skus.length) return notify.warning('没有「比我低价」的卖家');
       try { await navigator.clipboard.writeText(skus.join('\n')); notify.success(`已复制 ${skus.length} 个「比我低」的卖家 SKU`); }
       catch { notify.warning('复制失败，请手动复制'); }
     };
     // 导出当前筛选结果（含卖家名/售价/是否比我低/是否已排除）
+    // v2.2.9.133 批量删除卖家（软删；删掉的不会再出现在复制/导出里）
+    const deleteSelectedSellers = async () => {
+      const sel = followerDrawer.selected || [];
+      if (!sel.length) return notify.warning('请先勾选要删除的卖家');
+      try { await confirmBox(`确定删除所选的 ${sel.length} 个卖家吗？\n（软删除，可联系管理员恢复）`); } catch (_e) { return; }
+      followerDrawer.deleting = true;
+      try {
+        const res = await axios.post('/api/ozon/follow-sellers/delete', {
+          offer_id: followerDrawer.offerId,
+          follower_skus: sel.map((x) => x.follower_sku).filter(Boolean),
+        });
+        notify.success(`已删除 ${res.data?.deleted || 0} 个卖家`);
+        followerDrawer.selected = [];
+        await openFollowers({ offer_id: followerDrawer.offerId, name: followerDrawer.name });
+      } catch (e) {
+        notify.error(e.response?.data?.error || e.message || '删除失败');
+      } finally { followerDrawer.deleting = false; }
+    };
+
     const exportFollowerCsv = () => {
       const rows = followerRows.value || [];
       if (!rows.length) return notify.warning('没有可导出的行');
@@ -1119,7 +1172,8 @@ window.ProductListView = {
       catch { notify.warning('复制失败，请手动复制：' + text); }
     };
     const copyAllFollowerSku = async () => {
-      const skus = followerDrawer.items.map((s) => s.follower_sku).filter(Boolean);
+      // v2.2.9.133 跟随**当前显示的列表**（已排除删除的、以及筛选/隐藏开关的影响）
+      const skus = followerRows.value.map((s) => s.follower_sku).filter(Boolean);
       if (!skus.length) return notify.warning('没有可复制的跟卖 SKU');
       try { await navigator.clipboard.writeText(skus.join('\n')); notify.success(`已复制 ${skus.length} 个跟卖 SKU`); }
       catch { notify.warning('复制失败，请手动复制'); }
@@ -1316,7 +1370,8 @@ window.ProductListView = {
     return {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
       saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows, setFollowBatch,
-      copyLowerFollowerSku, exportFollowerCsv,
+      deleteSelectedProducts, restoreDeletedProducts,
+      copyLowerFollowerSku, exportFollowerCsv, deleteSelectedSellers,
       zoom, showZoom, moveZoom, hideZoom, lowerBusy, copyLowerSkus, exportLowerSkusCsv,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
       followBatchTokens, collectFollowBySkus, cancelFollowJob,
@@ -1982,6 +2037,10 @@ window.ProductListView = {
               复制比我低价的跟卖 SKU
             </el-button>
             <el-button plain :loading="lowerBusy" @click="exportLowerSkusCsv">导出这些 SKU</el-button>
+            <el-button type="danger" :disabled="!follow.selected.length" :loading="follow.deleting" @click="deleteSelectedProducts">
+              删除所选{{ follow.selected.length ? '（' + follow.selected.length + '）' : '' }}
+            </el-button>
+            <el-button link type="info" size="small" @click="restoreDeletedProducts">恢复已删除</el-button>
             <span style="font-size:12px; color:#94a3b8">（列表按上面的「查询范围」店铺筛选）</span>
           </div>
 
@@ -2039,7 +2098,9 @@ window.ProductListView = {
           </div>
 
           <el-table :data="follow.items" v-loading="follow.loading" border size="small"
-            max-height="calc(100vh - 330px)">
+            max-height="calc(100vh - 330px)"
+            @selection-change="(rows) => { follow.selected = rows; }">
+            <el-table-column type="selection" width="42" />
             <template #empty>
               <div style="padding:26px 12px; display:flex; flex-direction:column; align-items:center; gap:10px">
                 <div style="font-size:15px; font-weight:800; color:#64748b">还没有跟卖数据</div>
@@ -2149,7 +2210,8 @@ window.ProductListView = {
           </div>
         </div>
 
-        <el-drawer v-model="followerDrawer.visible" title="跟卖卖家列表" size="560px" append-to-body destroy-on-close>
+        <!-- v2.2.9.133 加宽到 760：多了「删除所选」按钮 + 多选列，560 会把按钮行挤出去 -->
+        <el-drawer v-model="followerDrawer.visible" title="跟卖卖家列表" size="760px" append-to-body destroy-on-close>
           <div v-if="followerDrawer.name" style="font-size:13px; color:#475569; margin-bottom:6px">{{ followerDrawer.name }}</div>
           <div style="font-size:12px; color:#94a3b8; margin-bottom:6px">货号：{{ followerDrawer.offerId }}</div>
           <div style="font-size:12px; color:#475569; margin-bottom:6px; line-height:1.9">
@@ -2173,10 +2235,16 @@ window.ProductListView = {
               复制「比我低价」SKU（{{ followerDrawer.lowerCount }}）
             </el-button>
             <el-button size="small" @click="exportFollowerCsv">导出 CSV</el-button>
+            <el-button size="small" type="danger" :disabled="!followerDrawer.selected.length"
+              :loading="followerDrawer.deleting" @click="deleteSelectedSellers">
+              删除所选{{ followerDrawer.selected.length ? '（' + followerDrawer.selected.length + '）' : '' }}
+            </el-button>
             <el-checkbox v-model="followerDrawer.onlyLower" size="small">只看比我低价（{{ followerDrawer.lowerCount }}）</el-checkbox>
             <el-checkbox v-model="followerDrawer.hideExcluded" size="small">隐藏已排除的卖家</el-checkbox>
           </div>
-          <el-table :data="followerRows" v-loading="followerDrawer.loading" size="small" border max-height="70vh">
+          <el-table :data="followerRows" v-loading="followerDrawer.loading" size="small" border max-height="70vh"
+            @selection-change="(rows) => { followerDrawer.selected = rows; }">
+            <el-table-column type="selection" width="42" />
             <el-table-column label="图" width="60">
               <template #default="{ row }">
                 <el-image v-if="row.follower_image" :src="row.follower_image" style="width:38px; height:38px; border-radius:5px; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="[row.follower_image]">

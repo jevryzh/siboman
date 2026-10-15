@@ -1795,6 +1795,9 @@ async function initDatabase() {
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS query_batch TEXT DEFAULT '';
       -- v2.2.9.132 商品名/图片、卖家图片：都从 Ozon 卡片上抓，这样这个功能**完全不依赖**
       --   自己的商品库（以前库里没有就显示「本地无该商品信息」，还要靠 app_products 关联）
+      -- v2.2.9.133 软删除：查出来的跟卖里偶尔混进别的商品，需要能删掉。
+      --   用 deleted_at 软删（不真删，便于回滚），列表/复制/导出全部过滤它。
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_name TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_image TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS follower_image TEXT DEFAULT '';
@@ -6052,7 +6055,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
                    AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
               ) AS excluded
          FROM ozon_follow_sellers fs
-        WHERE fs.user_id = $1 AND fs.offer_id = $2
+        WHERE fs.user_id = $1 AND fs.offer_id = $2 AND fs.deleted_at IS NULL
         ORDER BY NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric ASC NULLS LAST,
                  fs.follower_sku`,
       [req.user.id, offerId, excludeSellers],
@@ -6137,6 +6140,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
        SELECT fs.*
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
+          AND fs.deleted_at IS NULL
           AND ($6 = '' OR COALESCE(fs.query_batch,'') = $6)
           AND NOT EXISTS (
             SELECT 1 FROM unnest($2::text[]) e
@@ -6213,6 +6217,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
               ${priceNumSql} AS price_num
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
+          AND fs.deleted_at IS NULL
           AND fs.offer_id = ANY($2::text[])
           AND ($3 = '' OR COALESCE(fs.query_batch,'') = $3)`,
       [userId, offerIds, batchId],
@@ -6359,7 +6364,7 @@ async function latestFollowBatchId(userId) {
   if (!db) return "";
   const r = await db.query(
     `SELECT query_batch FROM ozon_follow_sellers
-      WHERE user_id = $1 AND COALESCE(query_batch,'') <> ''
+      WHERE user_id = $1 AND deleted_at IS NULL AND COALESCE(query_batch,'') <> ''
       ORDER BY scanned_at DESC LIMIT 1`,
     [userId],
   );
@@ -6403,6 +6408,7 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
               MAX(fs.scanned_at) AS scanned_at
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
+          AND fs.deleted_at IS NULL
           AND ($3 = '' OR COALESCE(fs.query_batch,'') = $3)
           AND NOT EXISTS (
             SELECT 1 FROM unnest($2::text[]) e
@@ -6416,7 +6422,7 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
       `WITH counts AS (
          SELECT store_name, COUNT(DISTINCT offer_id)::int AS products
            FROM ozon_follow_sellers
-          WHERE user_id = $1 AND COALESCE(store_name,'') <> ''
+          WHERE user_id = $1 AND deleted_at IS NULL AND COALESCE(store_name,'') <> ''
           GROUP BY store_name
        )
        SELECT s.name AS store_name, COALESCE(c.products, 0)::int AS products
@@ -6435,6 +6441,7 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
       `SELECT COUNT(*)::int AS excluded
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
+          AND fs.deleted_at IS NULL
           AND EXISTS (
             SELECT 1 FROM unnest($2::text[]) e
              WHERE btrim(e) <> ''
@@ -6529,6 +6536,61 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
       skus: allSkus,
       by_product: byProduct,
     });
+  } catch (error) { next(error); }
+});
+
+// 「被跟卖商品」批量删除（v2.2.9.133）
+//   查出来的跟卖里偶尔会混进别的商品，用户要能删掉。
+//   软删除（deleted_at），列表/复制/导出都会自动排除，误删也能捞回来。
+app.post("/api/ozon/followed-products/delete", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const offerIds = [...new Set((Array.isArray(req.body?.offer_ids) ? req.body.offer_ids : [])
+      .map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 500);
+    if (!offerIds.length) return res.status(400).json({ success: false, error: "没有指定要删除的商品" });
+    const r = await db.query(
+      `UPDATE ozon_follow_sellers SET deleted_at = now()
+        WHERE user_id = $1 AND offer_id = ANY($2::text[]) AND deleted_at IS NULL`,
+      [req.user.id, offerIds],
+    );
+    res.json({ success: true, deleted: r.rowCount, products: offerIds.length });
+  } catch (error) { next(error); }
+});
+
+// 恢复（误删可捞回）
+app.post("/api/ozon/followed-products/restore", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const offerIds = [...new Set((Array.isArray(req.body?.offer_ids) ? req.body.offer_ids : [])
+      .map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 500);
+    const r = await db.query(
+      `UPDATE ozon_follow_sellers SET deleted_at = NULL
+        WHERE user_id = $1
+          AND ($2::text[] = '{}'::text[] OR offer_id = ANY($2::text[]))
+          AND deleted_at IS NOT NULL`,
+      [req.user.id, offerIds],
+    );
+    res.json({ success: true, restored: r.rowCount });
+  } catch (error) { next(error); }
+});
+
+// 跟卖卖家列表里批量删除卖家（v2.2.9.133）
+app.post("/api/ozon/follow-sellers/delete", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(409).json({ success: false, error: "任务队列未启用（需要数据库）。" });
+    const offerId = String(req.body?.offer_id || "").trim();
+    if (!offerId) return res.status(400).json({ success: false, error: "缺少 offer_id" });
+    const followerSkus = [...new Set((Array.isArray(req.body?.follower_skus) ? req.body.follower_skus : [])
+      .map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 2000);
+    const deleteAll = req.body?.all === true;
+    if (!followerSkus.length && !deleteAll) return res.status(400).json({ success: false, error: "没有指定要删除的卖家" });
+    const r = await db.query(
+      `UPDATE ozon_follow_sellers SET deleted_at = now()
+        WHERE user_id = $1 AND offer_id = $2 AND deleted_at IS NULL
+          AND ($3::boolean OR follower_sku = ANY($4::text[]))`,
+      [req.user.id, offerId, deleteAll, followerSkus],
+    );
+    res.json({ success: true, deleted: r.rowCount });
   } catch (error) { next(error); }
 });
 
