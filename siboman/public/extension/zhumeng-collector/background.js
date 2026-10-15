@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.137";
+const VERSION = "2.2.9.138";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1677,6 +1677,7 @@ function extractFollowBundleInPage(productId) {
       productImage: b.productImage || "",
       variants: variants,
       variantTotal: variantSkus.length,
+      variantSkus: variantSkus,   // v2.2.9.138 全量变体 SKU（含没有其他卖家的），供界面展示「该卡片共 N 个变体」
     };
     });
   });
@@ -1715,6 +1716,7 @@ async function fetchOtherOffersFromSellersInPlugin(productId, tabId, needVariant
       productName: out.productName || "",
       productImage: out.productImage || "",
       variants: Array.isArray(out.variants) ? out.variants : [],
+      variantSkus: Array.isArray(out.variantSkus) ? out.variantSkus : [],
     };
   };
   try {
@@ -1779,6 +1781,7 @@ async function runQueuedOzonPatrolJob(remoteJob) {
           product_name: bundle.productName || "",
           product_image: bundle.productImage || "",
           variants: bundle.variants || [],
+          variant_skus: bundle.variantSkus || [],
         });
         if (sellers.length) {
           okCount += 1;

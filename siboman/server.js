@@ -1802,6 +1802,9 @@ async function initDatabase() {
       --   跟卖者在同一卡片下加的其它变体 SKU 得靠「变体 SKU → 查它的卖家列表」补出来。
       --   这些补出来的行标 from_variant=true，界面上带「变体」标记，便于核对。
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS from_variant BOOLEAN NOT NULL DEFAULT FALSE;
+      -- v2.2.9.138 该卡片的完整变体 SKU 清单（来自商品页 webAspects），
+      --   界面要显示「该卡片共 N 个变体 SKU」，这是规格组合数、不是卖家数，两者容易混。
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS variant_skus TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_name TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_image TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS follower_image TEXT DEFAULT '';
@@ -6053,6 +6056,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
               COALESCE(fs.follower_name,'') AS follower_name,
               COALESCE(fs.follower_image,'') AS follower_image,
               COALESCE(fs.from_variant, FALSE) AS from_variant,
+              COALESCE(fs.variant_skus,'') AS variant_skus,
               COALESCE(fs.card_price,'') AS card_price,
               COALESCE(fs.list_price,'') AS list_price,
               fs.follower_price,
@@ -6114,6 +6118,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       follower_price: x.follower_price,
       follower_image: x.follower_image || '',
       from_variant: !!x.from_variant,
+      variant_skus: (() => { try { return JSON.parse(x.variant_skus || '[]'); } catch (_e) { return []; } })(),
       price_num: x.price_num === null || x.price_num === undefined ? null : Number(x.price_num),
       excluded: !!x.excluded,
       lower_than_my: myPriceRub !== null && x.price_num !== null && x.price_num !== undefined
@@ -6126,6 +6131,13 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       my_price: myPrice,
       my_price_rub: myPriceRub,
       my_price_source: myPriceSource,
+      // v2.2.9.138 该卡片的完整变体 SKU 清单（顶层，一张卡片一份）
+      variant_skus: (() => {
+        for (const row of r.rows) {
+          try { const a = JSON.parse(row.variant_skus || '[]'); if (Array.isArray(a) && a.length) return a; } catch (_e) { /* 忽略 */ }
+        }
+        return [];
+      })(),
       card_price_text: (r.rows[0] && r.rows[0].card_price) || '',
       list_price_text: (r.rows[0] && r.rows[0].list_price) || '',
       rub_cny_rate: RUB_CNY_RATE,
@@ -19408,13 +19420,14 @@ async function applyOzonPatrolFollowResults(userId, updated) {
         variantSellers.push({ s, variantSku: String(v.sku || "") });
       }
     }
+    const variantSkusJson = JSON.stringify(Array.isArray(r?.variant_skus) ? r.variant_skus.map((x) => String(x)) : []);
     const queryBatch = String(updated?.payload?.queryBatch || updated?.id || "").trim();
     const productName = String(r?.product_name || "").trim();
     const productImage = String(r?.product_image || "").trim();
     const insertFollower = async (sk, s2, isVariant) => {
       await db.query(
-        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price, query_batch, product_name, product_image, follower_image, from_variant) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
-        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sk, String(s2.name || ""), String(s2.price || ""), cardPrice, listPrice, queryBatch, productName, productImage, String(s2.image || ""), !!isVariant],
+        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price, query_batch, product_name, product_image, follower_image, from_variant, variant_skus) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sk, String(s2.name || ""), String(s2.price || ""), cardPrice, listPrice, queryBatch, productName, productImage, String(s2.image || ""), !!isVariant, variantSkusJson],
       );
       n += 1;
     };

@@ -939,6 +939,7 @@ window.ProductListView = {
       myPrice: null, myCurrency: '', myPriceRub: null, rubCnyRate: null,
       myPriceSource: '', listPriceText: '',
       selected: [], deleting: false,   // v2.2.9.133
+      variantSkus: [],                 // v2.2.9.138 该卡片的变体 SKU 清单
       rivalMin: null, rivalCurrency: '',
       excludedCount: 0, lowerCount: 0, hideExcluded: false, onlyLower: false,
     });
@@ -1095,6 +1096,15 @@ window.ProductListView = {
       if (row.price_class === 'not_lower') return { type: 'success', text: '没人比我低' };
       return { type: 'info', text: '价格未知' };
     };
+    // 有多少个变体 SKU 是真的有别的卖家在卖（其余是只有主卖家）
+    const variantWithFollowers = Vue.computed(() => {
+      const skus = new Set((followerDrawer.variantSkus || []).map(String));
+      const hit = new Set();
+      for (const x of (followerDrawer.items || [])) {
+        if (x.from_variant) hit.add(String(x.follower_sku || '').slice(-10));
+      }
+      return hit.size;
+    });
     const followerRows = Vue.computed(() => (followerDrawer.items || [])
       .filter((x) => !followerDrawer.hideExcluded || !x.excluded)
       .filter((x) => !followerDrawer.onlyLower || x.lower_than_my));
@@ -1168,6 +1178,7 @@ window.ProductListView = {
         followerDrawer.myPriceRub = res.data?.my_price_rub ?? null;
         followerDrawer.myPriceSource = res.data?.my_price_source || '';
         followerDrawer.listPriceText = res.data?.list_price_text || '';
+        followerDrawer.variantSkus = Array.isArray(res.data?.variant_skus) ? res.data.variant_skus : [];
         followerDrawer.rubCnyRate = res.data?.rub_cny_rate ?? null;
         followerDrawer.rivalMin = res.data?.rival_min ?? null;
         followerDrawer.excludedCount = Number(res.data?.excluded_count || 0);
@@ -1384,7 +1395,7 @@ window.ProductListView = {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
       saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows, setFollowBatch,
       deleteSelectedProducts, restoreDeletedProducts, setQueryVariants,
-      copyLowerFollowerSku, exportFollowerCsv, deleteSelectedSellers,
+      copyLowerFollowerSku, exportFollowerCsv, deleteSelectedSellers, variantWithFollowers,
       zoom, showZoom, moveZoom, hideZoom, lowerBusy, copyLowerSkus, exportLowerSkusCsv,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
       followBatchTokens, collectFollowBySkus, cancelFollowJob,
@@ -2252,6 +2263,20 @@ window.ProductListView = {
             <span style="color:#dc2626; font-weight:700"> · 比我低 {{ followerDrawer.lowerCount }} 个</span>
             <span v-if="followerDrawer.excludedCount" style="color:#b45309"> · 已在排除名单里 {{ followerDrawer.excludedCount }} 个</span>
             <span v-if="followerDrawer.items.filter(x => x.from_variant).length" style="color:#2563eb"> · 其中 <b>{{ followerDrawer.items.filter(x => x.from_variant).length }}</b> 条来自变体补全</span>
+          </div>
+          <!-- v2.2.9.138 「变体 SKU 数」和「卖家数」是两回事，之前用户把两者混了，这里分开写清楚 -->
+          <div v-if="followerDrawer.variantSkus.length" style="font-size:12px; color:#475569; margin-bottom:6px">
+            该卡片共 <b style="color:#2563eb">{{ followerDrawer.variantSkus.length }}</b> 个变体 SKU（规格组合）
+            <el-tooltip placement="top">
+              <template #content>
+                <div style="max-width:420px; line-height:1.8">
+                  <div style="margin-bottom:4px">来自商品页 webAspects（规格矩阵），是<b>整个卡片有多少个 SKU</b>，与「卖家数」不是一个概念。</div>
+                  <div style="font-family:monospace">{{ followerDrawer.variantSkus.join(', ') }}</div>
+                </div>
+              </template>
+              <span style="color:#2563eb; cursor:pointer; margin-left:4px">查看全部</span>
+            </el-tooltip>
+            <span style="color:#94a3b8"> · 其中 {{ variantWithFollowers }} 个有其他卖家</span>
           </div>
           <div style="font-size:11px; color:#94a3b8; margin-bottom:10px">
             我的价取自 Ozon 商品页上的绿标价（与跟卖价同为卢布，直接比较）；只有卡片上取不到时才回退库里价折汇率 —— 与列表页同一套口径。
