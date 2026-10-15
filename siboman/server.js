@@ -5780,6 +5780,8 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
     const tokens = [...new Set(rawTokens.map((v) => String(v || "").trim()).filter(Boolean))].slice(0, 2000);
     // v2.2.9.129 「查跟卖」探针模式：只查不落库（查的是任意商品，不是自己的）
     const probe = req.body?.probe === true;
+    // v2.2.9.136 是否同时查「变体 SKU」——默认关闭（插件要打开商品页，用户担心影响销量）
+    const queryVariants = req.body?.query_variants === true;
     // v2.2.9.129 允许**多个跟卖任务并发**。
     //   以前只要有任务在跑就直接复用旧的（existing:true），想同时查几批 SKU 会被挡住；
     //   多个账号（如 eason / jindiao）各自的任务本来也互不影响，不该被人为串行化。
@@ -5796,6 +5798,7 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
       const wantKey = [...tokens].sort().join("|");
       const dup = activePatrols.rows.find((j) => {
         if (Boolean(j.payload?.probe) !== probe) return false;   // 探针和自己的跟卖任务分开算
+        if (Boolean(j.payload?.queryVariants) !== queryVariants) return false; // 开/不开变体算两种任务
         const saved = Array.isArray(j.payload?.reqTokens) ? j.payload.reqTokens : null;
         const its = Array.isArray(j.payload?.items) ? j.payload.items : [];
         const key = saved
@@ -5882,7 +5885,7 @@ app.post("/api/ozon/patrol/collect", requireAuth, async (req, res, next) => {
       }
       const queuedTargeted = await createQueuedDbJob(req.user, {
         id: crypto.randomUUID(), kind: "ozon-patrol", storeId: null, total: items.length, phase: "等待插件采集跟卖",
-      }, { items, mode: "targeted", reqTokens: tokens, probe, scopeStoreName: scopeStoreName || "", scopeStoreId: scopeStoreId || "" });
+      }, { items, mode: "targeted", reqTokens: tokens, probe, queryVariants, scopeStoreName: scopeStoreName || "", scopeStoreId: scopeStoreId || "" });
       return res.json({
         success: true, jobId: queuedTargeted.id, queued: true, total: items.length, mode: "targeted",
         unresolved, tokens: tokens.length, multi_store: multiStore,

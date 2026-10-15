@@ -906,6 +906,9 @@ window.ProductListView = {
       batch: (() => { try { return localStorage.getItem('followBatchMode') || 'latest'; } catch (_e) { return 'latest'; } })(),
       selected: [],        // v2.2.9.133 批量删除用
       deleting: false,
+      // v2.2.9.136 是否同时查「变体 SKU」——默认关闭。
+      //   查变体需要把奥森标签页导航到商品页，会额外产生浏览/请求，用户担心影响销量，故默认不开。
+      queryVariants: (() => { try { return localStorage.getItem('followQueryVariants') === '1'; } catch (_e) { return false; } })(),
       // v2.2.9.127 定向查询：批量粘贴 SKU/货号，只查这些商品，不整店跑
       batchText: '', batchBusy: false,
       jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
@@ -1061,6 +1064,13 @@ window.ProductListView = {
       return window.confirm(msg) ? Promise.resolve() : Promise.reject(new Error('cancel'));
     };
 
+    const setQueryVariants = (v) => {
+      follow.queryVariants = !!v;
+      try { localStorage.setItem('followQueryVariants', v ? '1' : '0'); } catch (_e) { /* 忽略 */ }
+      notify.info && notify.info(v
+        ? '已开启变体查询：会把 Ozon 标签页打开到商品页，可能影响该商品的浏览数据，且每个商品多几次请求'
+        : '已关闭变体查询');
+    };
     const setFollowBatch = (v) => {
       follow.batch = v;
       try { localStorage.setItem('followBatchMode', v); } catch (_e) { /* 忽略 */ }
@@ -1278,6 +1288,7 @@ window.ProductListView = {
         await ensureCapablePlugin();
         const res = await axios.post('/api/ozon/patrol/collect', {
           skus,
+          query_variants: !!follow.queryVariants,
           // 限定店铺：同一货号常同时铺在多个店铺，不限定会取到别的店的商品
           store_name: follow.storeName || undefined,
         }, { timeout: 120000 });
@@ -1372,7 +1383,7 @@ window.ProductListView = {
     return {
       follow, followerDrawer, openFollowed, loadFollowed, openFollowers,
       saveFollowExclude, fillMyStoresAsExclude, classCount, classTag, followerRows, setFollowBatch,
-      deleteSelectedProducts, restoreDeletedProducts,
+      deleteSelectedProducts, restoreDeletedProducts, setQueryVariants,
       copyLowerFollowerSku, exportFollowerCsv, deleteSelectedSellers,
       zoom, showZoom, moveZoom, hideZoom, lowerBusy, copyLowerSkus, exportLowerSkusCsv,
       copyText, copyAllFollowerSku, collectFollowData, fmtTime, diffText, diffColor,
@@ -1988,6 +1999,19 @@ window.ProductListView = {
             </div>
             <el-input v-model="follow.batchText" type="textarea" :rows="3" spellcheck="false"
               placeholder="每行一条：Ozon 商品链接、SKU（纯数字）或本地货号都可以；逗号/空格/分号分隔也行。&#10;https://www.ozon.ru/product/pryazha-kid-moher-belyy-4-motka-5618810078/&#10;3859920996" />
+            <!-- v2.2.9.136 变体查询开关（默认关）：开了会打开商品页，用户担心影响销量 -->
+            <div style="display:flex; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap">
+              <el-switch :model-value="follow.queryVariants" @change="setQueryVariants" />
+              <span style="font-size:13px; font-weight:700; color:#334155">同时查变体 SKU</span>
+              <el-tag size="small" :type="follow.queryVariants ? 'warning' : 'info'" effect="plain">
+                {{ follow.queryVariants ? '已开启' : '默认关闭' }}
+              </el-tag>
+              <span style="font-size:12px; color:#94a3b8">
+                跟卖者在同一卡片下挂的其它 SKU。开启后会把 Ozon 标签页打开到商品页逐个抓，
+                <b>可能影响该商品的浏览数据、且多花时间</b>；不需要就保持关闭。
+              </span>
+            </div>
+
             <div style="display:flex; align-items:center; gap:10px; margin-top:10px; flex-wrap:wrap">
               <span style="font-size:13px; font-weight:700; color:#334155; white-space:nowrap">查询范围</span>
               <el-select v-model="follow.storeName" clearable placeholder="全部店铺" style="width:210px" @change="loadFollowed(true)">

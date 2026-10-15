@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.134";
+const VERSION = "2.2.9.136";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1765,8 +1765,9 @@ async function runQueuedOzonPatrolJob(remoteJob) {
       await reportSourcingProgress(job);
       try {
         if (!productId) throw new Error("缺少 product_id");
-        // 定向查询（用户粘 SKU 的那种）才去抓变体：整店扫描商品太多，逐个导航太慢
-        const needVariants = String(payload.mode || "") === "targeted";
+        // 变体查询**默认关闭**（v2.2.9.136）：抓变体要把标签页导航到商品页，
+        //   用户担心影响商品浏览数据/销量，所以必须显式开启才做。
+        const needVariants = payload.queryVariants === true;
         const bundle = await fetchOtherOffersFromSellersInPlugin(productId, patrolTab.id, needVariants);
         const sellers = bundle.sellers || [];
         job.results.push({
