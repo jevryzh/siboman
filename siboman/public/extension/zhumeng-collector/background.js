@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.136";
+const VERSION = "2.2.9.137";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1595,7 +1595,24 @@ function extractFollowBundleInPage(productId) {
         }
       } catch (_e) { /* 跳过 */ }
     }
-    // ③ 卡片主价（绿标 cardPrice / 常规 price）
+    // ③ 变体矩阵：webAspects.aspects[].variants[].sku
+    //    ⚠️ 商品页 DOM 里只渲染前 10 个变体链接（懒加载），靠 DOM 抓会漏；
+    //   webAspects 是接口直接给的**完整**列表，而且不用把标签页打开到商品页
+    //   （用户担心打开商品页会影响该商品的浏览数据/销量）。
+    let variantSkus = [];
+    for (let i = 0; i < keys.length; i += 1) {
+      if (keys[i].indexOf("webAspects") !== 0) continue;
+      try {
+        const v = typeof ws[keys[i]] === "string" ? JSON.parse(ws[keys[i]]) : ws[keys[i]];
+        for (const asp of (v && v.aspects) || []) {
+          for (const vv of (asp && asp.variants) || []) {
+            const sk = String(vv && vv.sku || "").trim();
+            if (sk && variantSkus.indexOf(sk) < 0) variantSkus.push(sk);
+          }
+        }
+      } catch (_e) { /* 跳过 */ }
+    }
+    // ④ 卡片主价（绿标 cardPrice / 常规 price）
     let cardPrice = "", listPrice = "", originalPrice = "";
     for (let i = 0; i < keys.length; i += 1) {
       if (keys[i].indexOf("webPrice") !== 0) continue;
@@ -1616,6 +1633,7 @@ function extractFollowBundleInPage(productId) {
       originalPrice: originalPrice,
       productName: productName,
       productImage: productImage,
+      variantSkus: variantSkus,
     };
   };
   const ts = Date.now();
@@ -1631,37 +1649,23 @@ function extractFollowBundleInPage(productId) {
       .then(function (r) { return r.ok ? r.json() : null; })
       .catch(function () { return null; });
   };
-  // v2.2.9.134 变体 SKU：Ozon 的 otherOffersFromSellers 每个卖家只回 1 个 SKU，
+  // v2.2.9.137 变体 SKU：Ozon 的 otherOffersFromSellers 每个卖家只回 1 个 SKU，
   //   跟卖者在本卡片下的**其它变体 SKU 完全拿不到**。
-  //   商品页 DOM 里带 from_sku=<当前SKU> 的商品链接就是本卡片的变体，
-  //   逐个去查它们的卖家列表，就能把变体归到具体卖家名下。
-  const findVariantSkus = function (cur) {
-    try {
-      const out = [];
-      const links = document.querySelectorAll('a[href*="/product/"]');
-      for (let i = 0; i < links.length; i += 1) {
-        const href = links[i].getAttribute("href") || "";
-        if (href.indexOf("from_sku=") < 0) continue;
-        const m = href.match(/-(\d{6,})\//);
-        if (!m || m[1] === cur) continue;
-        if (out.indexOf(m[1]) < 0) out.push(m[1]);
-      }
-      return out.slice(0, 10);   // 限量：每多一个变体就多一次接口调用
-    } catch (_e) { return []; }
-  };
-  const variantSkus = findVariantSkus(String(productId));
-  const variantJobs = variantSkus.map(function (sku) {
-    return grab(modalOf(sku)).then(function (data) {
-      const v = pick(data);
-      return { sku: sku, sellers: v.sellers || [] };
-    });
-  });
-  return Promise.all([grab(modalOf(productId)), grab(pageUrl)].concat(variantJobs)).then(function (all) {
-    const a = pick(all[0]);
-    const b = pick(all[1]);
+  //   变体清单从商品页接口的 webAspects 拿（完整、且不需要打开商品页），
+  //   再逐个查这些变体各自的卖家列表，就能把变体归到具体卖家名下。
+  return Promise.all([grab(modalOf(productId)), grab(pageUrl)]).then(function (pair) {
+    const a = pick(pair[0]);
+    const b = pick(pair[1]);
+    // 变体清单以 webAspects 为准；去掉当前商品自己
+    const variantSkus = (b.variantSkus || []).filter(function (sk) { return String(sk) !== String(productId); });
+    return Promise.all(variantSkus.map(function (sku) {
+      return grab(modalOf(sku)).then(function (data) {
+        const v = pick(data);
+        return { sku: sku, sellers: v.sellers || [] };
+      });
+    })).then(function (variantResults) {
     const variants = [];
-    for (let i = 2; i < all.length; i += 1) {
-      const v = all[i];
+    for (const v of variantResults) {
       if (v && v.sku && (v.sellers || []).length) variants.push(v);
     }
     return {
@@ -1672,7 +1676,9 @@ function extractFollowBundleInPage(productId) {
       productName: b.productName || "",
       productImage: b.productImage || "",
       variants: variants,
+      variantTotal: variantSkus.length,
     };
+    });
   });
 }
 
@@ -1681,17 +1687,9 @@ async function fetchOtherOffersFromSellersInPlugin(productId, tabId, needVariant
   // v2.2.9.134 变体 SKU 只能从**该商品自己的页面** DOM 里读（带 from_sku 的链接）。
   //   插件复用的那个 ozon 标签页通常停在别的商品上，直接注入读到的是别人的变体，
   //   所以需要变体时先把标签导航到本商品页，等加载完再注入。
-  if (needVariants) {
-    try {
-      const cur = await chrome.tabs.get(tabId).catch(() => null);
-      const want = `https://www.ozon.ru/product/${productId}/`;
-      if (!cur || String(cur.url || "").indexOf(`/product/${productId}`) < 0) {
-        await chrome.tabs.update(tabId, { url: want });
-        await waitForTabComplete(tabId, 30000).catch(() => {});
-        await sleep(1200);   // 变体区块常是异步渲染，多等一会儿
-      }
-    } catch (_e) { /* 导航失败就退化成没有变体 */ }
-  }
+  // v2.2.9.137 变体清单改从 webAspects 接口拿，**不再需要把标签页导航到商品页**，
+  //   所以不会产生额外的商品页浏览，也就不影响该商品的浏览数据。
+  void needVariants;
   const runOn = async (id) => {
     // 注入前兜一层：被 Chrome 丢弃的标签必须唤醒，否则报的是误导性的「权限不足」
     const t = await chrome.tabs.get(id).catch(() => null);
