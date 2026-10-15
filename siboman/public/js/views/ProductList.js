@@ -1012,11 +1012,11 @@ window.ProductListView = {
         const rows = [];
         for (const p of (d.by_product || [])) {
           for (const x of p.skus) {
-            rows.push([p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, x.sku, String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price]);
+            rows.push([p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, x.sku, String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price, x.from_variant ? '变体补全' : '主列表']);
           }
         }
         if (!rows.length) return notify.warning('没有找到「比我低价」的跟卖 SKU');
-        const head = ['我的货号', '商品名', '我的价(我店铺报价₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价'];
+        const head = ['我的货号', '商品名', '我的价(我店铺报价₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价', '来源'];
         const csv = '\ufeff' + [head, ...rows].map((r) => r.join(',')).join('\n');
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
@@ -1119,11 +1119,13 @@ window.ProductListView = {
     const exportFollowerCsv = () => {
       const rows = followerRows.value || [];
       if (!rows.length) return notify.warning('没有可导出的行');
-      const head = ['卖家SKU', '卖家名', '售价', '售价(数值)', '比我低', '已排除'];
+      const head = ['卖家SKU', '卖家名', '售价', '售价(数值)', '比我低', '已排除', '来源'];
       const body = rows.map((x) => [
         x.follower_sku || '', String(x.follower_name || '').replace(/[,\r\n]/g, ' '),
         x.follower_price || '', x.price_num ?? '',
         x.lower_than_my ? '是' : '', x.excluded ? '是' : '',
+        // v2.2.9.135 标明这条是主接口给的，还是「变体 SKU → 查它的卖家」补出来的
+        x.from_variant ? '变体补全' : '主列表',
       ]);
       const csv = '\ufeff' + [head, ...body].map((r) => r.join(',')).join('\n');
       const a = document.createElement('a');

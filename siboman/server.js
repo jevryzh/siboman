@@ -6218,6 +6218,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
               fs.follower_price,
               COALESCE(fs.card_price,'') AS card_price,
               COALESCE(fs.list_price,'') AS list_price,
+              COALESCE(fs.from_variant, FALSE) AS from_variant,
               COALESCE(fs.product_name,'') AS card_product_name,
               COALESCE(fs.product_image,'') AS card_product_image,
               ${priceNumSql} AS price_num
@@ -6513,7 +6514,10 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
         if (n === null || n >= myPrice) continue;            // 只留比我低的
         const sku = String(r.follower_sku || "").trim();
         if (!sku) continue;
-        skus.push({ sku, name: r.follower_name || "", price: r.follower_price || "", price_num: n });
+        skus.push({
+          sku, name: r.follower_name || "", price: r.follower_price || "", price_num: n,
+          from_variant: !!r.from_variant,   // v2.2.9.135 让导出的 CSV 能标出哪个是变体补的
+        });
         if (!seen.has(sku)) { seen.add(sku); allSkus.push(sku); }
       }
       if (skus.length) {
@@ -19411,14 +19415,21 @@ async function applyOzonPatrolFollowResults(userId, updated) {
       );
       n += 1;
     };
+    // ⚠️ 主接口返回的列表里**同一个 SKU 可能出现多次**（Ozon 会按不同配送/仓库重复列出），
+    //   不去重就会出现「同一卖家同一 SKU 两条」，让抽屉里的卖家数和比价统计都虚高。
+    const insertedSku = new Set();
     for (const s of sellers) {
       const sku = String(s?.sku || "").trim();
-      if (!sku) continue;
+      if (!sku || insertedSku.has(sku)) continue;
+      insertedSku.add(sku);
       await insertFollower(sku, s, false);
     }
     // v2.2.9.134 变体补出来的卖家（跟卖者在同一卡片下的其它 SKU）
     for (const v of variantSellers) {
-      await insertFollower(String(v.s.sku || "").trim(), v.s, true);
+      const sku = String(v.s.sku || "").trim();
+      if (!sku || insertedSku.has(sku)) continue;
+      insertedSku.add(sku);
+      await insertFollower(sku, v.s, true);
     }
   }
   console.log(`[ozon-patrol] 跟卖卖家入库 ${n} 条（mode=${targeted ? "targeted" : "full"}）`);
