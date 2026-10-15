@@ -2007,8 +2007,9 @@ window.ProductListView = {
             <span style="font-size:12px; color:#94a3b8">「我的价」= 你在该商品卡片上的自家报价（卢布），与跟卖价同币种；不需要商品在商品库里</span>
           </div>
 
+          <!-- 算不出「我的价」时给出可操作的原因 -->
           <el-alert
-            v-if="!follow.excludeSellers && classCount('unknown') > 0"
+            v-if="classCount('unknown') > 0 && !follow.excludeSellers"
             type="warning" :closable="false" show-icon style="margin-bottom:2px">
             <template #title>
               还有 {{ classCount('unknown') }} 个商品算不出「谁比你低」：<b>没有设置「排除店铺（卖家名）」</b>。
@@ -2016,6 +2017,18 @@ window.ProductListView = {
             <div style="font-size:12px; line-height:1.8">
               Ozon 的商品卡片上<b>没有「这是我」的标记</b>，系统只能靠店名认出哪个卖家是你（同时也是卡片主卖家时不在“其他卖家”列表里）。
               请把你自己的 Ozon 店名填进上面的黄色输入框并点「应用」，就能算出你和别人的价差。
+            </div>
+          </el-alert>
+          <el-alert
+            v-else-if="classCount('unknown') > 0"
+            type="info" :closable="false" show-icon style="margin-bottom:2px">
+            <template #title>
+              还有 {{ classCount('unknown') }} 个商品没算出价：<b>采集插件版本较旧</b>，不返回商品页上的价格。
+            </template>
+            <div style="font-size:12px; line-height:1.8">
+              「我的价」优先读 Ozon 商品页上的绿标价（2.2.9.131+ 的插件才会带回来），
+              拿不到时才回退商品库价。请到「店铺管理 → 下载插件」更新到最新版（当前 2.2.9.132）后重载插件，
+              再重查一次即可。
             </div>
           </el-alert>
 
