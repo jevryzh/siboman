@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.138";
+const VERSION = "2.2.9.139";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1549,7 +1549,7 @@ function extractOtherOffersInPage(productId) {
 // 卖家列表 + 卡片主价，一次注入全抓回来（v2.2.9.131）。
 //   ⚠️ 必须**完全自包含**：executeScript 注入的函数只能引用自身函数体内的代码，
 //   引用外面的函数会 ReferenceError，表现为「页面注入无返回」。
-function extractFollowBundleInPage(productId) {
+function extractFollowBundleInPage(productId, wantVariants) {
   const pick = function (data) {
     const ws = (data && data.widgetStates) || {};
     const keys = Object.keys(ws);
@@ -1566,7 +1566,6 @@ function extractFollowBundleInPage(productId) {
               sku: s.sku || "",
               name: s.name || "",
               price: price,
-              // v2.2.9.132 卖家自己的商品图 + 商品链接，页面上直接展示
               image: s.coverImage || "",
               productLink: s.productLink || "",
               sellerId: s.id || "",
@@ -1576,7 +1575,7 @@ function extractFollowBundleInPage(productId) {
         }
       } catch (_e) { /* 单个 widget 解析失败跳过 */ }
     }
-    // ② 商品名 + 主图（这样不依赖自己的商品库也能显示商品）
+    // ② 商品名 + 主图
     let productName = "", productImage = "";
     for (let i = 0; i < keys.length; i += 1) {
       if (keys[i].indexOf("webProductHeading") !== 0) continue;
@@ -1596,10 +1595,10 @@ function extractFollowBundleInPage(productId) {
       } catch (_e) { /* 跳过 */ }
     }
     // ③ 变体矩阵：webAspects.aspects[].variants[].sku
-    //    ⚠️ 商品页 DOM 里只渲染前 10 个变体链接（懒加载），靠 DOM 抓会漏；
-    //   webAspects 是接口直接给的**完整**列表，而且不用把标签页打开到商品页
-    //   （用户担心打开商品页会影响该商品的浏览数据/销量）。
-    let variantSkus = [];
+    //    ⚠️ 单个商品的 webAspects 只列「和它同一层的」一部分变体
+    //    （实测 5850796244 只有 11 个，而整个家族有 32 个），
+    //    所以必须逐个变体页继续挖（见下面的 collectFamily）。
+    const aspectSkus = [];
     for (let i = 0; i < keys.length; i += 1) {
       if (keys[i].indexOf("webAspects") !== 0) continue;
       try {
@@ -1607,7 +1606,7 @@ function extractFollowBundleInPage(productId) {
         for (const asp of (v && v.aspects) || []) {
           for (const vv of (asp && asp.variants) || []) {
             const sk = String(vv && vv.sku || "").trim();
-            if (sk && variantSkus.indexOf(sk) < 0) variantSkus.push(sk);
+            if (sk && aspectSkus.indexOf(sk) < 0) aspectSkus.push(sk);
           }
         }
       } catch (_e) { /* 跳过 */ }
@@ -1627,59 +1626,101 @@ function extractFollowBundleInPage(productId) {
       } catch (_e) { /* 跳过 */ }
     }
     return {
-      sellers: sellers,
-      cardPrice: cardPrice,
-      listPrice: listPrice,
-      originalPrice: originalPrice,
-      productName: productName,
-      productImage: productImage,
-      variantSkus: variantSkus,
+      sellers: sellers, cardPrice: cardPrice, listPrice: listPrice, originalPrice: originalPrice,
+      productName: productName, productImage: productImage, aspectSkus: aspectSkus,
     };
   };
-  const ts = Date.now();
-  const modalOf = function (sku) {
-    return "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
-      + encodeURIComponent("/modal/otherOffersFromSellers?product_id=" + sku + "&sort=price&page_changed=true")
-      + "&_mjgd_ts=" + ts;
-  };
-  const pageUrl = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
-    + encodeURIComponent("/product/" + productId + "/") + "&_mjgd_ts=" + ts;
+
+  const base = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=";
   const grab = function (u) {
     return fetch(u, { credentials: "include", cache: "no-store" })
       .then(function (r) { return r.ok ? r.json() : null; })
       .catch(function () { return null; });
   };
-  // v2.2.9.137 变体 SKU：Ozon 的 otherOffersFromSellers 每个卖家只回 1 个 SKU，
-  //   跟卖者在本卡片下的**其它变体 SKU 完全拿不到**。
-  //   变体清单从商品页接口的 webAspects 拿（完整、且不需要打开商品页），
-  //   再逐个查这些变体各自的卖家列表，就能把变体归到具体卖家名下。
-  return Promise.all([grab(modalOf(productId)), grab(pageUrl)]).then(function (pair) {
+  const modalOf = function (sku) {
+    return base + encodeURIComponent("/modal/otherOffersFromSellers?product_id=" + sku + "&sort=price&page_changed=true")
+      + "&_mjgd_ts=" + Date.now();
+  };
+  const pageOf = function (sku) {
+    return base + encodeURIComponent("/product/" + sku + "/") + "&_mjgd_ts=" + Date.now();
+  };
+
+  // v2.2.9.139 变体家族全量枚举（BFS）：
+  //   Ozon 的商品页 webAspects 只列出**当前这一层**能看到的变体，
+  //   整个家族要顺着每个变体自己的页面继续挖才能挖全
+  //   （实测商品 5850796244：首页只给 11 个，挖完是 32 个 = 8 长度 × 4 颜色）。
+  //   每个 SKU 一次页面请求 +（要卖家时）一次卖家请求，所以限量并用小并发跑。
+  const FAMILY_CAP = 80;
+  const collectFamily = function (startSku, withSellers) {
+    const seen = [String(startSku)];
+    const seenSet = { };
+    seenSet[String(startSku)] = true;
+    const pending = [String(startSku)];
+    const runBatch = function (list, worker) {
+      const out = [];
+      let idx = 0;
+      const next = function () {
+        if (idx >= list.length) return Promise.resolve();
+        const cur = list[idx];
+        idx += 1;
+        return worker(cur).then(function (r) { out.push(r); return next(); });
+      };
+      const lanes = [];
+      for (let i = 0; i < Math.min(4, list.length); i += 1) lanes.push(next());
+      return Promise.all(lanes).then(function () { return out; });
+    };
+    let frontier = pending;
+    return (function loop() {
+      if (!frontier.length || seen.length >= FAMILY_CAP) return Promise.resolve();
+      const batch = frontier.slice(0, FAMILY_CAP - seen.length);
+      frontier = [];
+      return runBatch(batch, function (sku) {
+        return grab(pageOf(sku)).then(function (d) { return { sku: sku, data: d }; });
+      }).then(function (results) {
+        for (const r of results) {
+          if (!r || !r.data) continue;
+          const skus = pick(r.data).aspectSkus || [];
+          for (const sk of skus) {
+            if (!seenSet[sk] && seen.length < FAMILY_CAP) {
+              seenSet[sk] = true;
+              seen.push(sk);
+              frontier.push(sk);
+            }
+          }
+        }
+        return loop();
+      });
+    })().then(function () {
+      if (!withSellers) return { skus: seen, sellersBySku: [] };
+      return runBatch(seen, function (sku) {
+        return grab(modalOf(sku)).then(function (d) {
+          return { sku: sku, sellers: pick(d).sellers || [] };
+        });
+      }).then(function (results) {
+        return { skus: seen, sellersBySku: results };
+      });
+    });
+  };
+
+  return Promise.all([grab(modalOf(productId)), grab(pageOf(productId))]).then(function (pair) {
     const a = pick(pair[0]);
     const b = pick(pair[1]);
-    // 变体清单以 webAspects 为准；去掉当前商品自己
-    const variantSkus = (b.variantSkus || []).filter(function (sk) { return String(sk) !== String(productId); });
-    return Promise.all(variantSkus.map(function (sku) {
-      return grab(modalOf(sku)).then(function (data) {
-        const v = pick(data);
-        return { sku: sku, sellers: v.sellers || [] };
-      });
-    })).then(function (variantResults) {
-    const variants = [];
-    for (const v of variantResults) {
-      if (v && v.sku && (v.sellers || []).length) variants.push(v);
-    }
-    return {
-      sellers: a.sellers,
-      cardPrice: a.cardPrice || b.cardPrice || "",
-      listPrice: a.listPrice || b.listPrice || "",
-      originalPrice: a.originalPrice || b.originalPrice || "",
-      productName: b.productName || "",
-      productImage: b.productImage || "",
-      variants: variants,
-      variantTotal: variantSkus.length,
-      variantSkus: variantSkus,   // v2.2.9.138 全量变体 SKU（含没有其他卖家的），供界面展示「该卡片共 N 个变体」
+    const finish = function (family) {
+      return {
+        sellers: a.sellers,
+        cardPrice: a.cardPrice || b.cardPrice || "",
+        listPrice: a.listPrice || b.listPrice || "",
+        originalPrice: a.originalPrice || b.originalPrice || "",
+        productName: b.productName || "",
+        productImage: b.productImage || "",
+        variantSkus: family.skus,
+        variants: (family.sellersBySku || []).map(function (x) { return { sku: x.sku, sellers: x.sellers || [] }; }),
+      };
     };
-    });
+    if (!wantVariants) {
+      return finish({ skus: [String(productId)].concat((b.aspectSkus || []).filter(function (x) { return String(x) !== String(productId); })), sellersBySku: [] });
+    }
+    return collectFamily(String(productId), true).then(finish);
   });
 }
 
@@ -1702,7 +1743,7 @@ async function fetchOtherOffersFromSellersInPlugin(productId, tabId, needVariant
     const [res] = await chrome.scripting.executeScript({
       target: { tabId: id },
       func: extractFollowBundleInPage,
-      args: [productId],
+      args: [productId, needVariants === true],
     });
     const out = res && res.result;
     if (!out) throw new Error("页面注入无返回（标签页可能没有加载 ozon.ru）");
