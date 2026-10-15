@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.132";
+const VERSION = "2.2.9.134";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1619,17 +1619,51 @@ function extractFollowBundleInPage(productId) {
     };
   };
   const ts = Date.now();
-  const modalUrl = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
-    + encodeURIComponent("/modal/otherOffersFromSellers?product_id=" + productId + "&sort=price&page_changed=true")
-    + "&_mjgd_ts=" + ts;
+  const modalOf = function (sku) {
+    return "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
+      + encodeURIComponent("/modal/otherOffersFromSellers?product_id=" + sku + "&sort=price&page_changed=true")
+      + "&_mjgd_ts=" + ts;
+  };
   const pageUrl = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url="
     + encodeURIComponent("/product/" + productId + "/") + "&_mjgd_ts=" + ts;
-  return Promise.all([
-    fetch(modalUrl, { credentials: "include", cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
-    fetch(pageUrl, { credentials: "include", cache: "no-store" }).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
-  ]).then(function (pair) {
-    const a = pick(pair[0]);
-    const b = pick(pair[1]);
+  const grab = function (u) {
+    return fetch(u, { credentials: "include", cache: "no-store" })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .catch(function () { return null; });
+  };
+  // v2.2.9.134 变体 SKU：Ozon 的 otherOffersFromSellers 每个卖家只回 1 个 SKU，
+  //   跟卖者在本卡片下的**其它变体 SKU 完全拿不到**。
+  //   商品页 DOM 里带 from_sku=<当前SKU> 的商品链接就是本卡片的变体，
+  //   逐个去查它们的卖家列表，就能把变体归到具体卖家名下。
+  const findVariantSkus = function (cur) {
+    try {
+      const out = [];
+      const links = document.querySelectorAll('a[href*="/product/"]');
+      for (let i = 0; i < links.length; i += 1) {
+        const href = links[i].getAttribute("href") || "";
+        if (href.indexOf("from_sku=") < 0) continue;
+        const m = href.match(/-(\d{6,})\//);
+        if (!m || m[1] === cur) continue;
+        if (out.indexOf(m[1]) < 0) out.push(m[1]);
+      }
+      return out.slice(0, 10);   // 限量：每多一个变体就多一次接口调用
+    } catch (_e) { return []; }
+  };
+  const variantSkus = findVariantSkus(String(productId));
+  const variantJobs = variantSkus.map(function (sku) {
+    return grab(modalOf(sku)).then(function (data) {
+      const v = pick(data);
+      return { sku: sku, sellers: v.sellers || [] };
+    });
+  });
+  return Promise.all([grab(modalOf(productId)), grab(pageUrl)].concat(variantJobs)).then(function (all) {
+    const a = pick(all[0]);
+    const b = pick(all[1]);
+    const variants = [];
+    for (let i = 2; i < all.length; i += 1) {
+      const v = all[i];
+      if (v && v.sku && (v.sellers || []).length) variants.push(v);
+    }
     return {
       sellers: a.sellers,
       cardPrice: a.cardPrice || b.cardPrice || "",
@@ -1637,12 +1671,27 @@ function extractFollowBundleInPage(productId) {
       originalPrice: a.originalPrice || b.originalPrice || "",
       productName: b.productName || "",
       productImage: b.productImage || "",
+      variants: variants,
     };
   });
 }
 
 // 在 ozon.ru 页面上下文里抓「其他卖家报价」（跟卖卖家）。
-async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
+async function fetchOtherOffersFromSellersInPlugin(productId, tabId, needVariants) {
+  // v2.2.9.134 变体 SKU 只能从**该商品自己的页面** DOM 里读（带 from_sku 的链接）。
+  //   插件复用的那个 ozon 标签页通常停在别的商品上，直接注入读到的是别人的变体，
+  //   所以需要变体时先把标签导航到本商品页，等加载完再注入。
+  if (needVariants) {
+    try {
+      const cur = await chrome.tabs.get(tabId).catch(() => null);
+      const want = `https://www.ozon.ru/product/${productId}/`;
+      if (!cur || String(cur.url || "").indexOf(`/product/${productId}`) < 0) {
+        await chrome.tabs.update(tabId, { url: want });
+        await waitForTabComplete(tabId, 30000).catch(() => {});
+        await sleep(1200);   // 变体区块常是异步渲染，多等一会儿
+      }
+    } catch (_e) { /* 导航失败就退化成没有变体 */ }
+  }
   const runOn = async (id) => {
     // 注入前兜一层：被 Chrome 丢弃的标签必须唤醒，否则报的是误导性的「权限不足」
     const t = await chrome.tabs.get(id).catch(() => null);
@@ -1667,6 +1716,7 @@ async function fetchOtherOffersFromSellersInPlugin(productId, tabId) {
       originalPrice: out.originalPrice || "",
       productName: out.productName || "",
       productImage: out.productImage || "",
+      variants: Array.isArray(out.variants) ? out.variants : [],
     };
   };
   try {
@@ -1715,7 +1765,9 @@ async function runQueuedOzonPatrolJob(remoteJob) {
       await reportSourcingProgress(job);
       try {
         if (!productId) throw new Error("缺少 product_id");
-        const bundle = await fetchOtherOffersFromSellersInPlugin(productId, patrolTab.id);
+        // 定向查询（用户粘 SKU 的那种）才去抓变体：整店扫描商品太多，逐个导航太慢
+        const needVariants = String(payload.mode || "") === "targeted";
+        const bundle = await fetchOtherOffersFromSellersInPlugin(productId, patrolTab.id, needVariants);
         const sellers = bundle.sellers || [];
         job.results.push({
           offer_id: offerId,
@@ -1727,10 +1779,13 @@ async function runQueuedOzonPatrolJob(remoteJob) {
           original_price: bundle.originalPrice || "",
           product_name: bundle.productName || "",
           product_image: bundle.productImage || "",
+          variants: bundle.variants || [],
         });
         if (sellers.length) {
           okCount += 1;
-          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家（卡片价 ${bundle.cardPrice || bundle.listPrice || "-"}）`, "info"));
+          const vCount = (bundle.variants || []).reduce(function (n, v) { return n + (v.sellers || []).length; }, 0);
+          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家（卡片价 ${bundle.cardPrice || bundle.listPrice || "-"}）`
+            + (vCount ? `，另从 ${(bundle.variants || []).length} 个变体补到 ${vCount} 条` : ""), "info"));
         }
       } catch (e) {
         errCount += 1;

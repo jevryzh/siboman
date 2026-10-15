@@ -1798,6 +1798,10 @@ async function initDatabase() {
       -- v2.2.9.133 软删除：查出来的跟卖里偶尔混进别的商品，需要能删掉。
       --   用 deleted_at 软删（不真删，便于回滚），列表/复制/导出全部过滤它。
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+      -- v2.2.9.134 变体来源：Ozon 的「其他卖家」接口每个卖家只回 1 个 SKU，
+      --   跟卖者在同一卡片下加的其它变体 SKU 得靠「变体 SKU → 查它的卖家列表」补出来。
+      --   这些补出来的行标 from_variant=true，界面上带「变体」标记，便于核对。
+      ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS from_variant BOOLEAN NOT NULL DEFAULT FALSE;
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_name TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_image TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS follower_image TEXT DEFAULT '';
@@ -6045,6 +6049,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       `SELECT fs.follower_sku,
               COALESCE(fs.follower_name,'') AS follower_name,
               COALESCE(fs.follower_image,'') AS follower_image,
+              COALESCE(fs.from_variant, FALSE) AS from_variant,
               COALESCE(fs.card_price,'') AS card_price,
               COALESCE(fs.list_price,'') AS list_price,
               fs.follower_price,
@@ -6105,6 +6110,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
       follower_name: x.follower_name,
       follower_price: x.follower_price,
       follower_image: x.follower_image || '',
+      from_variant: !!x.from_variant,
       price_num: x.price_num === null || x.price_num === undefined ? null : Number(x.price_num),
       excluded: !!x.excluded,
       lower_than_my: myPriceRub !== null && x.price_num !== null && x.price_num !== undefined
@@ -19380,17 +19386,39 @@ async function applyOzonPatrolFollowResults(userId, updated) {
     }
     const cardPrice = String(r?.card_price || "").trim();
     const listPrice = String(r?.list_price || "").trim();
+    // 变体补出来的卖家：按 follower_sku 去重，合并进同一商品（标 from_variant）
+    const variantSellers = [];
+    const seenVariantSku = new Set();
+    for (const s of (Array.isArray(r?.sellers) ? r.sellers : [])) {
+      const k = String(s?.sku || "").trim();
+      if (k) seenVariantSku.add(k);
+    }
+    for (const v of (Array.isArray(r?.variants) ? r.variants : [])) {
+      for (const s of (Array.isArray(v?.sellers) ? v.sellers : [])) {
+        const k = String(s?.sku || "").trim();
+        if (!k || seenVariantSku.has(k)) continue;   // 主动接口已经有的就不重复
+        seenVariantSku.add(k);
+        variantSellers.push({ s, variantSku: String(v.sku || "") });
+      }
+    }
     const queryBatch = String(updated?.payload?.queryBatch || updated?.id || "").trim();
     const productName = String(r?.product_name || "").trim();
     const productImage = String(r?.product_image || "").trim();
+    const insertFollower = async (sk, s2, isVariant) => {
+      await db.query(
+        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price, query_batch, product_name, product_image, follower_image, from_variant) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sk, String(s2.name || ""), String(s2.price || ""), cardPrice, listPrice, queryBatch, productName, productImage, String(s2.image || ""), !!isVariant],
+      );
+      n += 1;
+    };
     for (const s of sellers) {
       const sku = String(s?.sku || "").trim();
       if (!sku) continue;
-      await db.query(
-        "INSERT INTO ozon_follow_sellers (user_id, offer_id, product_id, store_name, follower_sku, follower_name, follower_price, card_price, list_price, query_batch, product_name, product_image, follower_image) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
-        [userId, offerId, String(r.product_id || ""), String(r.store_name || ""), sku, String(s.name || ""), String(s.price || ""), cardPrice, listPrice, queryBatch, productName, productImage, String(s.image || "")],
-      );
-      n += 1;
+      await insertFollower(sku, s, false);
+    }
+    // v2.2.9.134 变体补出来的卖家（跟卖者在同一卡片下的其它 SKU）
+    for (const v of variantSellers) {
+      await insertFollower(String(v.s.sku || "").trim(), v.s, true);
     }
   }
   console.log(`[ozon-patrol] 跟卖卖家入库 ${n} 条（mode=${targeted ? "targeted" : "full"}）`);

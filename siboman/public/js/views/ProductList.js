@@ -2225,6 +2225,7 @@ window.ProductListView = {
             共 <b>{{ followerDrawer.items.length }}</b> 个卖家
             <span style="color:#dc2626; font-weight:700"> · 比我低 {{ followerDrawer.lowerCount }} 个</span>
             <span v-if="followerDrawer.excludedCount" style="color:#b45309"> · 已在排除名单里 {{ followerDrawer.excludedCount }} 个</span>
+            <span v-if="followerDrawer.items.filter(x => x.from_variant).length" style="color:#2563eb"> · 其中 <b>{{ followerDrawer.items.filter(x => x.from_variant).length }}</b> 条来自变体补全</span>
           </div>
           <div style="font-size:11px; color:#94a3b8; margin-bottom:10px">
             我的价取自 Ozon 商品页上的绿标价（与跟卖价同为卢布，直接比较）；只有卡片上取不到时才回退库里价折汇率 —— 与列表页同一套口径。
@@ -2263,9 +2264,12 @@ window.ProductListView = {
             <el-table-column label="卖家名" min-width="150">
               <template #default="{ row }">
                 <div :style="{ color: row.excluded ? '#b45309' : '#0f172a', wordBreak: 'break-all' }">{{ row.follower_name || '-' }}</div>
-                <div v-if="row.lower_than_my || row.excluded" style="margin-top:2px; display:flex; gap:4px; flex-wrap:wrap">
+                <div v-if="row.lower_than_my || row.excluded || row.from_variant" style="margin-top:2px; display:flex; gap:4px; flex-wrap:wrap">
                   <el-tag v-if="row.lower_than_my" size="small" type="danger" effect="dark">比我低</el-tag>
                   <el-tag v-if="row.excluded" size="small" type="warning" effect="plain">已排除</el-tag>
+                  <!-- v2.2.9.134 这条是通过「变体 SKU → 查它的卖家」补出来的，
+                       即该卖家在同一卡片下挂的其它 SKU -->
+                  <el-tag v-if="row.from_variant" size="small" type="primary" effect="plain">变体</el-tag>
                 </div>
               </template>
             </el-table-column>
