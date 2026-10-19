@@ -2673,8 +2673,13 @@ async function updateProductField(req, res, next) {
       if (!Number.isInteger(numericValue) || numericValue < 0) {
         return res.status(400).json({ success: false, error: "库存必须是大于等于 0 的整数" });
       }
-      await callOzonSellerAPI("/v1/product/import-stocks", {
-        stocks: [{ offer_id: offerId, stocks: numericValue }]
+      // v2.2.9.142 老接口 /v1/product/import-stocks 已废弃（404），改 /v2/products/stocks（按仓库）
+      const warehouseId = await resolveOfferWarehouse(storeId, userId, offerId);
+      if (!warehouseId) {
+        return res.status(409).json({ success: false, error: "没有找到可用的 Ozon 仓库，无法设置库存，请到「库存管理」里按仓库设置" });
+      }
+      await callOzonSellerAPI("/v2/products/stocks", {
+        stocks: [{ offer_id: offerId, stock: numericValue, warehouse_id: warehouseId }],
       }, { storeId, userId });
     }
 
@@ -2906,6 +2911,39 @@ async function ozonFbsListAll({ since, to, status, with: withObj = { financial_d
     cursor = r.cursor;
   }
   return out;
+}
+
+// v2.2.9.142 /v1/product/import-stocks 已废弃（实测 404 page not found）。
+//   替代接口是 /v2/products/stocks，但它是**按仓库**写的（必须给 warehouse_id），
+//   而老接口是「设一个总库存」。这里先解析出该商品实际有货的仓库再写。
+const ozonWarehouseCache = new Map();   // storeId -> { at, ids }
+async function listActiveWarehouses(storeId, userId) {
+  const hit = ozonWarehouseCache.get(storeId);
+  if (hit && Date.now() - hit.at < 5 * 60 * 1000) return hit.ids;
+  const data = await callOzonSellerAPI("/v2/warehouse/list", { limit: 100, offset: 0 }, { storeId, userId });
+  const all = data?.result || data?.warehouses || [];
+  const ids = all
+    .filter((w) => String(w.status || "").toLowerCase() === "created")
+    .map((w) => Number(w.warehouse_id))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  const fallback = all.map((w) => Number(w.warehouse_id)).filter((n) => Number.isFinite(n) && n > 0);
+  const out = ids.length ? ids : fallback;
+  ozonWarehouseCache.set(storeId, { at: Date.now(), ids: out });
+  return out;
+}
+async function resolveOfferWarehouse(storeId, userId, offerId) {
+  const ids = await listActiveWarehouses(storeId, userId);
+  for (const wid of ids) {
+    try {
+      const d = await callOzonSellerAPI("/v1/product/info/warehouse/stocks", {
+        offer_id: [String(offerId)], warehouse_id: wid, limit: 100,
+      }, { storeId, userId });
+      const rows = d?.result || d?.items || [];
+      const present = (Array.isArray(rows) ? rows : []).reduce((n, r) => n + Number(r.present || 0), 0);
+      if (present > 0) return wid;
+    } catch (_e) { /* 这个仓库查不到就试下一个 */ }
+  }
+  return ids[0] || null;
 }
 
 // v3 兼容壳：调用方仍可传 offset / limit，拿回 { result: { postings, has_next } }
@@ -15262,7 +15300,9 @@ app.post("/api/seller/orders/ship", requireAuth, async (req, res) => {
         await db.query(`UPDATE app_order_ship_events SET status='failed', error=$1, updated_at=now() WHERE id=$2`, [`订单当前状态 ${currentStatus || '未知'} 不允许发货`, event.id]);
         return res.status(409).json({ success: false, code: "ORDER_STATUS_CHANGED", error: `订单状态已变为 ${currentStatus || "未知"}，请刷新后重试` });
       }
-      data = await callOzonSellerAPI("/v3/posting/fbs/ship", {
+      // v2.2.9.142 /v3/posting/fbs/ship 已废弃（实测 404 page not found），改 v4。
+      //   v4 的请求体与 v3 一致（错误里仍写 FbsPostingShipV3Request），只换路径即可。
+      data = await callOzonSellerAPI("/v4/posting/fbs/ship", {
         posting_number,
         packages,
         with: { additional_data: true },
