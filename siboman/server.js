@@ -2752,6 +2752,38 @@ app.post("/api/browser/close", async (_req, res) => {
   }
 });
 
+// v2.2.9.140 Ozon Seller API 有「每秒请求数」限流（429 code:8）。
+//   仪表盘原先 8 个店铺**完全并发**调用、每个还要翻页，直接打爆限流 →
+//   每个店铺都返回 0，界面看起来就是「所有店铺今日/7日都是 0 单」。
+//   这里加一个全局并发闸门（最多 4 个在飞、相邻请求至少间隔 120ms）+ 429/5xx 指数退避重试。
+const OZON_API_MAX_CONCURRENCY = 4;
+const OZON_API_MIN_GAP_MS = 120;
+let ozonApiActive = 0;
+let ozonApiLastAt = 0;
+const ozonApiWaiters = [];
+const ozonApiSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function acquireOzonApiSlot() {
+  return new Promise((resolve) => {
+    const grant = () => {
+      ozonApiActive += 1;
+      const release = () => {
+        ozonApiActive = Math.max(0, ozonApiActive - 1);
+        const next = ozonApiWaiters.shift();
+        if (next) next();
+      };
+      const gap = Date.now() - ozonApiLastAt;
+      if (gap < OZON_API_MIN_GAP_MS) {
+        setTimeout(() => { ozonApiLastAt = Date.now(); resolve(release); }, OZON_API_MIN_GAP_MS - gap);
+      } else {
+        ozonApiLastAt = Date.now();
+        resolve(release);
+      }
+    };
+    if (ozonApiActive < OZON_API_MAX_CONCURRENCY) grant();
+    else ozonApiWaiters.push(grant);
+  });
+}
+
 async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, userId = null, baseUrl = OZON_SELLER_BASE_URL, timeoutMs = 60000 } = {}) {
   let clientId = OZON_SELLER_CLIENT_ID;
   let apiKey = OZON_SELLER_API_KEY;
@@ -2778,25 +2810,34 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
   }
   // v2.2.9.100: 给 Ozon Seller API 调用加超时，避免官方接口慢/挂起时请求无限等待（前端会先超时报"插件超时"）
   let response;
-  try {
-    response = await fetch(`${baseUrl}${path}`, {
-      method,
-      headers: {
-        "Client-Id": clientId,
-        "Api-Key": apiKey,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(Math.max(15000, Number(timeoutMs) || 60000)),
-    });
-  } catch (fetchError) {
-    if (fetchError && fetchError.name === "TimeoutError") {
-      const error = new Error(`Ozon Seller API 请求超时(${timeoutMs}ms)：${path}`);
-      error.statusCode = 504;
-      throw error;
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const release = await acquireOzonApiSlot();
+    try {
+      response = await fetch(`${baseUrl}${path}`, {
+        method,
+        headers: {
+          "Client-Id": clientId,
+          "Api-Key": apiKey,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(Math.max(15000, Number(timeoutMs) || 60000)),
+      });
+    } catch (fetchError) {
+      if (fetchError && fetchError.name === "TimeoutError") {
+        const error = new Error(`Ozon Seller API 请求超时(${timeoutMs}ms)：${path}`);
+        error.statusCode = 504;
+        throw error;
+      }
+      throw fetchError;
+    } finally {
+      release();
     }
-    throw fetchError;
+    // 429（每秒限流）/ 5xx：退避重试，别把整段数据丢成 0
+    if (response.status !== 429 && response.status < 500) break;
+    if (attempt === 3) break;
+    await ozonApiSleep(250 * Math.pow(2, attempt) + Math.floor(Math.random() * 150));
   }
   const text = await response.text();
   let payload = null;
@@ -13202,7 +13243,7 @@ app.post("/api/finance/product-cost", requireAuth, async (req, res, next) => {
  * 金额: 严格按 v0.3.5c 币种感知 (CNY 直读, RUB × 0.0862)
  * v2.2.9.100 提速: 每店订单合并为 1 次 7 天全量查询(内存分桶/过滤), 并加 60s 结果缓存
  */
-const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 60 * 1000);
+const DASHBOARD_CACHE_TTL_MS = Number(process.env.DASHBOARD_CACHE_TTL_MS || 120 * 1000);
 const dashboardCache = new Map();  // key=`userId:range` → { at, data }
 
 app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
@@ -13261,21 +13302,28 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const fetchStoreOrders = async (store, since, to, status) => {
       try {
         const postings = [];
-        for (let offset = 0; offset < 5000; offset += 100) {
+        // v2.2.9.140 每页从 100 提到 1000（Ozon /v3/posting/fbs/list 支持 limit=1000）：
+        //   原来 7 天数据要翻 5~10 次页，9 个店铺同时打开仪表盘就是几十个请求，
+        //   很容易撞 Ozon 的每秒限流；改成 1000/页后每店 1~2 次请求，压力降一个数量级。
+        const PAGE = 1000;
+        for (let offset = 0; offset < 5000; offset += PAGE) {
           const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
             dir: "DESC",
             filter: { since, to, ...(status && status !== "all" ? { status } : {}) },
-            limit: 100,
+            limit: PAGE,
             offset,
             with: { financial_data: true },
           }, { storeId: store.id, userId });
           const page = data?.result?.postings || [];
           postings.push(...page);
-          if (page.length < 100 || data?.result?.has_next === false) break;
+          if (page.length < PAGE || data?.result?.has_next === false) break;
         }
         return postings;
       } catch (e) {
         console.warn(`[dashboard] store=${store.name} orders fetch fail:`, e.message);
+        // v2.2.9.140 记下失败原因：Ozon 429 限流时原来会静默返回空数组，
+        //   界面就显示成「所有店铺 0 单」，用户完全不知道是接口挂了还是真没单。
+        store.__fetchError = String(e.message || "订单接口调用失败").slice(0, 200);
         return [];
       }
     };
@@ -13492,6 +13540,7 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
         store_id: store.id,
         store_name: store.name,
         platform: "ozon",
+        fetch_error: String(store.__fetchError || ""),   // v2.2.9.140 该店铺本次是否取数失败
         // 7 大核心指标 (对齐 MyERP)
         active_products: activeProducts,
         today_orders: todayOrders.length,
@@ -13676,7 +13725,12 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     const totalYesterdayGmv = allStoreData.reduce((s, x) => s + x.yesterday_gmv, 0);
     const totalTodayOrders = allStoreData.reduce((s, x) => s + x.today_orders, 0);
     const totalYesterdayOrders = allStoreData.reduce((s, x) => s + x.yesterday_orders, 0);
+    // v2.2.9.140 接口失败汇总：让界面能明确提示「是接口限流，不是你没单」
+    const failedStores = allStoreData.filter((x) => x.fetch_error);
     const summary = {
+      api_failures: failedStores.length,
+      api_error: failedStores.length ? String(failedStores[0].fetch_error || "").slice(0, 300) : "",
+      api_error_stores: failedStores.map((x) => x.store_name).slice(0, 12),
       today_orders: totalTodayOrders,
       today_gmv: Math.round(totalTodayGmv * 100) / 100,
       yesterday_orders: totalYesterdayOrders,

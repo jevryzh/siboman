@@ -75,6 +75,10 @@ window.DashboardView = {
             profit_complete: s.profit_complete === true,
             cost_missing_count: num(s.cost_missing_count),
             return_rate: num(s.return_rate),
+            // v2.2.9.140 接口失败信息（有值就在顶部弹红条）
+            api_failures: num(s.api_failures),
+            api_error: String(s.api_error || ''),
+            api_error_stores: Array.isArray(s.api_error_stores) ? s.api_error_stores : [],
           };
           storeComparison.value = (res.data.store_comparison || []).map(sc => ({
             ...sc,
@@ -179,6 +183,25 @@ window.DashboardView = {
             <span v-else>同步中...</span>
           </el-button>
         </div>
+      </div>
+
+      <!-- v2.2.9.140 接口取数失败时明确提示：否则所有店铺都显示 0 单，用户以为是没生意 -->
+      <div v-if="summary.api_failures" style="padding: 16px 20px 0">
+        <el-alert type="error" :closable="false" show-icon>
+          <template #title>
+            有 <b>{{ summary.api_failures }}</b> 个店铺的订单数据没取到（下面这些店铺的 0 单<b>不代表没有订单</b>）
+          </template>
+          <div style="font-size: 12px; line-height: 1.9; margin-top: 2px">
+            <div>{{ summary.api_error }}</div>
+            <div style="color: #64748b; margin-top: 4px">
+              涉及店铺：{{ (summary.api_error_stores || []).join('、') }}
+            </div>
+            <div style="color: #64748b; margin-top: 4px">
+              常见原因：Ozon 卖家 API 每秒请求数超限（429，同一出口 IP 的所有店铺共用配额）。
+              系统已加并发闸门与退避重试，稍等几分钟再点「刷新」通常就恢复。
+            </div>
+          </div>
+        </el-alert>
       </div>
 
       <!-- ========== KPI 卡片区 (4列网格, 阴影圆角) ========== -->
