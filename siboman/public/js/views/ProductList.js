@@ -1013,21 +1013,38 @@ window.ProductListView = {
       lowerBusy.value = true;
       try {
         const d = await fetchLowerSkus();
-        const rows = [];
+        // ⚠️ 必须和「复制比我低价的跟卖 SKU」用**同一份集合**：
+        //   同一个跟卖 SKU 可能挂在我的多个商品下（尤其我查的 SKU 本身是同一变体家族，
+        //   每个商品的变体家族互相重叠），按商品展开就会重复。
+        //   复制那边用的是去重后的扁平列表，这里也按 SKU 去重，并多给一列「出现商品数」，
+        //   信息不丢、条数也对得上。
+        const bySku = new Map();
+        let rawRows = 0;
         for (const p of (d.by_product || [])) {
           for (const x of p.skus) {
-            rows.push([p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, x.sku, String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price, x.from_variant ? '变体补全' : '主列表']);
+            rawRows += 1;
+            const key = String(x.sku || '');
+            if (!key) continue;
+            if (bySku.has(key)) { bySku.get(key).hits += 1; continue; }
+            bySku.set(key, {
+              hits: 1,
+              row: [p.offer_id, String(p.name || '').replace(/[,\r\n]/g, ' '), p.my_price, x.sku,
+                String(x.name || '').replace(/[,\r\n]/g, ' '), x.price_num, x.price,
+                x.from_variant ? '变体补全' : '主列表'],
+            });
           }
         }
+        const rows = [...bySku.values()].map((v) => [...v.row, v.hits]);
         if (!rows.length) return notify.warning('没有找到「比我低价」的跟卖 SKU');
-        const head = ['我的货号', '商品名', '我的价(我店铺报价₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价', '来源'];
-        const csv = '\ufeff' + [head, ...rows].map((r) => r.join(',')).join('\n');
+        const head = ['我的货号', '商品名', '我的价(我店铺报价₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价', '来源', '出现商品数'];
+        const csv = '﻿' + [head, ...rows].map((r) => r.join(',')).join('\n');
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
         a.download = `比我低价的跟卖SKU_${rows.length}条.csv`;
         a.click();
         URL.revokeObjectURL(a.href);
-        notify.success(`已导出 ${rows.length} 条`);
+        const dupNote = rawRows > rows.length ? `（原始 ${rawRows} 行，跨商品重复的 ${rawRows - rows.length} 行已合并）` : '';
+        notify.success(`已导出 ${rows.length} 条${dupNote}`);
       } catch (e) {
         notify.error(e.response?.data?.error || e.message || '导出失败');
       } finally { lowerBusy.value = false; }
