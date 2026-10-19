@@ -2860,6 +2860,76 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
   return payload;
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// v2.2.9.141 Ozon 把「FBS 订单列表」升级到了 **v4**，v3 已废弃。
+//
+//   ⚠️ 坑点：v3 废弃后返回的不是 404，而是
+//         HTTP 429 {"code":8,"message":"You have reached request rate limit per second"}
+//         响应头 ratelimit-remaining: 0
+//      看起来完全像「限流」，实际是端点被停用了 —— 我们为此误判了很久，
+//      连"等限流恢复""降并发""加退避重试"都没用，因为根本不是限流。
+//
+//   v4 与 v3 的差异：
+//     · 路径：/v3/posting/fbs/list → /v4/posting/fbs/list
+//     · limit 最大 100（1000 会 400：value must be in range）
+//     · 分页用 cursor，不再用 offset
+//     · 响应是扁平的 { postings, has_next, cursor }，没有 result 包裹
+//
+//   下面这个兼容封装让调用方继续按 v3 的写法（offset / data.result.postings）工作。
+// ═══════════════════════════════════════════════════════════════════════
+async function ozonFbsListV4Page({ since, to, status, limit = 100, cursor = "", with: withObj, storeId, userId }) {
+  const filter = { since, to };
+  if (status && status !== "all") filter.status = status;
+  const body = {
+    dir: "DESC",
+    filter,
+    limit: Math.min(100, Math.max(1, Number(limit) || 100)),
+  };
+  if (withObj) body.with = withObj;
+  if (cursor) body.cursor = String(cursor);
+  const data = await callOzonSellerAPI("/v4/posting/fbs/list", body, { storeId, userId });
+  return {
+    postings: data?.postings || data?.result?.postings || [],
+    has_next: data?.has_next === true || data?.result?.has_next === true,
+    cursor: data?.cursor || data?.result?.cursor || "",
+  };
+}
+
+// 翻完所有页（cursor 递增），用于「拉一段时间内的全部订单」
+async function ozonFbsListAll({ since, to, status, with: withObj = { financial_data: true }, storeId, userId, maxPages = 50 }) {
+  const out = [];
+  let cursor = "";
+  for (let i = 0; i < maxPages; i += 1) {
+    const r = await ozonFbsListV4Page({ since, to, status, limit: 100, cursor, with: withObj, storeId, userId });
+    out.push(...r.postings);
+    if (!r.has_next || !r.cursor) break;
+    cursor = r.cursor;
+  }
+  return out;
+}
+
+// v3 兼容壳：调用方仍可传 offset / limit，拿回 { result: { postings, has_next } }
+async function ozonFbsListCompat({ since, to, status, limit = 100, offset = 0, with: withObj = { financial_data: true }, storeId, userId }) {
+  const pageSize = Math.min(100, Math.max(1, Number(limit) || 100));
+  const target = Math.max(0, Number(offset) || 0);
+  let cursor = "";
+  let seen = 0;
+  let page = [];
+  let hasNext = false;
+  for (let guard = 0; guard < 200; guard += 1) {
+    const r = await ozonFbsListV4Page({ since, to, status, limit: pageSize, cursor, with: withObj, storeId, userId });
+    page = r.postings;
+    hasNext = r.has_next;
+    if (seen + page.length > target) {
+      return { result: { postings: page.slice(Math.max(0, target - seen)), has_next: hasNext } };
+    }
+    seen += page.length;
+    if (!hasNext || !r.cursor) break;
+    cursor = r.cursor;
+  }
+  return { result: { postings: [], has_next: false } };
+}
+
 let yandexMarketContextCache = null;
 const yandexMarketContextByStore = new Map(); // storeId('__env__') -> {campaignId,businessId,apiSecret,...}
 // Yandex 无独立状态计数接口，计数需全量分页扫描（每页约 1.5-2.5s）。
@@ -10336,15 +10406,14 @@ app.post("/api/seller/analytics/bestsellers", requireAuth, async (req, res, next
     if (!owned.rowCount) return res.status(404).json({ success: false, error: "店铺不存在、已停用或无权限" });
     const to = new Date();
     const since = new Date(to.getTime() - 90 * 86400e3);
-    const ozonData = await callOzonSellerAPI("/v3/posting/fbs/list", {
-      dir: "DESC",
-      filter: { since: since.toISOString(), to: to.toISOString() },
-      limit: 1000,
-      offset: 0,
+    // v2.2.9.141 改用 v4（v3 已废弃，返回假 429）
+    const allPostings = await ozonFbsListAll({
+      since: since.toISOString(), to: to.toISOString(),
       with: { financial_data: false, analytics_data: false },
-    }, { storeId, userId: req.user.id });
+      storeId, userId: req.user.id, maxPages: 100,
+    });
     const salesMap = new Map();
-    for (const posting of (ozonData?.result?.postings || [])) {
+    for (const posting of allPostings) {
       for (const product of (posting?.products || [])) {
         const offerId = String(product?.offer_id || "").trim();
         if (!offerId) continue;
@@ -13301,24 +13370,11 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     // 2. 并行调每个店铺的 Ozon 订单 API (今日 + 7 日 + 待打包 + 待发货 + 退货)
     const fetchStoreOrders = async (store, since, to, status) => {
       try {
-        const postings = [];
-        // v2.2.9.140 每页从 100 提到 1000（Ozon /v3/posting/fbs/list 支持 limit=1000）：
-        //   原来 7 天数据要翻 5~10 次页，9 个店铺同时打开仪表盘就是几十个请求，
-        //   很容易撞 Ozon 的每秒限流；改成 1000/页后每店 1~2 次请求，压力降一个数量级。
-        const PAGE = 1000;
-        for (let offset = 0; offset < 5000; offset += PAGE) {
-          const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
-            dir: "DESC",
-            filter: { since, to, ...(status && status !== "all" ? { status } : {}) },
-            limit: PAGE,
-            offset,
-            with: { financial_data: true },
-          }, { storeId: store.id, userId });
-          const page = data?.result?.postings || [];
-          postings.push(...page);
-          if (page.length < PAGE || data?.result?.has_next === false) break;
-        }
-        return postings;
+        // v2.2.9.141 改用 v4（v3 已废弃）：v4 每页上限 100、用 cursor 翻页
+        return await ozonFbsListAll({
+          since, to, status, with: { financial_data: true },
+          storeId: store.id, userId, maxPages: 40,
+        });
       } catch (e) {
         console.warn(`[dashboard] store=${store.name} orders fetch fail:`, e.message);
         // v2.2.9.140 记下失败原因：Ozon 429 限流时原来会静默返回空数组，
@@ -13333,6 +13389,16 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
     // Payout = Σ(fd.payout × qty)  卖家到手 (已扣佣金/物流)
     // Profit = Payout_CNY - Purchase_Price_CNY (从 app_products 查)
     //         若 purchase_price_cny 为空, 不猜测利润，并明确返回待补成本数量。
+    // v2.2.9.141 Ozon v4 把金额字段从数字改成了 {amount, currency} 对象：
+    //   数字版 Number(40) = 40；对象版 Number({amount:"40"}) = NaN → GMV 全变 0。
+    //   这里统一取值，两种形态都兼容。
+    const moneyNum = (v) => {
+      if (v === null || v === undefined) return 0;
+      if (typeof v === "object") return Number(v.amount ?? v.price ?? 0) || 0;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const moneyCurrency = (v) => (v && typeof v === "object" && v.currency ? String(v.currency) : "");
     const calcOrderMetrics = (posting) => {
       let gmvCny = 0;
       let payoutCny = 0;
@@ -13340,10 +13406,10 @@ app.get("/api/seller/dashboard", requireAuth, async (req, res, next) => {
       for (const pd of (posting.products || [])) {
         const fd = (posting.financial_data?.products || []).find(x => String(x.product_id) === String(pd.sku)) || {};
         // v0.3.5c: 优先 pd.currency_code (卖家结算币), fd.currency_code 是平台核算币
-        const currency = String(pd.currency_code || fd.currency_code || "RUB").toUpperCase();
-        const priceNative = Number(pd.price || fd.price || 0);
-        const payoutNative = Number(fd.payout || 0);
-        const platformPrice = Number(fd.price || fd.customer_price || 0);
+        const currency = String(pd.currency_code || fd.currency_code || moneyCurrency(pd.price) || moneyCurrency(fd.customer_price) || "RUB").toUpperCase();
+        const priceNative = moneyNum(pd.price) || moneyNum(fd.price);
+        const payoutNative = moneyNum(fd.payout);
+        const platformPrice = moneyNum(fd.price) || moneyNum(fd.customer_price);
         const qty = Number(pd.quantity || fd.quantity || 1);
         const priceCny = currency === "CNY" ? priceNative
                        : currency === "RUB" ? convertRub(priceNative)
@@ -14908,13 +14974,13 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     const fetchLiveOrders = async ({ since, to, status: liveStatus, pageLimit = limit, pageOffset = offset }) => {
       const filter = { since, to };
       if (liveStatus && liveStatus !== "all") filter.status = liveStatus;
-      const ozonData = await callOzonSellerAPI("/v3/posting/fbs/list", {
-        dir: "DESC",
-        filter,
+      const ozonData = await ozonFbsListCompat({
+        since, to, status: liveStatus,
         limit: pageLimit,
         offset: pageOffset,
         with: { financial_data: true, analytics_data: true },
-      }, { storeId, userId: req.user.id });
+        storeId, userId: req.user.id,
+      });
       const postings = ozonData?.result?.postings || [];
       const hasNext = ozonData?.result?.has_next === true;
       const totalCount = hasNext ? pageOffset + postings.length + 1 : pageOffset + postings.length;
@@ -15985,9 +16051,7 @@ app.get("/api/seller/warehouses", requireAuth, async (_req, res, next) => {
     const to = now.toISOString();
     let result = { result: [] };
     try {
-      const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
-        filter: { since, to }, limit: 100,
-      });
+      const data = await ozonFbsListCompat({ since, to, limit: 100, offset: 0, with: { financial_data: false }, storeId: null, userId: null });
       const map = new Map();
       for (const p of (data?.result?.postings || [])) {
         const m = p?.delivery_method || {};
@@ -18494,9 +18558,12 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       to: req.body?.to || new Date().toISOString(),
     };
     if (status && status.toLowerCase() !== "all") filter.status = status;
-    const data = await callOzonSellerAPI("/v3/posting/fbs/list", {
-      filter, limit, with: { financial_data: true, analytics_data: true },
-    }, { storeId, userId: req.user.id });
+    // v2.2.9.141 改用 v4（v3 已废弃，返回假 429）
+    const data = await ozonFbsListCompat({
+      since: filter.since, to: filter.to, status: filter.status,
+      limit, offset: 0, with: { financial_data: true, analytics_data: true },
+      storeId, userId: req.user.id,
+    });
     const postings = data?.result?.postings || [];
 
     // 本地备注补充
