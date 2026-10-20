@@ -1805,6 +1805,35 @@ async function initDatabase() {
       -- v2.2.9.138 该卡片的完整变体 SKU 清单（来自商品页 webAspects），
       --   界面要显示「该卡片共 N 个变体 SKU」，这是规格组合数、不是卖家数，两者容易混。
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS variant_skus TEXT DEFAULT '';
+      -- v2.2.9.143 Ozon 应收费用结算（按订单汇总），数据来自 Ozon 财务接口导出的 xlsx。
+      --   订单详情要显示「合计费用」和「合计费用（人民币）」。
+      CREATE TABLE IF NOT EXISTS ozon_order_fees (
+        id BIGSERIAL PRIMARY KEY,
+        user_id UUID NOT NULL,
+        order_number TEXT NOT NULL,
+        order_status TEXT DEFAULT '',
+        order_type TEXT DEFAULT '',
+        settle_period TEXT DEFAULT '',
+        accrual NUMERIC(16,2) DEFAULT 0,
+        acquiring NUMERIC(16,2) DEFAULT 0,
+        brand_commission NUMERIC(16,2) DEFAULT 0,
+        compensation NUMERIC(16,2) DEFAULT 0,
+        last_mile NUMERIC(16,2) DEFAULT 0,
+        logistics NUMERIC(16,2) DEFAULT 0,
+        pickup_return NUMERIC(16,2) DEFAULT 0,
+        reverse_logistics NUMERIC(16,2) DEFAULT 0,
+        agency_commission NUMERIC(16,2) DEFAULT 0,
+        intl_shipping NUMERIC(16,2) DEFAULT 0,
+        stars NUMERIC(16,2) DEFAULT 0,
+        cross_border_intermediary NUMERIC(16,2) DEFAULT 0,
+        cross_border_platform NUMERIC(16,2) DEFAULT 0,
+        total_fee NUMERIC(16,2) DEFAULT 0,
+        total_fee_cny NUMERIC(16,2) DEFAULT 0,
+        source_file TEXT DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (user_id, order_number)
+      );
+      CREATE INDEX IF NOT EXISTS idx_order_fees_user_order ON ozon_order_fees(user_id, order_number);
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_name TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS product_image TEXT DEFAULT '';
       ALTER TABLE ozon_follow_sellers ADD COLUMN IF NOT EXISTS follower_image TEXT DEFAULT '';
@@ -2863,6 +2892,74 @@ async function callOzonSellerAPI(path, body, { method = "POST", storeId = null, 
     throw error;
   }
   return payload;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// v2.2.9.143 极简 xlsx 解析（用 fflate 解压 + 正则读 XML）
+//   项目里没有 xlsx 依赖，而 .xlsx 本质就是 zip + XML，这里只实现「读单表为二维数组」够用。
+//   ⚠️ xlsx 的属性顺序不固定（rels 里 Id 常出现在 Target 之后），必须按属性名解析。
+// ═══════════════════════════════════════════════════════════════════════
+function parseXlsxBuffer(buf) {
+  const files = unzipSync(new Uint8Array(buf));
+  const textOf = (p) => (files[p] ? strFromU8(files[p]) : "");
+  const unesc = (x) => String(x == null ? "" : x)
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+  const shared = [];
+  const ssXml = textOf("xl/sharedStrings.xml");
+  if (ssXml) {
+    for (const m of ssXml.matchAll(/<si[^>]*>([\s\S]*?)<\/si>/g)) {
+      shared.push(unesc([...m[1].matchAll(/<t[^>]*>([\s\S]*?)<\/t>/g)].map((x) => x[1]).join("")));
+    }
+  }
+  const attrOf = (tag, name) => {
+    const m = tag.match(new RegExp(name + '="([^"]*)"'));
+    return m ? m[1] : "";
+  };
+  const relMap = new Map();
+  for (const m of textOf("xl/_rels/workbook.xml.rels").matchAll(/<Relationship\b[^>]*>/g)) {
+    const id = attrOf(m[0], "Id");
+    const tgt = attrOf(m[0], "Target");
+    if (id && tgt) relMap.set(id, tgt);
+  }
+  const sheets = [];
+  for (const m of textOf("xl/workbook.xml").matchAll(/<sheet\b[^>]*>/g)) {
+    const name = unesc(attrOf(m[0], "name"));
+    const rid = attrOf(m[0], "r:id");
+    const t = relMap.get(rid) || "";
+    sheets.push({ name, path: t ? (t.startsWith("/") ? t.slice(1) : "xl/" + t.replace(/^\.\//, "")) : "" });
+  }
+  const colIdx = (ref) => {
+    const letters = String(ref || "").replace(/\d+/g, "");
+    let n = 0;
+    for (const ch of letters) n = n * 26 + (ch.charCodeAt(0) - 64);
+    return letters ? n - 1 : -1;
+  };
+  const readSheet = (path) => {
+    const xml = textOf(path);
+    const rows = [];
+    for (const rm of xml.matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
+      const arr = [];
+      for (const cm of rm[1].matchAll(/<c([^>]*)>([\s\S]*?)<\/c>/g)) {
+        const attrs = cm[1];
+        const inner = cm[2];
+        const type = attrOf(attrs, "t");
+        const ref = attrOf(attrs, "r");
+        const idx = ref ? colIdx(ref) : arr.length;
+        const vm = inner.match(/<v[^>]*>([\s\S]*?)<\/v>/);
+        let val = vm ? vm[1] : "";
+        if (type === "s") val = shared[Number(val)] ?? "";
+        else if (type === "inlineStr") {
+          const im = inner.match(/<t[^>]*>([\s\S]*?)<\/t>/);
+          val = im ? im[1] : "";
+        }
+        arr[idx >= 0 ? idx : arr.length] = unesc(val);
+      }
+      rows.push(arr);
+    }
+    return rows;
+  };
+  return { sheets, readSheet };
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -15229,11 +15326,247 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
     p.total_cny = Math.round(totalCny * 100) / 100;
     p.total_rub = Math.round((totalCny / RUB_CNY_RATE) * 100) / 100;
 
+    // ═══ v2.2.9.143 利润明细（估算）—— 对齐 Yandex 订单详情的版式 ═══
+    //   Ozon 的 financial_data 比 Yandex 全：能给到买家实付(customer_price)和平台佣金(commission)。
+    //   金额字段有两种形态（数字 / {amount,currency}），统一取值。
+    const moneyNum = (v) => {
+      if (v === null || v === undefined) return 0;
+      if (typeof v === "object") return Number(v.amount ?? v.price ?? 0) || 0;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const curOf = (v) => (v && typeof v === "object" && v.currency ? String(v.currency).toUpperCase() : "");
+    const toCnyCur = (amount, currency) => (currency === "CNY" ? Number(amount || 0) : rubToCny(Number(amount || 0)));
+    const fdProducts = p.financial_data?.products || [];
+    let sellerGoodsCny = 0;       // 卖家货值（我实际能拿到的货值）
+    let buyerPaidCny = 0;         // 买家实付（折算 CNY）
+    let commissionCny = 0;        // 平台佣金（Ozon 结算后才有值）
+    let purchaseCny = 0;          // 1688 采购成本
+    let costUnknown = false;      // 有商品缺采购价
+    let commissionKnown = false;  // 佣金是否已回填
+    for (const pd of (p.products || [])) {
+      const qty = Number(pd.quantity || 1);
+      sellerGoodsCny += Number(pd.price_cny || 0) * qty;
+      const fd = fdProducts.find((x) => String(x.product_id) === String(pd.sku)) || {};
+      const buyerCur = curOf(fd.customer_price) || "RUB";
+      buyerPaidCny += toCnyCur(moneyNum(fd.customer_price), buyerCur) * qty;
+      const comm = moneyNum(fd.commission);
+      if (comm > 0) { commissionKnown = true; commissionCny += toCnyCur(comm, curOf(fd.commission) || "RUB") * qty; }
+      const ppc = Number(pd.purchase_price_cny || 0);
+      if (ppc > 0) purchaseCny += ppc * qty; else costUnknown = true;
+    }
+    const round2 = (v) => Math.round(v * 100) / 100;
+    // ⚠️ 口径：卖家收入 = **卖家货值**（我挂的价），不是买家实付。
+    //   买家实付里含 Ozon 的加价/运费，那部分不进卖家口袋，只作参考。
+    //   差额为正 = Ozon 加价；为负 = Ozon 出钱补贴买家（卖家收入不变）。
+    const buyerDiffCny = round2(buyerPaidCny - sellerGoodsCny);
+    const revenueCny = round2(sellerGoodsCny);   // 收入合计 = 卖家货值
+    const fixedCny = (p.products || []).length ? 8 : 0;   // 国内运费5 + 代贴单3（与 Yandex 口径一致）
+    const celCny = 0;                                      // Ozon 不返回头程，留待财务配置
+    const profitCny = costUnknown ? null : round2(revenueCny - purchaseCny - commissionCny - celCny - fixedCny);
+    p.profit = {
+      seller_goods_cny: round2(sellerGoodsCny),
+      buyer_paid_cny: round2(buyerPaidCny),
+      buyer_diff_cny: buyerDiffCny,   // 买家实付 − 卖家货值（正=Ozon加价，负=Ozon补贴）
+      revenue_cny: revenueCny,
+      purchase_cny: costUnknown ? null : round2(purchaseCny),
+      commission_cny: commissionKnown ? round2(commissionCny) : null,
+      cel_cny: celCny,
+      fixed_cny: fixedCny,
+      profit_cny: profitCny,
+      cost_missing: costUnknown,
+      commission_pending: !commissionKnown,   // Ozon 结算后才回填
+      currency: "CNY",
+    };
+
+    // v2.2.9.143 带上该订单的应收费用结算（来自导入的 xlsx）
+    p.fees = null;
+    if (db && posting_number) {
+      try {
+        const fr = await db.query(
+          `SELECT total_fee, total_fee_cny, accrual, intl_shipping, stars,
+                  cross_border_intermediary, cross_border_platform, agency_commission,
+                  settle_period, order_status, updated_at
+             FROM ozon_order_fees WHERE user_id = $1 AND order_number = $2 LIMIT 1`,
+          [req.user.id, posting_number],
+        );
+        if (fr.rows[0]) {
+          const f = fr.rows[0];
+          p.fees = {
+            total_fee: Number(f.total_fee || 0),
+            total_fee_cny: Number(f.total_fee_cny || 0),
+            accrual: Number(f.accrual || 0),
+            intl_shipping: Number(f.intl_shipping || 0),
+            stars: Number(f.stars || 0),
+            cross_border_intermediary: Number(f.cross_border_intermediary || 0),
+            cross_border_platform: Number(f.cross_border_platform || 0),
+            agency_commission: Number(f.agency_commission || 0),
+            settle_period: f.settle_period || "",
+            updated_at: f.updated_at,
+          };
+        }
+      } catch (_e) { /* 费用表还没建好也不影响详情 */ }
+    }
+
     res.json({ success: true, order: p });
   } catch (error) {
     console.error("[Orders.detail]", error.message, error.payload);
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
+});
+
+/**
+ * v2.2.9.143 导入 Ozon 应收费用结算 xlsx
+ *   body: { file_base64, filename }
+ *   表「订单应计汇总」列：订单号/状态/类型/结算日期/订单应计/收单业务费/品牌佣金/补偿/
+ *     最后一公里配送/物流/自提点退货接收/逆向物流/Ozon代理佣金(尾程)/国际配送服务(头程)/
+ *     星星商品/跨境中介服务费/跨境平台对接服务费/合计/合计（人民币）
+ *   按 (user_id, order_number) upsert；末行「合计」汇总行会跳过。
+ */
+app.post("/api/seller/order-fees/import", requireAuth, async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const b64 = String(req.body?.file_base64 || "").replace(/^data:[^,]*,/, "");
+    if (!b64) return res.status(400).json({ success: false, error: "没有收到文件内容" });
+    const buf = Buffer.from(b64, "base64");
+    if (buf.length < 100) return res.status(400).json({ success: false, error: "文件内容为空" });
+    let parsed;
+    try {
+      parsed = parseXlsxBuffer(buf);
+    } catch (e) {
+      return res.status(400).json({ success: false, error: "无法解析 xlsx：" + String(e.message || e).slice(0, 120) });
+    }
+    // 优先找名字里带「订单应计」的表，否则用第一张
+    const sheet = parsed.sheets.find((x) => x.name.includes("订单应计")) || parsed.sheets[0];
+    if (!sheet || !sheet.path) return res.status(400).json({ success: false, error: "xlsx 里没有可读的工作表" });
+    const rows = parsed.readSheet(sheet.path);
+    // 定位表头行（第 0 列或任一列是「订单号」）
+    let headerIdx = -1;
+    for (let i = 0; i < Math.min(rows.length, 20); i += 1) {
+      if ((rows[i] || []).some((c) => String(c || "").trim() === "订单号")) { headerIdx = i; break; }
+    }
+    if (headerIdx < 0) return res.status(400).json({ success: false, error: "找不到表头（含「订单号」的行）" });
+    const header = rows[headerIdx].map((c) => String(c || "").trim());
+    const findCol = (kw) => header.findIndex((h) => h.includes(kw));
+    const col = {
+      order: 0,
+      status: findCol("订单状态"),
+      type: findCol("订单类型"),
+      period: findCol("结算日期"),
+      accrual: findCol("订单应计"),
+      acquiring: findCol("收单业务费"),
+      brand: findCol("品牌佣金"),
+      compensation: findCol("补偿"),
+      lastMile: findCol("最后一公里"),
+      logistics: findCol("物流"),
+      pickup: findCol("自提点退货"),
+      reverse: findCol("逆向物流"),
+      agency: findCol("代理佣金"),
+      intl: findCol("国际配送服务"),
+      stars: findCol("星星商品"),
+      crossMid: findCol("跨境中介"),
+      crossPlat: findCol("跨境平台对接"),
+      total: -1,
+      totalCny: -1,
+    };
+    // 「合计」和「合计（人民币）」要精确区分（不能用 includes 顺序误配）
+    header.forEach((h, i) => {
+      if (/^合计（人民币）$|^合计\(人民币\)$/.test(h)) col.totalCny = i;
+      else if (/^合计$/.test(h)) col.total = i;
+    });
+    if (col.total < 0 || col.totalCny < 0) {
+      return res.status(400).json({ success: false, error: "表头里找不到「合计」或「合计（人民币）」列" });
+    }
+    const num = (v) => {
+      const n = Number(String(v == null ? "" : v).replace(/[,\s]/g, ""));
+      return Number.isFinite(n) ? n : 0;
+    };
+    const payload = [];
+    let skipped = 0;
+    for (let i = headerIdx + 1; i < rows.length; i += 1) {
+      const r = rows[i] || [];
+      const orderNumber = String(r[col.order] || "").trim();
+      // 跳过空行 / 「合计」汇总行 / 非三段式订单号
+      if (!orderNumber || orderNumber === "合计" || !/^\d+-\d+-/.test(orderNumber)) { skipped += 1; continue; }
+      payload.push([
+        orderNumber,
+        String(r[col.status] || ""), String(r[col.type] || ""), String(r[col.period] || ""),
+        num(r[col.accrual]), num(r[col.acquiring]), num(r[col.brand]), num(r[col.compensation]),
+        num(r[col.lastMile]), num(r[col.logistics]), num(r[col.pickup]), num(r[col.reverse]),
+        num(r[col.agency]), num(r[col.intl]), num(r[col.stars]),
+        num(r[col.crossMid]), num(r[col.crossPlat]),
+        num(r[col.total]), num(r[col.totalCny]),
+      ]);
+    }
+    if (!payload.length) return res.status(400).json({ success: false, error: "没有解析到任何订单费用行" });
+    const client = await db.connect();
+    let saved = 0;
+    try {
+      await client.query("BEGIN");
+      for (const row of payload) {
+        await client.query(
+          `INSERT INTO ozon_order_fees (
+             user_id, order_number, order_status, order_type, settle_period,
+             accrual, acquiring, brand_commission, compensation, last_mile, logistics,
+             pickup_return, reverse_logistics, agency_commission, intl_shipping, stars,
+             cross_border_intermediary, cross_border_platform, total_fee, total_fee_cny,
+             source_file, updated_at
+           ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,now())
+           ON CONFLICT (user_id, order_number) DO UPDATE SET
+             order_status = EXCLUDED.order_status, order_type = EXCLUDED.order_type,
+             settle_period = EXCLUDED.settle_period, accrual = EXCLUDED.accrual,
+             acquiring = EXCLUDED.acquiring, brand_commission = EXCLUDED.brand_commission,
+             compensation = EXCLUDED.compensation, last_mile = EXCLUDED.last_mile,
+             logistics = EXCLUDED.logistics, pickup_return = EXCLUDED.pickup_return,
+             reverse_logistics = EXCLUDED.reverse_logistics, agency_commission = EXCLUDED.agency_commission,
+             intl_shipping = EXCLUDED.intl_shipping, stars = EXCLUDED.stars,
+             cross_border_intermediary = EXCLUDED.cross_border_intermediary,
+             cross_border_platform = EXCLUDED.cross_border_platform,
+             total_fee = EXCLUDED.total_fee, total_fee_cny = EXCLUDED.total_fee_cny,
+             source_file = EXCLUDED.source_file, updated_at = now()`,
+          [req.user.id, ...row, String(req.body?.filename || "").slice(0, 200)],
+        );
+        saved += 1;
+      }
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
+    }
+    const sum = await db.query(
+      `SELECT count(*)::int AS n, COALESCE(sum(total_fee),0)::float AS total,
+              COALESCE(sum(total_fee_cny),0)::float AS total_cny,
+              COALESCE(min(settle_period),'') AS p1, COALESCE(max(settle_period),'') AS p2
+         FROM ozon_order_fees WHERE user_id = $1`,
+      [req.user.id],
+    );
+    res.json({
+      success: true, imported: saved, skipped,
+      sheet: sheet.name, total_rows: payload.length,
+      stored: sum.rows[0].n,
+      sum_total: Math.round(sum.rows[0].total * 100) / 100,
+      sum_total_cny: Math.round(sum.rows[0].total_cny * 100) / 100,
+      period: `${sum.rows[0].p1 || ""} ~ ${sum.rows[0].p2 || ""}`,
+    });
+  } catch (error) { next(error); }
+});
+
+// 费用数据概览（导入后给个反馈）
+app.get("/api/seller/order-fees/stats", requireAuth, async (req, res, next) => {
+  try {
+    if (!requireDb(res)) return;
+    const r = await db.query(
+      `SELECT count(*)::int AS n, COALESCE(sum(total_fee),0)::float AS total,
+              COALESCE(sum(total_fee_cny),0)::float AS total_cny,
+              COALESCE(min(settle_period),'') AS p1, COALESCE(max(settle_period),'') AS p2,
+              max(updated_at) AS updated_at
+         FROM ozon_order_fees WHERE user_id = $1`,
+      [req.user.id],
+    );
+    res.json({ success: true, ...r.rows[0] });
+  } catch (error) { next(error); }
 });
 
 /**

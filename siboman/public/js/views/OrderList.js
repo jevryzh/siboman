@@ -200,6 +200,47 @@ window.OrderListView = {
     ];
     const roundMoney = (value) => Math.round(Number(value || 0) * 100) / 100;
     const moneyText = (value) => `¥${Number(value || 0).toFixed(2)}`;
+    // v2.2.9.143 利润相关（对齐 Yandex 订单详情）
+    // v2.2.9.143 导入 Ozon 应收费用结算 xlsx
+    const feesFileInput = Vue.ref(null);
+    const feesImporting = Vue.ref(false);
+    const pickFeesFile = () => { if (feesFileInput.value) feesFileInput.value.click(); };
+    const onFeesFile = async (ev) => {
+      const file = ev && ev.target && ev.target.files ? ev.target.files[0] : null;
+      if (!file) return;
+      feesImporting.value = true;
+      try {
+        const b64 = await new Promise((resolve, reject) => {
+          const r = new FileReader();
+          r.onload = () => resolve(String(r.result || "").split(",")[1] || "");
+          r.onerror = reject;
+          r.readAsDataURL(file);
+        });
+        const res = await axios.post('/api/seller/order-fees/import', { file_base64: b64, filename: file.name });
+        const d = res.data || {};
+        notify.success(`已导入 ${d.imported} 个订单的费用（表「${d.sheet}」）｜累计 ${d.stored} 单，` +
+          `合计 ₽${Number(d.sum_total || 0).toFixed(2)} / ¥${Number(d.sum_total_cny || 0).toFixed(2)}` +
+          (d.period ? `｜结算期 ${d.period}` : ''));
+        await fetchOrders();
+      } catch (e) {
+        notify.error('导入失败：' + (e.response && e.response.data && e.response.data.error || e.message));
+      } finally {
+        feesImporting.value = false;
+        if (ev && ev.target) ev.target.value = '';
+      }
+    };
+    const profitOf = (o) => (o && o.profit) || null;
+    const profitColor = (o) => {
+      const p = profitOf(o);
+      if (!p || p.profit_cny === null || p.profit_cny === undefined) return '#94a3b8';
+      return p.profit_cny >= 0 ? '#16a34a' : '#dc2626';
+    };
+    const profitText = (o) => {
+      const p = profitOf(o);
+      if (!p) return '待核算';
+      if (p.profit_cny === null || p.profit_cny === undefined) return '待核算（缺成本）';
+      return `¥${Number(p.profit_cny).toFixed(2)}`;
+    };
     const trendColor = (value) => Number(value || 0) >= 0 ? '#059669' : '#dc2626';
     const trendText = (value, suffix = '%') => {
       const n = Number(value || 0);
@@ -899,6 +940,8 @@ window.OrderListView = {
       openProcurementSource, saveProcurementSource, findSourceForOrder, handleRowAction, cancelOrder,
       selectStatusTab, searchKeyword, filterField, filterOptions, autoSync,
       todayLabel, syncRangeText, summaryStats, moneyText, trendText, trendColor, primaryProduct, rowCreatedTime,
+      profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
+      feesFileInput, feesImporting, pickFeesFile, onFeesFile,
       rowStatusSubtext, copyPostingNumber, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
       // v0.3.5 时窗
@@ -1023,6 +1066,10 @@ window.OrderListView = {
           <el-button size="large" type="warning" plain @click="exportOrders">
             <el-icon><Download /></el-icon><span>订单导出</span>
           </el-button>
+          <el-button size="large" plain :loading="feesImporting" @click="pickFeesFile">
+            <el-icon><Upload /></el-icon><span>导入费用结算</span>
+          </el-button>
+          <input ref="feesFileInput" type="file" accept=".xlsx" style="display:none" @change="onFeesFile" />
           <div style="display:flex; align-items:center; gap:10px; color:#64748b; font-weight:700">
             <span :style="{ width:'8px', height:'8px', borderRadius:'50%', background:autoSync ? '#10b981' : '#cbd5e1', display:'inline-block' }"></span>
             <span>自动同步</span>
@@ -1264,7 +1311,8 @@ window.OrderListView = {
         <div v-loading="detailDrawer.loading">
           <template v-if="detailDrawer.order">
             <el-descriptions :column="2" border size="small">
-              <el-descriptions-item label="货件单号">{{ detailDrawer.order.posting_number }}</el-descriptions-item>
+              <el-descriptions-item label="货件单号"><b>{{ detailDrawer.order.posting_number }}</b></el-descriptions-item>
+              <el-descriptions-item label="外部订单号">{{ detailDrawer.order.order_number || detailDrawer.order.order_id || '-' }}</el-descriptions-item>
               <el-descriptions-item label="状态">
                 <el-tag size="small" :type="statusTagType(detailDrawer.order.status)">{{ statusText(detailDrawer.order.status) }}</el-tag>
               </el-descriptions-item>
@@ -1272,6 +1320,64 @@ window.OrderListView = {
               <el-descriptions-item label="发货截止">{{ toBeijingTime(detailDrawer.order.shipment_date) }}</el-descriptions-item>
               <el-descriptions-item label="订单总额">¥ {{ Number(detailDrawer.order.total_cny || 0).toFixed(2) }} <span style="color:#999">(₽ {{ Number(detailDrawer.order.total_rub || 0).toFixed(2) }})</span></el-descriptions-item>
               <el-descriptions-item label="配送方式">{{ detailDrawer.order.tpl_integration_type || '-' }}</el-descriptions-item>
+              <el-descriptions-item label="物流方向">
+                {{ detailDrawer.order.financial_data?.cluster_from || '-' }} → {{ detailDrawer.order.financial_data?.cluster_to || '-' }}
+              </el-descriptions-item>
+              <!-- v2.2.9.143 应收费用结算（来自导入的 Ozon 结算 xlsx），只要这两个合计 -->
+              <el-descriptions-item label="合计费用">
+                <span style="font-weight:700; color:#b45309">
+                  {{ detailDrawer.order.fees ? '₽ ' + Number(detailDrawer.order.fees.total_fee || 0).toFixed(2) : '-' }}
+                </span>
+                <span v-if="!detailDrawer.order.fees" style="margin-left:8px; font-size:12px; color:#94a3b8">未导入费用结算</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="合计费用（人民币）">
+                <span style="font-weight:700; color:#b45309">
+                  {{ detailDrawer.order.fees ? '¥ ' + Number(detailDrawer.order.fees.total_fee_cny || 0).toFixed(2) : '-' }}
+                </span>
+                <span v-if="detailDrawer.order.fees && detailDrawer.order.fees.settle_period" style="margin-left:8px; font-size:12px; color:#94a3b8">结算期 {{ detailDrawer.order.fees.settle_period }}</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="利润(估算)">
+                <span :style="{ color: profitColor(detailDrawer.order), fontWeight: 800 }">{{ profitText(detailDrawer.order) }}</span>
+                <span v-if="detailDrawer.order.profit?.cost_missing" style="margin-left:8px; font-size:12px; color:#94a3b8">缺 1688 采购价</span>
+                <span v-else-if="detailDrawer.order.profit?.commission_pending" style="margin-left:8px; font-size:12px; color:#94a3b8">佣金待 Ozon 结算回填</span>
+              </el-descriptions-item>
+            </el-descriptions>
+
+            <!-- v2.2.9.143 利润明细（估算）：版式与 Yandex 订单详情一致 -->
+            <el-divider content-position="left">利润明细（估算）</el-divider>
+            <el-descriptions :column="1" border size="small">
+              <el-descriptions-item label="卖家货值">{{ moneyText(detailDrawer.order.profit?.seller_goods_cny) }}</el-descriptions-item>
+              <el-descriptions-item label="买家实付">
+                {{ moneyText(detailDrawer.order.profit?.buyer_paid_cny) }}
+                <span style="margin-left:8px; font-size:12px; color:#94a3b8">已按汇率折算，含 Ozon 促销</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="加价/补贴差">
+                <span :style="{ color: (detailDrawer.order.profit?.buyer_diff_cny || 0) >= 0 ? '#b45309' : '#16a34a' }">
+                  {{ moneyText(detailDrawer.order.profit?.buyer_diff_cny) }}
+                </span>
+                <span style="margin-left:8px; font-size:12px; color:#94a3b8">
+                  买家实付 − 卖家货值；正数=Ozon 加价（不进我口袋），负数=Ozon 出钱补贴买家
+                </span>
+              </el-descriptions-item>
+              <el-descriptions-item label="收入合计">
+                {{ moneyText(detailDrawer.order.profit?.revenue_cny) }}
+                <span style="margin-left:8px; font-size:12px; color:#94a3b8">= 卖家货值（不含 Ozon 加价）</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="1688 采购成本">
+                <span v-if="detailDrawer.order.profit?.purchase_cny === null" style="color:#b45309">待核算（缺成本）</span>
+                <span v-else>{{ moneyText(detailDrawer.order.profit?.purchase_cny) }}</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="平台佣金">
+                <span v-if="detailDrawer.order.profit?.commission_cny === null" style="color:#94a3b8">待 Ozon 结算后回填</span>
+                <span v-else>{{ moneyText(detailDrawer.order.profit?.commission_cny) }}</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="CEL 头程">
+                <span style="color:#94a3b8">—（Ozon 订单接口不返回，需财务配置）</span>
+              </el-descriptions-item>
+              <el-descriptions-item label="国内运费+代贴单">{{ moneyText(detailDrawer.order.profit?.fixed_cny) }}</el-descriptions-item>
+              <el-descriptions-item label="利润">
+                <span :style="{ color: profitColor(detailDrawer.order), fontWeight: 800 }">{{ profitText(detailDrawer.order) }}</span>
+              </el-descriptions-item>
             </el-descriptions>
 
             <el-divider content-position="left">商品清单 ({{ (detailDrawer.order.products || []).length }})</el-divider>
