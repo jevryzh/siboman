@@ -44,8 +44,26 @@ window.StoreManagementView = {
         probingCampaigns.value = false;
       }
     };
-    const PLUGIN_MANIFEST_VERSION = "2.2.9.127";
-    const PLUGIN_ZIP_VERSION = "2.2.9.127";
+    // v2.2.9.144 版本号不再写死（以前固定成 2.2.9.127，插件升到 139 了这里还显示旧版本，
+    //   连"插件版本一致"的判断和下载链接的缓存号都是错的）。统一从 /api/version 读。
+    const PLUGIN_MANIFEST_VERSION = Vue.ref('');
+    const PLUGIN_ZIP_VERSION = Vue.ref('');
+    const fetchPluginVersions = async () => {
+      try {
+        const res = await axios.get('/api/version');
+        const v = String(res.data?.pluginVersion || '');
+        PLUGIN_MANIFEST_VERSION.value = v;
+        PLUGIN_ZIP_VERSION.value = String(res.data?.pluginZipVersion || v);
+      } catch (_e) {
+        // 接口取不到就退回到线上 manifest（静态文件，一定有）
+        try {
+          const r = await fetch('/extension/zhumeng-collector/manifest.json');
+          const m = await r.json();
+          PLUGIN_MANIFEST_VERSION.value = String(m.version || '');
+          PLUGIN_ZIP_VERSION.value = String(m.version || '');
+        } catch (_e2) { /* 保持空 */ }
+      }
+    };
     const pluginDetected = Vue.ref(false);
     const pluginChecking = Vue.ref(false);
     const installedPluginVersion = Vue.ref('');
@@ -64,7 +82,9 @@ window.StoreManagementView = {
       }
       return 0;
     };
-    const needsPluginRefresh = Vue.computed(() => !installedPluginVersion.value || compareVersion(installedPluginVersion.value, PLUGIN_MANIFEST_VERSION) < 0);
+    const needsPluginRefresh = Vue.computed(() => !installedPluginVersion.value
+      || !PLUGIN_MANIFEST_VERSION.value
+      || compareVersion(installedPluginVersion.value, PLUGIN_MANIFEST_VERSION.value) < 0);
     const sendToExtension = (kind, extra = {}, timeoutMs = 5000) => new Promise((resolve) => {
       const reqId = `store-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
       let resolved = false;
@@ -109,7 +129,7 @@ window.StoreManagementView = {
       if (!pluginDetected.value) {
         pluginStatusText.value = '未检测到 ERP 页面桥接，请确认已安装并在 chrome://extensions 重新加载插件。';
       } else if (needsPluginRefresh.value) {
-        pluginStatusText.value = `当前插件 v${installedPluginVersion.value || '未知'} 低于发布包 v${PLUGIN_MANIFEST_VERSION}，需要重新下载或在扩展程序页点重新加载。`;
+        pluginStatusText.value = `当前插件 v${installedPluginVersion.value || '未知'} 低于发布包 v${PLUGIN_MANIFEST_VERSION.value}，需要重新下载或在扩展程序页点重新加载。`;
       } else {
         pluginStatusText.value = `当前插件 v${installedPluginVersion.value} 已与发布包一致。`;
       }
@@ -206,7 +226,7 @@ window.StoreManagementView = {
 
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = `/extension/zhumeng-collector.zip?v=${PLUGIN_ZIP_VERSION}`;
+      link.href = `/extension/zhumeng-collector.zip?v=${PLUGIN_ZIP_VERSION.value || Date.now()}`;
       link.download = 'zhumeng-collector.zip';
       link.click();
     };
@@ -269,7 +289,7 @@ window.StoreManagementView = {
       return maskClientId(row.client_id);
     };
 
-    Vue.onMounted(() => { fetchShops(); refreshPluginStatus(); fetchLlmSettings(); });
+    Vue.onMounted(() => { fetchPluginVersions(); fetchShops(); refreshPluginStatus(); fetchLlmSettings(); });
     const onShopChanged = () => fetchShops();
     window.addEventListener('shop-changed', onShopChanged);
     Vue.onBeforeUnmount(() => {

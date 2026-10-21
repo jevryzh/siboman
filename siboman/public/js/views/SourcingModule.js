@@ -52,7 +52,15 @@ window.SourcingModuleView = {
     const apiError = (error) => error?.response?.data?.error || error?.message || '请求失败';
     const PROTO = "__zhumeng_proto";
     const PROTO_VAL = "zhumeng-v1";
-    const PLUGIN_ZIP_VERSION = "2.2.9.121";
+    // v2.2.9.144 不再写死（以前固定 2.2.9.121，插件已到 139，下载缓存号一直是旧的）
+    const PLUGIN_ZIP_VERSION = Vue.ref('');
+    (async () => {
+      try {
+        const r = await fetch('/api/version');
+        const d = await r.json();
+        PLUGIN_ZIP_VERSION.value = String(d?.pluginZipVersion || d?.pluginVersion || '');
+      } catch (_e) { /* 取不到就用时间戳兜底 */ }
+    })();
     window.__zhumeng_pending__ = window.__zhumeng_pending__ || {};
 
     const handleExtensionMessage = (event) => {
@@ -644,7 +652,7 @@ window.SourcingModuleView = {
     };
     const downloadExtension = () => {
       const link = document.createElement('a');
-      link.href = `/extension/zhumeng-collector.zip?v=${PLUGIN_ZIP_VERSION}`;
+      link.href = `/extension/zhumeng-collector.zip?v=${PLUGIN_ZIP_VERSION.value || Date.now()}`;
       link.download = 'zhumeng-collector.zip';
       link.click();
     };

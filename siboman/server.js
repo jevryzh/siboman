@@ -2653,8 +2653,36 @@ app.post("/api/upload", requireAuth,
   },
 );
 
-app.get("/api/version", (_req, res) => {
-  res.json({ version: BUILD_VERSION, buildTime: BUILD_TIME, rubCnyRate: RUB_CNY_RATE });
+// v2.2.9.144 插件版本的唯一来源：直接读线上解压目录里的 manifest.json。
+//   以前前端多处把版本号写死（StoreManagement 里写的是 2.2.9.127），
+//   插件升级后这些地方一直显示旧版本、"版本一致"判断也跟着错，用户被误导。
+let pluginManifestCache = { at: 0, version: "", mtime: 0 };
+// ⚠️ 本文件的 fs 是 node:fs/promises（异步 API），没有 statSync/readFileSync，
+//    写成同步版会抛 TypeError 再被 catch 吞掉，接口就静默返回空字符串。
+async function readPluginManifestVersion() {
+  try {
+    const file = path.join(PUBLIC_DIR, "extension", "zhumeng-collector", "manifest.json");
+    const st = await fs.stat(file);
+    if (pluginManifestCache.version && pluginManifestCache.mtime === st.mtimeMs) return pluginManifestCache.version;
+    const m = JSON.parse(await fs.readFile(file, "utf8"));
+    const version = String(m.version || "").trim();
+    pluginManifestCache = { at: Date.now(), version, mtime: st.mtimeMs };
+    return version;
+  } catch (_e) {
+    return pluginManifestCache.version || "";
+  }
+}
+
+app.get("/api/version", async (_req, res) => {
+  const pluginVersion = await readPluginManifestVersion();
+  res.json({
+    version: BUILD_VERSION,
+    buildTime: BUILD_TIME,
+    rubCnyRate: RUB_CNY_RATE,
+    // v2.2.9.144 插件发布版本（前端不要写死，统一读这里）
+    pluginVersion,
+    pluginZipVersion: pluginVersion,
+  });
 });
 
 /* ============================================================
