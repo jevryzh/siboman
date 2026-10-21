@@ -1299,8 +1299,23 @@ window.ProductListView = {
         if (!online.length) {
           notify.warning('没检测到在线的采集插件：请确认浏览器开着这个 ERP 页面，并在 chrome://extensions 点一下插件的「重新加载」。');
         } else {
-          const vers = [...new Set(online.map((w) => `v${w.version || '未知'}`))].join('、');
-          notify.warning(`在线插件是 ${vers}，但都低于最低要求${minVer ? ` v${minVer}` : ''}。请到「店铺管理 → 立即下载插件」重新下载，再在 chrome://extensions 重新加载。`);
+          // v2.2.9.144 以前所有「领不到任务」都笼统说成「版本低于要求」，
+          //   实际还可能是「被停用」—— 用户明明升到最新版还是被这么提示，完全误导。
+          const disabled = online.filter((w) => !w.versionTooOld && w.canClaimAnyKind === false);
+          const tooOld = online.filter((w) => w.versionTooOld);
+          const parts = [];
+          if (tooOld.length) {
+            const vers = [...new Set(tooOld.map((w) => `v${w.version || '未知'}`))].join('、');
+            parts.push(`版本过旧：${vers}，最低要求${minVer ? ` v${minVer}` : '更高版本'}`);
+          }
+          if (disabled.length) {
+            const names = [...new Set(disabled.map((w) => w.workerName || '未知采集端'))].join('、');
+            parts.push(`被停用：${names}${disabled[0]?.currentPhase ? `（${disabled[0].currentPhase}）` : ''}`);
+          }
+          notify.warning(`在线插件领不到任务 —— ${parts.join('；') || '状态异常'}`,
+            parts.some((x) => x.startsWith('版本过旧'))
+              ? '请到「店铺管理 → 立即下载插件」重新下载，再在 chrome://extensions 重新加载。'
+              : '被停用的采集端请联系管理员在服务端恢复，或改用其它浏览器的采集端。');
         }
         return false;
       } catch (_e) { /* 状态查不到就不拦 */ }

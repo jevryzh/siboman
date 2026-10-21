@@ -122,11 +122,13 @@ const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.127";
 // 也不会被超时捞回，界面上只显示「等待本机插件采集」，完全无从判断。
 const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect", "ozon-patrol"];
 const WORKER_STORE_SCOPE_EXEMPT_SQL = `(${WORKER_STORE_SCOPE_EXEMPT_KINDS.map((k) => `'${k}'`).join(",")})`;
-// 已停用的采集端（扩展 ID 或 worker 名，逗号分隔，可用环境变量 DISABLED_WORKER_IDS 追加）。
-// 默认拉黑那台已弃用的 Windows 机器上的旧插件副本：它只会上报 run/yandex-research，
-// 留着会抢单品找货/精核价任务，还会让"在线插件版本"看起来是旧的。
+// 已停用的采集端（扩展 ID 或 worker 名，逗号分隔，可用环境变量 DISABLED_WORKER_IDS 指定）。
+// 历史：这里曾默认拉黑 mjegcnmknbbdkhljbcgmdabgjfdlhegf（那台 Windows 上的旧插件副本）。
+//   ⚠️ 但 2026-10 那台机器已经升级到 2.2.9.139，却仍被这条硬编码拉黑 →
+//   采集端在线、版本达标，却领不到任务，界面还误报「版本低于要求」。
+//   现在默认不再拉黑任何采集端：真正过旧的由版本门槛（MIN_*_PLUGIN_VERSION）兜住。
 const DISABLED_WORKER_IDS = new Set(
-  String(process.env.DISABLED_WORKER_IDS || "mjegcnmknbbdkhljbcgmdabgjfdlhegf,zhumeng-plugin-mjegcnmk")
+  String(process.env.DISABLED_WORKER_IDS || "")
     .split(",").map((v) => v.trim()).filter(Boolean),
 );
 const ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS = /^(1|true|yes)$/i.test(process.env.ALLOW_LEGACY_EXTENSION_SELLER_CREDENTIALS || "true");
