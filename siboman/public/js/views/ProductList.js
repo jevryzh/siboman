@@ -909,6 +909,7 @@ window.ProductListView = {
       // v2.2.9.136 是否同时查「变体 SKU」——默认关闭。
       //   查变体需要把奥森标签页导航到商品页，会额外产生浏览/请求，用户担心影响销量，故默认不开。
       queryVariants: (() => { try { return localStorage.getItem('followQueryVariants') === '1'; } catch (_e) { return false; } })(),
+      batchId: '',       // v2.2.9.145 列表当前实际显示的那个批次，导出/复制要锁到同一批
       // v2.2.9.127 定向查询：批量粘贴 SKU/货号，只查这些商品，不整店跑
       batchText: '', batchBusy: false,
       jobId: '', jobStatus: '', jobPhase: '', jobProcessed: 0, jobTotal: 0,
@@ -974,6 +975,7 @@ window.ProductListView = {
           },
         });
         follow.items = res.data?.items || [];
+        follow.batchId = res.data?.batch_id || '';   // v2.2.9.145 供导出/复制锁批次
         follow.total = Number(res.data?.total || 0);
         follow.summary = res.data?.summary || follow.summary;
         follow.stores = res.data?.stores || [];
@@ -992,6 +994,9 @@ window.ProductListView = {
           store_name: follow.storeName || undefined,
           min_followers: follow.minFollowers || 1,
           exclude_sellers: follow.excludeSellers || undefined,
+          // v2.2.9.145 锁定列表当前那一批：否则并发查询时「最新批次」会漂移，
+          //   出现「头部 162 条、导出 174 条」这种对不上的情况
+          batch: follow.batch === 'all' ? 'all' : (follow.batchId || 'latest'),
         },
       });
       return res.data || {};

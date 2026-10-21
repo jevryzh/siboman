@@ -6690,7 +6690,11 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
     // 批次：默认只看最新一次查询（用户要求「每次都按最新查询的结果来」），
     //   batch=all 才显示全部历史。
     const batchMode = String(req.query?.batch || "latest").trim();
-    const batchId = batchMode === "all" ? "" : await latestFollowBatchId(userId);
+    // batch=latest|all，也可以直接传批次 id（导出/复制时锁到列表当前那一批，
+    //   否则并发查询期间「最新批次」会漂移，列表说 162 条、导出却是 174 条）
+    const batchId = batchMode === "all" ? ""
+      : batchMode === "latest" ? await latestFollowBatchId(userId)
+      : batchMode;
     const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers, batchId });
     const items = bundle.items;
     const classCounts = bundle.classCounts;
@@ -6699,22 +6703,16 @@ app.get("/api/ozon/followed-products", requireAuth, async (req, res, next) => {
     const total = filtered.length;
     const pageItems = filtered.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize);
 
-    // 5) 汇总（排除店铺后重新算）
-    const summaryResult = await db.query(
-      `SELECT COUNT(DISTINCT fs.offer_id)::int AS products,
-              COUNT(*)::int AS followers,
-              MAX(fs.scanned_at) AS scanned_at
-         FROM ozon_follow_sellers fs
-        WHERE fs.user_id = $1
-          AND fs.deleted_at IS NULL
-          AND ($3 = '' OR COALESCE(fs.query_batch,'') = $3)
-          AND NOT EXISTS (
-            SELECT 1 FROM unnest($2::text[]) e
-             WHERE btrim(e) <> ''
-               AND lower(btrim(COALESCE(fs.follower_name,''))) = lower(btrim(e))
-          )`,
-      [userId, excludeSellers, batchId],
-    );
+    // 5) 汇总：**直接由列表同一份数据算出**。
+    //    以前这里单独发一条 SQL，查询进行中（数据边写边读）会出现
+    //    「头部写 6 个商品、下面只有 4 行」这种自相矛盾的情况。
+    const summaryResult = {
+      rows: [{
+        products: items.length,
+        followers: items.reduce((n, it) => n + Number(it.follower_count || 0), 0),
+        scanned_at: items.reduce((mx, it) => (it.scanned_at && (!mx || new Date(it.scanned_at) > new Date(mx)) ? it.scanned_at : mx), null),
+      }],
+    };
     // 店铺下拉必须列出用户所有在用 Ozon 店铺（含还没采到跟卖数据的）
     const storeResult = await db.query(
       `WITH counts AS (
@@ -6787,7 +6785,9 @@ app.get("/api/ozon/followed-products/lower-skus", requireAuth, async (req, res, 
     const warnNoExclude = excludeSellers.length === 0;
 
     const batchMode = String(req.query?.batch || "latest").trim();
-    const batchId = batchMode === "all" ? "" : await latestFollowBatchId(userId);
+    const batchId = batchMode === "all" ? ""
+      : batchMode === "latest" ? await latestFollowBatchId(userId)
+      : batchMode;
     const bundle = await loadFollowedBundle({ userId, q, storeName, minFollowers, excludeSellers, batchId });
     const byProduct = [];
     const allSkus = [];
