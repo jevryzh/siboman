@@ -15446,6 +15446,55 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
 });
 
 /**
+ * v2.2.9.146 WHD 退货列表
+ *   Ozon 官方接口 /v1/returns/list 返回的全部是 schema="Whd" 的记录
+ *   （实测 54 条：客户退货 ClientReturn 6 / 订单取消 Cancellation 48，地点「Склад WHD」）。
+ *   注意：截图那个「退货 → WHD」页里的**货件/发货单**不在这套接口里（官方 API 没有），
+ *   那些货件号在 FBS / FBO / returns 里都查不到，只能走卖家后台网页接口。
+ *   body: { store_id, limit, offset, filter? }
+ */
+app.post("/api/seller/returns", requireAuth, async (req, res, next) => {
+  try {
+    const storeId = req.body?.store_id || req.body?.storeId;
+    if (!storeId) return res.status(400).json({ success: false, error: "缺少 store_id" });
+    const limit = Math.min(200, Math.max(1, Number(req.body?.limit) || 50));
+    const offset = Math.max(0, Number(req.body?.offset) || 0);
+    const filter = req.body?.filter && typeof req.body.filter === "object" ? req.body.filter : {};
+    const data = await callOzonSellerAPI("/v1/returns/list", { filter, limit, offset }, { storeId, userId: req.user.id });
+    const list = Array.isArray(data?.returns) ? data.returns : [];
+    const money = (m) => (m && typeof m === "object" ? Number(m.price || 0) : 0);
+    const cur = (m) => (m && typeof m === "object" ? String(m.currency_code || "") : "");
+    const rows = list.map((r) => ({
+      id: r.id,
+      posting_number: r.posting_number || "",
+      order_number: r.order_number || "",
+      order_id: r.order_id || "",
+      type: r.type || "",
+      schema: r.schema || "",
+      reason: r.return_reason_name || "",
+      place: r.place?.name || "",
+      target_place: r.target_place?.name || "",
+      sku: r.product?.sku || "",
+      offer_id: r.product?.offer_id || "",
+      product_name: r.product?.name || "",
+      quantity: Number(r.product?.quantity || 0),
+      price: money(r.product?.price),
+      currency: cur(r.product?.price),
+      return_date: r.logistic?.return_date || "",
+      final_moment: r.logistic?.final_moment || "",
+      barcode: r.logistic?.barcode || "",
+      compensation_status: r.compensation_status || "",
+      storage_days: Number(r.storage?.days || 0),
+      storage_sum: money(r.storage?.sum),
+    }));
+    res.json({ success: true, returns: rows, total: rows.length, has_more: rows.length >= limit });
+  } catch (error) {
+    console.error("[returns]", error.message, error.payload);
+    res.status(error.statusCode || 502).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * v2.2.9.143 导入 Ozon 应收费用结算 xlsx
  *   body: { file_base64, filename }
  *   表「订单应计汇总」列：订单号/状态/类型/结算日期/订单应计/收单业务费/品牌佣金/补偿/

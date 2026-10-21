@@ -201,6 +201,48 @@ window.OrderListView = {
     const roundMoney = (value) => Math.round(Number(value || 0) * 100) / 100;
     const moneyText = (value) => `¥${Number(value || 0).toFixed(2)}`;
     // v2.2.9.143 利润相关（对齐 Yandex 订单详情）
+    // v2.2.9.146 WHD 退货（Ozon /v1/returns/list，实测全部是 schema=Whd）
+    const returnsDrawer = Vue.reactive({ visible: false, loading: false, rows: [], error: '', scanned: 0, failed: [] });
+    const openReturns = async () => {
+      returnsDrawer.visible = true;
+      returnsDrawer.loading = true;
+      returnsDrawer.error = '';
+      returnsDrawer.rows = [];
+      returnsDrawer.failed = [];
+      try {
+        // ⚠️ 不能用 selectedStoreIds()：订单页默认带的是 CURRENT_STORE，
+        //   localStorage 里可能存着一个**已失效的旧店铺 id**，结果只查那一个、
+        //   而且它的 API Key 还是错的 → 一条都出不来。
+        //   WHD 退货直接查**全部 Ozon 店铺**（表格里有「店铺」列可区分）。
+        let ids = activeStoreIds();
+        if (!ids.length) { await fetchShops(); ids = activeStoreIds(); }
+        if (!ids.length) { returnsDrawer.error = '没有可用的 Ozon 店铺'; returnsDrawer.loading = false; return; }
+        const all = [];
+        const failed = [];
+        for (const sid of ids) {
+          try {
+            const res = await axios.post('/api/seller/returns', { store_id: sid, limit: 200 });
+            const storeName = (shops.value.find((x) => String(x.id) === String(sid)) || {}).name || '';
+            (res.data?.returns || []).forEach((r) => all.push({ ...r, store_id: sid, store_name: storeName }));
+          } catch (e) {
+            // 个别店铺 API Key 失效/无权限时，不要让整个列表挂掉
+            const name = (shops.value.find((x) => String(x.id) === String(sid)) || {}).name || sid;
+            failed.push(`${name}（${e.response?.data?.error || e.message}）`);
+          }
+        }
+        returnsDrawer.failed = failed;
+        all.sort((a, b) => new Date(b.return_date || b.final_moment || 0) - new Date(a.return_date || a.final_moment || 0));
+        returnsDrawer.rows = all;
+        returnsDrawer.scanned = ids.length;
+      } catch (e) {
+        returnsDrawer.error = e.response?.data?.error || e.message || '读取失败';
+      } finally {
+        returnsDrawer.loading = false;
+      }
+    };
+    const returnsTypeText = (t) => ({ ClientReturn: '客户退货', Cancellation: '订单取消' }[t] || t || '-');
+    const returnsTypeTag = (t) => (t === 'ClientReturn' ? 'warning' : 'info');
+
     // v2.2.9.143 导入 Ozon 应收费用结算 xlsx
     const feesFileInput = Vue.ref(null);
     const feesImporting = Vue.ref(false);
@@ -942,6 +984,7 @@ window.OrderListView = {
       todayLabel, syncRangeText, summaryStats, moneyText, trendText, trendColor, primaryProduct, rowCreatedTime,
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
       feesFileInput, feesImporting, pickFeesFile, onFeesFile,
+      returnsDrawer, openReturns, returnsTypeText, returnsTypeTag,   // v2.2.9.146 WHD 退货
       rowStatusSubtext, copyPostingNumber, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
       // v0.3.5 时窗
@@ -1068,6 +1111,9 @@ window.OrderListView = {
           </el-button>
           <el-button size="large" plain :loading="feesImporting" @click="pickFeesFile">
             <el-icon><Upload /></el-icon><span>导入费用结算</span>
+          </el-button>
+          <el-button size="large" plain @click="openReturns">
+            <el-icon><Box /></el-icon><span>WHD 退货</span>
           </el-button>
           <input ref="feesFileInput" type="file" accept=".xlsx" style="display:none" @change="onFeesFile" />
           <div style="display:flex; align-items:center; gap:10px; color:#64748b; font-weight:700">
@@ -1307,6 +1353,62 @@ window.OrderListView = {
       </el-dialog>
 
       <!-- v0.3.3 订单详情抽屉 -->
+      <!-- v2.2.9.146 WHD 退货抽屉 -->
+      <el-drawer v-model="returnsDrawer.visible" title="WHD 退货" size="980px" append-to-body destroy-on-close>
+        <div v-loading="returnsDrawer.loading" element-loading-text="正在读取 WHD 退货...">
+          <el-alert v-if="returnsDrawer.error" type="error" :closable="false" show-icon
+            :title="'读取失败：' + returnsDrawer.error" style="margin-bottom:10px" />
+          <el-alert v-if="returnsDrawer.failed.length" type="warning" :closable="false" show-icon style="margin-bottom:10px"
+            :title="'有 ' + returnsDrawer.failed.length + ' 个店铺读取失败（已跳过，其余店铺正常显示）：' + returnsDrawer.failed.join('；')" />
+          <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px">
+            <el-tag type="success" effect="plain">共 {{ returnsDrawer.rows.length }} 条</el-tag>
+            <span style="font-size:12px; color:#94a3b8">
+              来源 Ozon 官方接口 /v1/returns/list（schema=Whd，仓库「Склад WHD」）
+            </span>
+            <el-button size="small" @click="openReturns">刷新</el-button>
+          </div>
+          <el-table :data="returnsDrawer.rows" size="small" border max-height="72vh" empty-text="没有 WHD 退货记录">
+            <el-table-column label="店铺" width="120" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.store_name || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="退货单号" width="150">
+              <template #default="{ row }"><span style="font-family:monospace">{{ row.posting_number || '-' }}</span></template>
+            </el-table-column>
+            <el-table-column label="订单号" width="130">
+              <template #default="{ row }"><span style="font-family:monospace">{{ row.order_number || '-' }}</span></template>
+            </el-table-column>
+            <el-table-column label="类型" width="96">
+              <template #default="{ row }">
+                <el-tag size="small" :type="returnsTypeTag(row.type)" effect="plain">{{ returnsTypeText(row.type) }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="退货原因" min-width="170" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.reason || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="商品" min-width="230">
+              <template #default="{ row }">
+                <div style="font-size:12px">{{ row.product_name || '-' }}</div>
+                <div style="font-size:11px; color:#94a3b8">货号 {{ row.offer_id || '-' }} · SKU {{ row.sku || '-' }}</div>
+              </template>
+            </el-table-column>
+            <el-table-column label="数量" width="60" align="center">
+              <template #default="{ row }">×{{ row.quantity || 1 }}</template>
+            </el-table-column>
+            <el-table-column label="金额" width="100" align="right">
+              <template #default="{ row }">
+                {{ row.currency === 'CNY' ? '¥' : '' }}{{ Number(row.price || 0).toFixed(2) }}{{ row.currency && row.currency !== 'CNY' ? ' ' + row.currency : '' }}
+              </template>
+            </el-table-column>
+            <el-table-column label="退货时间" width="150">
+              <template #default="{ row }">{{ toBeijingTime(row.return_date || row.final_moment) || '-' }}</template>
+            </el-table-column>
+            <el-table-column label="仓库" min-width="110" show-overflow-tooltip>
+              <template #default="{ row }">{{ row.place || '-' }}</template>
+            </el-table-column>
+          </el-table>
+        </div>
+      </el-drawer>
+
       <el-drawer v-model="detailDrawer.visible" title="订单详情" size="720px" destroy-on-close>
         <div v-loading="detailDrawer.loading">
           <template v-if="detailDrawer.order">
