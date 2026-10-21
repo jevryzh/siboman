@@ -11,7 +11,7 @@
   if (window.__ozonFunnelStandaloneInjected) return;
   window.__ozonFunnelStandaloneInjected = true;
 
-  const VERSION = "1.5.0";
+  const VERSION = "1.5.1";
   const HOST_ID = "__ozon_funnel_host";
 
   const PAGE_SIZE = 50;      // 接口 limit 上限 50
@@ -93,7 +93,8 @@
         if (p.colOrder && typeof p.colOrder === "object") state.colOrder = p.colOrder;
         if (p.group && GROUPS[p.group]) state.group = p.group;
         if (p.days !== undefined) state.days = p.days;
-        if (p.mode && ["sales", "visibility", "rank"].includes(p.mode)) state.mode = p.mode;
+        // v1.5.1 只允许 sales（搜索可见性/查词排位已隐藏），旧偏好一律回落到销售报表
+        if (p.mode === "sales") state.mode = "sales";
         render();
       });
     } catch (_e) { /* 无 storage 权限时静默 */ }
@@ -492,15 +493,18 @@
     }, "收起面板（快捷键 Esc）"));
     panel.appendChild(head);
 
-    // ── 模式切换：我的商品销售 / 搜索可见性 / 查词排位 ──
+    // ── 模式切换 ──
+    // v1.5.1 按需求**隐藏「搜索可见性」和「查词排位」**：这两个功能还不完善，
+    //   先不暴露给用户；相关代码（renderVisibility / renderRank 及其数据请求）保留，
+    //   以后要放出来只需把下面数组里两项加回去。
+    //   同时强制 mode 只能是 sales —— 否则浏览器里存着的旧 pref（mode=visibility/rank）
+    //   会让面板白屏。
+    state.mode = "sales";
     const modeBar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px");
-    [["sales", "📈 我的商品销售"], ["visibility", "🔎 搜索可见性"], ["rank", "🎯 查词排位"]].forEach(([k, label]) => {
+    [["sales", "📈 我的商品销售"]].forEach(([k, label]) => {
       modeBar.appendChild(btn(label, state.mode === k, () => { state.mode = k; savePrefs(); render(); }));
     });
     panel.appendChild(modeBar);
-
-    if (state.mode === "visibility") return renderVisibility(panel);
-    if (state.mode === "rank") return renderRank(panel);
 
     // ── 日期 ──
     const bar = el("div", "display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px");
