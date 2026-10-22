@@ -1465,6 +1465,14 @@ window.OrderListView = {
                 {{ moneyText(detailDrawer.order.profit?.revenue_cny) }}
                 <span style="margin-left:8px; font-size:12px; color:#94a3b8">= 卖家货值（不含 Ozon 加价）</span>
               </el-descriptions-item>
+              <!-- v2.2.9.147 回款金额：结算后是 Ozon 真实 payout；结算前按「卖家货值 − 平台佣金」估算 -->
+              <el-descriptions-item label="回款金额">
+                <b style="color:#0f766e">{{ moneyText(detailDrawer.order.payout?.payout_cny) }}</b>
+                <span v-if="detailDrawer.order.payout?.estimated" style="margin-left:8px; font-size:12px; color:#b45309">
+                  估算（Ozon 还没结算，按 卖家货值 − 平台佣金 计算）
+                </span>
+                <span v-else style="margin-left:8px; font-size:12px; color:#16a34a">Ozon 结算实值</span>
+              </el-descriptions-item>
               <el-descriptions-item label="1688 采购成本">
                 <span v-if="detailDrawer.order.profit?.purchase_cny === null" style="color:#b45309">待核算（缺成本）</span>
                 <span v-else>{{ moneyText(detailDrawer.order.profit?.purchase_cny) }}</span>

@@ -3095,6 +3095,12 @@ async function ozonFbsListCompat({ since, to, status, limit = 100, offset = 0, w
   return { result: { postings: [], has_next: false } };
 }
 
+// v2.2.9.147 Yandex 订单分页：/v2/campaigns/{id}/orders 的 page 参数**已失效**
+//   （实测 page=1 和 page=2 返回同一批订单），新分页是 paging.nextPageToken。
+//   但 UI 用的是页码，所以这里「一次拉全 + 内存分页」，并加 60 秒缓存避免每次翻页都打 Yandex。
+const yandexOrdersCache = new Map();   // key -> { at, items }
+const YANDEX_ORDERS_CACHE_TTL_MS = 60 * 1000;
+
 let yandexMarketContextCache = null;
 const yandexMarketContextByStore = new Map(); // storeId('__env__') -> {campaignId,businessId,apiSecret,...}
 // Yandex 无独立状态计数接口，计数需全量分页扫描（每页约 1.5-2.5s）。
@@ -3790,7 +3796,17 @@ function enrichYandexOrderProfit(order, costMap) {
   const items = Array.isArray(order.products) ? order.products : [];
   const raw = order.raw || {};
   const subsidiesCny = (Array.isArray(raw.subsidies) ? raw.subsidies : []).reduce((s, x) => s + Number(x.amount || 0), 0);
-  const itemsTotal = Number(order.total || 0) || 0; // itemsTotal 已是订单币种（CNY）
+  let itemsTotal = Number(order.total || 0) || 0; // itemsTotal 已是订单币种（CNY）
+  // v2.2.9.147 异常兜底：实测个别订单 itemsTotal 会小到离谱（如 0.08），
+  //   而买家实付 buyerItemsTotal=393₽（≈33.9 CNY）。若卖家货值不到买家货值的 20%，
+  //   说明 itemsTotal 不可信，改用「买家实付 × 汇率」估算，否则利润/回款会完全失真。
+  const buyerTotalCny = Number(order.total_rub || 0) * RUB_CNY_RATE;
+  if (buyerTotalCny > 0 && itemsTotal < buyerTotalCny * 0.2) {
+    itemsTotal = Math.round(buyerTotalCny * 100) / 100;
+    order.total = itemsTotal;
+    order.total_cny = itemsTotal;
+    order.total_suspect_fixed = true;
+  }
   const revenueCny = itemsTotal + subsidiesCny;
   let purchaseCny = 0;
   let celCny = 0;
@@ -3808,6 +3824,10 @@ function enrichYandexOrderProfit(order, costMap) {
   const platformFeeCny = itemsTotal * platformRate;
   const fixedCny = items.length ? 8 : 0; // 国内运费5 + 代贴单3
   const profitCny = revenueCny - purchaseCny - platformFeeCny - celCny - fixedCny;
+  // v2.2.9.147 回款金额：平台扣掉佣金/收单/提现/尾程后**实际打给卖家**的钱。
+  //   采购成本、头程、国内运费是卖家自己的成本，不从回款里扣。
+  order.payout_cny = Math.round((revenueCny - platformFeeCny) * 100) / 100;
+  order.payout_estimated = true;   // 佣金是 24% 估的，不是 Yandex 结算实值
   order.subsidies_cny = Math.round(subsidiesCny * 100) / 100;
   order.revenue_cny = Math.round(revenueCny * 100) / 100;
   order.purchase_cny = costUnknown ? null : Math.round(purchaseCny * 100) / 100;
@@ -5826,7 +5846,8 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
     const storeId = String(req.query?.store_id || req.body?.store_id || "").trim() || null;
     const context = await getYandexMarketContext({ storeId, userId: req.user.id });
     const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(50, Math.max(1, Number(req.query.page_size || req.query.limit || 20)));
+    // ⚠️ 前端每页可选 [20,50,100,200]，这里原来写死 Math.min(50,...) → 选 100/200 也只回 50 条。
+    const pageSize = Math.min(200, Math.max(1, Number(req.query.page_size || req.query.limit || 20)));
     const activeStatus = String(req.query.status || "all").trim().toLowerCase();
     const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
     const to = new Date();
@@ -5837,8 +5858,7 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       return `${dd}-${mm}-${date.getFullYear()}`;
     };
     const query = {
-      limit: pageSize,
-      page,
+      limit: 200,
       fromDate: formatDate(from),
       // Yandex 订单接口的 toDate 是「当日 00:00」边界（不含当天晚些时候的订单），
       // 必须 +1 天才能把「今天下午刚下的单」包含进来。
@@ -5850,13 +5870,33 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
     else if (activeStatus === "delivered") query.status = ["DELIVERED"];
     else if (activeStatus === "cancelled") query.status = ["CANCELLED"];
 
-    const payload = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/orders`, {
-      method: "GET",
-      query,
-      timeoutMs: 60000,
-      apiSecret: context.apiSecret,
-    });
-    let items = (payload.orders || []).map((order) => normalizeYandexOrder(order, context));
+    // 全量拉取（Yandex 的 page 已失效，只能顺着 nextPageToken 走），最多 5 页 / 1000 单
+    const cacheKey = `${req.user.id}:${context.campaignId}:${query.fromDate}:${query.toDate}`;
+    const cached = yandexOrdersCache.get(cacheKey);
+    let rawOrders = [];
+    let payload = {};
+    if (cached && Date.now() - cached.at < YANDEX_ORDERS_CACHE_TTL_MS) {
+      rawOrders = cached.items;
+    } else {
+      let pageToken = "";
+      for (let i = 0; i < 5; i += 1) {
+        const q = { ...query };
+        if (pageToken) q.page_token = pageToken;
+        const p = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/orders`, {
+          method: "GET",
+          query: q,
+          timeoutMs: 60000,
+          apiSecret: context.apiSecret,
+        });
+        if (!i) payload = p || {};
+        const batch = (p?.orders || []);
+        rawOrders.push(...batch);
+        pageToken = p?.paging?.nextPageToken || "";
+        if (!pageToken || batch.length === 0) break;
+      }
+      yandexOrdersCache.set(cacheKey, { at: Date.now(), items: rawOrders });
+    }
+    let items = rawOrders.map((order) => normalizeYandexOrder(order, context));
     // 订单接口不带商品图：反查 offer 首图填回，避免列表/详情全是「无图」
     const orderImageMap = await buildYandexOrderImageMap(context, storeId, items);
     // 利润核算：反查商品 1688 采购成本（候选表 purchase_cny + cel_fee_cny）
@@ -5889,6 +5929,9 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
         ...(item.products || []).flatMap((product) => [product.offer_id, product.sku, product.name]),
       ].some((value) => String(value || "").toLowerCase().includes(q)));
     }
+    // 过滤完再在内存里分页（原来先让 Yandex 分页、再本地过滤，会出现整页空白/翻页无效）
+    const totalCount = items.length;
+    items = items.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize);
     res.json({
       success: true,
       api_ready: true,
@@ -5900,8 +5943,10 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
         placement_type: context.placementType,
       },
       items,
-      total: Number(payload.pager?.total || ((page - 1) * pageSize + items.length)),
-      has_next: Boolean(payload.paging?.nextPageToken),
+      total: totalCount,
+      has_next: (page - 1) * pageSize + items.length < totalCount,
+      page,
+      page_size: pageSize,
     });
   } catch (error) {
     // 返回 JSON 错误（含 Yandex 原始报错）。否则 Express 默认错误页是 HTML，
@@ -15394,6 +15439,22 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
     const fixedCny = (p.products || []).length ? 8 : 0;   // 国内运费5 + 代贴单3（与 Yandex 口径一致）
     const celCny = 0;                                      // Ozon 不返回头程，留待财务配置
     const profitCny = costUnknown ? null : round2(revenueCny - purchaseCny - commissionCny - celCny - fixedCny);
+    // v2.2.9.147 回款金额：优先用 Ozon 结算后回填的真实 payout；
+    //   结算前 payout=0，就用「卖家货值 − 平台佣金」估算并标注是估算值。
+    let payoutCny = 0;
+    let payoutKnown = false;
+    for (const pd of (p.products || [])) {
+      const fd = fdProducts.find((x) => String(x.product_id) === String(pd.sku)) || {};
+      const qty = Number(pd.quantity || 1);
+      const pv = moneyNum(fd.payout);
+      if (pv > 0) { payoutKnown = true; payoutCny += toCnyCur(pv, curOf(fd.payout) || "RUB") * qty; }
+    }
+    if (!payoutKnown) payoutCny = sellerGoodsCny - commissionCny;
+    p.payout = {
+      payout_cny: round2(payoutCny),
+      estimated: !payoutKnown,
+    };
+
     p.profit = {
       seller_goods_cny: round2(sellerGoodsCny),
       buyer_paid_cny: round2(buyerPaidCny),

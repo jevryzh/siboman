@@ -33,10 +33,12 @@ window.YandexOrderListView = {
       cancelled: '已取消',
     }[String(status || '').toLowerCase()] || status || '-');
 
+    // v2.2.9.147 原来「配送中(delivering)」和「已完成(delivered)」都是 success（同一个绿色），
+    //   用户分不清。改成：待发货=灰蓝(info)、配送中=蓝(primary)、已完成=绿(success)。
     const statusTagType = (status) => ({
       processing: 'warning',
-      awaiting_delivery: 'primary',
-      delivering: 'success',
+      awaiting_delivery: 'info',
+      delivering: 'primary',
       delivered: 'success',
       cancelled: 'danger',
     }[String(status || '').toLowerCase()] || 'info');
@@ -319,6 +321,11 @@ window.YandexOrderListView = {
             <el-descriptions-item label="卖家货值">{{ moneyText(detailDrawer.row.total, detailDrawer.row.currency_code) }}</el-descriptions-item>
             <el-descriptions-item label="平台补贴">{{ moneyText(detailDrawer.row.subsidies_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
             <el-descriptions-item label="收入合计">{{ moneyText(detailDrawer.row.revenue_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
+            <!-- v2.2.9.147 回款金额 = 收入 − 平台费率，是平台**实际打给卖家**的钱 -->
+            <el-descriptions-item label="回款金额(估算)">
+              <b style="color:#0f766e">{{ moneyText(detailDrawer.row.payout_cny, detailDrawer.row.currency_code) }}</b>
+              <span style="margin-left:8px; font-size:12px; color:#94a3b8">收入合计 − 平台费率；不含采购/头程/国内运费（那是你自己的成本）</span>
+            </el-descriptions-item>
             <el-descriptions-item label="1688 采购成本">{{ detailDrawer.row.purchase_cny === null || detailDrawer.row.purchase_cny === undefined ? '待核算（缺成本）' : moneyText(detailDrawer.row.purchase_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
             <el-descriptions-item label="平台费率(佣金+收单+提现+尾程)">{{ moneyText(detailDrawer.row.platform_fee_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
             <el-descriptions-item label="CEL 头程">{{ moneyText(detailDrawer.row.cel_fee_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
