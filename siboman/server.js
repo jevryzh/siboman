@@ -3095,6 +3095,150 @@ async function ozonFbsListCompat({ since, to, status, limit = 100, offset = 0, w
   return { result: { postings: [], has_next: false } };
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+// v2.2.9.148 Yandex 回款（计划 / 实际）
+//   官方接口：POST /v2/reports/united-netting/generate  （Отчет по платежам 付款报告）
+//            → reportId → GET /v2/reports/info/{reportId} → 下载地址
+//   ⚠️ 三个坑（都实测过）：
+//     ① 报告是**异步生成**，要轮询；② 限流 **1 次 / 2 分钟**（超了返回 420）；
+//     ③ 有的店铺 api_secret 已吊销，得用 api_key 那一列。
+//   所以这里「按 business 拉一次 + 缓存 15 分钟」，再把每笔交易按订单号映射到订单上，
+//   订单详情直接从缓存读，不会因为看订单而触发报告生成。
+// ═══════════════════════════════════════════════════════════════════════
+const yandexNettingCache = new Map();      // key -> { at, map }
+const yandexNettingInflight = new Map();   // key -> Promise
+const YANDEX_NETTING_TTL_MS = 15 * 60 * 1000;
+const YANDEX_NETTING_FAIL_TTL_MS = 3 * 60 * 1000;
+
+function yandexNettingBucket() {
+  // 报告里每个订单会有多笔交易：应收(Начисление 正数) + 各种扣除(Удержание 负数)。
+  // ⚠️ 只加应计会高估（佣金等费用是单独一行、单独状态的），必须把待扣除的费用一起算，
+  //    得到的才是「净回款」。
+  return {
+    // 已经发生（已回款）
+    actual: [
+      "Отправлен",                       // 已发出
+      "Справочно: пополнен баланс",      // 已入账
+      "Удержан из платежей покупателей", // 已从买家付款中扣除
+      "Справочно: списан с баланса",     // 已从余额扣除
+    ],
+    // 还没发生（计划中）
+    planned: [
+      "Будет переведён по графику выплат",   // 将按付款计划转账
+      "Справочно: будет пополнен баланс",    // 将入账
+      "Будет удержан из платежей покупателей", // 待从买家付款中扣除
+      "Справочно: не будет пополнен баланс",   // 不会入账（平台服务费）
+      "Не будет удержан из-за отмены заказа",
+      "Не будет переведён из-за отмены заказа",
+    ],
+  };
+}
+
+async function buildYandexNettingMap(context) {
+  const now = new Date();
+  const from = new Date(now.getTime() - 35 * 86400e3);
+  const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const gen = await callYandexMarketAPI("/v2/reports/united-netting/generate", {
+    method: "POST",
+    query: { format: "FILE", language: "RU" },
+    body: {
+      businessId: Number(context.businessId),
+      dateFrom: ymd(from),
+      dateTo: ymd(now),
+    },
+    timeoutMs: 60000,
+    apiSecret: context.apiSecret,
+  });
+  const reportId = gen?.result?.reportId;
+  if (!reportId) throw new Error("付款报告没有返回 reportId");
+  let fileUrl = "";
+  for (let i = 0; i < 24; i += 1) {
+    await new Promise((r) => setTimeout(r, 4000));
+    const info = await callYandexMarketAPI(`/v2/reports/info/${encodeURIComponent(reportId)}`, {
+      method: "GET", timeoutMs: 30000, apiSecret: context.apiSecret,
+    });
+    if (info?.result?.status === "FAILED") throw new Error("付款报告生成失败");
+    if (info?.result?.status === "DONE" || info?.result?.file) { fileUrl = info.result.file || ""; break; }
+  }
+  if (!fileUrl) throw new Error("付款报告生成超时");
+  const resp = await fetch(fileUrl, { signal: AbortSignal.timeout(60000) });
+  if (!resp.ok) throw new Error(`下载付款报告失败 HTTP ${resp.status}`);
+  const buf = Buffer.from(await resp.arrayBuffer());
+  const parsed = parseXlsxBuffer(buf);
+  const sheet = parsed.sheets.find((x) => /платеж/i.test(x.name)) || parsed.sheets[0];
+  if (!sheet?.path) throw new Error("付款报告里没有可读的工作表");
+  const rows = parsed.readSheet(sheet.path);
+  // 表头在第 2 行（第 1 行是分组标题）；找到含「Статус」的那行
+  let hi = -1;
+  for (let i = 0; i < Math.min(rows.length, 8); i += 1) {
+    if ((rows[i] || []).some((c) => String(c || "").includes("Статус"))) { hi = i; break; }
+  }
+  if (hi < 0) throw new Error("付款报告找不到表头");
+  const header = (rows[hi] || []).map((c) => String(c || ""));
+  const findCol = (kw) => header.findIndex((h) => h.includes(kw));
+  const colOrder = findCol("Номер заказа");      // 订单号
+  const colAmount = findCol("Сумма транзакции, "); // 交易金额（¥）
+  const colStatus = findCol("Статус");
+  const colBank = findCol("Номер платежного поручения");
+  if (colOrder < 0 || colAmount < 0 || colStatus < 0) throw new Error("付款报告缺少 订单号/金额/状态 列");
+  const { planned, actual } = yandexNettingBucket();
+  const map = new Map();
+  const num = (v) => {
+    const n = Number(String(v == null ? "" : v).replace(/[,\s¥]/g, ""));
+    return Number.isFinite(n) ? n : 0;
+  };
+  // ⚠️ Yandex 的 xlsx 把订单号存成数字，原始 XML 里是科学计数法（6.189343853E10），
+  //   直接当字符串用会和订单接口的 order_id 对不上。
+  const normId = (v) => {
+    const raw = String(v == null ? "" : v).trim();
+    if (!raw) return "";
+    if (/e\+?\d+$/i.test(raw)) {
+      const n = Number(raw);
+      if (Number.isFinite(n)) return String(Math.round(n));
+    }
+    return raw.replace(/\.0+$/, "");
+  };
+  for (let i = hi + 1; i < rows.length; i += 1) {
+    const r = rows[i] || [];
+    const orderId = normId(r[colOrder]);
+    if (!orderId) continue;
+    const amount = num(r[colAmount]);
+    const status = String(r[colStatus] || "").trim();
+    const cur = map.get(orderId) || { planned: 0, actual: 0, bankOrders: [] };
+    if (planned.includes(status)) cur.planned += amount;
+    else if (actual.includes(status)) cur.actual += amount;
+    const bank = normId(r[colBank]);
+    if (bank && !cur.bankOrders.includes(bank)) cur.bankOrders.push(bank);
+    map.set(orderId, cur);
+  }
+  console.log(`[yandex-netting] 报告解析: 工作表=${sheet.name} 总行=${rows.length} 表头行=${hi} 订单数=${map.size} 样例=${JSON.stringify([...map.keys()].slice(0, 3))}`);
+  return map;
+}
+
+// 带缓存 + 单飞（同一业务只跑一份报告），失败也缓存一会儿避免反复撞 2 分钟限流
+async function getYandexNettingMap(context) {
+  const key = String(context.businessId || "");
+  const hit = yandexNettingCache.get(key);
+  if (hit && Date.now() - hit.at < hit.ttl) return hit.map;
+  if (yandexNettingInflight.has(key)) return yandexNettingInflight.get(key);
+  const task = (async () => {
+    try {
+      const map = await buildYandexNettingMap(context);
+      yandexNettingCache.set(key, { at: Date.now(), map, ttl: YANDEX_NETTING_TTL_MS });
+      return map;
+    } catch (e) {
+      console.warn("[yandex-netting]", String(e.message || e).slice(0, 160));
+      const map = new Map();
+      yandexNettingCache.set(key, { at: Date.now(), map, ttl: YANDEX_NETTING_FAIL_TTL_MS });
+      return map;
+    } finally {
+      yandexNettingInflight.delete(key);
+    }
+  })();
+  yandexNettingInflight.set(key, task);
+  return task;
+}
+
 // v2.2.9.147 Yandex 订单分页：/v2/campaigns/{id}/orders 的 page 参数**已失效**
 //   （实测 page=1 和 page=2 返回同一批订单），新分页是 paging.nextPageToken。
 //   但 UI 用的是页码，所以这里「一次拉全 + 内存分页」，并加 60 秒缓存避免每次翻页都打 Yandex。
@@ -5929,6 +6073,19 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
         ...(item.products || []).flatMap((product) => [product.offer_id, product.sku, product.name]),
       ].some((value) => String(value || "").toLowerCase().includes(q)));
     }
+    // v2.2.9.148 挂上「计划回款 / 实际回款」（来自付款报告，按订单号映射；失败不影响列表）
+    try {
+      const netting = await getYandexNettingMap(context);
+      if (netting && netting.size) {
+        for (const it of items) {
+          const hit = netting.get(String(it.order_id));
+          if (!hit) continue;
+          it.payout_planned_cny = Math.round(hit.planned * 100) / 100;
+          it.payout_actual_cny = Math.round(hit.actual * 100) / 100;
+          it.bank_orders = hit.bankOrders;
+        }
+      }
+    } catch (_e) { /* 回款数据拿不到不影响订单列表 */ }
     // 过滤完再在内存里分页（原来先让 Yandex 分页、再本地过滤，会出现整页空白/翻页无效）
     const totalCount = items.length;
     items = items.slice((page - 1) * pageSize, (page - 1) * pageSize + pageSize);
