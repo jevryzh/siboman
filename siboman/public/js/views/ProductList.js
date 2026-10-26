@@ -944,6 +944,12 @@ window.ProductListView = {
       rivalMin: null, rivalCurrency: '',
       excludedCount: 0, lowerCount: 0, hideExcluded: false, onlyLower: false,
     });
+    // v2.2.9.149 CSV 必须转义：之前直接 join(',')，而价格是 "28,62 ¥"（逗号小数），
+    //   会把一列拆成两列，导出的表整个错位。
+    const csvCell = (v) => {
+      const t = String(v == null ? '' : v);
+      return /[",\r\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t;
+    };
     const parsePriceText = (s) => {
       if (!s) return 0;
       const n = String(s).replace(/[^\d.,]/g, '').replace(/\s/g, '').replace(',', '.');
@@ -1041,8 +1047,15 @@ window.ProductListView = {
         }
         const rows = [...bySku.values()].map((v) => [...v.row, v.hits]);
         if (!rows.length) return notify.warning('没有找到「比我低价」的跟卖 SKU');
-        const head = ['我的货号', '商品名', '我的价(我店铺报价₽)', '跟卖SKU', '跟卖卖家', '跟卖价(数值₽)', '跟卖价', '来源', '出现商品数'];
-        const csv = '﻿' + [head, ...rows].map((r) => r.join(',')).join('\n');
+        // v2.2.9.149 表头原来写死「₽」，但实际价格是「¥」（Ozon 按账号显示币种）→ 按数据识别
+        const curLabel = (() => {
+          const blob = rows.slice(0, 200).map((r) => String(r[6] || '')).join(' ');
+          if (blob.includes('¥')) return '¥';
+          if (blob.includes('₽')) return '₽';
+          return '';
+        })();
+        const head = ['我的货号', '商品名', '我的价' + (curLabel ? `(${curLabel})` : ''), '跟卖SKU', '跟卖卖家', '跟卖价(数值' + (curLabel ? curLabel : '') + ')', '跟卖价', '来源', '出现商品数'];
+        const csv = '﻿' + [head, ...rows].map((r) => r.map(csvCell).join(',')).join('\n');
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
         a.download = `比我低价的跟卖SKU_${rows.length}条.csv`;
@@ -1161,7 +1174,13 @@ window.ProductListView = {
     const exportFollowerCsv = () => {
       const rows = followerRows.value || [];
       if (!rows.length) return notify.warning('没有可导出的行');
-      const head = ['卖家SKU', '卖家名', '售价', '售价(数值)', '比我低', '已排除', '来源'];
+      const curLabel2 = (() => {
+        const blob = rows.slice(0, 200).map((x) => String(x.follower_price || '')).join(' ');
+        if (blob.includes('¥')) return '¥';
+        if (blob.includes('₽')) return '₽';
+        return '';
+      })();
+      const head = ['卖家SKU', '卖家名', '售价', '售价(数值' + (curLabel2 ? curLabel2 : '') + ')', '比我低', '已排除', '来源'];
       const body = rows.map((x) => [
         x.follower_sku || '', String(x.follower_name || '').replace(/[,\r\n]/g, ' '),
         x.follower_price || '', x.price_num ?? '',
@@ -1169,7 +1188,7 @@ window.ProductListView = {
         // v2.2.9.135 标明这条是主接口给的，还是「变体 SKU → 查它的卖家」补出来的
         x.from_variant ? '变体补全' : '主列表',
       ]);
-      const csv = '\ufeff' + [head, ...body].map((r) => r.join(',')).join('\n');
+      const csv = '\ufeff' + [head, ...body].map((r) => r.map(csvCell).join(',')).join('\n');
       const a = document.createElement('a');
       a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
       a.download = `跟卖卖家_${followerDrawer.offerId || ''}_${rows.length}条.csv`;

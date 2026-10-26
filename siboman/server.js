@@ -75,6 +75,31 @@ const MINIMAX_IMAGE_INPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_INPUT_USD
 const MINIMAX_IMAGE_OUTPUT_USD_PER_M = Number(process.env.MINIMAX_IMAGE_OUTPUT_USD_PER_M || 1.20);
 const MINIMAX_IMAGE_PER_IMAGE_USD = Number(process.env.MINIMAX_IMAGE_PER_IMAGE_USD || 0.03);
 const RUB_CNY_RATE = Number(process.env.RUB_CNY_RATE || 0.0862);  // 1 RUB = ¥0.0862
+// v2.2.9.149 Ozon 价格文本解析。
+//   ⚠️ 以前用的是「剥掉所有非数字」： "38,32 ¥" → 3832（把小数逗号当千分位），差 100 倍；
+//   而且和 "1 234 ₽" 这种格式混在一起时大小关系也错。
+//   Ozon 显示格式：'1 234 ¥'（空格千分位、无小数）/ '38,32 ¥'（逗号小数）。
+function parseOzonMoneyText(t) {
+  let s = String(t == null ? "" : t).replace(/[\s\u00a0\u202f¥₽$€]/g, "").trim();
+  if (!s) return null;
+  s = s.replace(/(CNY|RUB|USD|EUR)$/i, "");
+  const lastComma = s.lastIndexOf(",");
+  const lastDot = s.lastIndexOf(".");
+  if (lastComma >= 0 && lastDot >= 0) {
+    // 两个都有：后面的那个是小数点
+    if (lastComma > lastDot) s = s.replace(/\./g, "").replace(",", ".");
+    else s = s.replace(/,/g, "");
+  } else if (lastComma >= 0) {
+    const frac = s.length - lastComma - 1;
+    // 逗号后 1~2 位 = 小数；3 位 = 千分位
+    s = frac >= 1 && frac <= 2 ? s.replace(",", ".") : s.replace(/,/g, "");
+  } else if (lastDot >= 0) {
+    const frac = s.length - lastDot - 1;
+    if (frac === 3 && s.split(".").length === 2) s = s.replace(/\./g, "");   // '1.234' 当千分位
+  }
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
 const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY || "";
 const DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/api/v1";
 const DASHSCOPE_IMAGE_MODEL = process.env.DASHSCOPE_IMAGE_MODEL || "wan2.6-image";
@@ -6538,7 +6563,7 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
               COALESCE(fs.card_price,'') AS card_price,
               COALESCE(fs.list_price,'') AS list_price,
               fs.follower_price,
-              NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric AS price_num,
+              COALESCE(fs.follower_price,'') AS follower_price_raw,
               EXISTS (
                 SELECT 1 FROM unnest($3::text[]) e
                  WHERE btrim(e) <> ''
@@ -6546,18 +6571,14 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
               ) AS excluded
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1 AND fs.offer_id = $2 AND fs.deleted_at IS NULL
-        ORDER BY NULLIF(regexp_replace(COALESCE(fs.follower_price,''), '\\D', '', 'g'), '')::numeric ASC NULLS LAST,
-                 fs.follower_sku`,
+        ORDER BY fs.follower_sku`,
       [req.user.id, offerId, excludeSellers],
     );
     // 「我的价」——必须和列表页用**同一套口径**，否则列表说「6 个比我低」、
     //   抽屉却说「比我低 0 个」（用户踩过）。
     //   ⓪ 卡片绿标价（跟卖采集时一起存下来的 card_price / list_price）—— 同币种(RUB)直接比
     //   ① 卡片上认不出时才退回 Ozon 价格接口（卖家币种 CNY）折汇率
-    const grabRub = (t) => {
-      const m = String(t || "").replace(/[^\d]/g, "");
-      return m ? Number(m) : null;
-    };
+    const grabRub = (t) => parseOzonMoneyText(t);   // v2.2.9.149 支持小数逗号
     let myPrice = null;      // 卖家币种价（仅兜底路径用）
     let myPriceRub = null;   // 比价用的卢布价
     let myPriceSource = "";
@@ -6590,18 +6611,22 @@ app.get("/api/ozon/follow-sellers", requireAuth, async (req, res, next) => {
         }
       }
     } catch (_e) { /* 取不到价不影响列表 */ }
-    const items = r.rows.map((x) => ({
-      follower_sku: x.follower_sku,
-      follower_name: x.follower_name,
-      follower_price: x.follower_price,
-      follower_image: x.follower_image || '',
-      from_variant: !!x.from_variant,
-      variant_skus: (() => { try { return JSON.parse(x.variant_skus || '[]'); } catch (_e) { return []; } })(),
-      price_num: x.price_num === null || x.price_num === undefined ? null : Number(x.price_num),
-      excluded: !!x.excluded,
-      lower_than_my: myPriceRub !== null && x.price_num !== null && x.price_num !== undefined
-        && Number(x.price_num) < myPriceRub,
-    }));
+    // ⚠️ price_num 必须先在 map 回调里算好再用于 lower_than_my ——
+    //   写在同一对象字面量里时 x.price_num 还是原始行（已不存在），恒为 false。
+    const items = r.rows.map((x) => {
+      const priceNum = parseOzonMoneyText(x.follower_price_raw ?? x.follower_price);
+      return {
+        follower_sku: x.follower_sku,
+        follower_name: x.follower_name,
+        follower_price: x.follower_price,
+        follower_image: x.follower_image || '',
+        from_variant: !!x.from_variant,
+        variant_skus: (() => { try { return JSON.parse(x.variant_skus || '[]'); } catch (_e) { return []; } })(),
+        price_num: priceNum,
+        excluded: !!x.excluded,
+        lower_than_my: myPriceRub !== null && priceNum !== null && priceNum < myPriceRub,
+      };
+    });
     res.json({
       success: true,
       items,
@@ -6714,7 +6739,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
               COALESCE(fs.from_variant, FALSE) AS from_variant,
               COALESCE(fs.product_name,'') AS card_product_name,
               COALESCE(fs.product_image,'') AS card_product_image,
-              ${priceNumSql} AS price_num
+              COALESCE(fs.follower_price,'') AS follower_price_raw
          FROM ozon_follow_sellers fs
         WHERE fs.user_id = $1
           AND fs.deleted_at IS NULL
@@ -6735,6 +6760,8 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
     const exclSet = new Set(excludeSellers.map((x) => String(x).trim().toLowerCase()).filter(Boolean));
     const isMine = (name) => exclSet.has(String(name || "").trim().toLowerCase());
     for (const r of fsResult.rows) {
+      // v2.2.9.149 价格数值改在 JS 里正确解析（SQL 的 regexp_replace 会把小数逗号吃掉）
+      r.price_num = parseOzonMoneyText(r.follower_price_raw);
       const box = isMine(r.follower_name) ? mineByOffer : perOffer;
       if (!box.has(r.offer_id)) box.set(r.offer_id, []);
       box.get(r.offer_id).push(r);
@@ -6772,10 +6799,7 @@ async function loadFollowedBundle({ userId, q = "", storeName = "", minFollowers
     //      price=常规）。这是用户实际看到的售价，最准，而且不依赖商品库。
     //      实测 5639775451：页面绿标 429 ₽、常规 457 ₽；而库里 CNY 价折出来是 464 ₽，对不上。
     const cardP = cardPriceByOffer.get(p.offer_id) || null;
-    const parseRub = (t) => {
-      const m = String(t || "").replace(/[^\d]/g, "");
-      return m ? Number(m) : null;
-    };
+    const parseRub = (t) => parseOzonMoneyText(t);   // v2.2.9.149 支持小数逗号「38,32 ¥」
     if (cardP) {
       const n = parseRub(cardP.card) ?? parseRub(cardP.list);
       if (n !== null) { myPrice = n; myPriceSource = "card-price"; }
