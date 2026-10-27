@@ -117,7 +117,12 @@ window.YandexOrderListView = {
       fetchOrders();
     };
 
+    // v2.2.9.150 请求序号守卫：Yandex 订单接口较慢（首次 10~20 秒），
+    //   快速切 tab 时后发的请求会先返回、先发的后返回 → 表格显示「上一个 tab 的数据」。
+    //   只接受「最后一次请求」的结果，过期响应直接丢弃。
+    let fetchSeq = 0;
     const fetchOrders = async () => {
+      const seq = ++fetchSeq;
       loading.value = true;
       try {
         const res = await axios.get('/api/yandex/orders', {
@@ -129,11 +134,13 @@ window.YandexOrderListView = {
             page_size: pagination.pageSize,
           },
         });
+        if (seq !== fetchSeq) return;   // 已经有更新的请求，丢弃这次结果
         orders.value = res.data?.items || res.data?.orders || [];
         pagination.total = Number(res.data?.total || orders.value.length || 0);
         apiReady.value = res.data?.api_ready !== false;
         storeContext.value = res.data?.context || null;
       } catch (error) {
+        if (seq !== fetchSeq) return;
         if (error.response?.status === 404) {
           apiReady.value = false;
           orders.value = [];
@@ -143,8 +150,10 @@ window.YandexOrderListView = {
           notify.error(error.response?.data?.error || error.message || '读取 Yandex 订单失败');
         }
       } finally {
-        hasFetched.value = true;
-        loading.value = false;
+        if (seq === fetchSeq) {
+          hasFetched.value = true;
+          loading.value = false;
+        }
       }
     };
 

@@ -3240,6 +3240,12 @@ async function buildYandexNettingMap(context) {
   return map;
 }
 
+// 同步读缓存（不触发报告生成）。订单列表用它挂回款数据，避免首次加载被报告生成阻塞。
+function peekYandexNettingMap(context) {
+  const hit = yandexNettingCache.get(String(context.businessId || ""));
+  return hit ? hit.map : null;
+}
+
 // 带缓存 + 单飞（同一业务只跑一份报告），失败也缓存一会儿避免反复撞 2 分钟限流
 async function getYandexNettingMap(context) {
   const key = String(context.businessId || "");
@@ -3928,6 +3934,12 @@ async function fetchYandexOfferMappingsPage(context, { pageToken = "", limit = 1
 }
 
 // Yandex 订单 item 不带图：从商品缓存 / offer-mappings 反查 offer 首图，填回订单商品。
+// v2.2.9.150 订单图片反查缓存：offer-mappings 一次要几秒，而商品图基本不变。
+//   以前每个订单列表请求都会为「缺图」的 offer 再打一次接口 → 首次打开 10~20 秒。
+//   现在按店铺缓存 10 分钟，且只查缓存里没有的 offer。
+const yandexOrderImageCache = new Map();   // storeKey -> { at, map: Map }
+const YANDEX_ORDER_IMG_TTL_MS = 10 * 60 * 1000;
+
 async function buildYandexOrderImageMap(context, storeId, orders) {
   const map = new Map();
   const offerIds = [...new Set((orders || []).flatMap((o) => (o.products || []).map((p) => String(p.offer_id || p.sku || "")).filter(Boolean)))];
@@ -3938,8 +3950,15 @@ async function buildYandexOrderImageMap(context, storeId, orders) {
     const pic = String(offer?.image || (Array.isArray(offer?.images) ? offer.images[0] : "") || "");
     if (oid && pic && offerIds.includes(oid) && !map.has(oid)) map.set(oid, pic);
   }
+  const cacheKey = String(storeId || context.businessId || "__env__");
+  const imgCache = yandexOrderImageCache.get(cacheKey);
+  if (imgCache && Date.now() - imgCache.at < YANDEX_ORDER_IMG_TTL_MS) {
+    for (const [oid, pic] of imgCache.map) {
+      if (offerIds.includes(oid) && !map.has(oid)) map.set(oid, pic);
+    }
+  }
   const missing = offerIds.filter((id) => !map.has(id));
-  if (missing.length) {
+  if (missing.length && !(imgCache && Date.now() - imgCache.at < YANDEX_ORDER_IMG_TTL_MS)) {
     try {
       const resp = await callYandexMarketAPI(`/v2/businesses/${encodeURIComponent(context.businessId)}/offer-mappings`, {
         method: "POST",
@@ -3947,12 +3966,14 @@ async function buildYandexOrderImageMap(context, storeId, orders) {
         timeoutMs: 60000,
         apiSecret: context.apiSecret,
       });
+      const store = new Map();
       for (const m of (resp?.result?.offerMappings || [])) {
         const o = m?.offer || {};
         const oid = String(o.offerId || "");
         const pic = String((Array.isArray(o.pictures) && o.pictures[0]) || (Array.isArray(o.mediaFiles?.pictures) && (o.mediaFiles.pictures[0]?.url || o.mediaFiles.pictures[0])) || "");
-        if (oid && pic) map.set(oid, pic);
+        if (oid && pic) { map.set(oid, pic); store.set(oid, pic); }
       }
+      yandexOrderImageCache.set(cacheKey, { at: Date.now(), map: store });
     } catch (_e) { /* 反查失败不影响订单列表 */ }
   }
   return map;
@@ -6034,10 +6055,10 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       toDate: formatDate(new Date(to.getTime() + 86400e3)),
       fake: false,
     };
-    if (activeStatus === "processing" || activeStatus === "awaiting_delivery") query.status = ["PROCESSING", "PENDING"];
-    else if (activeStatus === "delivering") query.status = ["DELIVERY", "PICKUP"];
-    else if (activeStatus === "delivered") query.status = ["DELIVERED"];
-    else if (activeStatus === "cancelled") query.status = ["CANCELLED"];
+    // ⚠️ v2.2.9.150 不要再把 status 传给 Yandex：
+    //   全量缓存（cacheKey 只含 用户+店铺+日期）里放的是「全部状态」的数据，
+    //   一旦按 status 请求就会命中同一份缓存 → 各 tab 显示的数据完全一样（用户报的 bug）。
+    //   改为始终拉全量，再在本地按归一化后的 status 过滤。
 
     // 全量拉取（Yandex 的 page 已失效，只能顺着 nextPageToken 走），最多 5 页 / 1000 单
     const cacheKey = `${req.user.id}:${context.campaignId}:${query.fromDate}:${query.toDate}`;
@@ -6090,18 +6111,24 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
       }
       enrichYandexOrderProfit(order, costMap);
     }
-    if (activeStatus === "awaiting_delivery") items = items.filter((item) => String(item.substatus || "").toUpperCase() === "READY_TO_SHIP");
-    else if (activeStatus === "processing") items = items.filter((item) => String(item.substatus || "").toUpperCase() !== "READY_TO_SHIP");
+    // v2.2.9.150 统一在本地按归一化状态过滤（normalizeYandexOrder 已把
+    //   PROCESSING+READY_TO_SHIP 归一成 awaiting_delivery，其余按 DELIVERY/DELIVERED/CANCELLED 归一）
+    if (activeStatus && activeStatus !== "all") {
+      items = items.filter((item) => String(item.status || "") === activeStatus);
+    }
     if (q) {
       items = items.filter((item) => [
         item.order_id, item.external_order_id, item.status_name,
         ...(item.products || []).flatMap((product) => [product.offer_id, product.sku, product.name]),
       ].some((value) => String(value || "").toLowerCase().includes(q)));
     }
-    // v2.2.9.148 挂上「计划回款 / 实际回款」（来自付款报告，按订单号映射；失败不影响列表）
+    // v2.2.9.150 挂上「计划回款 / 实际回款」
+    //   ⚠️ 付款报告要异步生成 + 限流 1 次/2 分钟，**绝不能阻塞订单列表** ——
+    //   实测同步等待会让首次打开订单页从 9 秒变成 46 秒。
+    //   策略：有缓存就直接挂；没有就在后台预热，本次先返回订单，下次刷新就有回款数据。
     try {
-      const netting = await getYandexNettingMap(context);
-      if (netting && netting.size) {
+      const netting = peekYandexNettingMap(context);
+      if (netting) {
         for (const it of items) {
           const hit = netting.get(String(it.order_id));
           if (!hit) continue;
@@ -6109,6 +6136,9 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
           it.payout_actual_cny = Math.round(hit.actual * 100) / 100;
           it.bank_orders = hit.bankOrders;
         }
+      } else {
+        // 后台预热（不 await），下次请求命中缓存
+        getYandexNettingMap(context).catch(() => {});
       }
     } catch (_e) { /* 回款数据拿不到不影响订单列表 */ }
     // 过滤完再在内存里分页（原来先让 Yandex 分页、再本地过滤，会出现整页空白/翻页无效）
