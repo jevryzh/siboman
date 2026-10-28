@@ -3229,9 +3229,9 @@ async function buildYandexNettingMap(context) {
     if (!orderId) continue;
     const amount = num(r[colAmount]);
     const status = String(r[colStatus] || "").trim();
-    const cur = map.get(orderId) || { planned: 0, actual: 0, bankOrders: [] };
-    if (planned.includes(status)) cur.planned += amount;
-    else if (actual.includes(status)) cur.actual += amount;
+    const cur = map.get(orderId) || { planned: 0, actual: 0, bankOrders: [], planned_n: 0, actual_n: 0 };
+    if (planned.includes(status)) { cur.planned += amount; cur.planned_n += 1; }
+    else if (actual.includes(status)) { cur.actual += amount; cur.actual_n += 1; }
     const bank = normId(r[colBank]);
     if (bank && !cur.bankOrders.includes(bank)) cur.bankOrders.push(bank);
     map.set(orderId, cur);
@@ -6154,6 +6154,12 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
           if (!hit) continue;
           it.payout_planned_cny = Math.round(hit.planned * 100) / 100;
           it.payout_actual_cny = Math.round(hit.actual * 100) / 100;
+          // v2.2.9.152 「计划」和「实际」不是先后关系，而是同一单的两部分
+          //   （已入账的一部分 + 还在排队的一部分），所以实际可能大于计划。
+          //   给出合计，并保留明细条数方便排查。
+          it.payout_total_cny = Math.round((hit.planned + hit.actual) * 100) / 100;
+          it.payout_planned_n = hit.planned_n || 0;
+          it.payout_actual_n = hit.actual_n || 0;
           it.bank_orders = hit.bankOrders;
         }
       } else {

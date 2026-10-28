@@ -345,14 +345,20 @@ window.YandexOrderListView = {
             <el-descriptions-item label="收入合计">{{ moneyText(detailDrawer.row.revenue_cny, detailDrawer.row.currency_code) }}</el-descriptions-item>
             <!-- v2.2.9.147 回款金额 = 收入 − 平台费率，是平台**实际打给卖家**的钱 -->
             <!-- v2.2.9.148 计划/实际回款来自 Yandex 官方「付款报告」（Отчет по платежам） -->
-            <el-descriptions-item label="计划回款">
-              <b style="color:#0369a1">{{ detailDrawer.row.payout_planned_cny !== undefined && detailDrawer.row.payout_planned_cny !== null ? moneyText(detailDrawer.row.payout_planned_cny, detailDrawer.row.currency_code) : '暂无（付款报告未覆盖该单）' }}</b>
-              <span style="margin-left:8px; font-size:12px; color:#94a3b8">来自 Yandex 付款报告：待按付款计划转账的金额</span>
+            <!-- v2.2.9.152 「待回款」和「已回款」是同一单的两个部分，不是先后关系：
+                 已入账一部分 + 还在排队一部分，所以已回款可能大于待回款。加「合计」避免误解。 -->
+            <el-descriptions-item label="待回款（尚未转账）">
+              <b style="color:#0369a1">{{ detailDrawer.row.payout_planned_cny !== undefined && detailDrawer.row.payout_planned_cny !== null ? moneyText(detailDrawer.row.payout_planned_cny, detailDrawer.row.currency_code) : '—' }}</b>
+              <span v-if="detailDrawer.row.payout_planned_n" style="margin-left:8px; font-size:12px; color:#94a3b8">{{ detailDrawer.row.payout_planned_n }} 笔待转账</span>
             </el-descriptions-item>
-            <el-descriptions-item label="实际已回款">
-              <b style="color:#059669">{{ detailDrawer.row.payout_actual_cny !== undefined && detailDrawer.row.payout_actual_cny !== null ? moneyText(detailDrawer.row.payout_actual_cny, detailDrawer.row.currency_code) : '暂无' }}</b>
+            <el-descriptions-item label="已回款（已入账）">
+              <b style="color:#059669">{{ detailDrawer.row.payout_actual_cny !== undefined && detailDrawer.row.payout_actual_cny !== null ? moneyText(detailDrawer.row.payout_actual_cny, detailDrawer.row.currency_code) : '—' }}</b>
+              <span v-if="detailDrawer.row.payout_actual_n" style="margin-left:8px; font-size:12px; color:#94a3b8">{{ detailDrawer.row.payout_actual_n }} 笔已入账</span>
               <span v-if="(detailDrawer.row.bank_orders || []).length" style="margin-left:8px; font-size:12px; color:#94a3b8">付款单 {{ (detailDrawer.row.bank_orders || []).join('、') }}</span>
-              <span v-else style="margin-left:8px; font-size:12px; color:#94a3b8">还未生成付款单</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="该单回款合计">
+              <b style="color:#0f766e">{{ detailDrawer.row.payout_total_cny !== undefined && detailDrawer.row.payout_total_cny !== null ? moneyText(detailDrawer.row.payout_total_cny, detailDrawer.row.currency_code) : '暂无（付款报告未覆盖该单）' }}</b>
+              <span style="margin-left:8px; font-size:12px; color:#94a3b8">待回款 + 已回款；来自 Yandex 付款报告</span>
             </el-descriptions-item>
             <el-descriptions-item label="回款金额(估算)">
               <b style="color:#0f766e">{{ moneyText(detailDrawer.row.payout_cny, detailDrawer.row.currency_code) }}</b>
