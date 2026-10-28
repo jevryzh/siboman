@@ -16,6 +16,14 @@ window.YandexOrderListView = {
       error: (msg) => (window.ElementPlus?.ElMessage || console).error?.(msg),
     };
 
+    // v2.2.9.151 时间范围（Yandex 单次最多 30 天，服务端会分段合并）
+    const dateRange = Vue.ref(30);
+    const dateRangeOptions = [
+      { label: '近 7 天', value: 7 },
+      { label: '近 30 天', value: 30 },
+      { label: '近 60 天', value: 60 },
+      { label: '近 90 天', value: 90 },
+    ];
     const statusTabs = [
       { label: '所有订单', value: 'all' },
       { label: '待处理', value: 'processing' },
@@ -132,6 +140,7 @@ window.YandexOrderListView = {
             q: search.value,
             page: pagination.currentPage,
             page_size: pagination.pageSize,
+            days: dateRange.value,
           },
         });
         if (seq !== fetchSeq) return;   // 已经有更新的请求，丢弃这次结果
@@ -199,6 +208,7 @@ window.YandexOrderListView = {
 
     return {
       orders, loading, hasFetched, activeTab, search, pagination, apiReady, statusTabs,
+      dateRange, dateRangeOptions,
       statusText, statusTagType, primaryProduct, productImages, moneyText, profitText, profitColor, toBeijing, fetchOrders, resetFilters,
       yandexStores, currentStoreId, storeContext, changeYandexStore,
       detailDrawer, openDetail, shipOrder, shipping,
@@ -241,6 +251,9 @@ window.YandexOrderListView = {
 
       <div class="erp-filter-row">
         <el-input v-model="search" size="large" clearable placeholder="搜索订单号 / 商品 / 货号" style="width:360px" @keyup.enter="fetchOrders" />
+        <el-select v-model="dateRange" size="large" style="width:140px" @change="() => { pagination.currentPage = 1; fetchOrders(); }">
+          <el-option v-for="opt in dateRangeOptions" :key="opt.value" :label="opt.label" :value="opt.value" />
+        </el-select>
         <el-button size="large" type="primary" @click="fetchOrders">查询</el-button>
         <el-button size="large" @click="resetFilters">重置</el-button>
       </div>

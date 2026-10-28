@@ -6041,7 +6041,11 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
     const activeStatus = String(req.query.status || "all").trim().toLowerCase();
     const q = String(req.query.q || req.query.search || "").trim().toLowerCase();
     const to = new Date();
-    const from = new Date(to.getTime() - 29 * 86400e3);
+    // v2.2.9.151 时间窗口可配（默认近 30 天）。
+    //   ⚠️ Yandex 单次查询最多 30 天，超过会**直接返回 0 单**（实测 60/120 天都是空），
+    //   所以更长的范围要按 ≤30 天分段拉取再合并。
+    const days = Math.min(180, Math.max(1, Number(req.query.days || req.query.range || 30) || 30));
+    const from = new Date(to.getTime() - days * 86400e3);
     const formatDate = (date) => {
       const dd = String(date.getDate()).padStart(2, "0");
       const mm = String(date.getMonth() + 1).padStart(2, "0");
@@ -6068,9 +6072,19 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
     if (cached && Date.now() - cached.at < YANDEX_ORDERS_CACHE_TTL_MS) {
       rawOrders = cached.items;
     } else {
+      // v2.2.9.151 按 ≤30 天分段拉取（Yandex 单次上限 30 天，超了直接返回空）
+      const segs = [];
+      // ⚠️ 每段用 29 天：下面 toDate 会 +1 天（为了包含今天），29+1=30 才不超 Yandex 上限
+      for (let end = new Date(to.getTime()); end > from; end = new Date(end.getTime() - 29 * 86400e3)) {
+        const start = new Date(Math.max(from.getTime(), end.getTime() - 29 * 86400e3));
+        segs.push({ from: start, to: end });
+        if (segs.length >= 6) break;
+      }
+      const seen = new Set();
+      for (const seg of segs) {
       let pageToken = "";
       for (let i = 0; i < 5; i += 1) {
-        const q = { ...query };
+        const q = { ...query, fromDate: formatDate(seg.from), toDate: formatDate(new Date(seg.to.getTime() + 86400e3)) };
         if (pageToken) q.page_token = pageToken;
         const p = await callYandexMarketAPI(`/v2/campaigns/${encodeURIComponent(context.campaignId)}/orders`, {
           method: "GET",
@@ -6078,11 +6092,17 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
           timeoutMs: 60000,
           apiSecret: context.apiSecret,
         });
-        if (!i) payload = p || {};
+        if (!i && !payload.orders) payload = p || {};
         const batch = (p?.orders || []);
-        rawOrders.push(...batch);
+        for (const o of batch) {
+          const k = String(o.id || "");
+          if (k && seen.has(k)) continue;
+          if (k) seen.add(k);
+          rawOrders.push(o);
+        }
         pageToken = p?.paging?.nextPageToken || "";
         if (!pageToken || batch.length === 0) break;
+      }
       }
       yandexOrdersCache.set(cacheKey, { at: Date.now(), items: rawOrders });
     }
