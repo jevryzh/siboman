@@ -6130,7 +6130,36 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
         }
       }
       enrichYandexOrderProfit(order, costMap);
+      // v2.2.9.153 两个金额口径：
+      //   客户实付 = 买家实付(buyerItemsTotal, RUB) 折算 CNY
+      //   平台订单金额 = 客户实付 + 平台补贴（平台口径的成交额）
+      order.buyer_paid_cny = Math.round(Number(order.total_rub || 0) * RUB_CNY_RATE * 100) / 100;
+      order.platform_order_cny = Math.round((order.buyer_paid_cny + Number(order.subsidies_cny || 0)) * 100) / 100;
     }
+    // v2.2.9.153 统计（必须在状态过滤之前算，否则切 tab 数字会变）
+    const startOfToday = new Date(); startOfToday.setHours(0, 0, 0, 0);
+    const startOfWeek = new Date(startOfToday);
+    startOfWeek.setDate(startOfWeek.getDate() - ((startOfWeek.getDay() + 6) % 7));   // 本周一 00:00
+    // ⚠️ Yandex 返回的 creationDate 是 **DD-MM-YYYY** 格式（如 03-10-2026 11:19:11），
+    //   new Date() 直接解析会得到 Invalid Date → 今日/本周统计恒为 0。这里手动解析。
+    const createdTs = (o) => {
+      const raw = String(o.created_at || "").trim();
+      let m = raw.match(/^(\d{2})-(\d{2})-(\d{4})(?:[ T](\d{2}):(\d{2}):(\d{2}))?/);
+      if (m) {
+        const [, dd, mm, yyyy, hh = "0", mi = "0", ss = "0"] = m;
+        return new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(mi), Number(ss)).getTime();
+      }
+      const t = new Date(raw).getTime();
+      return Number.isFinite(t) ? t : NaN;
+    };
+    const weekItems = items.filter((o) => createdTs(o) >= startOfWeek.getTime());
+    const stats = {
+      today_orders: items.filter((o) => createdTs(o) >= startOfToday.getTime()).length,
+      week_orders: weekItems.length,
+      week_gmv: Math.round(weekItems.reduce((n, o) => n + Number(o.platform_order_cny || 0), 0) * 100) / 100,
+      pending_orders: items.filter((o) => ["processing", "awaiting_delivery"].includes(String(o.status || ""))).length,
+      week_start: startOfWeek.toISOString(),
+    };
     // v2.2.9.150 统一在本地按归一化状态过滤（normalizeYandexOrder 已把
     //   PROCESSING+READY_TO_SHIP 归一成 awaiting_delivery，其余按 DELIVERY/DELIVERED/CANCELLED 归一）
     if (activeStatus && activeStatus !== "all") {
@@ -6181,6 +6210,7 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
         placement_type: context.placementType,
       },
       items,
+      stats,
       total: totalCount,
       has_next: (page - 1) * pageSize + items.length < totalCount,
       page,

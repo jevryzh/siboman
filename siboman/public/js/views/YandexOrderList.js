@@ -18,6 +18,7 @@ window.YandexOrderListView = {
 
     // v2.2.9.151 时间范围（Yandex 单次最多 30 天，服务端会分段合并）
     const dateRange = Vue.ref(30);
+    const stats = Vue.reactive({ today_orders: 0, week_orders: 0, week_gmv: 0, pending_orders: 0 });
     const dateRangeOptions = [
       { label: '近 7 天', value: 7 },
       { label: '近 30 天', value: 30 },
@@ -148,6 +149,11 @@ window.YandexOrderListView = {
         pagination.total = Number(res.data?.total || orders.value.length || 0);
         apiReady.value = res.data?.api_ready !== false;
         storeContext.value = res.data?.context || null;
+        const st = res.data?.stats || {};
+        stats.today_orders = Number(st.today_orders || 0);
+        stats.week_orders = Number(st.week_orders || 0);
+        stats.week_gmv = Number(st.week_gmv || 0);
+        stats.pending_orders = Number(st.pending_orders || 0);
       } catch (error) {
         if (seq !== fetchSeq) return;
         if (error.response?.status === 404) {
@@ -208,7 +214,7 @@ window.YandexOrderListView = {
 
     return {
       orders, loading, hasFetched, activeTab, search, pagination, apiReady, statusTabs,
-      dateRange, dateRangeOptions,
+      dateRange, dateRangeOptions, stats,
       statusText, statusTagType, primaryProduct, productImages, moneyText, profitText, profitColor, toBeijing, fetchOrders, resetFilters,
       yandexStores, currentStoreId, storeContext, changeYandexStore,
       detailDrawer, openDetail, shipOrder, shipping,
@@ -244,6 +250,30 @@ window.YandexOrderListView = {
         style="margin-bottom:14px"
         title="Yandex 订单 API 尚未接入"
         description="当前页面已完成菜单、路由和字段布局；API 凭据会放在服务端配置里，避免泄露到浏览器端。" />
+
+      <!-- v2.2.9.153 四项统计：今日订单数 / 本周 GMV / 本周订单数 / 待处理订单数 -->
+      <div class="erp-kpi-grid" style="display:grid; grid-template-columns:repeat(4, 1fr); gap:14px; margin-bottom:16px">
+        <div style="background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:14px 16px">
+          <div style="font-size:12px; color:#94a3b8; font-weight:700">今日订单数</div>
+          <div style="font-size:26px; font-weight:800; color:#0f172a; margin-top:4px">{{ stats.today_orders }}</div>
+          <div style="font-size:11px; color:#cbd5e1; margin-top:2px">按北京时间当天</div>
+        </div>
+        <div style="background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:14px 16px">
+          <div style="font-size:12px; color:#94a3b8; font-weight:700">本周 GMV</div>
+          <div style="font-size:26px; font-weight:800; color:#0f766e; margin-top:4px">{{ moneyText(stats.week_gmv, 'CNY') }}</div>
+          <div style="font-size:11px; color:#cbd5e1; margin-top:2px">平台订单金额（实付+补贴）· 本周一至今</div>
+        </div>
+        <div style="background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:14px 16px">
+          <div style="font-size:12px; color:#94a3b8; font-weight:700">本周订单数</div>
+          <div style="font-size:26px; font-weight:800; color:#0f172a; margin-top:4px">{{ stats.week_orders }}</div>
+          <div style="font-size:11px; color:#cbd5e1; margin-top:2px">本周一 00:00 至今</div>
+        </div>
+        <div style="background:#fff; border:1px solid #e2e8f0; border-radius:10px; padding:14px 16px">
+          <div style="font-size:12px; color:#94a3b8; font-weight:700">待处理订单数</div>
+          <div style="font-size:26px; font-weight:800; color:#b45309; margin-top:4px">{{ stats.pending_orders }}</div>
+          <div style="font-size:11px; color:#cbd5e1; margin-top:2px">待处理 + 待发货</div>
+        </div>
+      </div>
 
       <el-tabs v-model="activeTab" @tab-change="() => { pagination.currentPage = 1; fetchOrders(); }">
         <el-tab-pane v-for="tab in statusTabs" :key="tab.value" :label="tab.label" :name="tab.value" />
@@ -286,8 +316,18 @@ window.YandexOrderListView = {
         <el-table-column label="状态" width="120">
           <template #default="{ row }"><el-tag :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag></template>
         </el-table-column>
-        <el-table-column label="订单金额" width="140" align="right">
-          <template #default="{ row }">{{ moneyText(row.total, row.currency_code || 'RUB') }}</template>
+        <!-- v2.2.9.153 客户实付（买家实际支付）+ 平台订单金额（实付+平台补贴） -->
+        <el-table-column label="客户实付" width="130" align="right">
+          <template #default="{ row }">
+            <span style="font-weight:700">{{ moneyText(row.buyer_paid_cny, 'CNY') }}</span>
+            <div style="font-size:11px; color:#94a3b8">买家实付</div>
+          </template>
+        </el-table-column>
+        <el-table-column label="平台订单金额" width="140" align="right">
+          <template #default="{ row }">
+            <span style="font-weight:700; color:#0f766e">{{ moneyText(row.platform_order_cny, 'CNY') }}</span>
+            <div style="font-size:11px; color:#94a3b8">实付 {{ moneyText(row.buyer_paid_cny, 'CNY') }} + 补贴 {{ moneyText(row.subsidies_cny, 'CNY') }}</div>
+          </template>
         </el-table-column>
         <el-table-column label="利润(估算)" width="130" align="right">
           <template #default="{ row }">
