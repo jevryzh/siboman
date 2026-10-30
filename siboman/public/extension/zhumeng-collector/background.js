@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.139";
+const VERSION = "2.2.9.155";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1632,10 +1632,19 @@ function extractFollowBundleInPage(productId, wantVariants) {
   };
 
   const base = "https://www.ozon.ru/api/entrypoint-api.bx/page/json/v2?url=";
-  const grab = function (u) {
+  // v2.2.9.155 记录每次请求的 HTTP 状态，便于排查「0 个跟卖」的真实原因
+  //   （以前静默返回 null，日志只写「有跟卖 0 个」，看不出是被封/登录失效/接口变了）
+  const fetchStatus = { modal: 0, page: 0 };
+  const grab = function (u, tag) {
     return fetch(u, { credentials: "include", cache: "no-store" })
-      .then(function (r) { return r.ok ? r.json() : null; })
-      .catch(function () { return null; });
+      .then(function (r) {
+        if (tag && !fetchStatus[tag]) fetchStatus[tag] = r.status;
+        return r.ok ? r.json() : null;
+      })
+      .catch(function () {
+        if (tag && !fetchStatus[tag]) fetchStatus[tag] = -1;
+        return null;
+      });
   };
   const modalOf = function (sku) {
     return base + encodeURIComponent("/modal/otherOffersFromSellers?product_id=" + sku + "&sort=price&page_changed=true")
@@ -1702,11 +1711,12 @@ function extractFollowBundleInPage(productId, wantVariants) {
     });
   };
 
-  return Promise.all([grab(modalOf(productId)), grab(pageOf(productId))]).then(function (pair) {
+  return Promise.all([grab(modalOf(productId), "modal"), grab(pageOf(productId), "page")]).then(function (pair) {
     const a = pick(pair[0]);
     const b = pick(pair[1]);
     const finish = function (family) {
       return {
+        fetchStatus: fetchStatus,
         sellers: a.sellers,
         cardPrice: a.cardPrice || b.cardPrice || "",
         listPrice: a.listPrice || b.listPrice || "",
@@ -1823,11 +1833,14 @@ async function runQueuedOzonPatrolJob(remoteJob) {
           product_image: bundle.productImage || "",
           variants: bundle.variants || [],
           variant_skus: bundle.variantSkus || [],
+          fetch_status: bundle.fetchStatus || null,
         });
         if (sellers.length) {
           okCount += 1;
           const vCount = (bundle.variants || []).reduce(function (n, v) { return n + (v.sellers || []).length; }, 0);
-          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家（卡片价 ${bundle.cardPrice || bundle.listPrice || "-"}）`
+          const fsd = bundle.fetchStatus || {};
+          const statusHint = sellers.length ? "" : ` ｜ 接口状态 跟卖列表=${fsd.modal} 商品页=${fsd.page}`;
+          job.logs.push(makeLog(`货号 ${offerId} 抓到 ${sellers.length} 个跟卖卖家（卡片价 ${bundle.cardPrice || bundle.listPrice || "-"}）${statusHint}`
             + (vCount ? `，另从 ${(bundle.variants || []).length} 个变体补到 ${vCount} 条` : ""), "info"));
         }
       } catch (e) {
