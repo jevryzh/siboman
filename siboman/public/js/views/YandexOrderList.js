@@ -82,21 +82,28 @@ window.YandexOrderListView = {
 
     // Yandex 订单时间（DD-MM-YYYY HH:MM:SS，莫斯科时间 UTC+3）转北京时间展示；
     // 兼容 ISO（含 T / 时区）与已转好的本地时间。
+    // v2.2.9.154 时间格式化修复。
+    //   ⚠️ 原判断 `/[+-]\d{2}:?\d{2}$/` 用来识别 ISO 的时区偏移，但日期型字符串
+    //   '03-11-2026' 结尾的「-2026」也满足这个模式 → 被当成 ISO 丢给 new Date()，
+    //   JS 按「月-日-年」解析成 3 月 11 日 ✗（'31-10-2026' 因为 31 不是合法月份才侥幸没中）。
+    //   现在严格区分：只有 YYYY-MM-DD 开头 / 带 T 或 Z 的才算 ISO。
     const toBeijing = (s) => {
       if (!s) return '-';
       const str = String(s).trim();
-      // 已含 T 或 Z（ISO 形式）：按标准 Date 解析后 +8h
-      if (/[TZ]/i.test(str) || /[+-]\d{2}:?\d{2}$/.test(str)) {
+      // ① ISO 形式：必须是 4 位年份开头，或含 T/Z
+      if (/^\d{4}-\d{2}-\d{2}/.test(str) || /T\d{2}:\d{2}/.test(str) || /\dZ$/i.test(str)) {
         const d = new Date(str);
         if (!Number.isNaN(d.getTime())) {
           return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
         }
       }
-      // Yandex 原始格式 DD-MM-YYYY HH:MM:SS（莫斯科时间）
-      const m = str.match(/^(\d{2})-(\d{2})-(\d{4})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+      // ② Yandex 原生格式 DD-MM-YYYY [HH:MM:SS]（莫斯科时间）
+      const m = str.match(/^(\d{2})-(\d{2})-(\d{4})(?:[ T](\d{2}):(\d{2})(?::(\d{2}))?)?/);
       if (m) {
         const [, dd, mm, yyyy, hh, mi, ss] = m;
-        const utc = Date.UTC(+yyyy, +mm - 1, +dd, +hh, +mi, +ss) - 3 * 3600 * 1000;
+        // 只有日期（如发货截止 '03-11-2026'）→ 规范成 YYYY-MM-DD，不做时区换算
+        if (hh === undefined) return `${yyyy}-${mm}-${dd}`;
+        const utc = Date.UTC(+yyyy, +mm - 1, +dd, +hh, +mi, +(ss || 0)) - 3 * 3600 * 1000;
         return new Date(utc + 8 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19);
       }
       return str;
