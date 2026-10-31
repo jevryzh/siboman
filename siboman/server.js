@@ -16260,7 +16260,7 @@ app.post("/api/seller/orders/cancel", requireAuth, async (req, res) => {
 //   rows 里每个单元格可以是标量，或 { v, s } —— s 为样式键。
 const XLSX_STYLES = {
   // 键 → cellXfs 索引（顺序必须与下面 STYLE_XFS 一致）
-  header: 1, no: 2, shipment: 3, colorqty: 4, qty: 5, label: 6, blank: 0,
+  header: 1, no: 2, shipment: 3, colorqty: 4, qty: 5, label: 6, colorqtyMixed: 7, blank: 0,
 };
 function buildXlsx(sheetName, rows, opts = {}) {
   const esc = (v) => String(v == null ? "" : v)
@@ -16299,6 +16299,8 @@ function buildXlsx(sheetName, rows, opts = {}) {
     `<xf numFmtId="0" fontId="5" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>`,
     // label（文本，保留前导 0）
     `<xf numFmtId="0" fontId="5" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>`,
+    // colorqty 混色（小字号）
+    `<xf numFmtId="0" fontId="6" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>`,
   ].join("");
   const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`
     + `<fonts count="6">`
@@ -16308,13 +16310,15 @@ function buildXlsx(sheetName, rows, opts = {}) {
     + `<font><sz val="8"/><color rgb="FF1F2937"/><name val="Arial"/></font>`
     + `<font><b/><sz val="12.5"/><color rgb="FF111827"/><name val="Arial"/></font>`
     + `<font><b/><sz val="14"/><color rgb="FF111827"/><name val="Arial"/></font>`
+    // v2.2.9.175 混色专用：12×1/18×1/26×1 这种长文本 12.5 号放不下会被截断 → 8.5 号
+    + `<font><b/><sz val="8.5"/><color rgb="FF111827"/><name val="Arial"/></font>`
     + `</fonts>`
     + `<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>`
     + `<fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/><bgColor indexed="64"/></patternFill></fill></fills>`
     + `<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border>`
     + `<border><left style="thin"><color rgb="FF9CA3AF"/></left><right style="thin"><color rgb="FF9CA3AF"/></right><top style="thin"><color rgb="FF9CA3AF"/></top><bottom style="thin"><color rgb="FF9CA3AF"/></bottom><diagonal/></border></borders>`
     + `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>`
-    + `<cellXfs count="7">${STYLE_XFS}</cellXfs>`
+    + `<cellXfs count="8">${STYLE_XFS}</cellXfs>`
     + `<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>`
     + `</styleSheet>`;
   const sheetXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`
@@ -16373,9 +16377,12 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       [req.user.id, picked],
     );
     // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
-    const customerNo = (posting) => {
-      const parts = String(posting || "").split("-");
-      return parts.length > 1 ? String(parts[1]) : "";
+    // v2.2.9.175 Label = 订单号第一个 "-" **前面**那一段的末 4 位
+    //   例：0152861040-0435-1 → 前段 0152861040 → 末 4 位 1040
+    //   保留前导 0（当字符串输出），不足 4 位左侧补 0
+    const labelOf = (posting) => {
+      const head = String(posting || "").split("-")[0];
+      return head.slice(-4).padStart(4, "0");
     };
     // v2.2.9.174 排序：单色在前（按色号，同色号按数量从小到大），混色最后
     const sorted = result.rows.slice().sort((a, b) => {
@@ -16394,7 +16401,7 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       shipment: r.pn,
       colorQty: r.color_qty,
       qty: Number(r.total_qty || 0),
-      label: customerNo(r.pn),
+      label: labelOf(r.pn),
     }));
     const PER_PAGE = 48;
     const PER_COL = 24;
@@ -16414,13 +16421,13 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
         rows.push([
           left ? { v: page * PER_PAGE + i + 1, s: "no" } : { v: "", s: "blank" },
           left ? { v: left.shipment, s: "shipment" } : { v: "", s: "blank" },
-          left ? { v: left.colorQty, s: "colorqty" } : { v: "", s: "blank" },
+          left ? { v: left.colorQty, s: left.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
           left ? { v: left.qty, s: "qty" } : { v: "", s: "blank" },
           left ? { v: left.label, s: "label" } : { v: "", s: "blank" },
           { v: "", s: "blank" },
           right ? { v: page * PER_PAGE + PER_COL + i + 1, s: "no" } : { v: "", s: "blank" },
           right ? { v: right.shipment, s: "shipment" } : { v: "", s: "blank" },
-          right ? { v: right.colorQty, s: "colorqty" } : { v: "", s: "blank" },
+          right ? { v: right.colorQty, s: right.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
           right ? { v: right.qty, s: "qty" } : { v: "", s: "blank" },
           right ? { v: right.label, s: "label" } : { v: "", s: "blank" },
         ]);
