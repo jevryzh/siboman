@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.158";
+const VERSION = "2.2.9.159";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5699,8 +5699,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 list_type: "postings",
                 company_id: companyId,
                 status_aliases: aliases,
-                cutoff_from: "2026-01-01T00:00:00Z",
-                cutoff_to: "2027-12-31T23:59:59Z",
+                // ⚠️ 接口限制 cutoff 区间 ≤ 180 天（超了返回 400 invalid cutoff），
+                //   这里用「前 90 天 ~ 后 30 天」，覆盖所有待处理货件且留足余量。
+                cutoff_from: new Date(Date.now() - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+                cutoff_to: new Date(Date.now() + 30 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
                 posting_numbers: postingNumbers,
                 delivery_groups: ["all"],
               },
