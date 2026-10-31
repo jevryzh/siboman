@@ -15501,20 +15501,34 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     };
 
     const syncCacheRange = async ({ since, to, label = "custom" }) => {
-      let syncOffset = 0;
+      // ⚠️ v2.2.9.161 翻页修复。
+      //   原来：pageLimit=200 + `if (enriched.length < 200) break`，
+      //   但 v4 接口**单页上限就是 100**（ozonFbsListCompat 里 Math.min(100, limit)），
+      //   于是 100 < 200 永远成立 → **每次同步只抓最新 100 单就停了**，
+      //   更早的货件永远进不了缓存（用户报「卖家后台有待发运、ERP 里查不到」的真因）。
+      //   现在：直接用 v4 的 cursor 翻页，单页 100，最多 60 页 = 6000 单。
+      const PAGE = 100;
+      let cursor = "";
       let synced = 0;
-      for (let page = 0; page < 12; page++) {
-        const live = await fetchLiveOrders({
+      for (let page = 0; page < 60; page++) {
+        const r = await ozonFbsListV4Page({
           since: since.toISOString(),
           to: to.toISOString(),
           status: "all",
-          pageLimit: 200,
-          pageOffset: syncOffset,
+          limit: PAGE,
+          cursor,
+          with: { financial_data: true, analytics_data: true },
+          storeId,
+          userId: req.user.id,
         });
-        await upsertOrderCache(live.enriched);
-        synced += live.enriched.length;
-        if (!live.hasNext || live.enriched.length < 200) break;
-        syncOffset += 200;
+        const batch = r.postings || [];
+        if (batch.length) {
+          const enriched = await enrichPostings(batch);
+          await upsertOrderCache(enriched.enriched || []);
+          synced += batch.length;
+        }
+        if (!r.has_next || !r.cursor || batch.length < PAGE) break;
+        cursor = r.cursor;
       }
       console.log(`[OrdersCache] store=${storeId} sync_range=${label} synced=${synced}`);
     };
