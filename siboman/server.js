@@ -15598,6 +15598,16 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       const statusCounts = {};
       for (const r of statusCountRes.rows) statusCounts[String(r.st)] = Number(r.cnt);
       statusCounts.all = Object.values(statusCounts).reduce((a, b) => a + b, 0);
+      // v2.2.9.163 「已超时」也在服务端算：前端原来要靠 summaryRows 全量行判断，
+      //   逼得前端翻 10 页 × 200 条（页面很慢）。这里用 shipment_date 直接数。
+      const overdueRes = await db.query(
+        `SELECT count(*)::int AS cnt FROM app_order_cache
+          WHERE ${where.join(" AND ")}
+            AND COALESCE(NULLIF(display_status, ''), status) IN ('awaiting_packaging','awaiting_deliver')
+            AND shipment_date IS NOT NULL AND shipment_date < now()`,
+        params,
+      );
+      statusCounts.overdue = Number(overdueRes.rows[0]?.cnt || 0);
 
       const countRes = await db.query(
         `SELECT count(*)::int AS count FROM app_order_cache WHERE ${where.join(" AND ")}`,

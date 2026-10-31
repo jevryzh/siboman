@@ -45,7 +45,7 @@ window.OrderListView = {
     const syncWindowDialog = Vue.reactive({ visible: false, since: '', to: '' });
     let autoSyncTimer = null;
     const ORDER_SUMMARY_PAGE_SIZE = 200;
-    const ORDER_SUMMARY_MAX_PAGES_PER_STORE = 10;
+    const ORDER_SUMMARY_MAX_PAGES_PER_STORE = 1;   // v2.2.9.163 计数已交给服务端统计，这里只留一页给超时/兜底逻辑
 
     // v0.3.5: 时窗筛选 (Ozon 限制窗口 ≤ 1 年)
     const dateRange = Vue.ref([]);
@@ -405,8 +405,11 @@ window.OrderListView = {
     const summaryStats = Vue.computed(() => {
       const current = ordersMetric(kpiRows.value);
       const previous = ordersMetric(previousKpiRows.value);
+      const sc = serverStatusCounts.value || {};
       const operationalRows = summaryRows.value.length ? summaryRows.value : orders.value;
-      const pending = operationalRows.filter((row) => ['awaiting_packaging', 'awaiting_deliver'].includes(row.status)).length;
+      const pending = (typeof sc.awaiting_packaging === 'number' && typeof sc.awaiting_deliver === 'number')
+        ? sc.awaiting_packaging + sc.awaiting_deliver
+        : operationalRows.filter((row) => ['awaiting_packaging', 'awaiting_deliver'].includes(row.status)).length;
       return {
         gmv: current.gmv,
         profit: current.profit,
@@ -415,15 +418,15 @@ window.OrderListView = {
         profitTrend: metricDelta(current.profit, previous.profit),
         profitRateTrend: Math.round((current.profitRate - previous.profitRate) * 10) / 10,
         pending,
-        awaitingPackaging: operationalRows.filter((row) => row.status === 'awaiting_packaging').length,
-        awaitingDeliver: operationalRows.filter((row) => row.status === 'awaiting_deliver').length,
+        awaitingPackaging: typeof sc.awaiting_packaging === 'number' ? sc.awaiting_packaging : operationalRows.filter((row) => row.status === 'awaiting_packaging').length,
+        awaitingDeliver: typeof sc.awaiting_deliver === 'number' ? sc.awaiting_deliver : operationalRows.filter((row) => row.status === 'awaiting_deliver').length,
       };
     });
     const statusCount = (value) => {
       // 服务端计数优先（准确）；「已超时」需要按时间判断，仍在前端算
       const sc = serverStatusCounts.value || {};
-      if (value === 'all' && typeof sc.all === 'number') return sc.all;
-      if (value !== 'overdue' && typeof sc[value] === 'number') return sc[value];
+      // v2.2.9.163 all / 各状态 / overdue 全部走服务端，前端不再需要翻全量列表
+      if (typeof sc[value] === 'number') return sc[value];
       const rows = summaryRows.value.length ? summaryRows.value : orders.value;
       if (value === 'all') return summaryRows.value.length || pagination.total || orders.value.length;
       if (value === 'overdue') return rows.filter(isOverdue).length;
