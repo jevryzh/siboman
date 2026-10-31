@@ -697,6 +697,49 @@ window.OrderListView = {
     };
 
     const onSelectionChange = (rows) => { selectedOrders.value = rows || []; };
+    // v2.2.9.156 打印面单：后端 /api/seller/orders/labels 早就写好了但前端没有入口。
+    //   Ozon 只允许「待备货 / 待发运」的单出标签，其它状态接口会报 INVALID_ARGUMENT，
+    //   所以这里先本地筛一遍，给出明确提示。
+    const labelsPrinting = Vue.ref(false);
+    const printLabels = async () => {
+      const sel = selectedOrders.value || [];
+      if (!sel.length) return notify.warning('请先勾选要打印面单的订单');
+      const eligible = sel.filter((row) => ['awaiting_packaging', 'awaiting_deliver'].includes(String(row.status || '')));
+      if (!eligible.length) {
+        return notify.warning(`所选 ${sel.length} 个订单都不是「待备货/待发运」状态，Ozon 不允许打印面单`);
+      }
+      // 按店铺分组（凭证是按店铺的）
+      const byStore = new Map();
+      for (const row of eligible) {
+        const sid = String(row.store_id || row.storeId || '').trim();
+        if (!sid) continue;
+        if (!byStore.has(sid)) byStore.set(sid, []);
+        byStore.get(sid).push(String(row.posting_number || row.order_id || ''));
+      }
+      if (!byStore.size) return notify.warning('所选订单没有关联店铺，无法打印');
+      labelsPrinting.value = true;
+      try {
+        const blobs = [];
+        for (const [storeId, postings] of byStore) {
+          const res = await axios.post('/api/seller/orders/labels', { store_id: storeId, posting_numbers: postings }, { responseType: 'blob' });
+          blobs.push(res.data);
+        }
+        const blob = new Blob(blobs, { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        notify.success(`已生成 ${eligible.length} 个订单的面单${eligible.length < sel.length ? `（${sel.length - eligible.length} 个状态不符已跳过）` : ''}`);
+      } catch (e) {
+        let msg = e.message;
+        try {
+          if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg;
+          else if (e.response?.data?.error) msg = e.response.data.error;
+        } catch (_e2) { /* 保持原错误 */ }
+        notify.error('打印面单失败：' + String(msg).slice(0, 200));
+      } finally {
+        labelsPrinting.value = false;
+      }
+    };
     const orderNote = (row) => {
       const sid = effectiveStoreIdForOrder(row);
       return notes[`${sid}:${row.posting_number}`]?.note || notes[row.posting_number]?.note || '';
@@ -984,6 +1027,7 @@ window.OrderListView = {
       todayLabel, syncRangeText, summaryStats, moneyText, trendText, trendColor, primaryProduct, rowCreatedTime,
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
       feesFileInput, feesImporting, pickFeesFile, onFeesFile,
+      labelsPrinting, printLabels,   // v2.2.9.156 打印面单
       returnsDrawer, openReturns, returnsTypeText, returnsTypeTag,   // v2.2.9.146 WHD 退货
       rowStatusSubtext, copyPostingNumber, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
@@ -1125,7 +1169,7 @@ window.OrderListView = {
 
         <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
           <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedOrders.length }} 个订单</span>
-          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
+          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
         </div>
 
         <el-alert

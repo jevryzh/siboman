@@ -16210,7 +16210,14 @@ app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
       body: JSON.stringify({ posting_number: postingNumbers }),
     });
     const bytes = Buffer.from(await response.arrayBuffer());
-    if (!response.ok) return res.status(response.status).json({ success: false, error: `Ozon 面单生成失败：${bytes.toString('utf8').slice(0, 1000)}` });
+    if (!response.ok) {
+      // v2.2.9.156 Ozon 对状态不符的订单只回 INVALID_ARGUMENT，对用户没有意义 → 转成人话
+      const raw = bytes.toString('utf8').slice(0, 1000);
+      const friendly = /INVALID_ARGUMENT/i.test(raw)
+        ? 'Ozon 不允许给这些订单打印面单：只有「待备货 / 待发运」状态的订单可以，请只勾选这类订单（已发货/已取消的不行）'
+        : `Ozon 面单生成失败：${raw}`;
+      return res.status(response.status).json({ success: false, error: friendly });
+    }
     const contentType = response.headers.get('content-type') || 'application/pdf';
     if (contentType.includes('json')) return res.status(502).json({ success: false, error: `Ozon 未返回 PDF：${bytes.toString('utf8').slice(0, 1000)}` });
     res.setHeader('Content-Type', contentType);
