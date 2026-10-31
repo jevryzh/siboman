@@ -720,6 +720,45 @@ window.OrderListView = {
     };
 
     const onSelectionChange = (rows) => { selectedOrders.value = rows || []; };
+    // v2.2.9.171 定制导出：毛线拣货单（xlsx）/ 毛线标签（PDF），都基于「待发运」的毛线订单
+    const yarnPicklistBusy = Vue.ref(false);
+    const yarnLabelsBusy = Vue.ref(false);
+    const downloadBlob = (data, filename, mime) => {
+      const blob = new Blob([data], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    };
+    const exportYarnPicklist = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先选择店铺');
+      yarnPicklistBusy.value = true;
+      try {
+        const res = await axios.post('/api/seller/orders/yarn-picklist-export', { store_ids: storeIds, status: 'awaiting_deliver' }, { responseType: 'blob', timeout: 120000 });
+        downloadBlob(res.data, `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        notify.success(`已导出毛线拣货单：${res.headers['x-item-count'] || '?'} 条 / ${res.headers['x-page-count'] || '?'} 页`);
+      } catch (e) {
+        let msg = e.message;
+        try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
+        notify.error('导出毛线拣货单失败：' + String(msg).slice(0, 200));
+      } finally { yarnPicklistBusy.value = false; }
+    };
+    const exportYarnLabels = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先选择店铺');
+      yarnLabelsBusy.value = true;
+      try {
+        const res = await axios.post('/api/seller/orders/yarn-labels', { store_ids: storeIds, status: 'awaiting_deliver' }, { responseType: 'blob', timeout: 600000 });
+        downloadBlob(res.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
+        notify.success(`已导出毛线标签：${res.headers['x-item-count'] || '?'} 个货件，失败 ${res.headers['x-failed-count'] || 0} 个`);
+      } catch (e) {
+        let msg = e.message;
+        try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
+        notify.error('导出毛线标签失败：' + String(msg).slice(0, 200));
+      } finally { yarnLabelsBusy.value = false; }
+    };
     const openPostingDialog = () => {
       postingDialog.text = postingFilter.value.join('\n');
       postingDialog.visible = true;
@@ -1136,7 +1175,8 @@ window.OrderListView = {
     return {
       orders, displayedOrders, loading, summaryLoading, kpiLoading, activeTab, statusTabs, statusTabItems, pagination,
       selectedOrders, notes, batchLoading,
-      postingFilter, postingDialog, openPostingDialog, applyPostingFilter, clearPostingFilter, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
+      postingFilter, postingDialog, openPostingDialog, applyPostingFilter, clearPostingFilter,
+      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
       lastBatchResult, hasFetched, orderEmptyText, shops, currentStoreName,
       storeScope, storeScopeOptions, onStoreScopeChange,
       detailDrawer, shipDialog,
@@ -1294,6 +1334,12 @@ window.OrderListView = {
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px">
           <el-button size="large" type="warning" plain @click="exportOrders">
             <el-icon><Download /></el-icon><span>订单导出</span>
+          </el-button>
+          <el-button size="large" plain :loading="yarnPicklistBusy" @click="exportYarnPicklist">
+            <el-icon><Tickets /></el-icon><span>导出毛线拣货单</span>
+          </el-button>
+          <el-button size="large" plain :loading="yarnLabelsBusy" @click="exportYarnLabels">
+            <el-icon><Tickets /></el-icon><span>导出毛线标签</span>
           </el-button>
           <el-button size="large" plain :loading="feesImporting" @click="pickFeesFile">
             <el-icon><Upload /></el-icon><span>导入费用结算</span>

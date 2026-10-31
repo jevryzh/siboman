@@ -16290,6 +16290,134 @@ function buildXlsx(sheetName, rows) {
 
 // v2.2.9.165 待备货毛线数量统计（定制需求）：
 //   把「待备货」订单里的商品按货号(SKU) 汇总数量，导出成 Excel。
+// v2.2.9.171 「导出毛线拣货单」（定制）：
+//   版式对齐用户给的模板「A4双列表」——每页 48 个（24 行 × 左右双栏），
+//   列：No. | Shipment(货件号) | Color×Qty(变体×数量) | Qty | Label(货件号前段末 4 位)
+// v2.2.9.171 「导出毛线标签」（定制）：把待发运里所有毛线订单的 Ozon 面单批量取回并合并成一个 PDF
+app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) => {
+  try {
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const status = String(req.body?.status || "awaiting_deliver");
+    const rows = await db.query(
+      `SELECT DISTINCT c.posting_number
+         FROM app_order_cache c
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+        WHERE c.user_id = $1
+          AND c.store_id = ANY($2::uuid[])
+          AND COALESCE(NULLIF(c.display_status,''), c.status) = $3
+          AND COALESCE(p->>'name','') ILIKE '%пряж%'
+        ORDER BY c.posting_number`,
+      [req.user.id, storeIds, status],
+    );
+    const postings = rows.rows.map((r) => String(r.posting_number)).filter(Boolean);
+    if (!postings.length) return res.status(400).json({ success: false, error: "没有符合条件的毛线订单" });
+    const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2`, [storeIds[0], req.user.id]);
+    if (!creds.rowCount) return res.status(404).json({ success: false, error: "未找到店铺凭证" });
+    const { client_id: clientId, api_key: apiKey } = creds.rows[0];
+    const CHUNK = 20, CONCURRENCY = 8;
+    const chunks = [];
+    for (let i = 0; i < postings.length; i += CHUNK) chunks.push(postings.slice(i, i + CHUNK));
+    const fetchChunk = async (batch) => {
+      const r = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
+        method: "POST",
+        headers: { "Client-Id": clientId, "Api-Key": apiKey, "Content-Type": "application/json", Accept: "application/pdf, application/json" },
+        body: JSON.stringify({ posting_number: batch }),
+      });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const ct = r.headers.get("content-type") || "";
+      return r.ok && !ct.includes("json") ? { ok: true, buf } : { ok: false, err: buf.toString("utf8").slice(0, 100) };
+    };
+    const pdfs = [];
+    let failed = 0;
+    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+      const wave = chunks.slice(i, i + CONCURRENCY);
+      const out = await Promise.all(wave.map((b) => fetchChunk(b).catch(() => ({ ok: false }))));
+      for (const o of out) { if (o.ok) pdfs.push(o.buf); else failed += 1; }
+    }
+    if (!pdfs.length) return res.status(400).json({ success: false, error: "Ozon 未返回任何标签，请确认订单状态" });
+    let merged = pdfs[0];
+    if (pdfs.length > 1) {
+      const outDoc = await PDFDocument.create();
+      for (const f of pdfs) {
+        const src = await PDFDocument.load(f, { ignoreEncryption: true });
+        const pages = await outDoc.copyPages(src, src.getPageIndices());
+        pages.forEach((pg) => outDoc.addPage(pg));
+      }
+      merged = Buffer.from(await outDoc.save());
+    }
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="毛线标签-${Date.now()}.pdf"`);
+    res.setHeader("X-Item-Count", String(postings.length));
+    res.setHeader("X-Failed-Count", String(failed));
+    res.send(merged);
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res, next) => {
+  try {
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const status = String(req.body?.status || "awaiting_deliver");
+    const result = await db.query(
+      `SELECT c.posting_number,
+              COALESCE(p->>'offer_id','') AS offer_id,
+              COALESCE((p->>'quantity')::int, 1) AS qty
+         FROM app_order_cache c
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+        WHERE c.user_id = $1
+          AND c.store_id = ANY($2::uuid[])
+          AND COALESCE(NULLIF(c.display_status,''), c.status) = $3
+          AND COALESCE(p->>'name','') ILIKE '%пряж%'
+          AND COALESCE(p->>'offer_id','') <> ''
+        ORDER BY COALESCE(p->>'offer_id',''), c.posting_number`,
+      [req.user.id, storeIds, status],
+    );
+    // 短码 = 货件号前段末 4 位，去掉前导 0（用户模板里的 Label 列就是这个规律）
+    const shortLabel = (posting) => {
+      const head = String(posting || "").split("-")[0].replace(/\D/g, "");
+      const tail = head.slice(-4);
+      return Number(tail) || 0;
+    };
+    const items = result.rows.map((r) => {
+      const variant = String(r.offer_id).split("-").pop();
+      return {
+        shipment: r.posting_number,
+        colorQty: `${variant}×${r.qty}`,
+        qty: Number(r.qty || 0),
+        label: shortLabel(r.posting_number),
+      };
+    });
+    // A4 双栏：每页 1 空行 + 表头 + 24 行数据 + 2 空行
+    const PER_PAGE = 48;
+    const PER_COL = 24;
+    const HEAD = ["No.", "Shipment", "Color×Qty", "Qty", "Label"];
+    const rows = [];
+    for (let page = 0; page * PER_PAGE < items.length; page += 1) {
+      const slice = items.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+      rows.push([]);
+      rows.push([...HEAD, "", ...HEAD]);
+      for (let i = 0; i < PER_COL; i += 1) {
+        const left = slice[i];
+        const right = slice[i + PER_COL];
+        const leftRow = left ? [page * PER_PAGE + i + 1, left.shipment, left.colorQty, left.qty, left.label] : [];
+        const rightRow = right ? [page * PER_PAGE + PER_COL + i + 1, right.shipment, right.colorQty, right.qty, right.label] : [];
+        rows.push([...leftRow, "", ...rightRow]);
+      }
+      rows.push([], []);
+    }
+    const buf = buildXlsx("A4双列表", rows);
+    const fname = `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
+    res.setHeader("X-Item-Count", String(items.length));
+    res.setHeader("X-Page-Count", String(Math.ceil(items.length / PER_PAGE) || 1));
+    res.send(buf);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, next) => {
   try {
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
