@@ -1161,6 +1161,18 @@ window.OrderListView = {
   },
   template: `
     <div class="order-list-v3" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px">
+            <!-- v2.2.9.169 批量单号筛选 -->
+        <el-dialog v-model="postingDialog.visible" title="按单号批量查询" width="560px">
+          <div style="font-size:13px; color:#64748b; margin-bottom:8px">
+            每行一个货件号，也支持用空格、逗号、分号分隔。最多 1000 个。
+          </div>
+          <el-input v-model="postingDialog.text" type="textarea" :rows="12" placeholder="例如：&#10;0126320481-0344-2&#10;0118486930-0033-1" />
+          <template #footer>
+            <el-button @click="postingDialog.visible = false">取消</el-button>
+            <el-button @click="clearPostingFilter">清空筛选</el-button>
+            <el-button type="primary" @click="applyPostingFilter">查询</el-button>
+          </template>
+        </el-dialog>
       <div style="max-width:1500px; margin:0 auto">
         <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
           <div>
@@ -1299,18 +1311,6 @@ window.OrderListView = {
 
         <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
           <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedOrders.length }} 个订单</span>
-          <!-- v2.2.9.169 批量单号筛选 -->
-      <el-dialog v-model="postingDialog.visible" title="按单号批量查询" width="560px">
-        <div style="font-size:13px; color:#64748b; margin-bottom:8px">
-          每行一个货件号，也支持用空格、逗号、分号分隔。最多 1000 个。
-        </div>
-        <el-input v-model="postingDialog.text" type="textarea" :rows="12" placeholder="例如：&#10;0126320481-0344-2&#10;0118486930-0033-1" />
-        <template #footer>
-          <el-button @click="postingDialog.visible = false">取消</el-button>
-          <el-button @click="clearPostingFilter">清空筛选</el-button>
-          <el-button type="primary" @click="applyPostingFilter">查询</el-button>
-        </template>
-      </el-dialog>
 
       <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button><el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button></div>
         </div>
