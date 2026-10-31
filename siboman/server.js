@@ -15590,6 +15590,14 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         params.push(status === "disputed" ? "dispute" : status);
         where.push(`COALESCE(NULLIF(display_status, ''), status) = $${params.length}`);
       }
+      // v2.2.9.169 按一批指定货件号查询（用户批量粘贴单号找订单）
+      const postingFilter = Array.isArray(req.body?.posting_numbers)
+        ? req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean).slice(0, 1000)
+        : [];
+      if (postingFilter.length) {
+        params.push(postingFilter);
+        where.push(`posting_number = ANY($${params.length}::text[])`);
+      }
       // v2.2.9.162 状态计数交回服务端。
       //   原来前端为了算 tab 个数，把订单列表翻到最多 10 页 × 200 = 2000 条再本地统计，
       //   但库里有 6700+ 条 → 数字全是残缺的（用户看到「待发运 771」，后台实际 667）。

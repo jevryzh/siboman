@@ -16,6 +16,9 @@ window.OrderListView = {
     const activeTab = Vue.ref('all');
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 20, total: 0 });
     const selectedOrders = Vue.ref([]);
+    // v2.2.9.169 批量单号筛选：粘贴一批货件号，只查这些单
+    const postingFilter = Vue.ref([]);
+    const postingDialog = Vue.reactive({ visible: false, text: '' });
     const notes = Vue.reactive({});
     const batchLoading = Vue.ref(false);
     const noteDialog = Vue.reactive({ visible: false, store_id: '', posting_number: '', note: '', saving: false });
@@ -461,6 +464,7 @@ window.OrderListView = {
           since, to,
           sync_mode: syncMode,
           ...(syncMode === 'latest' ? (syncWindowBounds() || {}) : {}),
+          ...(postingFilter.value.length ? { posting_numbers: postingFilter.value } : {}),
           limit,
           offset,
         }).then((res) => ({ sid, data: res.data }))));
@@ -590,6 +594,7 @@ window.OrderListView = {
           const res = await axios.post('/api/seller/orders', {
             store_id: sid,
             status: 'all',
+            ...(postingFilter.value.length ? { posting_numbers: postingFilter.value } : {}),
             ...(range?.since ? { since: range.since } : {}),
             ...(range?.to ? { to: range.to } : {}),
             sync_mode: 'cache',
@@ -715,6 +720,23 @@ window.OrderListView = {
     };
 
     const onSelectionChange = (rows) => { selectedOrders.value = rows || []; };
+    const openPostingDialog = () => {
+      postingDialog.text = postingFilter.value.join('\n');
+      postingDialog.visible = true;
+    };
+    const applyPostingFilter = () => {
+      const list = String(postingDialog.text || '').split(/[\s,，;；、]+/).map((x) => x.trim()).filter(Boolean);
+      postingFilter.value = [...new Set(list)].slice(0, 1000);
+      postingDialog.visible = false;
+      pagination.currentPage = 1;
+      fetchOrders();
+    };
+    const clearPostingFilter = () => {
+      postingFilter.value = [];
+      postingDialog.text = '';
+      pagination.currentPage = 1;
+      fetchOrders();
+    };
     // v2.2.9.156 打印面单：后端 /api/seller/orders/labels 早就写好了但前端没有入口。
     //   Ozon 只允许「待备货 / 待发运」的单出标签，其它状态接口会报 INVALID_ARGUMENT，
     //   所以这里先本地筛一遍，给出明确提示。
@@ -1113,7 +1135,8 @@ window.OrderListView = {
 
     return {
       orders, displayedOrders, loading, summaryLoading, kpiLoading, activeTab, statusTabs, statusTabItems, pagination,
-      selectedOrders, notes, batchLoading, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
+      selectedOrders, notes, batchLoading,
+      postingFilter, postingDialog, openPostingDialog, applyPostingFilter, clearPostingFilter, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
       lastBatchResult, hasFetched, orderEmptyText, shops, currentStoreName,
       storeScope, storeScopeOptions, onStoreScopeChange,
       detailDrawer, shipDialog,
@@ -1233,6 +1256,12 @@ window.OrderListView = {
           <el-select v-model="filterField" size="large" style="width:100%">
             <el-option v-for="item in filterOptions" :key="item.value" :label="item.label" :value="item.value" />
           </el-select>
+          <el-button size="large" @click="openPostingDialog">
+            <el-icon><Tickets /></el-icon><span style="margin-left:4px">批量单号</span>
+          </el-button>
+          <el-tag v-if="postingFilter.length" closable type="success" size="large" @close="clearPostingFilter">
+            已按 {{ postingFilter.length }} 个单号筛选
+          </el-tag>
           <el-input v-model="searchKeyword" size="large" clearable placeholder="搜索货件号 / SKU / 货号 / 商品名..." style="width:100%">
             <template #prefix><el-icon><Search /></el-icon></template>
           </el-input>
@@ -1270,7 +1299,20 @@ window.OrderListView = {
 
         <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
           <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedOrders.length }} 个订单</span>
-          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button><el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button></div>
+          <!-- v2.2.9.169 批量单号筛选 -->
+      <el-dialog v-model="postingDialog.visible" title="按单号批量查询" width="560px">
+        <div style="font-size:13px; color:#64748b; margin-bottom:8px">
+          每行一个货件号，也支持用空格、逗号、分号分隔。最多 1000 个。
+        </div>
+        <el-input v-model="postingDialog.text" type="textarea" :rows="12" placeholder="例如：&#10;0126320481-0344-2&#10;0118486930-0033-1" />
+        <template #footer>
+          <el-button @click="postingDialog.visible = false">取消</el-button>
+          <el-button @click="clearPostingFilter">清空筛选</el-button>
+          <el-button type="primary" @click="applyPostingFilter">查询</el-button>
+        </template>
+      </el-dialog>
+
+      <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button><el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button></div>
         </div>
 
         <el-alert
