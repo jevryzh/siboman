@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.159";
+const VERSION = "2.2.9.160";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5726,13 +5726,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               log.push({ i, statusHttp: st.status, state: stateStr, text: st.text.slice(0, 160) });
               if (/error|fail|cancel/.test(stateStr)) return { ok: false, step: "status", code, log, error: `报告任务失败：${stateStr}` };
               const dl = await post("/api/report/download", { company_id: companyId, code });
-              const ct = dl.status === 200 && dl.buf.byteLength > 100;
+              // 下载接口有两种返回形式：
+              //   ① 直接是 PDF 二进制（%PDF）
+              //   ② JSON：{"result":{"content_type":"pdf","file_name":"...","file_content":"<base64>"}}
+              //   ← 用户实测是 ②，之前只认 ① 所以一直判成超时。
+              let pdfBase64 = "";
               const head = String.fromCharCode.apply(null, new Uint8Array(dl.buf.slice(0, 4)));
-              if (ct && head === "%PDF") {
-                let bin = "";
+              if (dl.status === 200 && head === "%PDF") {
                 const bytes = new Uint8Array(dl.buf);
+                let bin = "";
                 for (let k = 0; k < bytes.length; k += 1) bin += String.fromCharCode(bytes[k]);
-                return { ok: true, code, size: bytes.length, base64: btoa(bin), pollCount: i + 1 };
+                pdfBase64 = btoa(bin);
+              } else if (dl.status === 200 && dl.json) {
+                const fc = (dl.json.result && (dl.json.result.file_content || dl.json.result.fileContent))
+                  || dl.json.file_content || dl.json.fileContent || "";
+                const ct2 = String((dl.json.result && dl.json.result.content_type) || dl.json.content_type || "");
+                if (fc && (!ct2 || /pdf/i.test(ct2))) {
+                  pdfBase64 = String(fc).replace(/^data:[^,]*,/, "");
+                }
+              }
+              if (pdfBase64) {
+                return {
+                  ok: true, code, size: Math.round(pdfBase64.length * 0.75), base64: pdfBase64,
+                  fileName: (dl.json && dl.json.result && dl.json.result.file_name) || "", pollCount: i + 1,
+                };
               }
               log[log.length - 1].downloadHttp = dl.status;
               log[log.length - 1].downloadText = dl.text.slice(0, 160);
