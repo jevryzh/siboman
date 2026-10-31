@@ -16344,7 +16344,11 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
       : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
     if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
-    const status = String(req.body?.status || "awaiting_deliver");
+    // v2.2.9.174 只导出**用户勾选**的订单（不再扫全店）
+    const picked = Array.isArray(req.body?.posting_numbers)
+      ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 5000)
+      : [];
+    if (!picked.length) return res.status(400).json({ success: false, error: "请先勾选要导出的订单" });
     // 先按「订单 × 色号」聚合，再按订单汇总成 12×1/18×1/26×1
     const result = await db.query(
       `WITH items AS (
@@ -16354,26 +16358,39 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
            FROM app_order_cache c
            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
           WHERE c.user_id = $1
-            AND c.store_id = ANY($2::uuid[])
-            AND COALESCE(NULLIF(c.display_status,''), c.status) = $3
+            AND c.posting_number = ANY($2::text[])
             AND COALESCE(p->>'name','') ILIKE '%пряж%'
             AND COALESCE(p->>'offer_id','') <> ''
           GROUP BY 1, 2
        )
        SELECT pn,
               string_agg(color || '×' || qty, '/' ORDER BY color) AS color_qty,
-              SUM(qty)::int AS total_qty
+              SUM(qty)::int AS total_qty,
+              COUNT(*)::int AS color_kinds,
+              MIN(color) AS first_color
          FROM items
-        GROUP BY pn
-        ORDER BY pn`,
-      [req.user.id, storeIds, status],
+        GROUP BY pn`,
+      [req.user.id, picked],
     );
     // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
     const customerNo = (posting) => {
       const parts = String(posting || "").split("-");
       return parts.length > 1 ? String(parts[1]) : "";
     };
-    const items = result.rows.map((r) => ({
+    // v2.2.9.174 排序：单色在前（按色号，同色号按数量从小到大），混色最后
+    const sorted = result.rows.slice().sort((a, b) => {
+      const aMixed = Number(a.color_kinds) > 1 ? 1 : 0;
+      const bMixed = Number(b.color_kinds) > 1 ? 1 : 0;
+      if (aMixed !== bMixed) return aMixed - bMixed;
+      const ca = String(a.first_color || "").padStart(4, "0");
+      const cb = String(b.first_color || "").padStart(4, "0");
+      if (ca !== cb) return ca < cb ? -1 : 1;
+      const qa = Number(a.total_qty || 0);
+      const qb = Number(b.total_qty || 0);
+      if (qa !== qb) return qa - qb;
+      return String(a.pn) < String(b.pn) ? -1 : 1;
+    });
+    const items = sorted.map((r) => ({
       shipment: r.pn,
       colorQty: r.color_qty,
       qty: Number(r.total_qty || 0),
@@ -16429,19 +16446,51 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
       : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
     if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
-    const status = String(req.body?.status || "awaiting_deliver");
+    // v2.2.9.174 只导勾选的订单，并且**顺序与「导出毛线拣货单」完全一致**
+    //   （传进来的 posting_numbers 已由前端按同样规则排好序）
+    const picked = Array.isArray(req.body?.posting_numbers)
+      ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 5000)
+      : [];
+    if (!picked.length) return res.status(400).json({ success: false, error: "请先勾选要导出的订单" });
     const rows = await db.query(
       `SELECT DISTINCT c.posting_number
          FROM app_order_cache c
          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
         WHERE c.user_id = $1
-          AND c.store_id = ANY($2::uuid[])
-          AND COALESCE(NULLIF(c.display_status,''), c.status) = $3
-          AND COALESCE(p->>'name','') ILIKE '%пряж%'
-        ORDER BY c.posting_number`,
-      [req.user.id, storeIds, status],
+          AND c.posting_number = ANY($2::text[])
+          AND COALESCE(p->>'name','') ILIKE '%пряж%'`,
+      [req.user.id, picked],
     );
-    const postings = rows.rows.map((r) => String(r.posting_number)).filter(Boolean);
+    // 用和「导出毛线拣货单」**完全相同**的 SQL + 排序规则，保证两个文件的顺序一一对应
+    const orderRows = await db.query(
+      `WITH items AS (
+         SELECT c.posting_number AS pn,
+                substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+           FROM app_order_cache c
+           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+          WHERE c.user_id = $1
+            AND c.posting_number = ANY($2::text[])
+            AND COALESCE(p->>'name','') ILIKE '%пряж%'
+            AND COALESCE(p->>'offer_id','') <> ''
+          GROUP BY 1, 2
+       )
+       SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS color_kinds, MIN(color) AS first_color
+         FROM items GROUP BY pn`,
+      [req.user.id, picked],
+    );
+    const sortedRows = orderRows.rows.slice().sort((a, b) => {
+      const aMixed = Number(a.color_kinds) > 1 ? 1 : 0;
+      const bMixed = Number(b.color_kinds) > 1 ? 1 : 0;
+      if (aMixed !== bMixed) return aMixed - bMixed;
+      const ca = String(a.first_color || "").padStart(4, "0");
+      const cb = String(b.first_color || "").padStart(4, "0");
+      if (ca !== cb) return ca < cb ? -1 : 1;
+      const qa = Number(a.total_qty || 0), qb = Number(b.total_qty || 0);
+      if (qa !== qb) return qa - qb;
+      return String(a.pn) < String(b.pn) ? -1 : 1;
+    });
+    const postings = sortedRows.map((r) => String(r.pn));
     if (!postings.length) return res.status(400).json({ success: false, error: "没有符合条件的毛线订单" });
     const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2`, [storeIds[0], req.user.id]);
     if (!creds.rowCount) return res.status(404).json({ success: false, error: "未找到店铺凭证" });
@@ -16459,13 +16508,18 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
       const ct = r.headers.get("content-type") || "";
       return r.ok && !ct.includes("json") ? { ok: true, buf } : { ok: false, err: buf.toString("utf8").slice(0, 100) };
     };
-    const pdfs = [];
+    // 并发取，但**按批次下标排序后再合并**，确保标签顺序与拣货单一致
+    const slots = new Array(chunks.length).fill(null);
     let failed = 0;
     for (let i = 0; i < chunks.length; i += CONCURRENCY) {
       const wave = chunks.slice(i, i + CONCURRENCY);
       const out = await Promise.all(wave.map((b) => fetchChunk(b).catch(() => ({ ok: false }))));
-      for (const o of out) { if (o.ok) pdfs.push(o.buf); else failed += 1; }
+      out.forEach((o, k) => {
+        if (o.ok) slots[i + k] = o.buf;
+        else failed += 1;
+      });
     }
+    const pdfs = slots.filter(Boolean);
     if (!pdfs.length) return res.status(400).json({ success: false, error: "Ozon 未返回任何标签，请确认订单状态" });
     let merged = pdfs[0];
     if (pdfs.length > 1) {

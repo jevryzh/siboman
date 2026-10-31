@@ -736,7 +736,9 @@ window.OrderListView = {
       if (!storeIds.length) return notify.warning('请先选择店铺');
       yarnPicklistBusy.value = true;
       try {
-        const res = await axios.post('/api/seller/orders/yarn-picklist-export', { store_ids: storeIds, status: 'awaiting_deliver' }, { responseType: 'blob', timeout: 120000 });
+        const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
+        if (!picked.length) { yarnPicklistBusy.value = false; return notify.warning('请先勾选要导出的订单'); }
+        const res = await axios.post('/api/seller/orders/yarn-picklist-export', { store_ids: storeIds, posting_numbers: picked }, { responseType: 'blob', timeout: 120000 });
         downloadBlob(res.data, `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         notify.success(`已导出毛线拣货单：${res.headers['x-item-count'] || '?'} 条 / ${res.headers['x-page-count'] || '?'} 页`);
       } catch (e) {
@@ -750,9 +752,11 @@ window.OrderListView = {
       if (!storeIds.length) return notify.warning('请先选择店铺');
       yarnLabelsBusy.value = true;
       try {
-        const res = await axios.post('/api/seller/orders/yarn-labels', { store_ids: storeIds, status: 'awaiting_deliver' }, { responseType: 'blob', timeout: 600000 });
+        const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
+        if (!picked.length) { yarnLabelsBusy.value = false; return notify.warning('请先勾选要导出的订单'); }
+        const res = await axios.post('/api/seller/orders/yarn-labels', { store_ids: storeIds, posting_numbers: picked }, { responseType: 'blob', timeout: 600000 });
         downloadBlob(res.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
-        notify.success(`已导出毛线标签：${res.headers['x-item-count'] || '?'} 个货件，失败 ${res.headers['x-failed-count'] || 0} 个`);
+        notify.success(`已导出 ${res.headers['x-item-count'] || '?'} 个订单的毛线标签，失败 ${res.headers['x-failed-count'] || 0} 个（顺序与拣货单一致）`);
       } catch (e) {
         let msg = e.message;
         try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
