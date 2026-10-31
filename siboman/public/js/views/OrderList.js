@@ -3,6 +3,10 @@ window.OrderListView = {
     const orders = Vue.ref([]);
     const loading = Vue.ref(false);
     const summaryRows = Vue.ref([]);
+    // v2.2.9.162 各状态真实条数（服务端 group by 统计）。
+    //   之前 tab 上的数字是把订单列表翻到最多 10 页 × 200 = 2000 条再本地数出来的，
+    //   而库里实际有 6700+ 条 → 数字全是残缺的（用户看到「待发运 771」，卖家后台 667）。
+    const serverStatusCounts = Vue.ref({});
     const summaryLoading = Vue.ref(false);
     const kpiRows = Vue.ref([]);
     const previousKpiRows = Vue.ref([]);
@@ -416,6 +420,10 @@ window.OrderListView = {
       };
     });
     const statusCount = (value) => {
+      // 服务端计数优先（准确）；「已超时」需要按时间判断，仍在前端算
+      const sc = serverStatusCounts.value || {};
+      if (value === 'all' && typeof sc.all === 'number') return sc.all;
+      if (value !== 'overdue' && typeof sc[value] === 'number') return sc[value];
       const rows = summaryRows.value.length ? summaryRows.value : orders.value;
       if (value === 'all') return summaryRows.value.length || pagination.total || orders.value.length;
       if (value === 'overdue') return rows.filter(isOverdue).length;
@@ -515,6 +523,7 @@ window.OrderListView = {
       summaryLoading.value = true;
       try {
         const { since, to } = dateRangeBounds();
+        const counts = {};
         const results = await Promise.allSettled(storeIds.map(async (sid) => {
           const rows = [];
           for (let page = 0; page < ORDER_SUMMARY_MAX_PAGES_PER_STORE; page++) {
@@ -527,6 +536,11 @@ window.OrderListView = {
               limit: ORDER_SUMMARY_PAGE_SIZE,
               offset: page * ORDER_SUMMARY_PAGE_SIZE,
             });
+            if (res.data.status_counts) {
+              for (const [k, v] of Object.entries(res.data.status_counts)) {
+                counts[k] = (counts[k] || 0) + Number(v || 0);
+              }
+            }
             const batch = (res.data.orders || []).map((row) => ({
               ...row,
               store_id: sid,
@@ -544,6 +558,7 @@ window.OrderListView = {
           else failures.push(result.reason?.response?.data?.error || result.reason?.message || '未知错误');
         }
         if (failures.length) notify.warning(`部分店铺统计读取失败：${failures.slice(0, 2).join('；')}`);
+        serverStatusCounts.value = counts;
         summaryRows.value = merged.sort((a, b) => new Date(b.in_process_at || b.created_at || 0) - new Date(a.in_process_at || a.created_at || 0));
       } catch (e) {
         notify.error('获取订单统计失败: ' + (e.response?.data?.payload?.message || e.response?.data?.error || e.message));

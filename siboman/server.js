@@ -5508,7 +5508,6 @@ app.get("/api/yandex/products", requireAuth, async (req, res, next) => {
       },
       items,
       total,
-      status_counts: statusCounts,
       has_next: hasNext,
       ai_stats: (await getAiStatsForOffers(storeId, items.map((it) => it.offer_id || it.offerId).filter(Boolean))) || {},
     });
@@ -13084,7 +13083,6 @@ app.get("/api/auto-listing/dashboard", requireAuth, async (req, res, next) => {
         ai_cost_cny: 0,
       },
       stages: AUTO_LISTING_STAGES.map(([key, label]) => ({ key, label, count: stageCounts[key] || 0 })),
-      status_counts: statusCounts,
       processing_items: processingRes.rows,
       events: eventRes.rows,
     });
@@ -15476,7 +15474,12 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,now(),now())
            ON CONFLICT (store_id, posting_number) DO UPDATE SET
              status = EXCLUDED.status,
-             display_status = COALESCE(NULLIF(app_order_cache.display_status, ''), EXCLUDED.display_status),
+             -- v2.2.9.162 原来这里是 COALESCE(NULLIF(旧值,''), 新值)，即「旧值非空就永不更新」，
+             --   导致 display_status 一旦被写（比如发货后本地乐观置为 delivering）就永久漂移：
+             --   实测库里出现 delivered 却显示 awaiting_deliver 的 729 条、display_status=awaiting_packaging
+             --   但真实状态是 delivering 的 187 条 → 界面 tab 数字全错（用户看到 1695/771，实际 667）。
+             --   现在始终以 Ozon 的最新状态为准。
+             display_status = EXCLUDED.display_status,
              substatus = EXCLUDED.substatus,
              in_process_at = EXCLUDED.in_process_at,
              shipment_date = EXCLUDED.shipment_date,
@@ -15584,6 +15587,18 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         params.push(status === "disputed" ? "dispute" : status);
         where.push(`COALESCE(NULLIF(display_status, ''), status) = $${params.length}`);
       }
+      // v2.2.9.162 状态计数交回服务端。
+      //   原来前端为了算 tab 个数，把订单列表翻到最多 10 页 × 200 = 2000 条再本地统计，
+      //   但库里有 6700+ 条 → 数字全是残缺的（用户看到「待发运 771」，后台实际 667）。
+      const statusCountRes = await db.query(
+        `SELECT COALESCE(NULLIF(display_status, ''), status) AS st, count(*)::int AS cnt
+           FROM app_order_cache WHERE ${where.join(" AND ")} GROUP BY 1`,
+        params,
+      );
+      const statusCounts = {};
+      for (const r of statusCountRes.rows) statusCounts[String(r.st)] = Number(r.cnt);
+      statusCounts.all = Object.values(statusCounts).reduce((a, b) => a + b, 0);
+
       const countRes = await db.query(
         `SELECT count(*)::int AS count FROM app_order_cache WHERE ${where.join(" AND ")}`,
         params,
@@ -15602,7 +15617,14 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         status: row.display_status || row.payload?.status || row.source_status,
       }));
       console.log(`[OrdersCache] store=${storeId} mode=${syncMode || "cache"} status=${status || "all"} limit=${limit} offset=${offset} total=${countRes.rows[0]?.count || 0}`);
-      return res.json({ success: true, orders, total: Number(countRes.rows[0]?.count || orders.length), has_next: offset + orders.length < Number(countRes.rows[0]?.count || 0), source: "cache" });
+      return res.json({
+        success: true,
+        orders,
+        status_counts: statusCounts,   // v2.2.9.162 各状态的真实条数（服务端统计，不受分页上限影响）
+        total: Number(countRes.rows[0]?.count || orders.length),
+        has_next: offset + orders.length < Number(countRes.rows[0]?.count || 0),
+        source: "cache",
+      });
     }
 
     const filter = {
