@@ -15259,7 +15259,8 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
     const convertRub = value => Math.round(Number(value || 0) * effectiveRubCnyRate * 100) / 100;
 
-    const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 50)));
+    // v2.2.9.164 每页最多 500（用户要求，原来卡在 200 导致选 500 仍只返回 200）
+    const limit = Math.min(500, Math.max(1, Number(req.body?.limit || 50)));
     const offset = Math.max(0, Number(req.body?.offset || 0));
     const status = String(req.body?.status || "").trim().toLowerCase();
     const hasExplicitRange = Boolean(req.body?.since || req.body?.to);
