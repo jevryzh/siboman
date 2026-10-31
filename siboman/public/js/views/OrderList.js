@@ -719,6 +719,37 @@ window.OrderListView = {
     //   Ozon 只允许「待备货 / 待发运」的单出标签，其它状态接口会报 INVALID_ARGUMENT，
     //   所以这里先本地筛一遍，给出明确提示。
     const labelsPrinting = Vue.ref(false);
+    // v2.2.9.165 导出「待备货毛线数量」（定制需求）：按货号汇总待备货订单的商品数量
+    const yarnExporting = Vue.ref(false);
+    const exportPendingSkus = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先选择店铺');
+      yarnExporting.value = true;
+      try {
+        const res = await axios.post('/api/seller/orders/pending-sku-export', { store_ids: storeIds }, { responseType: 'blob' });
+        const blob = new Blob([res.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `待备货毛线数量_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        const skuCount = res.headers['x-sku-count'] || '?';
+        const totalQty = res.headers['x-total-qty'] || '?';
+        notify.success(`已导出：${skuCount} 个货号，合计 ${totalQty} 个`);
+      } catch (e) {
+        let msg = e.message;
+        try {
+          if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg;
+          else if (e.response?.data?.error) msg = e.response.data.error;
+        } catch (_e2) { /* 保持原错误 */ }
+        notify.error('导出待备货毛线数量失败：' + String(msg).slice(0, 200));
+      } finally {
+        yarnExporting.value = false;
+      }
+    };
     // v2.2.9.157 生成拣货单：调卖家后台异步报告（assembly/list → report/status → report/download），
     //   接口会话绑定 IP，只能由插件在 seller.ozon.ru 里带着登录态调用。
     const pickListBusy = Vue.ref(false);
@@ -1084,6 +1115,7 @@ window.OrderListView = {
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
       feesFileInput, feesImporting, pickFeesFile, onFeesFile,
       labelsPrinting, printLabels,   // v2.2.9.156 打印面单
+      yarnExporting, exportPendingSkus,   // v2.2.9.165 导出待备货毛线数量
       pickListBusy, printPickList,   // v2.2.9.157 生成拣货单
       returnsDrawer, openReturns, returnsTypeText, returnsTypeTag,   // v2.2.9.146 WHD 退货
       rowStatusSubtext, copyPostingNumber, deadlineBadgeStyle, warehouseText, deliveryText,
@@ -1226,7 +1258,7 @@ window.OrderListView = {
 
         <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
           <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedOrders.length }} 个订单</span>
-          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
+          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button><el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button></div>
         </div>
 
         <el-alert
@@ -1365,7 +1397,7 @@ window.OrderListView = {
             v-model:current-page="pagination.currentPage"
             v-model:page-size="pagination.pageSize"
             :total="pagination.total"
-            :page-sizes="[20, 50, 100, 200, 500]"
+            :page-sizes="[20, 50, 100, 200, 500, 1000]"
             layout="total, sizes, prev, pager, next"
             @size-change="onPageSizeChange"
             @current-change="onPageChange"

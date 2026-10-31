@@ -15259,8 +15259,8 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     const effectiveRubCnyRate = Number(rateResult.rows[0]?.rate || RUB_CNY_RATE);
     const convertRub = value => Math.round(Number(value || 0) * effectiveRubCnyRate * 100) / 100;
 
-    // v2.2.9.164 每页最多 500（用户要求，原来卡在 200 导致选 500 仍只返回 200）
-    const limit = Math.min(500, Math.max(1, Number(req.body?.limit || 50)));
+    // v2.2.9.165 每页最多 1000（用户要求：待处理单量 600+，500 不够一页）
+    const limit = Math.min(1000, Math.max(1, Number(req.body?.limit || 50)));
     const offset = Math.max(0, Number(req.body?.offset || 0));
     const status = String(req.body?.status || "").trim().toLowerCase();
     const hasExplicitRange = Boolean(req.body?.since || req.body?.to);
@@ -16243,6 +16243,79 @@ app.post("/api/seller/orders/cancel", requireAuth, async (req, res) => {
     console.error("[Orders.cancel]", error.message, error.payload);
     res.status(error.statusCode || 502).json({ success: false, error: error.message, payload: error.payload || null });
   }
+});
+
+// v2.2.9.165 极简 XLSX 生成器（只支持单 sheet、内联字符串 + 数字）。
+//   服务端已有 fflate（parseXlsxBuffer 用它解压），这里反过来用它打 zip，无需新增依赖。
+function buildXlsx(sheetName, rows) {
+  const esc = (v) => String(v == null ? "" : v)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
+  const colName = (i) => {
+    let n = i + 1; let out = "";
+    while (n > 0) { const m = (n - 1) % 26; out = String.fromCharCode(65 + m) + out; n = Math.floor((n - 1) / 26); }
+    return out;
+  };
+  const body = rows.map((row, ri) => {
+    const cells = row.map((v, ci) => {
+      const ref = `${colName(ci)}${ri + 1}`;
+      if (typeof v === "number" && Number.isFinite(v)) return `<c r="${ref}"><v>${v}</v></c>`;
+      if (v == null || v === "") return "";
+      return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`;
+    }).join("");
+    return `<row r="${ri + 1}">${cells}</row>`;
+  }).join("");
+  const files = {
+    "[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`,
+    "_rels/.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+    "xl/workbook.xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${esc(sheetName).slice(0, 31)}" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+    "xl/_rels/workbook.xml.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`,
+    "xl/worksheets/sheet1.xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`,
+  };
+  // ⚠️ fflate 是具名导入（import { zipSync, strToU8 } ...），不能用 fflate.xxx
+  const zipped = zipSync(Object.fromEntries(
+    Object.entries(files).map(([k, v]) => [k, strToU8(v)]),
+  ));
+  return Buffer.from(zipped);
+}
+
+// v2.2.9.165 待备货毛线数量统计（定制需求）：
+//   把「待备货」订单里的商品按货号(SKU) 汇总数量，导出成 Excel。
+app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, next) => {
+  try {
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const result = await db.query(
+      `SELECT COALESCE(p->>'offer_id','') AS sku,
+              COALESCE(MAX(p->>'name'),'') AS name,
+              SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+         FROM app_order_cache c
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+        WHERE c.user_id = $1
+          AND c.store_id = ANY($2::uuid[])
+          AND COALESCE(NULLIF(c.display_status,''), c.status) = 'awaiting_packaging'
+          AND COALESCE(p->>'offer_id','') <> ''
+          -- v2.2.9.165 只统计毛线（商品名含 Пряжа/пряж），否则泳池、画板包也会被算进来
+          AND COALESCE(p->>'name','') ILIKE '%пряж%'
+        GROUP BY 1
+        ORDER BY 1`,
+      [req.user.id, storeIds],
+    );
+    const totalQty = result.rows.reduce((n, r) => n + Number(r.qty || 0), 0);
+    const rows = [["序号", "货号（SKU）", "商品名称", "类别", "数量(个)"]];
+    result.rows.forEach((r, i) => {
+      rows.push([i + 1, r.sku, r.name || "", "毛线", Number(r.qty || 0)]);
+    });
+    rows.push(["", "合计", "", "", totalQty]);
+    const buf = buildXlsx("待备货毛线数量", rows);
+    const fname = `待备货毛线数量_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
+    res.setHeader("X-Sku-Count", String(result.rows.length));
+    res.setHeader("X-Total-Qty", String(totalQty));
+    res.send(buf);
+  } catch (error) { next(error); }
 });
 
 app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
