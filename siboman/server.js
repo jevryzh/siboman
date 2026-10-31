@@ -1,6 +1,7 @@
 import express from "express";
 import { chromium } from "playwright";
 import { zipSync, unzipSync, strToU8, strFromU8 } from "fflate";
+import { PDFDocument } from "pdf-lib";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import multer from "multer";
@@ -16344,12 +16345,14 @@ app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
     const { client_id: clientId, api_key: apiKey } = credentials.rows[0];
     // ⚠️ v2.2.9.167 Ozon 面单接口**单次最多 20 个货件**（实测 20 个 OK、50 个直接 400 INVALID_ARGUMENT）。
     //   用户一次勾 667 个 → 必然失败。改为按 20 个分批，多批时打包成 ZIP 返回。
+    // v2.2.9.168 Ozon 单次最多 **20** 个货件（实测 25 就 400），667 单要 34 批。
+    //   之前串行跑 → 3 分钟、34 个 PDF，用户体验很差。
+    //   现在：**并发 5 批** + **用 pdf-lib 合并成一个 PDF**（pdf-lib 本来就是依赖，已装）。
     const CHUNK = 20;
+    const CONCURRENCY = 8;   // 10 时偶发 1 批失败（Ozon 限流），8 更稳
     const chunks = [];
     for (let i = 0; i < postingNumbers.length; i += CHUNK) chunks.push(postingNumbers.slice(i, i + CHUNK));
-    const pdfs = [];
-    const failed = [];
-    for (const batch of chunks) {
+    const fetchChunk = async (batch) => {
       const response = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
         method: 'POST',
         headers: { 'Client-Id': clientId, 'Api-Key': apiKey, 'Content-Type': 'application/json', Accept: 'application/pdf, application/json' },
@@ -16358,10 +16361,19 @@ app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
       const bytes = Buffer.from(await response.arrayBuffer());
       const contentType = response.headers.get('content-type') || '';
       if (!response.ok || contentType.includes('json')) {
-        failed.push(`${batch.length} 个（${batch[0]}…）：${bytes.toString('utf8').slice(0, 120)}`);
-        continue;
+        return { ok: false, err: `${batch.length} 个（${batch[0]}…）：${bytes.toString('utf8').slice(0, 120)}` };
       }
-      pdfs.push({ name: `labels-${pdfs.length + 1}-${batch.length}.pdf`, buf: bytes });
+      return { ok: true, buf: bytes };
+    };
+    const pdfs = [];
+    const failed = [];
+    for (let i = 0; i < chunks.length; i += CONCURRENCY) {
+      const wave = chunks.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(wave.map((b) => fetchChunk(b).catch((e) => ({ ok: false, err: String(e.message || e).slice(0, 120) }))));
+      for (const r2 of results) {
+        if (r2.ok) pdfs.push({ name: `labels-${pdfs.length + 1}.pdf`, buf: r2.buf });
+        else failed.push(r2.err);
+      }
     }
     if (!pdfs.length) {
       const raw = failed[0] || '';
@@ -16371,17 +16383,30 @@ app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: friendly });
     }
     const stamp = Date.now();
-    if (pdfs.length === 1) {
-      res.setHeader('Content-Type', 'application/pdf');
-      res.setHeader('Content-Disposition', `inline; filename="ozon-labels-${stamp}.pdf"`);
-      return res.send(pdfs[0].buf);
-    }
-    const zip = zipSync(Object.fromEntries(pdfs.map((p) => [p.name, new Uint8Array(p.buf)])));
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="ozon-labels-${stamp}.zip"`);
     res.setHeader('X-Batch-Count', String(pdfs.length));
     res.setHeader('X-Failed-Count', String(failed.length));
-    return res.send(Buffer.from(zip));
+    // 合并成一个 PDF（失败则退回第一份，至少能打）
+    let merged = pdfs[0].buf;
+    if (pdfs.length > 1) {
+      try {
+        const outDoc = await PDFDocument.create();
+        for (const f of pdfs) {
+          const src = await PDFDocument.load(f.buf, { ignoreEncryption: true });
+          const pages = await outDoc.copyPages(src, src.getPageIndices());
+          pages.forEach((pg) => outDoc.addPage(pg));
+        }
+        merged = Buffer.from(await outDoc.save());
+      } catch (_e) {
+        // 合并失败：退化为 ZIP，保证不丢数据
+        const zip = zipSync(Object.fromEntries(pdfs.map((f) => [f.name, new Uint8Array(f.buf)])));
+        res.setHeader('Content-Type', 'application/zip');
+        res.setHeader('Content-Disposition', `attachment; filename="ozon-labels-${stamp}.zip"`);
+        return res.send(Buffer.from(zip));
+      }
+    }
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="ozon-labels-${stamp}.pdf"`);
+    return res.send(merged);
   } catch (error) { next(error); }
 });
 
