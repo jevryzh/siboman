@@ -16478,7 +16478,9 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
       merged = Buffer.from(await outDoc.save());
     }
     res.setHeader("Content-Type", "application/pdf");
-    res.setHeader("Content-Disposition", `attachment; filename="毛线标签-${Date.now()}.pdf"`);
+    // ⚠️ HTTP header 只能是 ASCII，中文文件名必须走 RFC 5987（filename*=UTF-8''...），
+    //   否则 Node 抛 ERR_INVALID_CHAR → 502（用户实测报了 502）
+    res.setHeader("Content-Disposition", `attachment; filename="yarn-labels-${Date.now()}.pdf"; filename*=UTF-8''${encodeURIComponent(`毛线标签-${new Date().toISOString().slice(0, 10)}.pdf`)}`);
     res.setHeader("X-Item-Count", String(postings.length));
     res.setHeader("X-Failed-Count", String(failed));
     res.send(merged);
