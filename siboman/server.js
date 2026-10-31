@@ -16254,9 +16254,15 @@ app.post("/api/seller/orders/cancel", requireAuth, async (req, res) => {
   }
 });
 
-// v2.2.9.165 极简 XLSX 生成器（只支持单 sheet、内联字符串 + 数字）。
-//   服务端已有 fflate（parseXlsxBuffer 用它解压），这里反过来用它打 zip，无需新增依赖。
-function buildXlsx(sheetName, rows) {
+// v2.2.9.172 带样式的 XLSX 生成器（单 sheet）。
+//   只支持我们实际需要的样式集合（表头 / 序号 / 货件号 / 颜色数量 / 数量 / 短码），
+//   纯手写 XML + fflate 打包，不引第三方库。
+//   rows 里每个单元格可以是标量，或 { v, s } —— s 为样式键。
+const XLSX_STYLES = {
+  // 键 → cellXfs 索引（顺序必须与下面 STYLE_XFS 一致）
+  header: 1, no: 2, shipment: 3, colorqty: 4, qty: 5, label: 6, blank: 0,
+};
+function buildXlsx(sheetName, rows, opts = {}) {
   const esc = (v) => String(v == null ? "" : v)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, "");
@@ -16266,34 +16272,158 @@ function buildXlsx(sheetName, rows) {
     return out;
   };
   const body = rows.map((row, ri) => {
-    const cells = row.map((v, ci) => {
+    const cells = (row || []).map((cell, ci) => {
       const ref = `${colName(ci)}${ri + 1}`;
-      if (typeof v === "number" && Number.isFinite(v)) return `<c r="${ref}"><v>${v}</v></c>`;
-      if (v == null || v === "") return "";
-      return `<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${esc(v)}</t></is></c>`;
+      const obj = cell && typeof cell === "object" ? cell : { v: cell, s: "blank" };
+      const sidx = XLSX_STYLES[obj.s] ?? 0;
+      const sAttr = sidx ? ` s="${sidx}"` : "";
+      if (obj.v == null || obj.v === "") return `<c r="${ref}"${sAttr}/>`;
+      if (typeof obj.v === "number" && Number.isFinite(obj.v)) return `<c r="${ref}"${sAttr}><v>${obj.v}</v></c>`;
+      return `<c r="${ref}"${sAttr} t="inlineStr"><is><t xml:space="preserve">${esc(obj.v)}</t></is></c>`;
     }).join("");
-    return `<row r="${ri + 1}">${cells}</row>`;
+    const h = opts.rowHeights && opts.rowHeights[ri];
+    return `<row r="${ri + 1}"${h ? ` ht="${h}" customHeight="1"` : ""}>${cells}</row>`;
   }).join("");
+  const cols = (opts.colWidths || []).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("");
+  const STYLE_XFS = [
+    `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>`,
+    // header: 白字加粗 + 蓝底 + 边框 + 居中
+    `<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>`,
+    // no
+    `<xf numFmtId="0" fontId="2" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>`,
+    // shipment
+    `<xf numFmtId="0" fontId="3" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>`,
+    // colorqty
+    `<xf numFmtId="0" fontId="4" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>`,
+    // qty
+    `<xf numFmtId="0" fontId="5" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>`,
+    // label（文本，保留前导 0）
+    `<xf numFmtId="0" fontId="5" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>`,
+  ].join("");
+  const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`
+    + `<fonts count="6">`
+    + `<font><sz val="11"/><name val="Arial"/></font>`
+    + `<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/></font>`
+    + `<font><sz val="10"/><color rgb="FF1F2937"/><name val="Arial"/></font>`
+    + `<font><sz val="8"/><color rgb="FF1F2937"/><name val="Arial"/></font>`
+    + `<font><b/><sz val="12.5"/><color rgb="FF111827"/><name val="Arial"/></font>`
+    + `<font><b/><sz val="14"/><color rgb="FF111827"/><name val="Arial"/></font>`
+    + `</fonts>`
+    + `<fills count="3"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>`
+    + `<fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/><bgColor indexed="64"/></patternFill></fill></fills>`
+    + `<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border>`
+    + `<border><left style="thin"><color rgb="FF9CA3AF"/></left><right style="thin"><color rgb="FF9CA3AF"/></right><top style="thin"><color rgb="FF9CA3AF"/></top><bottom style="thin"><color rgb="FF9CA3AF"/></bottom><diagonal/></border></borders>`
+    + `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>`
+    + `<cellXfs count="7">${STYLE_XFS}</cellXfs>`
+    + `<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>`
+    + `</styleSheet>`;
+  const sheetXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`
+    + (cols ? `<cols>${cols}</cols>` : "")
+    + `<sheetData>${body}</sheetData></worksheet>`;
   const files = {
-    "[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`,
+    "[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`,
     "_rels/.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
     "xl/workbook.xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="${esc(sheetName).slice(0, 31)}" sheetId="1" r:id="rId1"/></sheets></workbook>`,
-    "xl/_rels/workbook.xml.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`,
-    "xl/worksheets/sheet1.xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`,
+    "xl/_rels/workbook.xml.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`,
+    "xl/styles.xml": stylesXml,
+    "xl/worksheets/sheet1.xml": sheetXml,
   };
-  // ⚠️ fflate 是具名导入（import { zipSync, strToU8 } ...），不能用 fflate.xxx
-  const zipped = zipSync(Object.fromEntries(
-    Object.entries(files).map(([k, v]) => [k, strToU8(v)]),
-  ));
+  const zipped = zipSync(Object.fromEntries(Object.entries(files).map(([k, v]) => [k, strToU8(v)])));
   return Buffer.from(zipped);
 }
 
 // v2.2.9.165 待备货毛线数量统计（定制需求）：
 //   把「待备货」订单里的商品按货号(SKU) 汇总数量，导出成 Excel。
-// v2.2.9.171 「导出毛线拣货单」（定制）：
-//   版式对齐用户给的模板「A4双列表」——每页 48 个（24 行 × 左右双栏），
-//   列：No. | Shipment(货件号) | Color×Qty(变体×数量) | Qty | Label(货件号前段末 4 位)
-// v2.2.9.171 「导出毛线标签」（定制）：把待发运里所有毛线订单的 Ozon 面单批量取回并合并成一个 PDF
+// v2.2.9.172 「导出毛线拣货单」（定制）—— 按用户反馈修正：
+//   ① Color×Qty = 各色号×该色号数量，混色用 / 连接（12×1/18×1/26×1）
+//   ② Qty = 该订单里毛线的**总数量**
+//   ③ Label = 订单号第一个 "-" 之后的 4 位（**客户号**，保留前导 0，如 0060）
+//   ④ 版式/字体/配色对齐用户模板「A4双列表」：每页 48 个（24 行 × 双栏）
+app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res, next) => {
+  try {
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const status = String(req.body?.status || "awaiting_deliver");
+    // 先按「订单 × 色号」聚合，再按订单汇总成 12×1/18×1/26×1
+    const result = await db.query(
+      `WITH items AS (
+         SELECT c.posting_number AS pn,
+                substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+           FROM app_order_cache c
+           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+          WHERE c.user_id = $1
+            AND c.store_id = ANY($2::uuid[])
+            AND COALESCE(NULLIF(c.display_status,''), c.status) = $3
+            AND COALESCE(p->>'name','') ILIKE '%пряж%'
+            AND COALESCE(p->>'offer_id','') <> ''
+          GROUP BY 1, 2
+       )
+       SELECT pn,
+              string_agg(color || '×' || qty, '/' ORDER BY color) AS color_qty,
+              SUM(qty)::int AS total_qty
+         FROM items
+        GROUP BY pn
+        ORDER BY pn`,
+      [req.user.id, storeIds, status],
+    );
+    // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
+    const customerNo = (posting) => {
+      const parts = String(posting || "").split("-");
+      return parts.length > 1 ? String(parts[1]) : "";
+    };
+    const items = result.rows.map((r) => ({
+      shipment: r.pn,
+      colorQty: r.color_qty,
+      qty: Number(r.total_qty || 0),
+      label: customerNo(r.pn),
+    }));
+    const PER_PAGE = 48;
+    const PER_COL = 24;
+    const H = (t) => ({ v: t, s: "header" });
+    const rows = [];
+    const rowHeights = {};
+    for (let page = 0; page * PER_PAGE < items.length; page += 1) {
+      const slice = items.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+      rowHeights[rows.length] = 10;                                  // 页首空行
+      rows.push([{ v: "", s: "blank" }]);
+      rowHeights[rows.length] = 24;                                  // 表头
+      rows.push([H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label"), H(""), H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label")]);
+      for (let i = 0; i < PER_COL; i += 1) {
+        const left = slice[i];
+        const right = slice[i + PER_COL];
+        rowHeights[rows.length] = 28;
+        rows.push([
+          left ? { v: page * PER_PAGE + i + 1, s: "no" } : { v: "", s: "blank" },
+          left ? { v: left.shipment, s: "shipment" } : { v: "", s: "blank" },
+          left ? { v: left.colorQty, s: "colorqty" } : { v: "", s: "blank" },
+          left ? { v: left.qty, s: "qty" } : { v: "", s: "blank" },
+          left ? { v: left.label, s: "label" } : { v: "", s: "blank" },
+          { v: "", s: "blank" },
+          right ? { v: page * PER_PAGE + PER_COL + i + 1, s: "no" } : { v: "", s: "blank" },
+          right ? { v: right.shipment, s: "shipment" } : { v: "", s: "blank" },
+          right ? { v: right.colorQty, s: "colorqty" } : { v: "", s: "blank" },
+          right ? { v: right.qty, s: "qty" } : { v: "", s: "blank" },
+          right ? { v: right.label, s: "label" } : { v: "", s: "blank" },
+        ]);
+      }
+      rowHeights[rows.length] = 12; rows.push([{ v: "", s: "blank" }]);
+      rowHeights[rows.length] = 12; rows.push([{ v: "", s: "blank" }]);
+    }
+    const buf = buildXlsx("A4双列表", rows, {
+      colWidths: [3.8, 12.8, 11.4, 4.0, 7.0, 1.4, 3.8, 12.8, 11.4, 4.0, 7.0],
+      rowHeights,
+    });
+    const fname = `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
+    res.setHeader("X-Item-Count", String(items.length));
+    res.setHeader("X-Page-Count", String(Math.ceil(items.length / PER_PAGE) || 1));
+    res.send(buf);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) => {
   try {
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
