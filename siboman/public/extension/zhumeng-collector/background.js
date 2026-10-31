@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.157";
+const VERSION = "2.2.9.158";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5653,6 +5653,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
+        // 状态别名必须和所选订单的实际状态一致，否则报告里没有匹配的货件（用户抓到的是待备货场景）
+        const statusAliases = (Array.isArray(msg.statusAliases) ? msg.statusAliases.map(String).filter(Boolean) : []);
+        const aliases = statusAliases.length ? statusAliases : ["awaiting_packaging", "awaiting_deliver"];
         if (!postingNumbers.length) return sendResponse({ ok: false, error: "没有传订单号" });
         // company_id：优先用调用方传的，否则从卖家后台 cookie 里读（插件有 cookies 权限）
         let companyId = String(msg.companyId || "").trim();
@@ -5672,8 +5675,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         const [res] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
-          func: async function (postingNumbers, companyId) {
-            const H = { "content-type": "application/json", accept: "application/json, text/plain, */*" };
+          func: async function (postingNumbers, companyId, aliases) {
+            // 卖家后台的接口除了 cookie，还校验这几个 x-o3-* 头（页面自己请求时都会带）
+            const H = {
+              "content-type": "application/json",
+              accept: "application/json, text/plain, */*",
+              "x-o3-app-name": "seller-ui",
+              "x-o3-company-id": String(companyId || ""),
+              "x-o3-language": "zh-Hans",
+              "x-o3-page-type": "CbPostingsFbs",
+            };
             const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
             const post = async (path, body) => {
               const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
@@ -5687,7 +5698,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               filter: {
                 list_type: "postings",
                 company_id: companyId,
-                status_aliases: ["awaiting_packaging"],
+                status_aliases: aliases,
                 cutoff_from: "2026-01-01T00:00:00Z",
                 cutoff_to: "2027-12-31T23:59:59Z",
                 posting_numbers: postingNumbers,
@@ -5695,7 +5706,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               },
             });
             const code = create.json && create.json.code;
-            if (!code) return { ok: false, step: "create", create: { status: create.status, text: create.text } };
+            if (!code) {
+              return {
+                ok: false, step: "create",
+                error: `创建报告任务失败：HTTP ${create.status} ${String(create.text || "").slice(0, 200)}`,
+                create: { status: create.status, text: create.text },
+                pageUrl: location.href,
+                companyId: companyId,
+              };
+            }
             // ② 轮询状态 + ③ 尝试下载（下载成功即完成，不依赖状态字符串的具体取值）
             const log = [];
             for (let i = 0; i < 20; i += 1) {
@@ -5703,7 +5722,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               const st = await post("/api/report/status", { code });
               const stateStr = String((st.json && (st.json.status || st.json.state)) || "").toLowerCase();
               log.push({ i, statusHttp: st.status, state: stateStr, text: st.text.slice(0, 160) });
-              if (/error|fail|cancel/.test(stateStr)) return { ok: false, step: "status", code, log };
+              if (/error|fail|cancel/.test(stateStr)) return { ok: false, step: "status", code, log, error: `报告任务失败：${stateStr}` };
               const dl = await post("/api/report/download", { company_id: companyId, code });
               const ct = dl.status === 200 && dl.buf.byteLength > 100;
               const head = String.fromCharCode.apply(null, new Uint8Array(dl.buf.slice(0, 4)));
@@ -5717,9 +5736,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               log[log.length - 1].downloadText = dl.text.slice(0, 160);
               if (/done|ready|success|complete/.test(stateStr) && i >= 3) break;
             }
-            return { ok: false, step: "download_timeout", code, log };
+            const last = log[log.length - 1] || {};
+            return { ok: false, step: "download_timeout", code, log,
+              error: `等待报告超时：最后一次状态 HTTP ${last.statusHttp} ${String(last.state || "")}，下载 HTTP ${last.downloadHttp} ${String(last.downloadText || "").slice(0, 150)}` };
           },
-          args: [postingNumbers, companyId],
+          args: [postingNumbers, companyId, aliases],
         });
         const r = res && res.result;
         if (!r) return sendResponse({ ok: false, error: "页面无返回（seller.ozon.ru 可能未登录）" });

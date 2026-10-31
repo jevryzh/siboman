@@ -713,10 +713,17 @@ window.OrderListView = {
       if (typeof send !== 'function') return notify.warning('检测不到采集插件，请确认浏览器已安装并启用');
       pickListBusy.value = true;
       try {
-        const res = await send('pickList.request', { postingNumbers }, 180000);
+        // 状态别名要和所选订单一致：待备货 → awaiting_packaging，待发运 → awaiting_deliver
+        const statusAliases = [...new Set(sel.map((row) => String(row.status || ''))
+          .filter((s2) => ['awaiting_packaging', 'awaiting_deliver'].includes(s2)))];
+        const res = await send('pickList.request', { postingNumbers, statusAliases }, 180000);
         if (!res || res.ok !== true) {
           const detail = res?.step ? `（失败步骤：${res.step}）` : '';
-          return notify.error('生成拣货单失败' + detail + '：' + String(res?.error || res?.text || '插件无返回').slice(0, 200));
+          const msg = res?.error
+            || res?.create?.text
+            || (res?.log && res.log.length && JSON.stringify(res.log[res.log.length - 1]))
+            || '插件无返回（可能是插件版本过旧，请到 chrome://extensions 重新加载）';
+          return notify.error('生成拣货单失败' + detail + '：' + String(msg).slice(0, 300), 12000);
         }
         const bin = atob(res.base64 || '');
         const bytes = new Uint8Array(bin.length);
