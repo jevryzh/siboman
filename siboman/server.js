@@ -14482,7 +14482,8 @@ app.post("/api/seller/products", requireAuth, async (req, res, next) => {
     const userId = req.user.id;
     const storeId = req.body?.store_id || req.body?.storeId;
     const visibility = String(req.body?.visibility || "ALL").toUpperCase();
-    const limit = Math.min(200, Math.max(1, Number(req.body?.limit || 50)));
+    // v2.2.9.164 允许每页 500（用户要求），上限放到 500
+    const limit = Math.min(500, Math.max(1, Number(req.body?.limit || 50)));
     const offset = Math.max(0, Number(req.body?.offset || 0));
     const search = String(req.body?.search || "").trim();
     const priceFilter = String(req.body?.price_filter || "all").trim();
