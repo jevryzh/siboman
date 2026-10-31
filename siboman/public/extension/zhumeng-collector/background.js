@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.155";
+const VERSION = "2.2.9.157";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5642,6 +5642,93 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     setTimeout(() => chrome.runtime.reload(), 1000);
     sendResponse({ ok: true, willReload: true });
     return;
+  }
+
+  // v2.2.9.157 生成拣货单（卖家后台异步报告）
+  //   链路：POST /api/report/v2/report/assembly/list → {code}
+  //         POST /api/report/status {code}          → 状态（可能带下载地址）
+  //         → 下载 PDF
+  //   ⚠️ 该接口的会话**绑定 IP**，必须在你浏览器里、带登录态调用，服务端直连一律 307。
+  if (msg.action === "pickList") {
+    (async () => {
+      try {
+        const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
+        if (!postingNumbers.length) return sendResponse({ ok: false, error: "没有传订单号" });
+        // company_id：优先用调用方传的，否则从卖家后台 cookie 里读（插件有 cookies 权限）
+        let companyId = String(msg.companyId || "").trim();
+        if (!companyId) {
+          try {
+            const c = await chrome.cookies.get({ url: "https://seller.ozon.ru", name: "sc_company_id" });
+            companyId = String((c && c.value) || "").trim();
+          } catch (_e) { /* 读不到就让页面自己想办法 */ }
+        }
+        if (!companyId) return sendResponse({ ok: false, error: "读不到 company_id：请先在浏览器登录 seller.ozon.ru" });
+        // 找/开一个 seller.ozon.ru 标签
+        let tabs = await chrome.tabs.query({ url: "*://seller.ozon.ru/*" });
+        let tab = tabs && tabs[0];
+        if (!tab) {
+          tab = await chrome.tabs.create({ url: "https://seller.ozon.ru/app/postings/crossborder/fbs", active: true });
+          await new Promise((r) => setTimeout(r, 6000));
+        }
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async function (postingNumbers, companyId) {
+            const H = { "content-type": "application/json", accept: "application/json, text/plain, */*" };
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const post = async (path, body) => {
+              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
+              const buf = await r.arrayBuffer();
+              let json = null; let text = "";
+              try { text = new TextDecoder("utf-8").decode(buf); json = JSON.parse(text); } catch (_e) { text = ""; }
+              return { status: r.status, json, text: text.slice(0, 300), buf };
+            };
+            // ① 创建报告任务
+            const create = await post("/api/report/v2/report/assembly/list", {
+              filter: {
+                list_type: "postings",
+                company_id: companyId,
+                status_aliases: ["awaiting_packaging"],
+                cutoff_from: "2026-01-01T00:00:00Z",
+                cutoff_to: "2027-12-31T23:59:59Z",
+                posting_numbers: postingNumbers,
+                delivery_groups: ["all"],
+              },
+            });
+            const code = create.json && create.json.code;
+            if (!code) return { ok: false, step: "create", create: { status: create.status, text: create.text } };
+            // ② 轮询状态 + ③ 尝试下载（下载成功即完成，不依赖状态字符串的具体取值）
+            const log = [];
+            for (let i = 0; i < 20; i += 1) {
+              await sleep(i === 0 ? 1200 : 2000);
+              const st = await post("/api/report/status", { code });
+              const stateStr = String((st.json && (st.json.status || st.json.state)) || "").toLowerCase();
+              log.push({ i, statusHttp: st.status, state: stateStr, text: st.text.slice(0, 160) });
+              if (/error|fail|cancel/.test(stateStr)) return { ok: false, step: "status", code, log };
+              const dl = await post("/api/report/download", { company_id: companyId, code });
+              const ct = dl.status === 200 && dl.buf.byteLength > 100;
+              const head = String.fromCharCode.apply(null, new Uint8Array(dl.buf.slice(0, 4)));
+              if (ct && head === "%PDF") {
+                let bin = "";
+                const bytes = new Uint8Array(dl.buf);
+                for (let k = 0; k < bytes.length; k += 1) bin += String.fromCharCode(bytes[k]);
+                return { ok: true, code, size: bytes.length, base64: btoa(bin), pollCount: i + 1 };
+              }
+              log[log.length - 1].downloadHttp = dl.status;
+              log[log.length - 1].downloadText = dl.text.slice(0, 160);
+              if (/done|ready|success|complete/.test(stateStr) && i >= 3) break;
+            }
+            return { ok: false, step: "download_timeout", code, log };
+          },
+          args: [postingNumbers, companyId],
+        });
+        const r = res && res.result;
+        if (!r) return sendResponse({ ok: false, error: "页面无返回（seller.ozon.ru 可能未登录）" });
+        sendResponse(r);
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 300) });
+      }
+    })();
+    return true;   // 异步 sendResponse
   }
 
   // v2.2.9.128: ERP 提交任务后立刻来领取，不用等 30 秒 alarm 轮询

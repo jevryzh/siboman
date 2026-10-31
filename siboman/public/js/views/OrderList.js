@@ -701,6 +701,37 @@ window.OrderListView = {
     //   Ozon 只允许「待备货 / 待发运」的单出标签，其它状态接口会报 INVALID_ARGUMENT，
     //   所以这里先本地筛一遍，给出明确提示。
     const labelsPrinting = Vue.ref(false);
+    // v2.2.9.157 生成拣货单：调卖家后台异步报告（assembly/list → report/status → report/download），
+    //   接口会话绑定 IP，只能由插件在 seller.ozon.ru 里带着登录态调用。
+    const pickListBusy = Vue.ref(false);
+    const printPickList = async () => {
+      const sel = selectedOrders.value || [];
+      if (!sel.length) return notify.warning('请先勾选要生成拣货单的订单');
+      const postingNumbers = sel.map((row) => String(row.posting_number || row.order_id || '')).filter(Boolean);
+      if (!postingNumbers.length) return notify.warning('所选订单没有货件编号');
+      const send = window.__zhumeng_send__;
+      if (typeof send !== 'function') return notify.warning('检测不到采集插件，请确认浏览器已安装并启用');
+      pickListBusy.value = true;
+      try {
+        const res = await send('pickList.request', { postingNumbers }, 180000);
+        if (!res || res.ok !== true) {
+          const detail = res?.step ? `（失败步骤：${res.step}）` : '';
+          return notify.error('生成拣货单失败' + detail + '：' + String(res?.error || res?.text || '插件无返回').slice(0, 200));
+        }
+        const bin = atob(res.base64 || '');
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+        const blob = new Blob([bytes], { type: 'application/pdf' });
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        notify.success(`已生成 ${postingNumbers.length} 个订单的拣货单（${Math.round((res.size || 0) / 1024)} KB）`);
+      } catch (e) {
+        notify.error('生成拣货单失败：' + String(e.message || e).slice(0, 200));
+      } finally {
+        pickListBusy.value = false;
+      }
+    };
     const printLabels = async () => {
       const sel = selectedOrders.value || [];
       if (!sel.length) return notify.warning('请先勾选要打印面单的订单');
@@ -1028,6 +1059,7 @@ window.OrderListView = {
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
       feesFileInput, feesImporting, pickFeesFile, onFeesFile,
       labelsPrinting, printLabels,   // v2.2.9.156 打印面单
+      pickListBusy, printPickList,   // v2.2.9.157 生成拣货单
       returnsDrawer, openReturns, returnsTypeText, returnsTypeTag,   // v2.2.9.146 WHD 退货
       rowStatusSubtext, copyPostingNumber, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
@@ -1169,7 +1201,7 @@ window.OrderListView = {
 
         <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
           <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedOrders.length }} 个订单</span>
-          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
+          <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button></div>
         </div>
 
         <el-alert
