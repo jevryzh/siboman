@@ -16286,20 +16286,36 @@ app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, 
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
       : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
     if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    // v2.2.9.166 货号清单要覆盖**全部变体 SKU**（数量为 0 的也要列出来）。
+    //   原来只从「待备货」订单里聚合，没进待备货的变体直接不出现；
+    //   现在先把该店铺历史上出现过的所有毛线 SKU 取出来，再左连接待备货数量。
     const result = await db.query(
-      `SELECT COALESCE(p->>'offer_id','') AS sku,
-              COALESCE(MAX(p->>'name'),'') AS name,
-              SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-         FROM app_order_cache c
-         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-        WHERE c.user_id = $1
-          AND c.store_id = ANY($2::uuid[])
-          AND COALESCE(NULLIF(c.display_status,''), c.status) = 'awaiting_packaging'
-          AND COALESCE(p->>'offer_id','') <> ''
-          -- v2.2.9.165 只统计毛线（商品名含 Пряжа/пряж），否则泳池、画板包也会被算进来
-          AND COALESCE(p->>'name','') ILIKE '%пряж%'
-        GROUP BY 1
-        ORDER BY 1`,
+      `WITH all_sku AS (
+         SELECT COALESCE(p->>'offer_id','') AS sku,
+                COALESCE(MAX(p->>'name'),'') AS name
+           FROM app_order_cache c
+           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+          WHERE c.user_id = $1
+            AND c.store_id = ANY($2::uuid[])
+            AND COALESCE(p->>'offer_id','') <> ''
+            AND COALESCE(p->>'name','') ILIKE '%пряж%'
+          GROUP BY 1
+       ), pending AS (
+         SELECT COALESCE(p->>'offer_id','') AS sku,
+                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+           FROM app_order_cache c
+           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+          WHERE c.user_id = $1
+            AND c.store_id = ANY($2::uuid[])
+            AND COALESCE(NULLIF(c.display_status,''), c.status) = 'awaiting_packaging'
+            AND COALESCE(p->>'offer_id','') <> ''
+            AND COALESCE(p->>'name','') ILIKE '%пряж%'
+          GROUP BY 1
+       )
+       SELECT a.sku, a.name, COALESCE(p.qty, 0)::int AS qty
+         FROM all_sku a
+         LEFT JOIN pending p ON p.sku = a.sku
+        ORDER BY a.sku`,
       [req.user.id, storeIds],
     );
     const totalQty = result.rows.reduce((n, r) => n + Number(r.qty || 0), 0);
