@@ -16337,53 +16337,52 @@ app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, 
 app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
   try {
     const storeId = req.body?.store_id || req.body?.storeId;
-    const postingNumbers = Array.isArray(req.body?.posting_numbers) ? req.body.posting_numbers.map(String).filter(Boolean).slice(0, 50) : [];
+    const postingNumbers = Array.isArray(req.body?.posting_numbers) ? req.body.posting_numbers.map(String).filter(Boolean) : [];
     if (!storeId || !postingNumbers.length) return res.status(400).json({ success: false, error: '请选择需要打印面单的订单' });
     const credentials = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2 AND active=TRUE`, [storeId, req.user.id]);
     if (!credentials.rowCount) return res.status(404).json({ success: false, error: '未找到店铺或无权限' });
-    const response = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
-      method: 'POST',
-      headers: { 'Client-Id': credentials.rows[0].client_id, 'Api-Key': credentials.rows[0].api_key, 'Content-Type': 'application/json', Accept: 'application/pdf, application/json' },
-      body: JSON.stringify({ posting_number: postingNumbers }),
-    });
-    const bytes = Buffer.from(await response.arrayBuffer());
-    if (!response.ok) {
-      // v2.2.9.156 Ozon 对状态不符的订单只回 INVALID_ARGUMENT，对用户没有意义 → 转成人话
-      const raw = bytes.toString('utf8').slice(0, 1000);
-      const friendly = /INVALID_ARGUMENT/i.test(raw)
-        ? 'Ozon 不允许给这些订单打印面单：只有「待备货 / 待发运」状态的订单可以，请只勾选这类订单（已发货/已取消的不行）'
-        : `Ozon 面单生成失败：${raw}`;
-      return res.status(response.status).json({ success: false, error: friendly });
+    const { client_id: clientId, api_key: apiKey } = credentials.rows[0];
+    // ⚠️ v2.2.9.167 Ozon 面单接口**单次最多 20 个货件**（实测 20 个 OK、50 个直接 400 INVALID_ARGUMENT）。
+    //   用户一次勾 667 个 → 必然失败。改为按 20 个分批，多批时打包成 ZIP 返回。
+    const CHUNK = 20;
+    const chunks = [];
+    for (let i = 0; i < postingNumbers.length; i += CHUNK) chunks.push(postingNumbers.slice(i, i + CHUNK));
+    const pdfs = [];
+    const failed = [];
+    for (const batch of chunks) {
+      const response = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
+        method: 'POST',
+        headers: { 'Client-Id': clientId, 'Api-Key': apiKey, 'Content-Type': 'application/json', Accept: 'application/pdf, application/json' },
+        body: JSON.stringify({ posting_number: batch }),
+      });
+      const bytes = Buffer.from(await response.arrayBuffer());
+      const contentType = response.headers.get('content-type') || '';
+      if (!response.ok || contentType.includes('json')) {
+        failed.push(`${batch.length} 个（${batch[0]}…）：${bytes.toString('utf8').slice(0, 120)}`);
+        continue;
+      }
+      pdfs.push({ name: `labels-${pdfs.length + 1}-${batch.length}.pdf`, buf: bytes });
     }
-    const contentType = response.headers.get('content-type') || 'application/pdf';
-    if (contentType.includes('json')) return res.status(502).json({ success: false, error: `Ozon 未返回 PDF：${bytes.toString('utf8').slice(0, 1000)}` });
-    res.setHeader('Content-Type', contentType);
-    res.setHeader('Content-Disposition', `inline; filename="ozon-labels-${Date.now()}.pdf"`);
-    res.send(bytes);
-  } catch (error) { res.status(error.statusCode || 502).json({ success: false, error: error.message }); }
-});
-
-// ---------- 上架记录 ----------
-app.get("/api/seller/import/history", requireAuth, async (req, res, next) => {
-  try {
-    if (!db || !req.user?.id) { res.json({ items: [], total: 0 }); return; }
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit || 50)));
-    const offset = Math.max(0, Number(req.query.offset || 0));
-    const status = String(req.query.status || "").trim();
-    const search = String(req.query.search || "").trim();
-    let where = "WHERE user_id = $1";
-    const params = [req.user.id];
-    let pi = 2;
-    if (status) { where += ` AND status = $${pi++}`; params.push(status); }
-    if (search) { where += ` AND (offer_id ILIKE $${pi} OR product_name ILIKE $${pi} OR task_id ILIKE $${pi})`; params.push(`%${search}%`); pi++; }
-    const countR = await db.query(`SELECT count(*) FROM app_listing_history ${where}`, params);
-    const total = Number(countR.rows[0]?.count || 0);
-    const rows = await db.query(
-      `SELECT * FROM app_listing_history ${where} ORDER BY created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
-      [...params, limit, offset],
-    );
-    res.json({ items: rows.rows, total, limit, offset });
-  } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+    if (!pdfs.length) {
+      const raw = failed[0] || '';
+      const friendly = /INVALID_ARGUMENT/i.test(raw)
+        ? 'Ozon 不允许给这些订单打印面单：只有「待备货 / 待发运」状态的订单可以；另外单次最多 20 个货件（已自动分批，仍失败请联系我们）'
+        : `Ozon 面单生成失败：${raw}`;
+      return res.status(400).json({ success: false, error: friendly });
+    }
+    const stamp = Date.now();
+    if (pdfs.length === 1) {
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader('Content-Disposition', `inline; filename="ozon-labels-${stamp}.pdf"`);
+      return res.send(pdfs[0].buf);
+    }
+    const zip = zipSync(Object.fromEntries(pdfs.map((p) => [p.name, new Uint8Array(p.buf)])));
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="ozon-labels-${stamp}.zip"`);
+    res.setHeader('X-Batch-Count', String(pdfs.length));
+    res.setHeader('X-Failed-Count', String(failed.length));
+    return res.send(Buffer.from(zip));
+  } catch (error) { next(error); }
 });
 
 app.post("/api/seller/import/portal-record", requireAuth, async (req, res) => {

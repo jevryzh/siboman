@@ -806,16 +806,28 @@ window.OrderListView = {
       if (!byStore.size) return notify.warning('所选订单没有关联店铺，无法打印');
       labelsPrinting.value = true;
       try {
-        const blobs = [];
+        // v2.2.9.167 后端按 20 个/批调 Ozon，多批会返回 ZIP（单批返回 PDF）
+        let lastBlob = null;
+        let lastType = 'application/pdf';
+        let batches = 1;
         for (const [storeId, postings] of byStore) {
-          const res = await axios.post('/api/seller/orders/labels', { store_id: storeId, posting_numbers: postings }, { responseType: 'blob' });
-          blobs.push(res.data);
+          const res = await axios.post('/api/seller/orders/labels', { store_id: storeId, posting_numbers: postings }, { responseType: 'blob', timeout: 600000 });
+          const type = String(res.headers['content-type'] || '');
+          if (res.headers['x-batch-count']) batches = Math.max(batches, Number(res.headers['x-batch-count']) || 1);
+          lastType = type.includes('zip') ? 'application/zip' : 'application/pdf';
+          lastBlob = lastBlob ? new Blob([lastBlob, res.data], { type: lastType }) : res.data;
         }
-        const blob = new Blob(blobs, { type: 'application/pdf' });
-        const url = URL.createObjectURL(blob);
-        window.open(url, '_blank');
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
-        notify.success(`已生成 ${eligible.length} 个订单的面单${eligible.length < sel.length ? `（${sel.length - eligible.length} 个状态不符已跳过）` : ''}`);
+        const url = URL.createObjectURL(lastBlob);
+        if (lastType === 'application/zip') {
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `ozon-labels-${Date.now()}.zip`;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+        } else {
+          window.open(url, '_blank');
+        }
+        setTimeout(() => URL.revokeObjectURL(url), 120000);
+        notify.success(`已生成 ${eligible.length} 个订单的面单（分 ${batches} 批）${eligible.length < sel.length ? `，${sel.length - eligible.length} 个状态不符已跳过` : ''}`);
       } catch (e) {
         let msg = e.message;
         try {
