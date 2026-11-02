@@ -27181,6 +27181,55 @@ await migrateYandexEnvToStores();
 if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
   setTimeout(() => maybeRefreshOzonOpportunityPool("startup"), 12000).unref?.();
   setInterval(() => maybeRefreshOzonOpportunityPool("interval"), OZON_OPPORTUNITY_REFRESH_INTERVAL_MS).unref?.();
+
+  // v2.2.9.176 定时刷新「近期订单状态」。
+  //   ⚠️ 原来的增量同步只拉「最近 24h 内**新建**」的订单，导致 10/31 下单、11/01 变更状态的单
+  //   永远不会被刷新（用户实测 7 条一直挂在「待备货」，实际已经是「待发运」）。
+  //   这里每 20 分钟把最近 3 天的订单重新拉一遍，覆盖这种状态变更。
+  const ORDER_STATUS_REFRESH_MS = 20 * 60 * 1000;
+  const ORDER_STATUS_REFRESH_DAYS = 3;
+  let orderStatusRefreshing = false;
+  const refreshRecentOrderStatuses = async () => {
+    if (orderStatusRefreshing) return;
+    orderStatusRefreshing = true;
+    try {
+      const stores = await db.query(`SELECT id, user_id FROM app_stores WHERE platform='ozon' AND active=TRUE`);
+      const to = new Date();
+      const since = new Date(to.getTime() - ORDER_STATUS_REFRESH_DAYS * 86400e3);
+      for (const st of stores.rows) {
+        let cursor = "";
+        let touched = 0;
+        for (let page = 0; page < 40; page += 1) {
+          const r = await ozonFbsListV4Page({
+            since: since.toISOString(), to: to.toISOString(), status: "all",
+            limit: 100, cursor, with: { financial_data: true, analytics_data: true },
+            storeId: st.id, userId: st.user_id,
+          });
+          const batch = r.postings || [];
+          for (const p of batch) {
+            await db.query(
+              `UPDATE app_order_cache
+                  SET status = $3, display_status = $3, substatus = $4,
+                      payload = COALESCE(payload, '{}'::jsonb) || $5::jsonb,
+                      synced_at = now(), updated_at = now()
+                WHERE store_id = $1 AND posting_number = $2`,
+              [st.id, String(p.posting_number), String(p.status || ""), String(p.substatus || ""), JSON.stringify(p)],
+            );
+            touched += 1;
+          }
+          if (!r.has_next || !r.cursor || batch.length < 100) break;
+          cursor = r.cursor;
+        }
+        if (touched) console.log(`[OrderStatusRefresh] store=${st.id} refreshed=${touched}`);
+      }
+    } catch (e) {
+      console.error("[OrderStatusRefresh] 失败:", String(e.message || e).slice(0, 200));
+    } finally {
+      orderStatusRefreshing = false;
+    }
+  };
+  setTimeout(() => refreshRecentOrderStatuses().catch(() => {}), 60 * 1000);
+  setInterval(() => refreshRecentOrderStatuses().catch(() => {}), ORDER_STATUS_REFRESH_MS).unref?.();
 }
 
 // SPA catch-all
