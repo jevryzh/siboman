@@ -280,7 +280,7 @@ window.CollectionBoxView = {
 
         <div style="background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:14px; margin-bottom:16px">
           <div style="display:grid; grid-template-columns:minmax(320px,1fr) 132px; gap:12px; align-items:start">
-            <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon 链接或 SKU，每行一条" />
+            <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon / 1688 / 拼多多 链接或 SKU，每行一条" />
             <el-button size="large" type="primary" style="height:76px; background:#111827; border-color:#111827" @click="handleImport">加入采集箱</el-button>
           </div>
           <div style="margin-top:8px; color:#64748b; font-size:12px; font-weight:700">加入后只创建采集箱记录和采集任务；送上架需要在采集完成后手动确认。</div>
@@ -312,7 +312,7 @@ window.CollectionBoxView = {
           <el-button size="large" type="primary" style="background:#111827; border-color:#111827" @click="onSearch">筛选</el-button>
         </div>
 
-        <el-table :data="items" v-loading="loading" element-loading-text="正在读取采集箱" size="large" stripe border style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" empty-text="暂无采集项。请粘贴 Ozon 链接或 SKU 后加入采集箱。" @selection-change="onSelectionChange">
+        <el-table :data="items" v-loading="loading" element-loading-text="正在读取采集箱" size="large" stripe border style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" empty-text="暂无采集项。请粘贴 Ozon / 1688 / 拼多多 链接或 SKU 后加入采集箱。" @selection-change="onSelectionChange">
           <el-table-column type="selection" width="52" />
           <el-table-column label="商品信息" min-width="360">
             <template #default="{ row }">
@@ -321,7 +321,13 @@ window.CollectionBoxView = {
                 <div v-else style="width:58px;height:58px;border-radius:8px;background:#f1f5f9;color:#94a3b8;display:flex;align-items:center;justify-content:center;font-size:11px">无图</div>
                 <div style="flex: 1; min-width: 0">
                   <div class="text-ellipsis" style="font-size:15px; line-height:1.4; font-weight:800; color:#1f2937">{{ row.title || '正在采集...' }}</div>
-                  <div style="font-size:12px; color:#94a3b8; margin-top:7px">SKU: {{ row.ozon_sku || '-' }}</div>
+                  <div style="font-size:12px; color:#94a3b8; margin-top:7px">
+                    <el-tag v-if="['1688','pdd'].includes(String(row.source_type || ''))" size="small"
+                            :type="row.source_type === '1688' ? 'warning' : 'danger'" style="margin-right:6px">
+                      {{ row.source_type === '1688' ? '1688' : '拼多多' }}
+                    </el-tag>
+                    SKU: {{ row.ozon_sku || '-' }}
+                  </div>
                   <div v-if="row.status === 'failed'" style="font-size:11px; color:#f56c6c; margin-top:3px">{{ rowFailureReason(row) }}</div>
                 </div>
               </div>

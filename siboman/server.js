@@ -1382,9 +1382,9 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
       const exists = await db.query(
         `SELECT id, status, ozon_url FROM collect_items
          WHERE user_id = $1
-           AND (($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3))
+           AND (($2 <> '' AND ozon_sku = $2) OR ($3 <> '' AND ozon_url = $3) OR ($4 <> '' AND source_value = $4))
          LIMIT 1`,
-        [req.user.id, row.ozonSku || "", row.ozonUrl || ""],
+        [req.user.id, row.ozonSku || "", row.ozonUrl || "", row.sourceValue || ""],
       );
       if (exists.rowCount) {
         const existing = exists.rows[0];
@@ -1410,14 +1410,34 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
       if (r.rows[0]) inserted.push(r.rows[0]);
     }
 
+    // v2.2.9.178 外部来源（1688 / 拼多多）单独建 collect-external 任务，交给插件采集
+    const externalRows = parsed.filter((r) => r.sourceType === "1688" || r.sourceType === "pdd");
+    if (externalRows.length) {
+      const jobRes = await db.query(
+        `INSERT INTO app_jobs (id, user_id, store_id, kind, status, phase, total, processed, payload)
+         VALUES (gen_random_uuid(), $1, $2, 'collect-external', 'queued', '等待采集端领取', $3, 0, $4) RETURNING id`,
+        [req.user.id, storeId, externalRows.length, JSON.stringify({
+          urls: externalRows.map((r) => ({ url: r.sourceValue, sourceType: r.sourceType })),
+        })],
+      );
+      // 把 insert 出来的 collect_items 关联到任务（按 source_value 匹配）
+      await db.query(
+        `UPDATE collect_items SET linked_job_id=$1, status='queued', updated_at=now()
+          WHERE user_id=$2 AND source_value = ANY($3::text[]) AND status IN ('pending','queued')`,
+        [jobRes.rows[0].id, req.user.id, externalRows.map((r) => r.sourceValue)],
+      );
+    }
+
+    // v2.2.9.178 外部来源不走 Ozon 采集任务（它们由上面的 collect-external 处理）
+    const ozonInserted = inserted.filter((it) => String(it.ozon_url || "").trim());
     // 采集箱只采 Ozon 信息；不启用 1688 搜图，避免进入已冻结的单品找货链路。
-    if (inserted.length) {
+    if (ozonInserted.length) {
       const jobResult = await db.query(
         `INSERT INTO app_jobs (id, user_id, store_id, kind, status, phase, total, processed, payload)
          VALUES (gen_random_uuid(), $1, $2, 'run', 'queued', '等待采集端领取', $3, 0, $4) RETURNING id`,
-        [req.user.id, storeId, inserted.length, JSON.stringify({
-          urls: inserted.map((item) => item.ozon_url),
-          urlRows: inserted.map((item, index) => ({ url: item.ozon_url, sourceRow: index + 1, collectId: item.id })),
+        [req.user.id, storeId, ozonInserted.length, JSON.stringify({
+          urls: ozonInserted.map((item) => item.ozon_url),
+          urlRows: ozonInserted.map((item, index) => ({ url: item.ozon_url, sourceRow: index + 1, collectId: item.id })),
           options: { enable1688: false, enableAI: false, collectionOnly: true }
         })]
       );
@@ -1425,7 +1445,7 @@ app.post("/api/collect-items", requireAuth, async (req, res, next) => {
         `UPDATE collect_items SET linked_job_id=$1,
            status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from',status,'to',status,'reason','创建采集任务','job_id',$1,'at',now())),
            updated_at=now() WHERE user_id=$2 AND id=ANY($3::uuid[])`,
-        [jobResult.rows[0].id, req.user.id, inserted.map((item) => item.id)],
+        [jobResult.rows[0].id, req.user.id, ozonInserted.map((item) => item.id)],
       );
     }
 
@@ -19510,6 +19530,44 @@ function requireDb(res) {
   return true;
 }
 
+// v2.2.9.178 把插件的 collect-external 采集结果写回采集箱。
+//   结果结构：{ results: [{ ok, sourceType, url, title, images, priceCny, skus, attributes, weightGrams, dimensionsText, error }] }
+async function applyCollectExternalResults(job, results, userId) {
+  if (!db || !Array.isArray(results)) return 0;
+  let n = 0;
+  for (const r of results) {
+    const url = String(r?.url || "").trim();
+    if (!url) continue;
+    const images = Array.isArray(r.images) ? r.images.filter(Boolean) : [];
+    const attrs = r.attributes && typeof r.attributes === "object" ? r.attributes : {};
+    const ok = r.ok !== false;
+    await db.query(
+      `UPDATE collect_items SET
+         title = COALESCE(NULLIF($3,''), title),
+         main_image = COALESCE(NULLIF($4,''), main_image),
+         images = CASE WHEN jsonb_array_length($5::jsonb) > 0 THEN $5::jsonb ELSE images END,
+         price_cny = COALESCE($6, price_cny),
+         attributes = CASE WHEN $7::jsonb <> '{}'::jsonb THEN $7::jsonb ELSE attributes END,
+         weight = COALESCE($8, weight),
+         status = $9,
+         note = $10,
+         status_log = COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('to',$9,'reason',$10,'at',now())),
+         updated_at = now()
+       WHERE user_id = $1 AND source_value = $2`,
+      [
+        userId || job.user_id, url,
+        String(r.title || ""), String((images[0]) || ""), JSON.stringify(images),
+        Number(r.priceCny || 0) || null, JSON.stringify(attrs),
+        Number(r.weightGrams || 0) || null,
+        ok ? "scraped" : "failed",
+        ok ? "" : String(r.error || "采集失败").slice(0, 300),
+      ],
+    );
+    n += 1;
+  }
+  return n;
+}
+
 function parseCollectInputs(text) {
   const rows = String(text || "").split(/[\r\n,;\s]+/).map((s) => s.trim()).filter(Boolean);
   const out = [];
@@ -19522,6 +19580,14 @@ function parseCollectInputs(text) {
       ozonUrl = raw;
       const skuMatch = raw.match(/\/product\/(\d+)(?:\/|\?|$)/) || raw.match(/\/product\/[^/]*-(\d+)(?:\/|\?|$)/) || raw.match(/[?&]sku=(\d+)/) || raw.match(/-(\d{6,})(?:\/|\?|$)/);
       if (skuMatch) ozonSku = skuMatch[1];
+    } else if (/^https?:\/\/[^/]*\b1688\.com\//i.test(raw) && /\/offer\/\d+\.html/i.test(raw)) {
+      // v2.2.9.178 1688 商品链接 → 走插件 collect-external 任务采集
+      sourceType = "1688";
+      ozonUrl = "";
+    } else if (/^https?:\/\/(mobile\.yangkeduo\.com|\S*\.pinduoduo\.com)\//i.test(raw)) {
+      // v2.2.9.178 拼多多商品链接
+      sourceType = "pdd";
+      ozonUrl = "";
     } else if (/^\d{6,}$/.test(raw)) {
       sourceType = "ozon_sku";
       ozonSku = raw;
@@ -20943,6 +21009,10 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     // 巡查跟卖收尾：把插件回传的跟卖卖家清单入库。
     //   v2.2.9.127：定向查询（mode=targeted）只替换「本次查到的那些 offer_id」，不清空全表，
     //   否则用户查完 A 批再查 B 批，A 批的数据会被整表删除抹掉。
+    if (updated && updated.kind === "collect-external") {
+      const n = await applyCollectExternalResults(updated, (updated.results && updated.results.results) || updated.results || [], existing.user_id || req.user?.id);
+      console.log(`[collect-external] job=${updated.id} 写回 ${n} 条`);
+    }
     if (updated && updated.kind === "ozon-patrol") {
       await applyOzonPatrolFollowResults(existing.user_id || req.user?.id, updated)
         .catch((e) => console.warn("[ozon-patrol] 入库失败:", e?.message || e));

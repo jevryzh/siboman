@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.160";
+const VERSION = "2.2.9.178";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -1304,6 +1304,276 @@ function extract1688ListingMedia() {
   return { images, detailImages, skus, attributes, vendorCode: vendOut, title, weightGrams, lengthCm, widthCm, heightCm, videoUrl, url: location.href };
 }
 
+// 外部平台商品采集（kind=collect-external）：按 payload.urls 逐条采集 1688 / 拼多多商品资料，
+// 只负责取数回传（标题/图集/价格/SKU/属性/重量尺寸），类目映射与上架由 ERP 侧处理。
+async function runQueuedCollectExternalJob(remoteJob) {
+  const payload = remoteJob.payload || {};
+  const rawItems = Array.isArray(payload.urls)
+    ? payload.urls
+    : (Array.isArray(payload.items) ? payload.items : []);
+  const items = rawItems.map((entry) => {
+    const raw = (entry && typeof entry === "object") ? entry : { url: entry };
+    const url = String(raw.url || raw.sourceUrl || "").trim();
+    let sourceType = String(raw.sourceType || raw.source || "").trim().toLowerCase();
+    if (!sourceType) {
+      // 兼容服务器只回传链接的情况：按域名判来源
+      if (/1688\.com/i.test(url)) sourceType = "1688";
+      else if (/(yangkeduo|pinduoduo)\.com/i.test(url)) sourceType = "pdd";
+    }
+    return { url, sourceType };
+  });
+  const previousResults = Array.isArray(remoteJob.results) ? remoteJob.results.slice() : [];
+  const job = {
+    id: remoteJob.id,
+    status: "running",
+    phase: "插件已领取，开始采集外部平台商品",
+    total: items.length,
+    processed: Math.min(previousResults.length, items.length),
+    logs: Array.isArray(remoteJob.logs) ? remoteJob.logs : [],
+    results: previousResults,
+    error: "",
+    cancelRequested: false,
+    abortController: typeof AbortController === "function" ? new AbortController() : null,
+  };
+  job.logs.push(makeLog(`逐梦插件 v${VERSION} 已领取外部平台商品采集任务（${items.length} 项）。`));
+  await setActiveSourcingJob(job);
+  await reportSourcingProgress(job);
+  const stopCancelMonitor = startSourcingCancelMonitor(job);
+  try {
+    for (let index = job.results.length; index < items.length; index += 1) {
+      if (job.cancelRequested) break;
+      const { url, sourceType } = items[index];
+      const sourceLabel = sourceType === "pdd" ? "拼多多" : (sourceType === "1688" ? "1688" : "外部平台");
+      job.phase = `采集${sourceLabel}商品 ${index + 1}/${items.length}`;
+      job.logs.push(makeLog(`采集 ${sourceType || "未知来源"} ${url}`));
+      await reportSourcingProgress(job);
+      try {
+        if (!url) throw new Error("缺少链接");
+        if (!/^https?:\/\//i.test(url)) throw new Error("链接格式不正确（需 http/https）");
+        let data = null;
+        if (sourceType === "1688") data = await collect1688ProductForListingInPlugin(url, job);
+        else if (sourceType === "pdd") data = await collectPddProductInPlugin(url, job);
+        else throw new Error(`不支持的来源类型：${sourceType || "未知"}`);
+        // 采集函数可能返回 { ok:false, error } 而不是抛错（拼多多反爬兜底）
+        if (data && data.ok === false) throw new Error(String(data.error || "未采集到商品数据"));
+        if (!data || !data.title) throw new Error("未采集到商品标题（页面结构变化或需要登录）");
+        const images = Array.isArray(data.images) ? data.images.filter(Boolean) : [];
+        const skus = Array.isArray(data.skus) ? data.skus : [];
+        const firstSkuPrice = skus.map((sku) => Number(sku?.priceCny)).find((n) => Number.isFinite(n) && n > 0) || 0;
+        const priceCny = Number(data.priceCny) > 0
+          ? Number(data.priceCny)
+          : (firstSkuPrice > 0 ? firstSkuPrice : (Number(String(data.priceText || "").replace(/[^\d.]/g, "")) || 0));
+        const weightGrams = Math.round(
+          Number(data.weightGrams) > 0
+            ? Number(data.weightGrams)
+            : (Number(data.weightKg) > 0 ? Number(data.weightKg) * 1000 : 0)
+        ) || 0;
+        let dimensionsText = String(data.dimensionsText || "").trim();
+        if (!dimensionsText) {
+          const dims = [Number(data.lengthCm) || 0, Number(data.widthCm) || 0, Number(data.heightCm) || 0];
+          if (dims.every((v) => v > 0)) dimensionsText = `${dims[0]}x${dims[1]}x${dims[2]}cm`;
+        }
+        job.results.push({
+          ok: true,
+          sourceType,
+          url,
+          title: String(data.title).slice(0, 300),
+          images,
+          priceCny,
+          skus,
+          attributes: (data.attributes && typeof data.attributes === "object" && !Array.isArray(data.attributes)) ? data.attributes : {},
+          weightGrams,
+          dimensionsText,
+          error: "",
+        });
+        job.logs.push(makeLog(`✓ ${String(data.title).slice(0, 40)} | 主图 ${images.length} 张 | SKU ${skus.length} 个 | 价格 ¥${priceCny || "-"}`));
+      } catch (e) {
+        const msg = (e?.message || String(e)).slice(0, 300);
+        job.results.push({ ok: false, sourceType, url, error: msg });
+        job.logs.push(makeLog(`✗ 采集失败 ${url}：${msg}`, "warn"));
+      }
+      job.processed = Math.min(index + 1, job.total);
+      job.phase = `已完成 ${job.processed}/${job.total}`;
+      await reportSourcingProgress(job);
+    }
+  } finally {
+    stopCancelMonitor();
+  }
+  const failed = job.results.filter((r) => r.ok === false).length;
+  job.status = job.cancelRequested ? "canceled" : (failed === job.results.length && job.results.length ? "error" : "done");
+  job.error = job.status === "error" ? "全部采集失败" : "";
+  job.phase = job.status === "done"
+    ? `采集完成：成功 ${job.results.length - failed} · 失败 ${failed}`
+    : (job.status === "canceled" ? "已停止" : "全部失败");
+  try {
+    await erpApi(`/api/worker/jobs/${encodeURIComponent(job.id)}/complete`, {
+      method: "POST",
+      body: { result: { results: job.results } },
+    });
+  } finally {
+    await clearActiveSourcingJob(job.id);
+  }
+}
+
+// 拼多多商品采集：打开 mobile.yangkeduo.com/goods.html?goods_id=xxx（非激活标签页），
+// 注入自包含函数优先读 window.rawData（页面把 goods 数据挂在 store.initDataObj.goods 上），
+// 拿不到再兜底读 og:title / og:image / DOM 图与价格。反爬/懒加载情况下间隔 2s 重试一次。
+async function collectPddProductInPlugin(url, job = null) {
+  assertSourcingNotCanceled(job);
+  const tab = await createTabWithRetry({ url, active: false }, "打开拼多多商品页");
+  try {
+    await waitForTabComplete(tab.id, 45000);
+    await sleep(randomInt(900, 1800));
+    assertSourcingNotCanceled(job);
+    let data = null;
+    let lastError = "";
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      data = null;
+      lastError = "";
+      try {
+        const [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id }, func: extractPddProductData });
+        data = res?.result || null;
+        lastError = String(data?.error || "");
+      } catch (e) {
+        lastError = String(e?.message || e).slice(0, 200);
+      }
+      const imgCount = Array.isArray(data?.images) ? data.images.length : 0;
+      if (job) {
+        job.logs.push(makeLog(
+          `拼多多采集 第${attempt}次：数据来源=${data?.source || "无"} 标题=${data?.title ? "有" : "无"} 图片=${imgCount} 张 价格=${data?.priceCny || 0}`
+          + (lastError ? ` 错误=${lastError}` : ""),
+          data?.title ? "info" : "warn",
+        ));
+      }
+      if (data?.title && imgCount > 0) break;
+      if (attempt < 2) {
+        // 反爬/二次渲染：第一次拿不到时再等 2s 重试一次
+        await sleep(2000);
+        assertSourcingNotCanceled(job);
+      }
+    }
+    if (!data || !data.title || !Array.isArray(data.images) || !data.images.length) {
+      if (job) job.logs.push(makeLog("拼多多页面数据未取到（可能需要登录或页面结构变化）", "warn"));
+      return { ok: false, error: "拼多多页面数据未取到（可能需要登录或页面结构变化）" };
+    }
+    return {
+      ok: true,
+      title: String(data.title).slice(0, 300),
+      images: data.images.filter(Boolean).slice(0, 20),
+      priceCny: Number(data.priceCny) || 0,
+      skus: Array.isArray(data.skus) ? data.skus : [],
+      attributes: {},
+      weightGrams: 0,
+      dimensionsText: "",
+      source: data.source || "",
+      url,
+      collectedAt: new Date().toISOString(),
+    };
+  } finally {
+    if (tab?.id) await safeRemoveTab(tab.id);
+  }
+}
+
+// 在拼多多商品页上下文执行（必须是自包含函数，不能引用 background 里的其它变量）：
+// window.rawData.store.initDataObj.goods 取标题/图集/价格/SKU，失败再走 meta / DOM。
+function extractPddProductData() {
+  try {
+    const clean = (v) => String(v ?? "").replace(/\s+/g, " ").trim();
+    const abs = (u) => {
+      const s = String(u ?? "").trim();
+      if (!s) return "";
+      if (s.startsWith("//")) return `https:${s}`;
+      if (s.startsWith("/")) return `${location.origin}${s}`;
+      return s;
+    };
+    const pushImg = (list, u) => {
+      const s = abs(u);
+      if (s && /^https?:\/\//i.test(s)) list.push(s);
+    };
+    // 拼多多接口价格单位是分；少数结构直接给元（带小数）
+    const toYuan = (v) => {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n <= 0) return 0;
+      return Number.isInteger(n) ? Math.round(n) / 100 : Math.round(n * 100) / 100;
+    };
+    const w = window;
+    const rd = w.rawData || w.__RAW_DATA__ || w.__INIT_DATA || null;
+    const init = rd?.store?.initDataObj || rd?.initDataObj || rd?.initData || null;
+    const goods = init?.goods || init?.goodsInfo || rd?.goods || null;
+    let source = "none";
+    let title = "";
+    let priceCny = 0;
+    let skus = [];
+    const images = [];
+    if (goods && typeof goods === "object") {
+      source = "rawData";
+      title = clean(goods.goodsName || goods.goods_name || goods.title);
+      const galleries = [goods.topGallery, goods.gallery, goods.detailGallery, goods.images, goods.imgList];
+      for (const gallery of galleries) {
+        for (const it of (Array.isArray(gallery) ? gallery : [])) {
+          pushImg(images, typeof it === "string" ? it : (it?.url || it?.imgUrl || it?.imageUrl || it?.gifUrl));
+        }
+      }
+      if (!images.length) pushImg(images, goods.thumbUrl || goods.thumb_url || goods.hdThumbUrl || goods.hdThumb_url);
+      priceCny = toYuan(goods.minGroupPrice ?? goods.minOnSaleGroupPrice ?? goods.min_group_price ?? goods.minNormalPrice ?? goods.min_normal_price);
+      const skuList = Array.isArray(goods.skus) ? goods.skus : (Array.isArray(goods.sku_list) ? goods.sku_list : []);
+      skus = skuList.map((s) => {
+        const spec = clean((Array.isArray(s?.specs) ? s.specs : [])
+          .map((sp) => sp?.spec_value || sp?.specValue || sp?.value || "")
+          .filter(Boolean).join(" ")) || clean(s?.spec || "");
+        const p = toYuan(s?.groupPrice ?? s?.normalPrice ?? s?.price);
+        return {
+          spec,
+          priceCny: p > 0 ? p : priceCny,
+          stock: Number(s?.quantity ?? s?.stock ?? s?.skuQuantity ?? 0) || 0,
+          image: abs(s?.thumbUrl || s?.thumb_url || ""),
+        };
+      }).filter((s) => s.spec);
+      if (!skus.length) skus = [{ spec: "", priceCny, stock: 0, image: images[0] || "" }];
+    }
+    // 兜底 1：meta / document.title（错误页/登录页的标题可能只是「拼多多」，需排除）
+    if (!title) {
+      const fallbackTitle = clean(document.querySelector('meta[property="og:title"]')?.content || document.title || "")
+        .replace(/\s*[-_]\s*(拼多多|多多).*$/i, "")
+        .slice(0, 300);
+      if (fallbackTitle && !/^(拼多多|多多)(\s*[-_—|].*)?$/.test(fallbackTitle)) {
+        title = fallbackTitle;
+        if (source === "none") source = "dom";
+      }
+    }
+    // 兜底 2：og:image + 页面 img（pddpic 图床）
+    if (!images.length) {
+      pushImg(images, document.querySelector('meta[property="og:image"]')?.content);
+      for (const img of Array.from(document.querySelectorAll("img"))) {
+        const u = img.currentSrc || img.src || img.getAttribute("data-src") || "";
+        if (!u || !/(pddpic|yangkeduo|pinduoduo)/i.test(u)) continue;
+        if ((img.naturalWidth || 0) > 0 && img.naturalWidth < 150) continue;
+        pushImg(images, u);
+      }
+      if (images.length && source === "none") source = "dom";
+    }
+    // 兜底 3：页面可见文本里的 ¥价格
+    if (!priceCny) {
+      const m = clean(document.body?.innerText || "").match(/[¥￥]\s*(\d+(?:\.\d+)?)/);
+      if (m) priceCny = Number(m[1]) || 0;
+    }
+    const uniq = images.filter((u, i, a) => a.indexOf(u) === i).slice(0, 20);
+    const goodsId = String(new URLSearchParams(location.search).get("goods_id") || "");
+    return {
+      ok: !!(title && uniq.length),
+      source,
+      goodsId,
+      title: title.slice(0, 300),
+      images: uniq,
+      priceCny,
+      skus,
+      rawDataKeys: rd && typeof rd === "object" ? Object.keys(rd).slice(0, 10) : [],
+    };
+  } catch (e) {
+    return { ok: false, source: "error", title: "", images: [], priceCny: 0, skus: [], error: String(e?.message || e).slice(0, 300) };
+  }
+}
+
 // Yandex 核价任务（kind=yandex-research）：逐项用 1688 官方以图找货返回同款候选（1688 登录态留在本机插件）。
 async function runQueuedYandexResearchJob(remoteJob) {
   const payload = remoteJob.payload || {};
@@ -1875,13 +2145,14 @@ async function pollSourcingQueueOnce() {
       : "逐梦插件在线，可领取单品找货任务";
     const data = await erpApi("/api/worker/jobs/next", {
       method: "POST",
-      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research", "yandex-collect", "ozon-patrol"] },
+      body: { ...workerMeta(currentPhase), currentJobId: activeJob?.id || "", kinds: ["run", "yandex-research", "yandex-collect", "ozon-patrol", "collect-external"] },
     });
     if (data.job) {
       console.log(`[SW ${VERSION}] 领取任务: ${data.job.id} kind=${data.job.kind}`);
       if (data.job.kind === "yandex-research") await runQueuedYandexResearchJob(data.job);
       else if (data.job.kind === "yandex-collect") await runQueuedYandexCollectJob(data.job);
       else if (data.job.kind === "ozon-patrol") await runQueuedOzonPatrolJob(data.job);
+      else if (data.job.kind === "collect-external") await runQueuedCollectExternalJob(data.job);
       else await runQueuedSourcingJob(data.job);
     }
   } catch (e) {
