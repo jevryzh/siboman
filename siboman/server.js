@@ -20813,6 +20813,15 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
     }
     if (["done", "error", "canceled"].includes(existing.status)) {
       await clearWorkerCurrentJobRefs(req.params.id);
+      // v2.2.9.179 用户中途停止：已采到的条目也要写回采集箱，不能白采
+      if (existing.kind === "collect-external") {
+        try {
+          const doneResults = (existing.results && existing.results.results) || existing.results || [];
+          if (Array.isArray(doneResults) && doneResults.length) {
+            await applyCollectExternalResults(existing, doneResults, existing.user_id);
+          }
+        } catch (_e) { /* 写回失败不影响停止 */ }
+      }
       res.json({ success: true, job: existing, terminal: true, canceled: existing.status === "canceled" });
       return;
     }
@@ -20825,6 +20834,11 @@ app.post("/api/worker/jobs/:id/progress", async (req, res, next) => {
       currentJobId: req.params.id,
       currentPhase: req.body?.phase || existing.phase || "采集中",
     });
+    // v2.2.9.179 插件按 { result: { results: [...] } } 上报（Yandex/1688 采集都是这个约定），
+    //   但 normalizeWorkerJobUpdate 只看 req.body.results → 之前结果会丢。这里先归一化。
+    if (req.body?.result && typeof req.body.result === "object" && !req.body.results) {
+      req.body.results = Array.isArray(req.body.result.results) ? req.body.result.results : req.body.result;
+    }
     const updates = normalizeWorkerJobUpdate(req.body || {}, existing);
     if (existing.status === "canceled" && updates.status && !["canceled", "done", "error"].includes(updates.status)) {
       delete updates.status;
@@ -21010,7 +21024,8 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
     //   v2.2.9.127：定向查询（mode=targeted）只替换「本次查到的那些 offer_id」，不清空全表，
     //   否则用户查完 A 批再查 B 批，A 批的数据会被整表删除抹掉。
     if (updated && updated.kind === "collect-external") {
-      const n = await applyCollectExternalResults(updated, (updated.results && updated.results.results) || updated.results || [], existing.user_id || req.user?.id);
+      const rawRes = (updated.results && updated.results.results) || updated.results || [];
+      const n = await applyCollectExternalResults(updated, Array.isArray(rawRes) ? rawRes : [], existing.user_id || req.user?.id);
       console.log(`[collect-external] job=${updated.id} 写回 ${n} 条`);
     }
     if (updated && updated.kind === "ozon-patrol") {
