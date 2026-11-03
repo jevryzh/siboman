@@ -16480,6 +16480,46 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
 
 // v2.2.9.188 返回「毛线订单」按拣货单规则的排序结果（供标签导出按同一顺序生成）。
 //   规则：单色在前（按色号）→ 同色号按数量升序 → 混色最后。
+// v2.2.9.189 把「逐单生成」的标签 PDF 按指定顺序合并成一个文件。
+//   插件逐单调卖家后台生成标签（保证一单一份），把每单的 S3 链接传回来，
+//   服务端按前端给的顺序下载并合并 —— 这样标签页顺序与拣货单完全一致。
+app.post("/api/seller/orders/yarn-label-pdf", requireAuth, async (req, res, next) => {
+  try {
+    const order = Array.isArray(req.body?.order) ? req.body.order.map(String) : [];
+    const items = Array.isArray(req.body?.items) ? req.body.items : [];
+    if (!items.length) return res.status(400).json({ success: false, error: "没有可合并的标签" });
+    const urlByPn = new Map();
+    for (const it of items) {
+      if (it && it.pn && it.url) urlByPn.set(String(it.pn), String(it.url));
+    }
+    const seq = order.length ? order.filter((pn) => urlByPn.has(pn)) : [...urlByPn.keys()];
+    const bufs = [];
+    for (const pn of seq) {
+      const u = urlByPn.get(pn);
+      if (!/^https:\/\/ir-\d+\.ozone\.ru\//i.test(u)) continue;   // 只允许 Ozon CDN，防 SSRF
+      try {
+        const r = await fetch(u, { redirect: "follow" });
+        if (!r.ok) continue;
+        const b = Buffer.from(await r.arrayBuffer());
+        if (b.slice(0, 4).toString() !== "%PDF") continue;
+        bufs.push(b);
+      } catch (_e) { /* 单个失败跳过 */ }
+    }
+    if (!bufs.length) return res.status(400).json({ success: false, error: "下载标签失败（未取到任何 PDF）" });
+    const outDoc = await PDFDocument.create();
+    for (const b of bufs) {
+      const src = await PDFDocument.load(b, { ignoreEncryption: true });
+      const pages = await outDoc.copyPages(src, src.getPageIndices());
+      pages.forEach((pg) => outDoc.addPage(pg));
+    }
+    const merged = Buffer.from(await outDoc.save());
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="yarn-labels-${Date.now()}.pdf"`);
+    res.setHeader("X-Page-Count", String(bufs.length));
+    res.send(merged);
+  } catch (error) { next(error); }
+});
+
 app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res, next) => {
   try {
     const picked = Array.isArray(req.body?.posting_numbers)

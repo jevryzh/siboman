@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.187";
+const VERSION = "2.2.9.189";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5920,15 +5920,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   //         POST /api/report/status {code}          → 状态（可能带下载地址）
   //         → 下载 PDF
   //   ⚠️ 该接口的会话**绑定 IP**，必须在你浏览器里、带登录态调用，服务端直连一律 307。
-  // v2.2.9.187 打印面单 v3：
-  //   ⚠️ 教训：① 后台 fetch 会被 403（Origin 是 chrome-extension://，卖家后台不认）
-  //            ② 注入页面返回大数据（几 MB base64）会让 executeScript 拿不到结果
-  //   所以：**注入页面只做 create + 轮询拿 PDF 链接**（返回很小的对象），
-  //        然后由后台去下载 S3 文件（S3 不限 Origin），再转 base64 给 ERP。
+  // v2.2.9.189 打印面单 v4：**一单一个任务**，保证顺序可控
+  //   背景：卖家后台的 create 接口如果一次传多个 posting_numbers，返回的 PDF 里页面顺序会被 Ozon 打乱，
+  //         和我们的拣货单顺序对不上（用户实测）。所以改成逐单生成，只把每单的 S3 链接带回来（数据很小），
+  //         再由 ERP 服务端按我们的顺序下载 + 合并。
   if (msg.action === "printLabels") {
     (async () => {
       try {
         const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
+        if (!postingNumbers.length) return sendResponse({ ok: false, error: "没有传订单号" });
         let tabs = await chrome.tabs.query({ url: "*://seller.ozon.ru/*" });
         let tab = tabs && tabs[0];
         if (!tab) {
@@ -5953,43 +5953,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
               const t = await r.text();
               let j = null; try { j = JSON.parse(t); } catch (_e) {}
-              return { status: r.status, json: j, text: t.slice(0, 300) };
+              return { status: r.status, json: j, text: t.slice(0, 200) };
             };
-            const now = Date.now();
-            const body = postingNumbers.length
-              ? { company_id: companyId, posting_numbers: postingNumbers }
-              : { company_id: companyId, filter: {
-                  cutoff_from: new Date(now - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
-                  cutoff_to: new Date(now + 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
-                  delivery_groups: ["DeliveryGroup_all"],
-                  label_format_name: "ozon: small" } };
-            const create = await post("/api/label/task/create", body);
-            const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
-            if (!taskId) return { ok: false, step: "create", error: `create HTTP ${create.status}`, createText: create.text };
-            let fileUrl = "", lastText = "";
-            for (let i = 0; i < 15 && !fileUrl; i += 1) {
-              await sleep(i === 0 ? 800 : 1200);
-              const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
-              lastText = st.text.slice(0, 160);
-              const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
-              if (m) fileUrl = m[0].replace(/\\\//g, "/");
+            const items = [];
+            const failed = [];
+            for (let k = 0; k < postingNumbers.length; k += 1) {
+              const pn = postingNumbers[k];
+              const create = await post("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] });
+              const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
+              if (!taskId) { failed.push({ pn, err: `create ${create.status}` }); continue; }
+              let url = "";
+              for (let i = 0; i < 12 && !url; i += 1) {
+                await sleep(i === 0 ? 600 : 900);
+                const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+                const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
+                if (m) url = m[0].replace(/\\\//g, "/");
+              }
+              if (url) items.push({ pn, url });
+              else failed.push({ pn, err: "no_url", taskId });
             }
-            if (!fileUrl) return { ok: false, step: "no_url", taskId, lastText };
-            return { ok: true, taskId, fileUrl };
+            return { ok: true, items, failed };
           },
           args: [postingNumbers],
         });
         const r = inj && inj.result;
         if (!r) return sendResponse({ ok: false, step: "inject", error: "注入无返回", tabUrl: String(tab.url || "").slice(0, 80) });
         if (!r.ok) return sendResponse(r);
-        // 后台下载 S3 PDF（不限 Origin）
-        const f = await fetch(r.fileUrl, { credentials: "omit" });
-        if (!f.ok) return sendResponse({ ok: false, step: "download", error: `下载失败 HTTP ${f.status}`, fileUrl: r.fileUrl.slice(0, 150) });
-        const buf = new Uint8Array(await f.arrayBuffer());
-        let bin = "";
-        const step = 8192;
-        for (let i = 0; i < buf.length; i += step) bin += String.fromCharCode.apply(null, buf.subarray(i, i + step));
-        sendResponse({ ok: true, taskId: r.taskId, fileUrl: r.fileUrl.slice(0, 200), size: buf.length, base64: btoa(bin) });
+        sendResponse(r);
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 300) });
       }

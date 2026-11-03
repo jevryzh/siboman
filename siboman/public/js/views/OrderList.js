@@ -763,16 +763,19 @@ window.OrderListView = {
           const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked }, { timeout: 30000 });
           if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
         } catch (_e) { /* 排序失败就用原顺序 */ }
-        const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: ordered }, 300000);
+        const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: ordered }, 600000);
         if (!res || res.ok !== true) {
-          const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.create?.text || res?.log?.[0]?.text || '').slice(0, 200);
+          const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
           return notify.error('导出毛线标签失败：' + String(msg).slice(0, 260), 12000);
         }
-        const bin = atob(res.base64 || '');
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-        downloadBlob(bytes, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
-        notify.success(`已导出毛线标签（${Math.round((res.size || 0) / 1024)} KB，任务 ${res.taskId || '-'}）`);
+        const items = Array.isArray(res.items) ? res.items : [];
+        if (!items.length) return notify.error('导出毛线标签失败：插件未取到任何标签');
+        notify.info(`已生成 ${items.length} 个标签，正在按顺序合并…`, 8000);
+        // 服务端按「拣货单顺序」下载并合并
+        const merged = await axios.post('/api/seller/orders/yarn-label-pdf', { order: ordered, items }, { responseType: 'blob', timeout: 300000 });
+        downloadBlob(merged.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
+        const failedCount = Array.isArray(res.failed) ? res.failed.length : 0;
+        notify.success(`已导出 ${items.length} 个订单的毛线标签${failedCount ? `（${failedCount} 单失败）` : ''}，顺序与拣货单一致`);
       } catch (e) {
         notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 200));
       } finally { yarnLabelsBusy.value = false; }
