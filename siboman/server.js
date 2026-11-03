@@ -15615,8 +15615,18 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         ? req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean).slice(0, 1000)
         : [];
       if (postingFilter.length) {
-        params.push(postingFilter);
-        where.push(`posting_number = ANY($${params.length}::text[])`);
+        // v2.2.9.180 宽容匹配：用户可能粘贴「货件号」(8765-0022-3)、
+        //   「订单号」(8765-0022)、或带空格的，做三种形式兜底。
+        const exact = postingFilter;
+        const prefixes = postingFilter.filter((x) => /^\d+-\d+$/.test(x));   // 订单号形式 → 匹配 posting_number LIKE 'xxx-%'
+        params.push(exact);
+        const exactIdx = params.length;
+        let sqlCond = `posting_number = ANY($${exactIdx}::text[]) OR payload->>'order_number' = ANY($${exactIdx}::text[])`;
+        if (prefixes.length) {
+          params.push(prefixes);
+          sqlCond += ` OR posting_number LIKE ANY(SELECT unnest($${params.length}::text[]) || '-%')`;
+        }
+        where.push(`(${sqlCond})`);
       }
       // v2.2.9.162 状态计数交回服务端。
       //   原来前端为了算 tab 个数，把订单列表翻到最多 10 页 × 200 = 2000 条再本地统计，
