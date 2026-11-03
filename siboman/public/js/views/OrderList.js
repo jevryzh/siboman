@@ -483,6 +483,17 @@ window.OrderListView = {
           total += Number(data.total || storeRows.length || 0);
         }
         if (failures.length) notify.warning(`部分店铺订单读取失败：${failures.slice(0, 2).join('；')}`);
+        // v2.2.9.193 批量单号筛选：提示查不到的单号
+        const missingPns = rows.__missingPostings || [];
+        if (postingFilter.value.length && missingPns.length) {
+          try {
+            window.ElementPlus.ElMessage.warning({
+              message: `有 ${missingPns.length} 个单号在本店铺查不到：${missingPns.slice(0, 5).join('、')}${missingPns.length > 5 ? ' 等' : ''}`,
+              duration: 15000,
+              showClose: true,
+            });
+          } catch (_e) { /* 忽略 */ }
+        }
         rows.sort((a, b) => new Date(b.in_process_at || b.created_at || 0) - new Date(a.in_process_at || a.created_at || 0));
         orders.value = rows;
         pagination.total = aggregateStoreMode ? rows.length : total;

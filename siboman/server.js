@@ -15651,6 +15651,19 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       );
       statusCounts.overdue = Number(overdueRes.rows[0]?.cnt || 0);
 
+      // v2.2.9.193 批量单号筛选时，告诉前端「哪些单号没匹配到」——用户遇到 1000 条只查到 964 条，
+      //   需要知道差的 36 条是重复的、还是不在本店铺缓存里。
+      let missingPostings = [];
+      if (postingFilter.length) {
+        try {
+          const foundRes = await db.query(
+            `SELECT posting_number FROM app_order_cache WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
+            [req.user.id, storeId, postingFilter],
+          );
+          const foundSet = new Set(foundRes.rows.map((r) => String(r.posting_number)));
+          missingPostings = postingFilter.filter((pn) => !foundSet.has(pn)).slice(0, 200);
+        } catch (_e) { /* 诊断失败不影响主流程 */ }
+      }
       const countRes = await db.query(
         `SELECT count(*)::int AS count FROM app_order_cache WHERE ${where.join(" AND ")}`,
         params,
@@ -15673,6 +15686,7 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         success: true,
         orders,
         status_counts: statusCounts,   // v2.2.9.162 各状态的真实条数（服务端统计，不受分页上限影响）
+        posting_filter_missing: missingPostings,   // v2.2.9.193 没匹配到的单号（便于用户核查）
         total: Number(countRes.rows[0]?.count || orders.length),
         has_next: offset + orders.length < Number(countRes.rows[0]?.count || 0),
         source: "cache",
