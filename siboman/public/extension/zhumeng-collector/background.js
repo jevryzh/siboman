@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.186";
+const VERSION = "2.2.9.187";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5920,71 +5920,76 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   //         POST /api/report/status {code}          → 状态（可能带下载地址）
   //         → 下载 PDF
   //   ⚠️ 该接口的会话**绑定 IP**，必须在你浏览器里、带登录态调用，服务端直连一律 307。
-  // v2.2.9.186 打印面单 —— 直接在后台用 fetch 调卖家后台接口（不再注入页面）
-  //   · 插件有 seller.ozon.ru 的 host 权限，后台 fetch 会带上登录 cookie
-  //   · 链路：POST /api/label/task/create {company_id, posting_numbers}
-  //          → {tasks:[{task_id}]}
-  //          → POST /api/label/task/get {task_id, company_id} 轮询拿到 .pdf 链接
-  //          → 下载 PDF 转 base64 返回
+  // v2.2.9.187 打印面单 v3：
+  //   ⚠️ 教训：① 后台 fetch 会被 403（Origin 是 chrome-extension://，卖家后台不认）
+  //            ② 注入页面返回大数据（几 MB base64）会让 executeScript 拿不到结果
+  //   所以：**注入页面只做 create + 轮询拿 PDF 链接**（返回很小的对象），
+  //        然后由后台去下载 S3 文件（S3 不限 Origin），再转 base64 给 ERP。
   if (msg.action === "printLabels") {
     (async () => {
       try {
         const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
-        // 从 cookie 读 company_id
-        let companyId = String(msg.companyId || "").trim();
-        if (!companyId) {
-          try {
-            const c = await chrome.cookies.get({ url: "https://seller.ozon.ru", name: "sc_company_id" });
-            companyId = String((c && c.value) || "").trim();
-          } catch (_e) { /* 忽略 */ }
+        let tabs = await chrome.tabs.query({ url: "*://seller.ozon.ru/*" });
+        let tab = tabs && tabs[0];
+        if (!tab) {
+          tab = await chrome.tabs.create({ url: "https://seller.ozon.ru/app/postings/crossborder/fbs", active: true });
+          await new Promise((r) => setTimeout(r, 6000));
         }
-        if (!companyId) return sendResponse({ ok: false, error: "读不到 company_id，请先在浏览器登录 seller.ozon.ru" });
-        const H = {
-          "content-type": "application/json",
-          accept: "application/json, text/plain, */*",
-          "x-o3-app-name": "seller-ui",
-          "x-o3-company-id": companyId,
-          "x-o3-language": "zh-Hans",
-          "x-o3-page-type": "CbPostingsFbs",
-        };
-        const post = async (path, body) => {
-          const r = await fetch("https://seller.ozon.ru" + path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
-          const t = await r.text();
-          let j = null; try { j = JSON.parse(t); } catch (_e) {}
-          return { status: r.status, json: j, text: t.slice(0, 300) };
-        };
-        const now = Date.now();
-        const createBody = postingNumbers.length
-          ? { company_id: companyId, posting_numbers: postingNumbers }
-          : {
-              company_id: companyId,
-              filter: {
-                cutoff_from: new Date(now - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
-                cutoff_to: new Date(now + 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
-                delivery_groups: ["DeliveryGroup_all"],
-                label_format_name: "ozon: small",
-              },
+        const [inj] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async function (postingNumbers) {
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const companyId = (document.cookie.match(/(?:^|;\s*)sc_company_id=([^;]+)/) || [])[1] || "";
+            if (!companyId) return { ok: false, step: "cookie", error: "读不到 sc_company_id" };
+            const H = {
+              "content-type": "application/json",
+              accept: "application/json, text/plain, */*",
+              "x-o3-app-name": "seller-ui",
+              "x-o3-company-id": companyId,
+              "x-o3-language": "zh-Hans",
+              "x-o3-page-type": "CbPostingsFbs",
             };
-        const create = await post("/api/label/task/create", createBody);
-        const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
-        if (!taskId) {
-          return sendResponse({ ok: false, step: "create", error: `create 失败 HTTP ${create.status}`, create: { status: create.status, text: create.text } });
-        }
-        let fileUrl = "", lastState = "";
-        for (let i = 0; i < 15 && !fileUrl; i += 1) {
-          await new Promise((r) => setTimeout(r, i === 0 ? 800 : 1200));
-          const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
-          lastState = st.text.slice(0, 160);
-          const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
-          if (m) fileUrl = m[0].replace(/\\\//g, "/");
-        }
-        if (!fileUrl) return sendResponse({ ok: false, step: "no_url", error: `task ${taskId} 未返回 PDF 链接`, lastState });
-        const f = await fetch(fileUrl, { credentials: "include" });
-        if (!f.ok) return sendResponse({ ok: false, step: "download", error: `下载失败 HTTP ${f.status}`, fileUrl: fileUrl.slice(0, 150) });
+            const post = async (path, body) => {
+              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
+              const t = await r.text();
+              let j = null; try { j = JSON.parse(t); } catch (_e) {}
+              return { status: r.status, json: j, text: t.slice(0, 300) };
+            };
+            const now = Date.now();
+            const body = postingNumbers.length
+              ? { company_id: companyId, posting_numbers: postingNumbers }
+              : { company_id: companyId, filter: {
+                  cutoff_from: new Date(now - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+                  cutoff_to: new Date(now + 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+                  delivery_groups: ["DeliveryGroup_all"],
+                  label_format_name: "ozon: small" } };
+            const create = await post("/api/label/task/create", body);
+            const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
+            if (!taskId) return { ok: false, step: "create", error: `create HTTP ${create.status}`, createText: create.text };
+            let fileUrl = "", lastText = "";
+            for (let i = 0; i < 15 && !fileUrl; i += 1) {
+              await sleep(i === 0 ? 800 : 1200);
+              const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+              lastText = st.text.slice(0, 160);
+              const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
+              if (m) fileUrl = m[0].replace(/\\\//g, "/");
+            }
+            if (!fileUrl) return { ok: false, step: "no_url", taskId, lastText };
+            return { ok: true, taskId, fileUrl };
+          },
+          args: [postingNumbers],
+        });
+        const r = inj && inj.result;
+        if (!r) return sendResponse({ ok: false, step: "inject", error: "注入无返回", tabUrl: String(tab.url || "").slice(0, 80) });
+        if (!r.ok) return sendResponse(r);
+        // 后台下载 S3 PDF（不限 Origin）
+        const f = await fetch(r.fileUrl, { credentials: "omit" });
+        if (!f.ok) return sendResponse({ ok: false, step: "download", error: `下载失败 HTTP ${f.status}`, fileUrl: r.fileUrl.slice(0, 150) });
         const buf = new Uint8Array(await f.arrayBuffer());
         let bin = "";
-        for (let i = 0; i < buf.length; i += 1) bin += String.fromCharCode(buf[i]);
-        sendResponse({ ok: true, taskId, fileUrl: fileUrl.slice(0, 200), size: buf.length, base64: btoa(bin) });
+        const step = 8192;
+        for (let i = 0; i < buf.length; i += step) bin += String.fromCharCode.apply(null, buf.subarray(i, i + step));
+        sendResponse({ ok: true, taskId: r.taskId, fileUrl: r.fileUrl.slice(0, 200), size: buf.length, base64: btoa(bin) });
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 300) });
       }
