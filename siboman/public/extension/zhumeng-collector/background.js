@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.182";
+const VERSION = "2.2.9.183";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5965,24 +5965,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
             if (!taskId) return { ok: false, step: "create", create: { status: create.status, text: create.text } };
 
-            // 轮询任务状态：依次探测候选路径，谁能返回文件地址就用谁
-            const cands = [
-              ["/api/label/task/info", { task_id: taskId }],
-              ["/api/label/task/status", { task_id: taskId }],
-              ["/api/label/task/get", { task_id: taskId }],
-              ["/api/label/task/download", { task_id: taskId }],
-              ["/api/label/task/list", { task_ids: [taskId] }],
-            ];
+            // v2.2.9.183 已确认的正确状态接口（用户抓包）：
+            //   POST /api/label/task/get  { task_id, company_id }  → 返回任务状态 + 文件地址
             const log = [];
             let fileUrl = "";
-            for (let i = 0; i < 20 && !fileUrl; i += 1) {
-              await sleep(i === 0 ? 1200 : 1800);
-              for (const [path, body] of cands) {
-                const r = await post(path, body);
-                if (i === 0) log.push({ path, status: r.status, text: r.text.slice(0, 120) });
-                const m = JSON.stringify(r.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
-                if (m) { fileUrl = m[0].replace(/\\\//g, "/"); break; }
-              }
+            for (let i = 0; i < 15 && !fileUrl; i += 1) {
+              await sleep(i === 0 ? 800 : 1200);
+              const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+              if (i === 0) log.push({ step: "get", status: st.status, text: st.text.slice(0, 200) });
+              const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
+              if (m) { fileUrl = m[0].replace(/\\\//g, "/"); break; }
+              const stateStr = String((st.json && (st.json.status || st.json.state)) || "").toLowerCase();
+              if (/error|fail|cancel/.test(stateStr)) return { ok: false, step: "task_failed", taskId, log, state: stateStr };
             }
             if (!fileUrl) return { ok: false, step: "no_url", taskId, log };
             const f = await fetch(fileUrl, { credentials: "include" });
