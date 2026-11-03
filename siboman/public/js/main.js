@@ -90,6 +90,7 @@ const initApp = () => {
       const shops = Vue.ref([]);
       const currentStoreId = Vue.ref(localStorage.getItem('currentStoreId') || '');
       const buildInfo = Vue.ref({ version: '', buildTime: '' });
+      const mobileNavOpen = Vue.ref(false);
 
       const envLabel = Vue.computed(() => {
         const host = window.location.hostname || '';
@@ -137,7 +138,7 @@ const initApp = () => {
         window.location.href = '/login';
       };
 
-      const goTo = (p) => { window.location.hash = p; };
+      const goTo = (p) => { mobileNavOpen.value = false; window.location.hash = p; };
       // 独立出图服务（image-set）的控制台：同域，未登录会跳 ERP 登录页
       const openImageSetConsole = () => window.open('/image-set-console.html', '_blank', 'noopener');
       const handleStoreChange = (val) => {
@@ -185,6 +186,7 @@ const initApp = () => {
         if (path.includes('upload')) return 'upload';
         if (path.includes('listing-history')) return 'listing-history';
         if (path.includes('ai-generator')) return 'ai-generator';
+        if (path.includes('statistics-analysis')) return 'statistics-analysis';
         if (path.includes('analytics')) return 'analytics';
         if (path.includes('data-screen')) return 'data-screen';
         if (path.includes('market-discovery')) return 'market-discovery';
@@ -211,10 +213,11 @@ const initApp = () => {
         }
       });
 
-      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, openImageSetConsole, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl };
+      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, openImageSetConsole, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl, mobileNavOpen };
     },
     template: `
-      <el-container class="layout-container" v-loading="!isReady">
+      <el-container class="layout-container" :class="{'statistics-mobile-nav-open':mobileNavOpen}" v-loading="!isReady">
+        <div v-if="mobileNavOpen && routeName === 'statistics-analysis'" class="statistics-nav-backdrop" @click="mobileNavOpen=false"></div>
         <el-aside width="200px">
           <div class="logo" style="display:flex; align-items:center; gap:8px">
             <img src="/extension/zhumeng-collector/icons/icon48.png" style="width:28px; height:28px; border-radius:6px" />
@@ -272,6 +275,9 @@ const initApp = () => {
             <el-menu-item index="#/sales-funnel" @click="goTo('#/sales-funnel')">
               <el-icon><TrendCharts /></el-icon><span>销售漏斗</span>
             </el-menu-item>
+            <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')">
+              <el-icon><DataAnalysis /></el-icon><span>统计分析</span>
+            </el-menu-item>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
             </el-menu-item>
@@ -282,6 +288,7 @@ const initApp = () => {
         </el-aside>
         <el-container>
           <el-header class="erp-app-header">
+            <el-button v-if="routeName === 'statistics-analysis'" class="statistics-nav-toggle" :icon="'Menu'" circle :aria-label="mobileNavOpen?'关闭导航':'打开导航'" :aria-expanded="mobileNavOpen" title="导航" @click="mobileNavOpen=!mobileNavOpen" />
             <el-breadcrumb separator="/">
               <el-breadcrumb-item>逐梦 ERP</el-breadcrumb-item>
               <el-breadcrumb-item>{{ routeName }}</el-breadcrumb-item>
@@ -321,6 +328,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'listing-history'" class="erp-route-page"><listing-history-view /></div>
             <div v-else-if="routeName === 'ai-generator'" class="erp-route-page"><ai-image-generator-view /></div>
             <div v-else-if="routeName === 'analytics'" class="erp-route-page"><analytics-center-view /></div>
+            <div v-else-if="routeName === 'statistics-analysis'" class="erp-route-page"><statistics-analysis-view /></div>
             <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
             <div v-else-if="routeName === 'market-discovery'" class="erp-route-page"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
@@ -362,6 +370,7 @@ const initApp = () => {
   register('listing-history-view', window.ListingHistoryView);
   register('ai-image-generator-view', window.AIImageGeneratorView);
   register('analytics-center-view', window.AnalyticsCenterView);
+  register('statistics-analysis-view', window.StatisticsAnalysisView);
   register('data-screen-view', window.DataScreenView);
   register('market-discovery-view', window.MarketDiscoveryView);
   register('store-management-view', window.StoreManagementView);
