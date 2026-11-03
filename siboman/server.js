@@ -17,6 +17,7 @@ import dns from "node:dns/promises";
 import https from "node:https";
 import net from "node:net";
 import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
+import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20000,13 +20001,39 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       to: req.body?.to || new Date().toISOString(),
     };
     if (status && status.toLowerCase() !== "all") filter.status = status;
-    // v2.2.9.141 改用 v4（v3 已废弃，返回假 429）
-    const data = await ozonFbsListCompat({
-      since: filter.since, to: filter.to, status: filter.status,
-      limit, offset: 0, with: { financial_data: true, analytics_data: true },
-      storeId, userId: req.user.id,
-    });
-    const postings = data?.result?.postings || [];
+    // v2.2.9.192 导出改为**按当前查询条件从本地缓存取全部数据**。
+    //   原来走 Ozon 实时接口，而 ozonFbsListCompat 单页最多 100 条 → 永远只导出 100 行（用户看到 101 行含表头）。
+    //   而且它不认搜索/单号筛选，和列表看到的不是同一批数据。
+    let postings = [];
+    if (req.body?.source === "cache" || req.body?.from_cache) {
+      const where = ["c.user_id = $1", "c.store_id = $2"];
+      const params = [req.user.id, storeId];
+      if (filter.since && req.body?.since) { params.push(req.body.since); where.push(`c.in_process_at >= $${params.length}`); }
+      if (filter.to && req.body?.to) { params.push(req.body.to); where.push(`c.in_process_at <= $${params.length}`); }
+      if (status && status.toLowerCase() !== "all") {
+        params.push(status);
+        where.push(`COALESCE(NULLIF(c.display_status,''), c.status) = $${params.length}`);
+      }
+      const pns = Array.isArray(req.body?.posting_numbers) ? req.body.posting_numbers.map(String).filter(Boolean) : [];
+      if (pns.length) { params.push(pns); where.push(`c.posting_number = ANY($${params.length}::text[])`); }
+      const q = String(req.body?.q || "").trim();
+      if (q) {
+        params.push(`%${q}%`);
+        where.push(`(c.posting_number ILIKE $${params.length} OR c.payload::text ILIKE $${params.length})`);
+      }
+      const sql = `SELECT c.payload, c.posting_number FROM app_order_cache c WHERE ${where.join(" AND ")} ORDER BY c.in_process_at DESC`;
+      const r = await db.query(sql, params);
+      postings = r.rows.map((x) => x.payload).filter(Boolean);
+      console.log(`[OrdersExport] cache 导出 store=${storeId} status=${status || "all"} q=${q || "-"} 单号=${pns.length} → ${postings.length} 条`);
+    } else {
+      // v2.2.9.141 改用 v4（v3 已废弃，返回假 429）
+      const data = await ozonFbsListCompat({
+        since: filter.since, to: filter.to, status: filter.status,
+        limit, offset: 0, with: { financial_data: true, analytics_data: true },
+        storeId, userId: req.user.id,
+      });
+      postings = data?.result?.postings || [];
+    }
 
     // 本地备注补充
     let notesMap = {};
@@ -27362,6 +27389,9 @@ try {
 }
 await initDatabase();
 await migrateYandexEnvToStores();
+const statisticsAnalysis = createStatisticsAnalysis({ db, assertStoreAccess: assertActiveStoreAccess, callOzon: callOzonSellerAPI, defaultRate: RUB_CNY_RATE, notify: sendAlertMailThrottled });
+await statisticsAnalysis.init();
+statisticsAnalysis.register(app, requireAuth);
 if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
   setTimeout(() => maybeRefreshOzonOpportunityPool("startup"), 12000).unref?.();
   setInterval(() => maybeRefreshOzonOpportunityPool("interval"), OZON_OPPORTUNITY_REFRESH_INTERVAL_MS).unref?.();
@@ -27450,6 +27480,7 @@ if (process.argv[1] === __filename) {
     console.log(`Ozon to 1688 tool running at http://0.0.0.0:${finalPort}`);
     startYandexOffersCacheLoop();
     startYandexStocksCacheLoop();
+    statisticsAnalysis.start();
     setTimeout(() => { resumeStaleBulkPricingJobs().catch(() => {}); }, 20000);
   });
 }

@@ -1079,13 +1079,16 @@ window.OrderListView = {
         if (!storeIds.length) return notify.warning('请先选择店铺');
         if (storeIds.length > 1) return notify.warning('全部店铺导出请先切到单家店铺后分别导出');
         const { since, to } = dateRangeBounds();
+        // v2.2.9.192 导出当前查询结果（走本地缓存，不限条数、与列表一致）
         const res = await axios.post('/api/seller/orders/export', {
           store_id: storeIds[0],
           status: activeTab.value === 'all' ? '' : activeTab.value,
           since,
           to,
-          limit: 1000,
-        }, { responseType: 'blob' });
+          q: searchKeyword.value || '',
+          posting_numbers: postingFilter.value.length ? postingFilter.value : undefined,
+          source: 'cache',
+        }, { responseType: 'blob', timeout: 120000 });
         const url = URL.createObjectURL(res.data);
         const a = document.createElement('a');
         a.href = url;
