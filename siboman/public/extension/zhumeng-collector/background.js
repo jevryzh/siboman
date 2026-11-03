@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.183";
+const VERSION = "2.2.9.184";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5960,8 +5960,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               delivery_groups: ["DeliveryGroup_all"],
               label_format_name: "ozon: small",
             };
-            if (postingNumbers.length) filter.posting_numbers = postingNumbers;   // 有些接口支持，不支持会忽略
-            const create = await post("/api/label/task/create", { company_id: companyId, filter });
+            // v2.2.9.184 已确认：**指定订单**时不要传 filter，直接在顶层传 posting_numbers：
+            //   { "company_id":"3010672", "posting_numbers":["xxx-1","yyy-1"] }
+            //   （之前把 posting_numbers 放进 filter 里被接口忽略，导致生成了全量标签，用户反馈很慢。）
+            const createBody = postingNumbers.length
+              ? { company_id: companyId, posting_numbers: postingNumbers }
+              : { company_id: companyId, filter };
+            const create = await post("/api/label/task/create", createBody);
             const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
             if (!taskId) return { ok: false, step: "create", create: { status: create.status, text: create.text } };
 
