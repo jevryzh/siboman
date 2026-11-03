@@ -9,8 +9,8 @@ window.StatisticsAnalysisView = {
     const rows = ref([]), monthly = ref([]), summary = ref({}), run = ref(null), total = ref(0);
     const page = ref(1), pageSize = ref(100), search = ref(''), status = ref(''), orderType = ref('');
     const lowOnly = ref(false), missingOnly = ref(false), sort = ref('settled_date'), direction = ref('asc');
-    const selected = ref([]), table = ref(null), costVisible = ref(false), drafts = ref([]), fillAmount = ref(null);
-    const costError = ref(''), costScope = ref(null), uploadInput = ref(null), monthVisible = ref(false);
+    const selected = ref([]), table = ref(null), costVisible = ref(false), drafts = ref([]), fillAmount = ref(null), labelFillAmount = ref(null);
+    const costError = ref(''), costScope = ref(null), uploadInput = ref(null), monthVisible = ref(false), costSource = ref('manual');
     const costPage = ref(1);
     const costPageRows = computed(() => drafts.value.slice((costPage.value - 1) * 50, costPage.value * 50));
     const monthDraft = ref({}), monthScope = ref(null), settingsError = ref('');
@@ -58,14 +58,30 @@ window.StatisticsAnalysisView = {
       } catch (e) { if (sameScope(scope)) error.value = message(e); }
       finally { syncing.value = false; }
     }
-    function openCosts(items = selected.value) {
-      costScope.value = ctx(); fillAmount.value = null; costError.value = ''; costPage.value = 1;
+    function openCosts(items = selected.value, source = 'manual') {
+      costScope.value = ctx(); fillAmount.value = null; labelFillAmount.value = null; costError.value = ''; costPage.value = 1;
+      costSource.value = source;
       drafts.value = items.map((r) => ({ posting_number: r.posting_number, purchase_cny: r.purchase_cny, label_cny: r.label_cny, version: r.version }));
       costVisible.value = true;
     }
     function fillCosts() {
       if (fillAmount.value == null || !Number.isFinite(fillAmount.value) || fillAmount.value < 0) return;
       drafts.value.forEach((r) => { r.purchase_cny = fillAmount.value; });
+    }
+    function fillLabels() {
+      if (labelFillAmount.value == null || !Number.isFinite(labelFillAmount.value) || labelFillAmount.value < 0) return;
+      drafts.value.forEach((r) => { r.label_cny = labelFillAmount.value; });
+    }
+    // 一次性取回所选结算月份的全部订单，导入核对与模板生成共用。
+    async function monthRows(scope) {
+      const known = new Map();
+      for (let p = 1; ; p++) {
+        const result = await axios.get('/api/statistics/report', { params: { ...scope, page: p, page_size: 500 } });
+        if (!sameScope(scope)) return null;
+        result.data.rows.forEach((r) => known.set(r.posting_number, r));
+        if (p * 500 >= result.data.total) return known;
+        if (p > 200) throw new Error('订单量超过导入核对上限');
+      }
     }
     function sortCosts({ prop, order }) {
       if (!prop) return;
@@ -77,50 +93,103 @@ window.StatisticsAnalysisView = {
       if (!sameScope(costScope.value)) { costError.value = '店铺或月份已改变，请重新打开'; return; }
       const invalid = drafts.value.some((r) => r.purchase_cny != null && (!Number.isFinite(r.purchase_cny) || r.purchase_cny < 0));
       if (invalid) { costError.value = '采购费用必须为空或大于等于0'; return; }
+      const badLabel = drafts.value.some((r) => r.label_cny == null || !Number.isFinite(r.label_cny) || r.label_cny < 0);
+      if (badLabel) { costError.value = '贴单费用必须填写且大于等于0（默认 ¥1.50，包含取消单）'; return; }
       try {
-        await ElementPlus.ElMessageBox.confirm(`保存 ${costScope.value.month} 共 ${drafts.value.length} 单的采购费用？采购费为空的订单将保持待核算，修改前会保留快照。`, '确认批量维护', { type: 'warning', confirmButtonText: '保存', cancelButtonText: '取消' });
+        await ElementPlus.ElMessageBox.confirm(`保存 ${costScope.value.month} 共 ${drafts.value.length} 单的采购费/贴单费？采购费为空的订单将保持待核算，修改前会保留快照。`, '确认批量维护', { type: 'warning', confirmButtonText: '保存', cancelButtonText: '取消' });
         if (!sameScope(costScope.value)) return;
         saving.value = true; costError.value = '';
-        await axios.patch('/api/statistics/costs', { ...costScope.value, items: drafts.value.map((r) => ({ ...r, purchase_cny: r.purchase_cny ?? null })) });
+        await axios.patch('/api/statistics/costs', { ...costScope.value, reason: costSource.value === 'import' ? '导入采购费/贴单费' : '批量维护采购费/贴单费',
+          items: drafts.value.map((r) => ({ posting_number: r.posting_number, purchase_cny: r.purchase_cny ?? null, label_cny: r.label_cny, version: r.version })) });
         costVisible.value = false; selected.value = []; table.value?.clearSelection();
-        ElementPlus.ElMessage.success('采购费已保存，修改快照已保留'); await load();
+        ElementPlus.ElMessage.success('采购费/贴单费已保存，修改快照已保留'); await load();
       } catch (e) { if (e !== 'cancel' && e !== 'close') costError.value = message(e); }
       finally { saving.value = false; }
+    }
+    // 导入模板：与页面导出 CSV 同构，但只保留可回填的列，便于原样导入。
+    const TEMPLATE_HEAD = ['订单号', '采购费用（CNY，含采购运费）', '贴单费用（CNY）', '订单状态', '结算日', '销售收入（RUB）', 'Ozon费用（RUB）', '取消原因', '订单类型'];
+    const templateAmount = (value, label, rowNo) => {
+      if (value == null || String(value).trim() === '') return null;
+      const text = String(value).trim().replace(/[,，¥￥\s]/g, '');
+      if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error(`第 ${rowNo} 行${label}无效：${String(value).trim().slice(0, 20)}`);
+      return Number(text);
+    };
+    async function downloadTemplate() {
+      const scope = ctx();
+      if (!scope.store_id) return;
+      if (!window.XLSX) { error.value = 'Excel组件尚未加载，请刷新后重试'; return; }
+      loading.value = true; error.value = '';
+      try {
+        const known = await monthRows(scope);
+        if (!known) return;
+        const list = [...known.values()].sort((a, b) => String(a.settled_date).localeCompare(String(b.settled_date)) || a.posting_number.localeCompare(b.posting_number));
+        if (!list.length) throw new Error('所选月份暂无结算订单，无法生成导入模板');
+        if (list.length > 5000) throw new Error(`本月共 ${list.length} 单，超过单次导入上限 5000 单，请分开维护`);
+        const sheet = XLSX.utils.aoa_to_sheet([TEMPLATE_HEAD, ...list.map((r) => [r.posting_number, r.purchase_cny ?? '', r.label_cny ?? '', r.status, r.settled_date, r.income_rub ?? '', r.ozon_fees_rub ?? '', r.cancel_reason ?? '', r.order_type])]);
+        sheet['!cols'] = [{ wch: 22 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 15 }, { wch: 15 }, { wch: 30 }, { wch: 14 }];
+        sheet['!freeze'] = { xSplit: '0', ySplit: '1' };
+        const help = XLSX.utils.aoa_to_sheet([
+          ['导入说明'], [''],
+          ['模板已填入所选结算月份的全部订单，以及当前已维护的采购费/贴单费。'],
+          ['1. 只填写需要修改的金额，留空的单元格表示保持不变（不会清零）。'],
+          ['2. 采购费用 = 采购价 + 采购运费，单位人民币，最多两位小数。'],
+          ['3. 贴单费用按单收取，默认 1.50 元，包含取消单；实际不同时按订单填写。'],
+          ['4. 文件首行必须含「订单号」，以及「采购费用」「贴单费用」中至少一列。'],
+          ['5. 单次最多 5000 单；保存前会弹出预览，确认后才写入，并保留修改快照可回滚。'],
+          ['6. 只导入贴单费时，采购费列可以整列留空，原有采购费不受影响。'],
+          ['7. 支持 .xlsx 与 .csv；订单号必须属于当前店铺的所选结算月份，否则整批拒绝导入。'],
+        ]);
+        help['!cols'] = [{ wch: 96 }];
+        const book = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(book, sheet, '采购贴单费');
+        XLSX.utils.book_append_sheet(book, help, '填写说明');
+        XLSX.writeFile(book, `${scope.month}-采购贴单费导入模板.xlsx`);
+        ElementPlus.ElMessage.success(`模板已下载：${list.length} 单`);
+      } catch (e) { if (sameScope(scope)) error.value = message(e); }
+      finally { loading.value = false; }
     }
     async function importCosts(event) {
       const file = event.target.files?.[0]; event.target.value = '';
       if (!file) return;
       if (file.size > 10 * 1024 * 1024) { error.value = '文件不能超过10MB'; return; }
       if (!window.XLSX) { error.value = 'Excel读取组件尚未加载，请刷新后重试'; return; }
-      const scope = ctx(); loading.value = true;
+      const scope = ctx(); loading.value = true; error.value = '';
       try {
         const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' });
         const matrix = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1, defval: null });
-        const headerIndex = matrix.findIndex((r) => r.some((c) => String(c || '').trim() === '订单号'));
-        if (headerIndex < 0) throw new Error('找不到“订单号”表头');
-        const header = matrix[headerIndex].map((c) => String(c || '').trim());
-        const idIndex = header.indexOf('订单号'), costIndex = header.findIndex((c) => c.startsWith('采购费用'));
-        if (costIndex < 0) throw new Error('找不到“采购费用”列');
+        const headerIndex = matrix.findIndex((r) => r.some((c) => String(c ?? '').trim() === '订单号'));
+        if (headerIndex < 0) throw new Error('找不到“订单号”表头，请使用「下载导入模板」生成的文件');
+        const header = matrix[headerIndex].map((c) => String(c ?? '').trim());
+        const idIndex = header.indexOf('订单号');
+        const purchaseIndex = header.findIndex((c) => c.startsWith('采购费'));
+        const labelIndex = header.findIndex((c) => c.startsWith('贴单费'));
+        if (purchaseIndex < 0 && labelIndex < 0) throw new Error('模板需至少包含“采购费用”或“贴单费用”一列');
         const imported = [], seen = new Set();
         for (const [i, row] of matrix.slice(headerIndex + 1).entries()) {
-          if (row[costIndex] == null || String(row[costIndex]).trim() === '') continue;
-          const id = String(row[idIndex] || '').trim(), text = String(row[costIndex]).trim();
-          if (!/^\d+-\d+-\d+$/.test(id) || !/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error(`第 ${headerIndex + i + 2} 行订单号或采购费用无效`);
+          const rowNo = headerIndex + i + 2;
+          const purchase = purchaseIndex < 0 ? null : templateAmount(row[purchaseIndex], '采购费用', rowNo);
+          const label = labelIndex < 0 ? null : templateAmount(row[labelIndex], '贴单费用', rowNo);
+          if (purchase === null && label === null) continue;
+          const id = String(row[idIndex] ?? '').trim();
+          if (!/^\d+-\d+-\d+$/.test(id)) throw new Error(`第 ${rowNo} 行订单号无效：${id || '（空）'}`);
           if (seen.has(id)) throw new Error(`订单号重复：${id}`);
-          seen.add(id); imported.push({ posting_number: id, purchase_cny: Number(text) });
+          seen.add(id);
+          imported.push({ posting_number: id, ...(purchase === null ? {} : { purchase_cny: purchase }), ...(label === null ? {} : { label_cny: label }) });
         }
-        if (!imported.length || imported.length > 5000) throw new Error('文件须包含1至5000条已填写采购费用的订单');
-        const known = new Map();
-        for (let p = 1; ; p++) {
-          const result = await axios.get('/api/statistics/report', { params: { ...scope, page: p, page_size: 500 } });
-          if (!sameScope(scope)) return;
-          result.data.rows.forEach((r) => known.set(r.posting_number, r));
-          if (p * 500 >= result.data.total) break;
-          if (p > 200) throw new Error('订单量超过导入核对上限');
-        }
+        if (!imported.length) throw new Error('没有读到要导入的金额，请填写“采购费用”或“贴单费用”后重试');
+        if (imported.length > 5000) throw new Error(`一次最多导入 5000 单，本次 ${imported.length} 单`);
+        const known = await monthRows(scope);
+        if (!known) return;
         for (const item of imported) if (!known.has(item.posting_number)) throw new Error(`订单不属于当前店铺的所选结算月份：${item.posting_number}`);
+        // 与当前值一致的订单不再写库，避免空导入制造无意义的版本和快照。
+        const changed = imported.filter((item) => {
+          const row = known.get(item.posting_number);
+          return (Object.hasOwn(item, 'purchase_cny') && (row.purchase_cny ?? null) !== item.purchase_cny)
+            || (Object.hasOwn(item, 'label_cny') && Number(row.label_cny) !== item.label_cny);
+        });
+        if (!changed.length) throw new Error('导入的金额与当前数据完全一致，没有需要保存的修改');
         if (!sameScope(scope)) return;
-        openCosts(imported.map((item) => ({ ...known.get(item.posting_number), purchase_cny: item.purchase_cny })));
+        openCosts(changed.map((item) => ({ ...known.get(item.posting_number), ...item })), 'import');
       } catch (e) { if (sameScope(scope)) error.value = message(e); }
       finally { loading.value = false; }
     }
@@ -198,9 +267,9 @@ window.StatisticsAnalysisView = {
     });
     onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); window.removeEventListener('shop-changed', shopChanged); });
     return { tab, month, monthRange, loading, saving, syncing, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, lowOnly, missingOnly,
-      selected, table, costVisible, drafts, fillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changesVisible, changes, changesLoading,
+      selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changesVisible, changes, changesLoading,
       ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, activeRun, progress, money, dateTime, titleProfit, feeName, disabledMonth, costPage, costPageRows,
-      load, applyFilter, sortChanged, sortCosts, syncNow, openCosts, fillCosts, saveCosts, importCosts, openMonth, saveMonth, openChanges, rollback, showLedger, exportOrders, exportMonths };
+      load, applyFilter, sortChanged, sortCosts, syncNow, openCosts, fillCosts, fillLabels, saveCosts, importCosts, downloadTemplate, openMonth, saveMonth, openChanges, rollback, showLedger, exportOrders, exportMonths };
   },
   template: `
   <section class="statistics-workbench">
@@ -232,7 +301,7 @@ window.StatisticsAnalysisView = {
             <el-button :icon="'Search'" @click="applyFilter">查询</el-button>
           </div>
           <div class="statistics-actions"><el-button :icon="'EditPen'" :disabled="!selected.length" @click="openCosts()">批量维护 ({{selected.length}})</el-button>
-            <el-button :icon="'Upload'" @click="uploadInput.click()">导入采购费</el-button><el-tooltip content="导出当前筛选的全部订单"><el-button :icon="'Download'" circle aria-label="导出订单CSV" @click="exportOrders"/></el-tooltip>
+            <el-button :icon="'Upload'" @click="uploadInput.click()">导入采购/贴单费</el-button><el-tooltip content="下载含全部订单与已维护金额的导入模板"><el-button :icon="'Document'" circle aria-label="下载导入模板" @click="downloadTemplate"/></el-tooltip><el-tooltip content="导出当前筛选的全部订单"><el-button :icon="'Download'" circle aria-label="导出订单CSV" @click="exportOrders"/></el-tooltip>
             <input ref="uploadInput" type="file" accept=".csv,.xlsx,.xls" hidden @change="importCosts"/>
           </div>
         </div>
@@ -244,7 +313,7 @@ window.StatisticsAnalysisView = {
           <el-table-column prop="ordered_at" label="下单日期" width="180" sortable="custom"><template #default="{row}">{{dateTime(row.ordered_at)}}</template></el-table-column>
           <el-table-column prop="settled_date" label="结算日" width="125" sortable="custom"/>
           <el-table-column prop="purchase_cny" label="采购费 ¥" width="125" align="right" sortable="custom"><template #default="{row}"><el-button link :type="row.purchase_cny==null?'warning':'primary'" @click="openCosts([row])">{{row.purchase_cny==null?'待录入':money(row.purchase_cny)}}</el-button></template></el-table-column>
-          <el-table-column prop="label_cny" label="贴单费 ¥" width="110" align="right" sortable="custom"><template #default="{row}">{{money(row.label_cny)}}</template></el-table-column>
+          <el-table-column prop="label_cny" label="贴单费 ¥" width="110" align="right" sortable="custom"><template #default="{row}"><el-button link type="primary" @click="openCosts([row])">{{money(row.label_cny)}}</el-button></template></el-table-column>
           <el-table-column prop="income_rub" label="销售收入 ₽" width="135" align="right" sortable="custom"><template #default="{row}"><span :class="{'statistics-warning':row.low_income}">{{money(row.income_rub)}}</span><el-tooltip v-if="row.pending_positive" content="仅含已明确归属部分，另有收入待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
           <el-table-column prop="ozon_fees_rub" label="Ozon 费用 ₽" width="140" align="right" sortable="custom"><template #default="{row}">{{money(row.ozon_fees_rub)}}<el-tooltip v-if="row.pending_negative" content="仅含已明确归属部分，另有费用待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
           <el-table-column prop="profit_cny" label="订单毛利 ¥" width="135" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'未扣店铺广告费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip></template></el-table-column>
@@ -271,8 +340,8 @@ window.StatisticsAnalysisView = {
         <div class="statistics-footer"><span>月度毛利 =（销售收入 − Ozon费用 ＋ 其他店铺净收支）× 汇率 − 采购费 − 贴单费 − 广告费。广告费不重复计入 Ozon 费用。</span></div>
       </el-tab-pane>
     </el-tabs>
-    <el-dialog v-model="costVisible" title="维护采购费用" width="850px" class="statistics-dialog" :close-on-click-modal="false" :close-on-press-escape="!saving" :show-close="!saving" :before-close="done=>!saving&&done()">
-      <div class="statistics-toolbar"><span>{{drafts.length}} 单 · 采购费用含采购运费（CNY）</span><div class="statistics-actions"><el-input-number v-model="fillAmount" :min="0" :max="100000000" :precision="2" :controls="false" placeholder="统一采购费"/><el-button @click="fillCosts" :disabled="fillAmount==null">填充全部</el-button></div></div>
+    <el-dialog v-model="costVisible" title="维护采购费 / 贴单费" width="850px" class="statistics-dialog" :close-on-click-modal="false" :close-on-press-escape="!saving" :show-close="!saving" :before-close="done=>!saving&&done()">
+      <div class="statistics-toolbar"><span>{{drafts.length}} 单 · 采购费用含采购运费（CNY）· 贴单费按单（CNY）</span><div class="statistics-actions"><el-input-number v-model="fillAmount" :min="0" :max="100000000" :precision="2" :controls="false" placeholder="统一采购费"/><el-button @click="fillCosts" :disabled="fillAmount==null">填充采购费</el-button><el-input-number v-model="labelFillAmount" :min="0" :max="100000000" :precision="2" :controls="false" placeholder="统一贴单费"/><el-button @click="fillLabels" :disabled="labelFillAmount==null">填充贴单费</el-button></div></div>
       <el-alert v-if="costError" :title="costError" type="error" :closable="false" class="statistics-alert"/>
       <el-table :data="costPageRows" border max-height="420" row-key="posting_number" @sort-change="sortCosts"><el-table-column prop="posting_number" label="订单号" min-width="210" sortable="custom"/><el-table-column prop="purchase_cny" label="采购费用 ¥" min-width="180" sortable="custom"><template #default="{row}"><el-input-number v-model="row.purchase_cny" :min="0" :max="100000000" :precision="2" :controls="false" placeholder="未维护"/></template></el-table-column><el-table-column prop="label_cny" label="贴单费用 ¥" min-width="170" sortable="custom"><template #default="{row}"><el-input-number v-model="row.label_cny" :min="0" :max="100000000" :precision="2" :controls="false"/></template></el-table-column></el-table>
       <el-pagination v-if="drafts.length>50" v-model:current-page="costPage" :page-size="50" :total="drafts.length" layout="total, prev, pager, next" style="margin-top:12px"/>
