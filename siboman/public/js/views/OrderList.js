@@ -750,17 +750,25 @@ window.OrderListView = {
     const exportYarnLabels = async () => {
       const storeIds = selectedStoreIds();
       if (!storeIds.length) return notify.warning('请先选择店铺');
+      const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
+      if (!picked.length) return notify.warning('请先勾选要导出的订单');
+      // v2.2.9.182 面单改走插件（卖家后台网页接口），不受 Seller API 配额限制
+      const send = window.__zhumeng_send__;
+      if (typeof send !== 'function') return notify.warning('检测不到采集插件，请确认浏览器已安装并启用');
       yarnLabelsBusy.value = true;
       try {
-        const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
-        if (!picked.length) { yarnLabelsBusy.value = false; return notify.warning('请先勾选要导出的订单'); }
-        const res = await axios.post('/api/seller/orders/yarn-labels', { store_ids: storeIds, posting_numbers: picked }, { responseType: 'blob', timeout: 600000 });
-        downloadBlob(res.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
-        notify.success(`已导出 ${res.headers['x-item-count'] || '?'} 个订单的毛线标签，失败 ${res.headers['x-failed-count'] || 0} 个（顺序与拣货单一致）`);
+        const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: picked }, 300000);
+        if (!res || res.ok !== true) {
+          const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.create?.text || res?.log?.[0]?.text || '').slice(0, 200);
+          return notify.error('导出毛线标签失败：' + String(msg).slice(0, 260), 12000);
+        }
+        const bin = atob(res.base64 || '');
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+        downloadBlob(bytes, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
+        notify.success(`已导出毛线标签（${Math.round((res.size || 0) / 1024)} KB，任务 ${res.taskId || '-'}）`);
       } catch (e) {
-        let msg = e.message;
-        try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
-        notify.error('导出毛线标签失败：' + String(msg).slice(0, 200));
+        notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 200));
       } finally { yarnLabelsBusy.value = false; }
     };
     const openPostingDialog = () => {

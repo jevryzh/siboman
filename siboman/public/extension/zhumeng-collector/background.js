@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.178";
+const VERSION = "2.2.9.182";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5920,6 +5920,91 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   //         POST /api/report/status {code}          → 状态（可能带下载地址）
   //         → 下载 PDF
   //   ⚠️ 该接口的会话**绑定 IP**，必须在你浏览器里、带登录态调用，服务端直连一律 307。
+  // v2.2.9.182 打印面单（走卖家后台网页接口，不受 Seller API 配额限制）
+  //   链路：POST /api/label/task/create → {tasks:[{task_id}]} → 轮询任务 → 下载 PDF
+  if (msg.action === "printLabels") {
+    (async () => {
+      try {
+        const storeId = String(msg.storeId || "");
+        const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
+        let tabs = await chrome.tabs.query({ url: "*://seller.ozon.ru/*" });
+        let tab = tabs && tabs[0];
+        if (!tab) {
+          tab = await chrome.tabs.create({ url: "https://seller.ozon.ru/app/postings/crossborder/fbs", active: true });
+          await new Promise((r) => setTimeout(r, 6000));
+        }
+        const [res] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: async function (postingNumbers) {
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const companyId = (document.cookie.match(/(?:^|;\s*)sc_company_id=([^;]+)/) || [])[1] || "";
+            if (!companyId) return { ok: false, step: "cookie", error: "读不到 sc_company_id，请确认已登录 seller.ozon.ru" };
+            const H = {
+              "content-type": "application/json",
+              accept: "application/json, text/plain, */*",
+              "x-o3-app-name": "seller-ui",
+              "x-o3-company-id": companyId,
+              "x-o3-language": "zh-Hans",
+              "x-o3-page-type": "CbPostingsFbs",
+            };
+            const post = async (path, body) => {
+              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
+              const t = await r.text();
+              let j = null; try { j = JSON.parse(t); } catch (_e) {}
+              return { status: r.status, json: j, text: t.slice(0, 300) };
+            };
+            const now = Date.now();
+            const filter = {
+              cutoff_from: new Date(now - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+              cutoff_to: new Date(now + 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+              delivery_groups: ["DeliveryGroup_all"],
+              label_format_name: "ozon: small",
+            };
+            if (postingNumbers.length) filter.posting_numbers = postingNumbers;   // 有些接口支持，不支持会忽略
+            const create = await post("/api/label/task/create", { company_id: companyId, filter });
+            const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
+            if (!taskId) return { ok: false, step: "create", create: { status: create.status, text: create.text } };
+
+            // 轮询任务状态：依次探测候选路径，谁能返回文件地址就用谁
+            const cands = [
+              ["/api/label/task/info", { task_id: taskId }],
+              ["/api/label/task/status", { task_id: taskId }],
+              ["/api/label/task/get", { task_id: taskId }],
+              ["/api/label/task/download", { task_id: taskId }],
+              ["/api/label/task/list", { task_ids: [taskId] }],
+            ];
+            const log = [];
+            let fileUrl = "";
+            for (let i = 0; i < 20 && !fileUrl; i += 1) {
+              await sleep(i === 0 ? 1200 : 1800);
+              for (const [path, body] of cands) {
+                const r = await post(path, body);
+                if (i === 0) log.push({ path, status: r.status, text: r.text.slice(0, 120) });
+                const m = JSON.stringify(r.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
+                if (m) { fileUrl = m[0].replace(/\\\//g, "/"); break; }
+              }
+            }
+            if (!fileUrl) return { ok: false, step: "no_url", taskId, log };
+            const f = await fetch(fileUrl, { credentials: "include" });
+            if (!f.ok) return { ok: false, step: "download", fileUrl, httpStatus: f.status };
+            const buf = await f.arrayBuffer();
+            let bin = "";
+            const bytes = new Uint8Array(buf);
+            for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
+            return { ok: true, taskId, fileUrl: fileUrl.slice(0, 200), size: bytes.length, base64: btoa(bin) };
+          },
+          args: [postingNumbers],
+        });
+        const r = res && res.result;
+        if (!r) return sendResponse({ ok: false, error: "页面无返回（seller.ozon.ru 可能未登录）" });
+        sendResponse(r);
+      } catch (e) {
+        sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 300) });
+      }
+    })();
+    return true;
+  }
+
   if (msg.action === "pickList") {
     (async () => {
       try {

@@ -56,6 +56,20 @@
 
     // v2.2.9.128: ERP 提交任务后立刻叫醒后台去领取，省掉最多 30 秒的 alarm 等待
     // v2.2.9.157 生成拣货单（卖家后台异步报告，必须在 seller.ozon.ru 里带登录态调）
+    if (kind === "printLabels.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: "printLabels",
+          storeId: data.storeId || "",
+          postingNumbers: data.postingNumbers || [],
+        });
+        replyToMain(reqId, "printLabels.response", resp || { ok: false, error: "插件无返回" });
+      } catch (e) {
+        replyToMain(reqId, "printLabels.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
     if (kind === "pickList.request") {
       try {
         const resp = await chrome.runtime.sendMessage({
