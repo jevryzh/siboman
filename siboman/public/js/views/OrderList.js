@@ -772,7 +772,7 @@ window.OrderListView = {
         const batches = [];
         for (let i = 0; i < ordered.length; i += CHUNK) batches.push(ordered.slice(i, i + CHUNK));
         for (let bi = 0; bi < batches.length; bi += 1) {
-          notify.info(`正在生成标签 ${bi + 1}/${batches.length} 批…`, 2500);
+          try { window.ElementPlus.ElMessage.info({ message: `正在生成标签 ${bi + 1}/${batches.length} 批…`, duration: 2000 }); } catch (_e) { /* 忽略 */ }
           const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 120000);
           if (!res || res.ok !== true) {
             const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
@@ -782,7 +782,7 @@ window.OrderListView = {
           (res.failed || []).forEach((f) => failedAll.push(f));
         }
         if (!items.length) return notify.error('导出毛线标签失败：插件未取到任何标签');
-        notify.info(`已生成 ${items.length} 个标签，正在按顺序合并…`, 8000);
+        try { window.ElementPlus.ElMessage.info({ message: `已生成 ${items.length} 个标签，正在按顺序合并…`, duration: 8000 }); } catch (_e) { /* 忽略 */ }
         // 服务端按「拣货单顺序」下载并合并
         const merged = await axios.post('/api/seller/orders/yarn-label-pdf', { order: ordered, items }, { responseType: 'blob', timeout: 300000 });
         downloadBlob(merged.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
