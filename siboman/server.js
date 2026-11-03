@@ -16478,6 +16478,43 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
   } catch (error) { next(error); }
 });
 
+// v2.2.9.188 返回「毛线订单」按拣货单规则的排序结果（供标签导出按同一顺序生成）。
+//   规则：单色在前（按色号）→ 同色号按数量升序 → 混色最后。
+app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res, next) => {
+  try {
+    const picked = Array.isArray(req.body?.posting_numbers)
+      ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 5000)
+      : [];
+    if (!picked.length) return res.json({ success: true, posting_numbers: [] });
+    const rows = await db.query(
+      `WITH items AS (
+         SELECT c.posting_number AS pn,
+                substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+           FROM app_order_cache c
+           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+          WHERE c.user_id = $1
+            AND c.posting_number = ANY($2::text[])
+            AND COALESCE(p->>'name','') ILIKE '%пряж%'
+            AND COALESCE(p->>'offer_id','') <> ''
+          GROUP BY 1, 2
+       )
+       SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS kinds, MIN(color) AS c1 FROM items GROUP BY pn`,
+      [req.user.id, picked],
+    );
+    const sorted = rows.rows.slice().sort((a, b) => {
+      const am = Number(a.kinds) > 1 ? 1 : 0, bm = Number(b.kinds) > 1 ? 1 : 0;
+      if (am !== bm) return am - bm;
+      const ca = String(a.c1 || "").padStart(4, "0"), cb = String(b.c1 || "").padStart(4, "0");
+      if (ca !== cb) return ca < cb ? -1 : 1;
+      const qa = Number(a.total_qty || 0), qb = Number(b.total_qty || 0);
+      if (qa !== qb) return qa - qb;
+      return String(a.pn) < String(b.pn) ? -1 : 1;
+    });
+    res.json({ success: true, posting_numbers: sorted.map((r) => String(r.pn)) });
+  } catch (error) { next(error); }
+});
+
 app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) => {
   try {
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
@@ -16532,32 +16569,44 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2`, [storeIds[0], req.user.id]);
     if (!creds.rowCount) return res.status(404).json({ success: false, error: "未找到店铺凭证" });
     const { client_id: clientId, api_key: apiKey } = creds.rows[0];
-    const CHUNK = 20, CONCURRENCY = 8;
+    // v2.2.9.181 Ozon 面单接口有「每秒请求数」限流（429），并发 8 会直接触发限流导致整批失败。
+    //   降到 3 + 429 指数退避重试，失败时把真实原因带回去（之前一律吞成"未返回任何标签"）。
+    const CHUNK = 20, CONCURRENCY = 3;
     const chunks = [];
     for (let i = 0; i < postings.length; i += CHUNK) chunks.push(postings.slice(i, i + CHUNK));
     const fetchChunk = async (batch) => {
-      const r = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
-        method: "POST",
-        headers: { "Client-Id": clientId, "Api-Key": apiKey, "Content-Type": "application/json", Accept: "application/pdf, application/json" },
-        body: JSON.stringify({ posting_number: batch }),
-      });
-      const buf = Buffer.from(await r.arrayBuffer());
-      const ct = r.headers.get("content-type") || "";
-      return r.ok && !ct.includes("json") ? { ok: true, buf } : { ok: false, err: buf.toString("utf8").slice(0, 100) };
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const r = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
+          method: "POST",
+          headers: { "Client-Id": clientId, "Api-Key": apiKey, "Content-Type": "application/json", Accept: "application/pdf, application/json" },
+          body: JSON.stringify({ posting_number: batch }),
+        });
+        const buf = Buffer.from(await r.arrayBuffer());
+        const ct = r.headers.get("content-type") || "";
+        if (r.ok && !ct.includes("json")) return { ok: true, buf };
+        const text = buf.toString("utf8").slice(0, 200);
+        if (r.status === 429) { await new Promise((x) => setTimeout(x, 1200 * (attempt + 1))); continue; }
+        return { ok: false, err: `HTTP ${r.status} ${text}` };
+      }
+      return { ok: false, err: "HTTP 429 限流重试 5 次仍失败" };
     };
     // 并发取，但**按批次下标排序后再合并**，确保标签顺序与拣货单一致
     const slots = new Array(chunks.length).fill(null);
     let failed = 0;
+    let firstErr = "";
     for (let i = 0; i < chunks.length; i += CONCURRENCY) {
       const wave = chunks.slice(i, i + CONCURRENCY);
-      const out = await Promise.all(wave.map((b) => fetchChunk(b).catch(() => ({ ok: false }))));
+      const out = await Promise.all(wave.map((b) => fetchChunk(b).catch((e) => ({ ok: false, err: String(e.message || e).slice(0, 150) }))));
       out.forEach((o, k) => {
         if (o.ok) slots[i + k] = o.buf;
-        else failed += 1;
+        else { failed += 1; if (!firstErr) firstErr = o.err || ''; }
       });
+      await new Promise((x) => setTimeout(x, 350));
     }
     const pdfs = slots.filter(Boolean);
-    if (!pdfs.length) return res.status(400).json({ success: false, error: "Ozon 未返回任何标签，请确认订单状态" });
+    if (!pdfs.length) {
+      return res.status(400).json({ success: false, error: `Ozon 未返回标签（${failed} 批失败，首批原因：${firstErr || '未知'}）` });
+    }
     let merged = pdfs[0];
     if (pdfs.length > 1) {
       const outDoc = await PDFDocument.create();

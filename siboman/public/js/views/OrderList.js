@@ -757,7 +757,13 @@ window.OrderListView = {
       if (typeof send !== 'function') return notify.warning('检测不到采集插件，请确认浏览器已安装并启用');
       yarnLabelsBusy.value = true;
       try {
-        const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: picked }, 300000);
+        // v2.2.9.188 先按拣货单规则拿到排序后的单号，让标签页顺序与拣货单一一对应
+        let ordered = picked;
+        try {
+          const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked }, { timeout: 30000 });
+          if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
+        } catch (_e) { /* 排序失败就用原顺序 */ }
+        const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: ordered }, 300000);
         if (!res || res.ok !== true) {
           const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.create?.text || res?.log?.[0]?.text || '').slice(0, 200);
           return notify.error('导出毛线标签失败：' + String(msg).slice(0, 260), 12000);
