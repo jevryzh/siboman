@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { buildSettlementReport, csvCell, datesBetween, financialDate, moneyCents, monthBounds, normalizeOrder, validateAccrual } from '../lib/ozon-settlement.js';
 
 const posting = '0100000001-0001-1', second = '0100000001-0001-2', other = '0200000002-0002-1';
@@ -89,4 +90,23 @@ test('menu, scoped API, daily schedule and read-only Ozon endpoints are wired', 
   assert.match(service, /assertStoreAccess\(storeId, userId/); assert.match(service, /platform !== 'ozon'/);
   assert.match(service, /SCHEDULE_HOUR = 2, SCHEDULE_MINUTE = 30/);
   for (const mutation of ['/v1/product/import', '/v2/products/stocks', '/posting/fbs/ship', '/posting/fbs/cancel']) assert.ok(!service.includes(mutation));
+});
+
+test('monthly view displays a provisional profit, retains missing-cost notes and sorts the displayed values', () => {
+  const context = { window: {}, Vue: { ref: (value) => ({ value }), computed: (get) => ({ get value() { return get(); } }), watch() {}, onMounted() {}, onBeforeUnmount() {} } };
+  vm.runInNewContext(readFileSync(new URL('../public/js/views/StatisticsAnalysis.js', import.meta.url), 'utf8'), context);
+  const view = context.window.StatisticsAnalysisView.setup();
+  const provisional = { profit_cny: null, known_cost_profit_cny: 123.45, missing_purchase: 8, pending_rows: 2, coverage: { complete: true } };
+  assert.equal(view.monthlyProfit(provisional), 123.45);
+  assert.equal(view.monthlyProfitEstimated(provisional), true);
+  assert.match(view.monthlyProfitNote(provisional), /暂估.*待补采购费 8 单.*收支待分摊 2 笔/);
+  assert.equal(view.monthlyProfit({ ...provisional, known_cost_profit_cny: 0 }), 0);
+  assert.equal(view.monthlyProfit({ ...provisional, known_cost_profit_cny: -20 }), -20);
+  assert.equal(view.monthlyProfit({ ...provisional, coverage: { complete: false } }), null);
+  assert.equal(view.monthlyProfit({ ...provisional, known_cost_profit_cny: null }), null);
+  const final = { ...provisional, profit_cny: 10, missing_purchase: 0, pending_rows: 0 };
+  assert.equal(view.monthlyProfit(final), 10);
+  assert.equal(view.monthlyProfitEstimated(final), false);
+  assert.equal(view.monthlyProfitNote(final), '');
+  assert.ok(view.sortMonthlyProfit({ ...provisional, known_cost_profit_cny: -20 }, provisional) < 0);
 });

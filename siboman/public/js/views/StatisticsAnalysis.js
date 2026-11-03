@@ -26,6 +26,20 @@ window.StatisticsAnalysisView = {
     const activeRun = computed(() => run.value && ['queued', 'running'].includes(run.value.status));
     const progress = computed(() => run.value?.days_total ? Math.min(99, Math.round(run.value.days_done / run.value.days_total * 90)) : 0);
     const titleProfit = (s) => s.profit_cny != null ? '' : !s.coverage?.complete ? '应计流水尚未完整同步' : s.missing_purchase ? `待补采购费 ${s.missing_purchase} 单` : s.pending_rows || s.unresolved_parents ? '存在未分摊收支' : s.missing_metadata ? '订单资料待补充' : !s.exchange_rate ? '汇率待设置' : '暂无订单';
+    const monthlyProfit = (s) => s.profit_cny ?? (s.coverage?.complete ? (s.known_cost_profit_cny ?? null) : null);
+    const monthlyProfitEstimated = (s) => s.profit_cny == null && monthlyProfit(s) != null;
+    function monthlyProfitNote(s) {
+      const notes = monthlyProfitEstimated(s) ? ['暂估'] : [];
+      if (s.missing_purchase) notes.push(`待补采购费 ${s.missing_purchase} 单`);
+      const pending = (s.pending_rows || 0) + (s.unresolved_parents || 0);
+      if (pending) notes.push(`收支待分摊 ${pending} 笔`);
+      if (s.missing_metadata) notes.push(`订单资料待补充 ${s.missing_metadata} 单`);
+      return notes.join(' · ');
+    }
+    function sortMonthlyProfit(a, b) {
+      const left = monthlyProfit(a), right = monthlyProfit(b);
+      return left == null ? (right == null ? 0 : 1) : right == null ? -1 : left - right;
+    }
     const typeLabels = { 1: '收单手续费（正数为退回）', 3: '品牌推广', 4: '品牌推广接入', 19: '站外推广', 23: '站内广告', 33: '广告服务', 41: '点击广告', 49: 'Premium推广', 54: '商品推广', 59: '逆向物流', 67: '国际配送服务', 87: '社交媒体广告', 122: '国际运输合同组织服务', 123: 'Ozon物流平台接入服务', 130: '展示广告' };
     const feeName = (row) => row.types?.length ? row.types.map((id) => typeLabels[id] || `费用类型 ${id}`).join('、') : '订单结算汇总（内层费用不重复累计）';
     const filters = () => ({ ...ctx(), page: page.value, page_size: pageSize.value, search: search.value, status: status.value,
@@ -247,8 +261,8 @@ window.StatisticsAnalysisView = {
       } catch (e) { error.value = '导出失败，请确认月份数据已加载后重试'; }
     }
     function exportMonths() {
-      const cells = [['月份', '订单数', '销售总收入（RUB，含退费）', 'Ozon费用（RUB）', '广告费（RUB）', '广告费（CNY）', '广告费来源', '其他店铺净收支（RUB）', '采购费用（CNY，已录入）', '贴单费用（CNY）', '汇率（CNY/RUB）', '毛利（CNY，含广告）', '待补采购费订单数', '待分摊流水数', '应计数据完整'],
-        ...monthly.value.map((r) => [r.month, r.orders, r.coverage?.checked_days ? r.income_rub : null, r.coverage?.checked_days ? r.ozon_fees_rub : null, r.advertising_rub, r.advertising_cny, r.advertising_source === 'manual' ? '手工' : 'API', r.other_shop_net_rub, r.purchase_cny, r.label_cny, r.exchange_rate, r.profit_cny, r.missing_purchase, r.pending_rows, r.coverage?.complete ? '是' : '否'])];
+      const cells = [['月份', '订单数', '销售总收入（RUB，含退费）', 'Ozon费用（RUB）', '广告费（RUB）', '广告费（CNY）', '广告费来源', '其他店铺净收支（RUB）', '采购费用（CNY，已录入）', '贴单费用（CNY）', '汇率（CNY/RUB）', '毛利（CNY，含广告）', '待补采购费订单数', '待分摊流水数', '应计数据完整', '毛利口径'],
+        ...monthly.value.map((r) => [r.month, r.orders, r.coverage?.checked_days ? r.income_rub : null, r.coverage?.checked_days ? r.ozon_fees_rub : null, r.advertising_rub, r.advertising_cny, r.advertising_source === 'manual' ? '手工' : 'API', r.other_shop_net_rub, r.purchase_cny, r.label_cny, r.exchange_rate, monthlyProfit(r), r.missing_purchase, r.pending_rows, r.coverage?.complete ? '是' : '否', monthlyProfitEstimated(r) ? '暂估（仅扣已录入成本）' : monthlyProfit(r) == null ? titleProfit(r) : '已核算'])];
       const csv = cells.map((r) => r.map((v) => `"${String(v ?? '').replaceAll('"', '""')}"`).join(',')).join('\r\n');
       const url = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }));
       const anchor = document.createElement('a'); anchor.href = url; anchor.download = '月度汇总.csv'; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -268,7 +282,7 @@ window.StatisticsAnalysisView = {
     onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); window.removeEventListener('shop-changed', shopChanged); });
     return { tab, month, monthRange, loading, saving, syncing, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, lowOnly, missingOnly,
       selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changesVisible, changes, changesLoading,
-      ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, activeRun, progress, money, dateTime, titleProfit, feeName, disabledMonth, costPage, costPageRows,
+      ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, activeRun, progress, money, dateTime, titleProfit, monthlyProfit, monthlyProfitEstimated, monthlyProfitNote, sortMonthlyProfit, feeName, disabledMonth, costPage, costPageRows,
       load, applyFilter, sortChanged, sortCosts, syncNow, openCosts, fillCosts, fillLabels, saveCosts, importCosts, downloadTemplate, openMonth, saveMonth, openChanges, rollback, showLedger, exportOrders, exportMonths };
   },
   template: `
@@ -330,7 +344,7 @@ window.StatisticsAnalysisView = {
           <el-table-column prop="income_rub" label="销售总收入 ₽" width="160" align="right" sortable><template #default="{row}">{{row.coverage?.checked_days?money(row.income_rub):'未同步'}}</template></el-table-column>
           <el-table-column prop="ozon_fees_rub" label="Ozon 费用 ₽" width="150" align="right" sortable><template #default="{row}">{{row.coverage?.checked_days?money(row.ozon_fees_rub):'—'}}</template></el-table-column>
           <el-table-column prop="advertising_rub" label="广告费 ₽" width="160" align="right" sortable><template #default="{row}"><el-button link type="primary" @click="openMonth(row)">{{row.coverage?.checked_days||row.advertising_source==='manual'?money(row.advertising_rub):'—'}}</el-button><div class="statistics-cell-note">{{row.advertising_source==='manual'?'手工覆盖':'API'}}</div></template></el-table-column>
-          <el-table-column prop="profit_cny" label="月度毛利 ¥" width="210" align="right" sortable><template #default="{row}"><b v-if="row.profit_cny!=null" :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</b><span class="statistics-warning" v-else>{{titleProfit(row)}}</span></template></el-table-column>
+          <el-table-column prop="profit_cny" label="月度毛利 ¥" width="210" align="right" sortable :sort-method="sortMonthlyProfit"><template #default="{row}"><template v-if="monthlyProfit(row)!=null"><el-tooltip :disabled="!monthlyProfitEstimated(row)" content="暂估仅扣已录入采购费，未录入部分暂按0；未明确归属的收支暂不计入。"><b :class="{'statistics-negative':monthlyProfit(row)<0}">{{money(monthlyProfit(row))}}</b></el-tooltip><div v-if="monthlyProfitNote(row)" class="statistics-cell-note statistics-warning">{{monthlyProfitNote(row)}}</div></template><span class="statistics-warning" v-else>{{titleProfit(row)}}</span></template></el-table-column>
           <el-table-column prop="other_shop_net_rub" label="其他店铺净收支 ₽" width="180" align="right" sortable><template #default="{row}">{{row.coverage?.checked_days?money(row.other_shop_net_rub):'—'}}</template></el-table-column>
           <el-table-column prop="purchase_cny" label="采购费用 ¥" width="145" align="right" sortable><template #default="{row}">{{money(row.purchase_cny)}}<div class="statistics-cell-note" v-if="row.missing_purchase">{{row.missing_purchase}} 单待录入</div></template></el-table-column>
           <el-table-column prop="label_cny" label="贴单费用 ¥" width="130" align="right" sortable><template #default="{row}">{{money(row.label_cny)}}</template></el-table-column>
