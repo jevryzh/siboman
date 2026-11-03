@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.184";
+const VERSION = "2.2.9.186";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5920,83 +5920,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   //         POST /api/report/status {code}          → 状态（可能带下载地址）
   //         → 下载 PDF
   //   ⚠️ 该接口的会话**绑定 IP**，必须在你浏览器里、带登录态调用，服务端直连一律 307。
-  // v2.2.9.182 打印面单（走卖家后台网页接口，不受 Seller API 配额限制）
-  //   链路：POST /api/label/task/create → {tasks:[{task_id}]} → 轮询任务 → 下载 PDF
+  // v2.2.9.186 打印面单 —— 直接在后台用 fetch 调卖家后台接口（不再注入页面）
+  //   · 插件有 seller.ozon.ru 的 host 权限，后台 fetch 会带上登录 cookie
+  //   · 链路：POST /api/label/task/create {company_id, posting_numbers}
+  //          → {tasks:[{task_id}]}
+  //          → POST /api/label/task/get {task_id, company_id} 轮询拿到 .pdf 链接
+  //          → 下载 PDF 转 base64 返回
   if (msg.action === "printLabels") {
     (async () => {
       try {
-        const storeId = String(msg.storeId || "");
         const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
-        let tabs = await chrome.tabs.query({ url: "*://seller.ozon.ru/*" });
-        let tab = tabs && tabs[0];
-        if (!tab) {
-          tab = await chrome.tabs.create({ url: "https://seller.ozon.ru/app/postings/crossborder/fbs", active: true });
-          await new Promise((r) => setTimeout(r, 6000));
+        // 从 cookie 读 company_id
+        let companyId = String(msg.companyId || "").trim();
+        if (!companyId) {
+          try {
+            const c = await chrome.cookies.get({ url: "https://seller.ozon.ru", name: "sc_company_id" });
+            companyId = String((c && c.value) || "").trim();
+          } catch (_e) { /* 忽略 */ }
         }
-        const [res] = await chrome.scripting.executeScript({
-          target: { tabId: tab.id },
-          func: async function (postingNumbers) {
-            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-            const companyId = (document.cookie.match(/(?:^|;\s*)sc_company_id=([^;]+)/) || [])[1] || "";
-            if (!companyId) return { ok: false, step: "cookie", error: "读不到 sc_company_id，请确认已登录 seller.ozon.ru" };
-            const H = {
-              "content-type": "application/json",
-              accept: "application/json, text/plain, */*",
-              "x-o3-app-name": "seller-ui",
-              "x-o3-company-id": companyId,
-              "x-o3-language": "zh-Hans",
-              "x-o3-page-type": "CbPostingsFbs",
+        if (!companyId) return sendResponse({ ok: false, error: "读不到 company_id，请先在浏览器登录 seller.ozon.ru" });
+        const H = {
+          "content-type": "application/json",
+          accept: "application/json, text/plain, */*",
+          "x-o3-app-name": "seller-ui",
+          "x-o3-company-id": companyId,
+          "x-o3-language": "zh-Hans",
+          "x-o3-page-type": "CbPostingsFbs",
+        };
+        const post = async (path, body) => {
+          const r = await fetch("https://seller.ozon.ru" + path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
+          const t = await r.text();
+          let j = null; try { j = JSON.parse(t); } catch (_e) {}
+          return { status: r.status, json: j, text: t.slice(0, 300) };
+        };
+        const now = Date.now();
+        const createBody = postingNumbers.length
+          ? { company_id: companyId, posting_numbers: postingNumbers }
+          : {
+              company_id: companyId,
+              filter: {
+                cutoff_from: new Date(now - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+                cutoff_to: new Date(now + 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
+                delivery_groups: ["DeliveryGroup_all"],
+                label_format_name: "ozon: small",
+              },
             };
-            const post = async (path, body) => {
-              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
-              const t = await r.text();
-              let j = null; try { j = JSON.parse(t); } catch (_e) {}
-              return { status: r.status, json: j, text: t.slice(0, 300) };
-            };
-            const now = Date.now();
-            const filter = {
-              cutoff_from: new Date(now - 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
-              cutoff_to: new Date(now + 90 * 86400e3).toISOString().replace(/\.\d{3}Z$/, "Z"),
-              delivery_groups: ["DeliveryGroup_all"],
-              label_format_name: "ozon: small",
-            };
-            // v2.2.9.184 已确认：**指定订单**时不要传 filter，直接在顶层传 posting_numbers：
-            //   { "company_id":"3010672", "posting_numbers":["xxx-1","yyy-1"] }
-            //   （之前把 posting_numbers 放进 filter 里被接口忽略，导致生成了全量标签，用户反馈很慢。）
-            const createBody = postingNumbers.length
-              ? { company_id: companyId, posting_numbers: postingNumbers }
-              : { company_id: companyId, filter };
-            const create = await post("/api/label/task/create", createBody);
-            const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
-            if (!taskId) return { ok: false, step: "create", create: { status: create.status, text: create.text } };
-
-            // v2.2.9.183 已确认的正确状态接口（用户抓包）：
-            //   POST /api/label/task/get  { task_id, company_id }  → 返回任务状态 + 文件地址
-            const log = [];
-            let fileUrl = "";
-            for (let i = 0; i < 15 && !fileUrl; i += 1) {
-              await sleep(i === 0 ? 800 : 1200);
-              const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
-              if (i === 0) log.push({ step: "get", status: st.status, text: st.text.slice(0, 200) });
-              const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
-              if (m) { fileUrl = m[0].replace(/\\\//g, "/"); break; }
-              const stateStr = String((st.json && (st.json.status || st.json.state)) || "").toLowerCase();
-              if (/error|fail|cancel/.test(stateStr)) return { ok: false, step: "task_failed", taskId, log, state: stateStr };
-            }
-            if (!fileUrl) return { ok: false, step: "no_url", taskId, log };
-            const f = await fetch(fileUrl, { credentials: "include" });
-            if (!f.ok) return { ok: false, step: "download", fileUrl, httpStatus: f.status };
-            const buf = await f.arrayBuffer();
-            let bin = "";
-            const bytes = new Uint8Array(buf);
-            for (let i = 0; i < bytes.length; i += 1) bin += String.fromCharCode(bytes[i]);
-            return { ok: true, taskId, fileUrl: fileUrl.slice(0, 200), size: bytes.length, base64: btoa(bin) };
-          },
-          args: [postingNumbers],
-        });
-        const r = res && res.result;
-        if (!r) return sendResponse({ ok: false, error: "页面无返回（seller.ozon.ru 可能未登录）" });
-        sendResponse(r);
+        const create = await post("/api/label/task/create", createBody);
+        const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
+        if (!taskId) {
+          return sendResponse({ ok: false, step: "create", error: `create 失败 HTTP ${create.status}`, create: { status: create.status, text: create.text } });
+        }
+        let fileUrl = "", lastState = "";
+        for (let i = 0; i < 15 && !fileUrl; i += 1) {
+          await new Promise((r) => setTimeout(r, i === 0 ? 800 : 1200));
+          const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+          lastState = st.text.slice(0, 160);
+          const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
+          if (m) fileUrl = m[0].replace(/\\\//g, "/");
+        }
+        if (!fileUrl) return sendResponse({ ok: false, step: "no_url", error: `task ${taskId} 未返回 PDF 链接`, lastState });
+        const f = await fetch(fileUrl, { credentials: "include" });
+        if (!f.ok) return sendResponse({ ok: false, step: "download", error: `下载失败 HTTP ${f.status}`, fileUrl: fileUrl.slice(0, 150) });
+        const buf = new Uint8Array(await f.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < buf.length; i += 1) bin += String.fromCharCode(buf[i]);
+        sendResponse({ ok: true, taskId, fileUrl: fileUrl.slice(0, 200), size: buf.length, base64: btoa(bin) });
       } catch (e) {
         sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 300) });
       }
