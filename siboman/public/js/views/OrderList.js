@@ -763,18 +763,30 @@ window.OrderListView = {
           const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked }, { timeout: 30000 });
           if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
         } catch (_e) { /* 排序失败就用原顺序 */ }
-        const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: ordered }, 600000);
-        if (!res || res.ok !== true) {
-          const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
-          return notify.error('导出毛线标签失败：' + String(msg).slice(0, 260), 12000);
+        // v2.2.9.190 分批调插件：MV3 后台服务在长任务中会被浏览器回收，
+        //   一次 165 单（每单 2 个请求、约 4 分钟）必然被中断 → 界面一直转、导不出来。
+        //   改为每批 10 单，前端循环，每批约 15 秒，稳定可控。
+        const CHUNK = 10;
+        const items = [];
+        const failedAll = [];
+        const batches = [];
+        for (let i = 0; i < ordered.length; i += CHUNK) batches.push(ordered.slice(i, i + CHUNK));
+        for (let bi = 0; bi < batches.length; bi += 1) {
+          notify.info(`正在生成标签 ${bi + 1}/${batches.length} 批…`, 2500);
+          const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 120000);
+          if (!res || res.ok !== true) {
+            const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
+            return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 12000);
+          }
+          (res.items || []).forEach((it) => items.push(it));
+          (res.failed || []).forEach((f) => failedAll.push(f));
         }
-        const items = Array.isArray(res.items) ? res.items : [];
         if (!items.length) return notify.error('导出毛线标签失败：插件未取到任何标签');
         notify.info(`已生成 ${items.length} 个标签，正在按顺序合并…`, 8000);
         // 服务端按「拣货单顺序」下载并合并
         const merged = await axios.post('/api/seller/orders/yarn-label-pdf', { order: ordered, items }, { responseType: 'blob', timeout: 300000 });
         downloadBlob(merged.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
-        const failedCount = Array.isArray(res.failed) ? res.failed.length : 0;
+        const failedCount = failedAll.length;
         notify.success(`已导出 ${items.length} 个订单的毛线标签${failedCount ? `（${failedCount} 单失败）` : ''}，顺序与拣货单一致`);
       } catch (e) {
         notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 200));
