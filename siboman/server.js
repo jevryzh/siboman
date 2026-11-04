@@ -27504,30 +27504,41 @@ if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
       if (needSlow) lastSlowRefreshAt = Date.now();
       const since = new Date(to.getTime() - days * 86400e3);
       for (const st of stores.rows) {
-        let cursor = "";
-        let touched = 0;
-        for (let page = 0; page < 40; page += 1) {
-          const r = await ozonFbsListV4Page({
-            since: since.toISOString(), to: to.toISOString(), status: "all",
-            limit: 100, cursor, with: { financial_data: true, analytics_data: true },
-            storeId: st.id, userId: st.user_id,
-          });
-          const batch = r.postings || [];
-          for (const p of batch) {
-            await db.query(
-              `UPDATE app_order_cache
-                  SET status = $3, display_status = $3, substatus = $4,
-                      payload = COALESCE(payload, '{}'::jsonb) || $5::jsonb,
-                      synced_at = now(), updated_at = now()
-                WHERE store_id = $1 AND posting_number = $2`,
-              [st.id, String(p.posting_number), String(p.status || ""), String(p.substatus || ""), JSON.stringify(p)],
-            );
-            touched += 1;
+        // v2.2.9.198 单店隔离：某个店铺 API Key 失效（403 Api-key is deactivated）时，
+        //   不能把整个刷新循环 abort 掉，否则排在后面的店铺（如 HappyFriday）永远刷不到，
+        //   状态停在旧值 → 前端「待备货」数字虚高（实测 25 vs 后台 3）。
+        try {
+          let cursor = "";
+          let touched = 0;
+          // v2.2.9.198 Ozon /v4/posting/fbs/list 的游标固定是 in_process_at 升序（不认 dir:DESC），
+          //   只翻 40 页×100=4000 条时，30 天窗口下 7457 条订单只能刷到最旧的 4000 条，
+          //   最新的待备货订单在第 60+ 页永远刷不到 → 前端「待备货」虚高（25 vs 后台 3）。
+          //   提到 120 页（12000 条）覆盖全部窗口订单。
+          for (let page = 0; page < 120; page += 1) {
+            const r = await ozonFbsListV4Page({
+              since: since.toISOString(), to: to.toISOString(), status: "all",
+              limit: 100, cursor, with: { financial_data: true, analytics_data: true },
+              storeId: st.id, userId: st.user_id,
+            });
+            const batch = r.postings || [];
+            for (const p of batch) {
+              await db.query(
+                `UPDATE app_order_cache
+                    SET status = $3, display_status = $3, substatus = $4,
+                        payload = COALESCE(payload, '{}'::jsonb) || $5::jsonb,
+                        synced_at = now(), updated_at = now()
+                  WHERE store_id = $1 AND posting_number = $2`,
+                [st.id, String(p.posting_number), String(p.status || ""), String(p.substatus || ""), JSON.stringify(p)],
+              );
+              touched += 1;
+            }
+            if (!r.has_next || !r.cursor || batch.length < 100) break;
+            cursor = r.cursor;
           }
-          if (!r.has_next || !r.cursor || batch.length < 100) break;
-          cursor = r.cursor;
+          if (touched) console.log(`[OrderStatusRefresh] store=${st.id} window=${days}d refreshed=${touched}`);
+        } catch (e) {
+          console.error(`[OrderStatusRefresh] store=${st.id} 失败，跳过该店继续刷新其他店:`, String(e.message || e).slice(0, 200));
         }
-        if (touched) console.log(`[OrderStatusRefresh] store=${st.id} window=${days}d refreshed=${touched}`);
       }
     } catch (e) {
       console.error("[OrderStatusRefresh] 失败:", String(e.message || e).slice(0, 200));
