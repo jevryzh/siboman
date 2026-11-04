@@ -2040,6 +2040,15 @@ async function initDatabase() {
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS status_log JSONB DEFAULT '[]'::jsonb;
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS source_url_1688 TEXT NOT NULL DEFAULT '';
       ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+      -- v2.2.9.194 复刻熊猫采集箱：多变体 SKU + 类目/税务/服装性别/发布状态/采集时间
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS variants JSONB NOT NULL DEFAULT '[]'::jsonb;
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS category_name TEXT NOT NULL DEFAULT '';
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS category_id BIGINT;
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS vat TEXT NOT NULL DEFAULT '0';
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS garment_gender TEXT NOT NULL DEFAULT '';
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS publish_status TEXT NOT NULL DEFAULT '';
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS collect_started_at TIMESTAMPTZ;
+      ALTER TABLE collect_items ADD COLUMN IF NOT EXISTS collect_finished_at TIMESTAMPTZ;
 
       UPDATE collect_items SET status='failed', note='未关联采集任务，请点击重新采集',
         status_log=COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('from','pending','to','failed','reason','启动时发现孤立任务','at',now())),
@@ -19730,7 +19739,8 @@ app.post("/api/collect-items/:id", requireAuth, async (req, res, next) => {
     const allowed = [
       "status", "note", "title", "main_image", "images", "price_cny", "price_rub",
       "seller", "brand", "linked_offer_id", "source_url_1688", "description",
-      "weight", "depth", "width", "height", "attributes"
+      "weight", "depth", "width", "height", "attributes",
+      "variants", "category_name", "category_id", "vat", "garment_gender", "publish_status"
     ];
     const sets = [];
     const args = [];
@@ -19740,7 +19750,7 @@ app.post("/api/collect-items/:id", requireAuth, async (req, res, next) => {
         if (key === "status" && !["pending", "scraped", "uploaded", "failed", "ignored"].includes(String(val))) {
           return res.status(400).json({ success: false, error: "无效采集状态" });
         }
-        if (["images", "attributes"].includes(key) && typeof val === "object") {
+        if (["images", "attributes", "variants"].includes(key) && typeof val === "object") {
           val = JSON.stringify(val);
         }
         args.push(val);
@@ -27403,7 +27413,7 @@ try {
 }
 await initDatabase();
 await migrateYandexEnvToStores();
-const statisticsAnalysis = createStatisticsAnalysis({ db, assertStoreAccess: assertActiveStoreAccess, callOzon: callOzonSellerAPI, defaultRate: RUB_CNY_RATE, notify: sendAlertMailThrottled });
+const statisticsAnalysis = createStatisticsAnalysis({ db, assertStoreAccess: assertActiveStoreAccess, callOzon: callOzonSellerAPI, defaultRate: RUB_CNY_RATE, credentialSecret: AUTH_SECRET, notify: sendAlertMailThrottled });
 await statisticsAnalysis.init();
 statisticsAnalysis.register(app, requireAuth);
 if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {

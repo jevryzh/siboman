@@ -9,6 +9,8 @@ window.CollectionBoxView = {
       showProfitCalc: false,
       calc: { cost_cny: 0, profit_rate: 30 }
     });
+    const uploadShop = Vue.reactive({ visible: false, row: null, note: '' });
+    const garmentGenders = ['自动', '男装', '女装', '童装', '中性'];
     const importText = Vue.ref('');
     const activeTab = Vue.ref('all');
     const search = Vue.ref('');
@@ -64,6 +66,13 @@ window.CollectionBoxView = {
 
     const handleImport = async () => {
       if (!importText.value.trim()) return;
+      const lines = importText.value.split('\n').map((s) => s.trim()).filter(Boolean);
+      if (!lines.length) return;
+      const MAX = 5;
+      if (lines.length > MAX) {
+        ElementPlus.ElMessage.warning(`单次最多 ${MAX} 条采集链接，超出部分将被忽略（当前 ${lines.length} 条）`);
+        importText.value = lines.slice(0, MAX).join('\n');
+      }
       try {
         const res = await axios.post('/api/collect-items', { inputs: importText.value, storeId: currentStoreId.value });
         ElementPlus.ElMessage.success(`已加入 ${res.data.insertedCount || 0} 条，跳过 ${res.data.skippedCount || 0} 条重复数据`);
@@ -74,14 +83,39 @@ window.CollectionBoxView = {
       }
     };
 
+    const defaultVariant = (row = {}) => ({
+      sku: row.ozon_sku || row.sku || '',
+      title: row.title || '',
+      color_image: '',
+      main_image: row.main_image || '',
+      images: Array.isArray(row.images) ? row.images : [],
+      cost_price: row.price_cny ?? null,
+      price: row.price_rub ?? null,
+      old_price: null,
+      weight: row.weight ?? null,
+      weight_unit: 'g',
+      depth: row.depth ?? null,
+      width: row.width ?? null,
+      height: row.height ?? null,
+      dimension_unit: 'mm',
+      merge: false,
+      color_name: '',
+      color: '',
+      manufacturer_size: '',
+      russian_size: '',
+    });
+    const addVariant = () => { drawer.form.variants.push(defaultVariant({})); };
+    const removeVariant = (i) => { if (drawer.form.variants.length > 1) drawer.form.variants.splice(i, 1); };
     const editItem = (row) => {
       drawer.itemId = row.id;
       drawer.form = JSON.parse(JSON.stringify(row));
-      // 预设尺寸重量
-      drawer.form.weight = drawer.form.weight || 0;
-      drawer.form.depth = drawer.form.depth || 0;
-      drawer.form.width = drawer.form.width || 0;
-      drawer.form.height = drawer.form.height || 0;
+      drawer.form.attributes = drawer.form.attributes || {};
+      drawer.form.variants = (Array.isArray(drawer.form.variants) && drawer.form.variants.length)
+        ? drawer.form.variants.map((v) => ({ ...defaultVariant(row), ...v }))
+        : [defaultVariant(row)];
+      drawer.form.vat = drawer.form.vat || '0';
+      drawer.form.garment_gender = drawer.form.garment_gender || '自动';
+      drawer.form.category_name = drawer.form.category_name || '';
       drawer.visible = true;
     };
 
@@ -200,6 +234,23 @@ window.CollectionBoxView = {
       window.location.hash = '#/upload';
     };
 
+    // ===== 上传店铺（选店铺 + 备注，复刻熊猫采集箱）=====
+    const openUploadShop = (row) => {
+      if (row.status === 'failed') return ElementPlus.ElMessage.warning('失败采集项请先重新采集, 成功后再送上架');
+      if (!row.ozon_sku && !row.ozon_url) return ElementPlus.ElMessage.warning('缺少 Ozon SKU 或链接, 暂不能上传店铺');
+      uploadShop.row = row;
+      uploadShop.note = (row.attributes && row.attributes.upload_note) || '';
+      uploadShop.visible = true;
+    };
+    const confirmUploadShop = async () => {
+      const row = uploadShop.row;
+      if (!row) return;
+      const attrs = { ...(row.attributes || {}), upload_note: uploadShop.note };
+      try { await axios.put(`/api/collect-items/${row.id}`, { attributes: attrs }); } catch {}
+      uploadShop.visible = false;
+      sendToListing(row);
+    };
+
     // ===== AI 套图（共享客户端：public/js/image-set-client.js）=====
     const aiImg = Vue.reactive({});   // itemId -> { busy, jobId, phase, processed, total, error, images }
     const aiImageSet = async (row) => {
@@ -257,6 +308,7 @@ window.CollectionBoxView = {
       onTabChange, onSearch, onSearchInput, onSizeChange, onSelectionChange, updateStatus, bulkDelete, deleteItem, retryItem, sendToListing, exportCsv,
       statusLabel, statusType, statusDescriptions, rowFailureReason, taskSummary,
       aiImg, aiImageSet,
+      uploadShop, garmentGenders, openUploadShop, confirmUploadShop, addVariant, removeVariant,
     };
   },
   template: `
@@ -280,10 +332,10 @@ window.CollectionBoxView = {
 
         <div style="background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:14px; margin-bottom:16px">
           <div style="display:grid; grid-template-columns:minmax(320px,1fr) 132px; gap:12px; align-items:start">
-            <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 Ozon / 1688 / 拼多多 链接或 SKU，每行一条" />
+            <el-input v-model="importText" type="textarea" :rows="3" resize="vertical" placeholder="粘贴 1688 / 淘宝 / 拼多多 / Ozon 链接，每行一条，单次最多 5 条" />
             <el-button size="large" type="primary" style="height:76px; background:#111827; border-color:#111827" @click="handleImport">加入采集箱</el-button>
           </div>
-          <div style="margin-top:8px; color:#64748b; font-size:12px; font-weight:700">加入后只创建采集箱记录和采集任务；送上架需要在采集完成后手动确认。</div>
+          <div style="margin-top:8px; color:#64748b; font-size:12px; font-weight:700">支持 1688 / 淘宝 / 拼多多 / Ozon 链接，来源自动识别；加入后只创建采集箱记录和采集任务，上传店铺需在采集完成后手动确认。</div>
         </div>
 
         <div style="background:#fff; border:1px solid #dfe7f1; border-radius:8px; padding:6px; margin-bottom:14px; display:flex; gap:8px; flex-wrap:wrap">
@@ -346,11 +398,24 @@ window.CollectionBoxView = {
                 <div v-else-if="!row.source_url_1688" style="color:#ccc">未匹配</div>
              </template>
           </el-table-column>
+          <el-table-column label="类目" min-width="140" show-overflow-tooltip>
+            <template #default="{ row }">{{ row.category_name || '—' }}</template>
+          </el-table-column>
           <el-table-column label="状态" width="110">
             <template #default="{ row }">
               <el-tooltip :content="statusDescriptions[row.status] || statusLabel(row.status)" placement="top">
                 <el-tag size="small" :type="statusType(row.status)">{{ statusLabel(row.status) }}</el-tag>
               </el-tooltip>
+            </template>
+          </el-table-column>
+          <el-table-column label="发布状态" width="110">
+            <template #default="{ row }">
+              <el-tag size="small" :type="row.status === 'uploaded' ? 'success' : 'info'">{{ row.publish_status || (row.status === 'uploaded' ? '上传成功' : '未上传') }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column label="采集时间" width="120">
+            <template #default="{ row }">
+              <div style="font-size:12px;color:#606266">{{ String(row.collect_finished_at || row.updated_at || '').slice(0,10) }}</div>
             </template>
           </el-table-column>
           <el-table-column label="AI 套图" width="190" align="center">
@@ -367,10 +432,11 @@ window.CollectionBoxView = {
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="240" fixed="right" align="center">
+          <el-table-column label="操作" width="260" fixed="right" align="center">
             <template #default="{ row }">
               <el-button link type="primary" @click="editItem(row)">编辑</el-button>
-              <el-button v-if="row.status === 'scraped'" link type="success" @click="sendToListing(row)">送上架</el-button>
+              <el-button v-if="row.status === 'scraped'" link type="success" @click="openUploadShop(row)">上传店铺</el-button>
+              <el-button v-if="row.status === 'uploaded'" link type="success" @click="openUploadShop(row)">重新上传</el-button>
               <el-button v-if="row.status === 'failed'" link type="danger" @click="retryItem(row)">重新采集</el-button>
               <el-button v-if="row.status !== 'ignored'" link type="warning" @click="updateStatus(row, 'ignored')">忽略</el-button>
               <el-button v-else link type="success" @click="updateStatus(row, 'pending')">恢复</el-button>
@@ -392,48 +458,123 @@ window.CollectionBoxView = {
         </div>
       </div>
 
-      <!-- 补全 Ozon 死穴字段的编辑抽屉 -->
-      <el-drawer v-model="drawer.visible" title="编辑采集商品" size="650px">
-        <el-alert title="保存采集资料只写入本地采集箱；上架需要点击送上架并在批量上架页确认。" type="info" :closable="false" show-icon style="margin-bottom:12px" />
+            <!-- 商品属性编辑（复刻熊猫采集箱） -->
+      <el-dialog v-model="drawer.visible" title="商品属性编辑" width="1280px" top="3vh" :close-on-click-modal="false">
+        <el-alert title="保存只写入本地采集箱；上传走「上传店铺」并在批量上架页确认。" type="info" :closable="false" show-icon style="margin-bottom:12px" />
         <el-alert v-if="drawer.form.status === 'failed'" :title="rowFailureReason(drawer.form)" type="error" :closable="false" show-icon style="margin-bottom:12px" />
-        <el-form :model="drawer.form" label-position="top">
-          <el-form-item label="商品名称 (俄/英)" required><el-input v-model="drawer.form.title" /></el-form-item>
-          
-          <el-row :gutter="20">
-            <el-col :span="12">
-              <el-form-item label="售价 (RUB)" required>
-                <el-input-number v-model="drawer.form.price_rub" style="width:100%" />
-                <el-button type="success" link size="small" @click="drawer.showProfitCalc = true">
-                   <el-icon><DataAnalysis /></el-icon> fx 利润计算器
-                </el-button>
-              </el-form-item>
-            </el-col>
-            <el-col :span="12">
-              <el-form-item label="品牌 (Brand)"><el-input v-model="drawer.form.brand" /></el-form-item>
-            </el-col>
-          </el-row>
 
-          <el-divider content-position="left">物流规格 (Ozon 备货死穴)</el-divider>
-          <el-row :gutter="10">
-            <el-col :span="6"><el-form-item label="重量 (g)"><el-input-number v-model="drawer.form.weight" :min="1" /></el-form-item></el-col>
-            <el-col :span="6"><el-form-item label="长 (mm)"><el-input-number v-model="drawer.form.depth" :min="1" /></el-form-item></el-col>
-            <el-col :span="6"><el-form-item label="宽 (mm)"><el-input-number v-model="drawer.form.width" :min="1" /></el-form-item></el-col>
-            <el-col :span="6"><el-form-item label="高 (mm)"><el-input-number v-model="drawer.form.height" :min="1" /></el-form-item></el-col>
-          </el-row>
+        <div style="display:flex; gap:16px; align-items:flex-end; margin-bottom:12px; flex-wrap:wrap">
+          <div style="flex:1; min-width:320px">
+            <div style="font-size:13px; font-weight:700; color:#111827; margin-bottom:4px">商品类目</div>
+            <el-input v-model="drawer.form.category_name" placeholder="输入类目关键词（如：休闲鞋 / 豆豆鞋）" clearable />
+          </div>
+          <div>
+            <div style="font-size:13px; font-weight:700; color:#111827; margin-bottom:4px">服装性别（辅助AI识别）</div>
+            <el-radio-group v-model="drawer.form.garment_gender" size="small">
+              <el-radio-button v-for="g in garmentGenders" :key="g" :value="g">{{ g }}</el-radio-button>
+            </el-radio-group>
+          </div>
+        </div>
 
-          <el-form-item label="详细描述 (Description)">
-             <el-input v-model="drawer.form.description" type="textarea" :rows="8" />
-          </el-form-item>
-          <el-form-item label="1688 货源链接">
-             <el-input v-model="drawer.form.source_url_1688" placeholder="https://detail.1688.com/offer/..." />
-          </el-form-item>
-        </el-form>
-        
+        <el-divider content-position="left">必填信息</el-divider>
+        <el-row :gutter="16">
+          <el-col :span="12"><el-form-item label="商品名称" required><el-input v-model="drawer.form.title" /></el-form-item></el-col>
+          <el-col :span="6"><el-form-item label="卖家ID"><el-input v-model="drawer.form.seller" /></el-form-item></el-col>
+          <el-col :span="6"><el-form-item label="税率 VAT"><el-select v-model="drawer.form.vat" style="width:100%"><el-option value="0" label="0%" /><el-option value="0.1" label="10%" /><el-option value="0.2" label="20%" /></el-select></el-form-item></el-col>
+        </el-row>
+
+        <el-divider content-position="left">商品必填属性</el-divider>
+        <el-row :gutter="16">
+          <el-col :span="8"><el-form-item label="服装和鞋类品牌"><el-input v-model="drawer.form.brand" placeholder="无品牌填「无品牌」" /></el-form-item></el-col>
+          <el-col :span="8"><el-form-item label="类型"><el-input v-model="drawer.form.attributes.type" /></el-form-item></el-col>
+          <el-col :span="8"><el-form-item label="性别"><el-input v-model="drawer.form.attributes.gender" /></el-form-item></el-col>
+        </el-row>
+
+        <el-divider content-position="left">SKU 多变体列表</el-divider>
+        <div style="margin-bottom:10px; display:flex; justify-content:space-between; align-items:center">
+          <span style="font-size:13px; color:#64748b">共 {{ (drawer.form.variants || []).length }} 个变体</span>
+          <el-button type="primary" size="small" @click="addVariant">+ 添加变体</el-button>
+        </div>
+        <div style="max-height:400px; overflow:auto; border:1px solid #e5e7eb; border-radius:8px">
+          <table style="width:100%; border-collapse:collapse; font-size:12px; min-width:1600px">
+            <thead>
+              <tr style="background:#f8fafc">
+                <th style="padding:8px; border:1px solid #e5e7eb">#</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">颜色样本图</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">主图</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">标题</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">SKU货号</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">成本价</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">售价</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">划线价</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">重量</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">长/宽/高</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">颜色名称</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">商品颜色</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">制造尺码</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">俄尺码</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">合并变体</th>
+                <th style="padding:8px; border:1px solid #e5e7eb">操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="(v, i) in drawer.form.variants" :key="i">
+                <td style="padding:6px; border:1px solid #e5e7eb; text-align:center">{{ i + 1 }}</td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.color_image" placeholder="图片URL" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.main_image" placeholder="图片URL" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.title" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.sku" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input-number v-model="v.cost_price" :min="0" :controls="false" size="small" style="width:80px" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input-number v-model="v.price" :min="0" :controls="false" size="small" style="width:80px" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input-number v-model="v.old_price" :min="0" :controls="false" size="small" style="width:80px" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input-number v-model="v.weight" :min="0" :controls="false" size="small" style="width:72px" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb">
+                  <div style="display:flex; gap:2px">
+                    <el-input-number v-model="v.depth" :min="0" :controls="false" size="small" style="width:58px" placeholder="长" />
+                    <el-input-number v-model="v.width" :min="0" :controls="false" size="small" style="width:58px" placeholder="宽" />
+                    <el-input-number v-model="v.height" :min="0" :controls="false" size="small" style="width:58px" placeholder="高" />
+                  </div>
+                </td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.color_name" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.color" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.manufacturer_size" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb"><el-input v-model="v.russian_size" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb; text-align:center"><el-switch v-model="v.merge" size="small" /></td>
+                <td style="padding:6px; border:1px solid #e5e7eb; text-align:center"><el-button link type="danger" size="small" @click="removeVariant(i)">删除</el-button></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <el-divider content-position="left">其他信息</el-divider>
+        <el-row :gutter="16">
+          <el-col :span="14"><el-form-item label="详细描述 (Description)"><el-input v-model="drawer.form.description" type="textarea" :rows="4" /></el-form-item></el-col>
+          <el-col :span="10"><el-form-item label="1688 货源链接"><el-input v-model="drawer.form.source_url_1688" placeholder="https://detail.1688.com/offer/..." /></el-form-item></el-col>
+        </el-row>
+
         <template #footer>
-          <el-button @click="drawer.visible = false">取消</el-button>
+          <el-button @click="drawer.visible = false">关闭</el-button>
           <el-button type="primary" @click="saveDraft">保存采集资料</el-button>
         </template>
-      </el-drawer>
+      </el-dialog>
+
+      <!-- 上传店铺（选店铺 + 备注） -->
+      <el-dialog v-model="uploadShop.visible" title="上传店铺" width="480px" :close-on-click-modal="false">
+        <el-form label-position="top">
+          <el-form-item label="选择店铺">
+            <el-tag type="primary" size="medium">当前店铺</el-tag>
+            <span style="margin-left:8px; font-size:12px; color:#94a3b8">（多店铺切换请使用右上角店铺选择器）</span>
+          </el-form-item>
+          <el-form-item label="上传备注">
+            <el-input v-model="uploadShop.note" type="textarea" :rows="4" maxlength="2000" show-word-limit placeholder="选填" />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="uploadShop.visible = false">取 消</el-button>
+          <el-button type="primary" @click="confirmUploadShop">确 定</el-button>
+        </template>
+      </el-dialog>
+
 
       <!-- fx 计算器弹窗 -->
       <el-dialog v-model="drawer.showProfitCalc" title="fx 利润计算器" width="400px" append-to-body>
