@@ -152,6 +152,38 @@ window.CollectionBoxView = {
       finally { aiFilling.value = false; }
     };
 
+    // ===== 一键添加水印（复用 /api/images/watermark）=====
+    const waterMarking = Vue.ref(false);
+    const watermarkText = Vue.ref('逐梦ERP');
+    const watermarkImages = async () => {
+      const seen = new Set();
+      if (drawer.form.main_image) seen.add(drawer.form.main_image);
+      (drawer.form.images || []).forEach((u) => u && seen.add(u));
+      (drawer.form.variants || []).forEach((v) => {
+        if (v.main_image) seen.add(v.main_image);
+        if (v.color_image) seen.add(v.color_image);
+        (v.images || []).forEach((u) => u && seen.add(u));
+      });
+      const list = [...seen].filter(Boolean);
+      if (!list.length) return ElementPlus.ElMessage.warning('该商品没有图片可加水印');
+      const text = (watermarkText.value || '逐梦ERP').trim();
+      waterMarking.value = true;
+      try {
+        const res = await axios.post('/api/images/watermark', { images: list, text });
+        const map = {};
+        list.forEach((u, i) => { map[u] = res.data.images?.[i] || u; });
+        if (drawer.form.main_image) drawer.form.main_image = map[drawer.form.main_image] || drawer.form.main_image;
+        drawer.form.images = (drawer.form.images || []).map((u) => map[u] || u);
+        (drawer.form.variants || []).forEach((v) => {
+          if (v.main_image) v.main_image = map[v.main_image] || v.main_image;
+          if (v.color_image) v.color_image = map[v.color_image] || v.color_image;
+          v.images = (v.images || []).map((u) => map[u] || u);
+        });
+        ElementPlus.ElMessage.success(`已为 ${list.length} 张图片添加水印`);
+      } catch (e) { ElementPlus.ElMessage.error('水印失败：' + (e.response?.data?.error || e.message)); }
+      finally { waterMarking.value = false; }
+    };
+
     const suggestedPrice = Vue.computed(() => {
       if (!drawer.calc.cost_cny) return 0;
       const rate = 0.0862;
@@ -343,6 +375,7 @@ window.CollectionBoxView = {
       aiImg, aiImageSet,
       uploadShop, garmentGenders, openUploadShop, confirmUploadShop, addVariant, removeVariant,
       aiFilling, translateTitle, aiFill,
+      waterMarking, watermarkText, watermarkImages,
     };
   },
   template: `
@@ -514,9 +547,11 @@ window.CollectionBoxView = {
         <el-row :gutter="16">
           <el-col :span="12"><el-form-item label="商品名称" required>
             <el-input v-model="drawer.form.title" />
-            <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap">
+            <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap; align-items:center">
               <el-button size="small" :loading="aiFilling" @click="translateTitle">翻译标题</el-button>
               <el-button size="small" type="primary" :loading="aiFilling" @click="aiFill">AI智能填充</el-button>
+              <el-input v-model="watermarkText" size="small" style="width:130px" placeholder="水印文字" />
+              <el-button size="small" type="warning" :loading="waterMarking" @click="watermarkImages">一键添加水印</el-button>
             </div>
           </el-form-item></el-col>
           <el-col :span="6"><el-form-item label="卖家ID"><el-input v-model="drawer.form.seller" /></el-form-item></el-col>
