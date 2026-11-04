@@ -773,7 +773,10 @@ window.OrderListView = {
         //   用户根本不知道要去升级插件 → 先 ping 拿插件版本，太旧就直接给明确提示。
         try {
           const ping = await send('ping.request', {}, 8000);
-          const ver = String(ping?.version || ping?.background_version || '');
+          // ⚠️ background_version 才是真正的插件版本（background.js 的 VERSION）；
+          //   content-bridge-iso.js 里那个 version 是写死的旧常量（2.2.9.157，从没跟着升），
+          //   之前误用它把 2.2.9.189 的新插件判成旧版 → 冤枉用户。
+          const ver = String(ping?.background_version || ping?.version || '');
           const cmpVer = (a, b) => {
             const pa = String(a || '').split('.').map((x) => Number(x) || 0);
             const pb = String(b || '').split('.').map((x) => Number(x) || 0);
