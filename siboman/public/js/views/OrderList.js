@@ -83,10 +83,13 @@ window.OrderListView = {
     };
     const effectiveStoreIdForOrder = (row) => String(row?.store_id || row?.storeId || getStoreId() || '').trim();
 
+    // v2.2.9.200 修「报错一闪而过」：原来 notify 只接一个参数，把 duration 丢掉了，
+    //   所有 notify.error(msg, 12000) 实际都用默认 3 秒 → 用户根本看不清。
+    //   现在透传 duration，并且错误默认 15 秒 + 可手动关闭；传 0 表示常驻不自动关。
     const notify = {
-      success: (m) => (window.ElementPlus?.ElMessage || console).success?.(m),
-      warning: (m) => (window.ElementPlus?.ElMessage || console).warning?.(m),
-      error: (m) => (window.ElementPlus?.ElMessage || console).error?.(m),
+      success: (m, d) => (window.ElementPlus?.ElMessage || console).success?.({ message: String(m), duration: d == null ? 3000 : d, showClose: true }),
+      warning: (m, d) => (window.ElementPlus?.ElMessage || console).warning?.({ message: String(m), duration: d == null ? 6000 : d, showClose: true }),
+      error: (m, d) => (window.ElementPlus?.ElMessage || console).error?.({ message: String(m), duration: d == null ? 15000 : d, showClose: true }),
     };
 
     const statusTabs = [
@@ -734,6 +737,12 @@ window.OrderListView = {
     // v2.2.9.171 定制导出：毛线拣货单（xlsx）/ 毛线标签（PDF），都基于「待发运」的毛线订单
     const yarnPicklistBusy = Vue.ref(false);
     const yarnLabelsBusy = Vue.ref(false);
+    // v2.2.9.200 导出/打印进度条：所有导出共用一条常驻进度，替代一闪而过的 toast
+    const exportProgress = Vue.reactive({ visible: false, label: '', percent: 0, detail: '' });
+    const exportStart = (label) => { exportProgress.visible = true; exportProgress.label = label; exportProgress.percent = 0; exportProgress.detail = ''; };
+    const exportStep = (percent, detail) => { exportProgress.percent = Math.max(0, Math.min(100, Math.round(percent))); if (detail != null) exportProgress.detail = String(detail); };
+    const exportFinish = () => { exportProgress.percent = 100; setTimeout(() => { exportProgress.visible = false; exportProgress.percent = 0; exportProgress.detail = ''; }, 1500); };
+    const exportFail = (label) => { exportProgress.visible = false; exportProgress.percent = 0; exportProgress.detail = ''; };
     const downloadBlob = (data, filename, mime) => {
       const blob = new Blob([data], { type: mime });
       const url = URL.createObjectURL(blob);
@@ -746,16 +755,22 @@ window.OrderListView = {
       const storeIds = selectedStoreIds();
       if (!storeIds.length) return notify.warning('请先选择店铺');
       yarnPicklistBusy.value = true;
+      exportStart(`导出毛线拣货单（${(selectedOrders.value || []).length} 单）`);
       try {
         const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
-        if (!picked.length) { yarnPicklistBusy.value = false; return notify.warning('请先勾选要导出的订单'); }
+        if (!picked.length) { yarnPicklistBusy.value = false; exportFail(); return notify.warning('请先勾选要导出的订单'); }
+        exportStep(20, `已选中 ${picked.length} 单，正在请求服务端…`);
         const res = await axios.post('/api/seller/orders/yarn-picklist-export', { store_ids: storeIds, posting_numbers: picked }, { responseType: 'blob', timeout: 120000 });
+        exportStep(80, '正在生成 xlsx…');
         downloadBlob(res.data, `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+        exportStep(100, `${res.headers['x-item-count'] || '?'} 条 / ${res.headers['x-page-count'] || '?'} 页`);
+        exportFinish();
         notify.success(`已导出毛线拣货单：${res.headers['x-item-count'] || '?'} 条 / ${res.headers['x-page-count'] || '?'} 页`);
       } catch (e) {
+        exportFail();
         let msg = e.message;
         try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
-        notify.error('导出毛线拣货单失败：' + String(msg).slice(0, 200));
+        notify.error('导出毛线拣货单失败：' + String(msg).slice(0, 240), 0);
       } finally { yarnPicklistBusy.value = false; }
     };
     const exportYarnLabels = async () => {
@@ -790,9 +805,11 @@ window.OrderListView = {
             return notify.error(`毛线标签导出需要插件 2.2.9.189 或更高版本，你当前是 ${ver}。请点右上角「插件下载」重新下载并覆盖安装最新插件后再试。`, 18000);
           }
         } catch (_e) { /* ping 失败就继续走，让真实错误暴露出来 */ }
+        exportStart(`导出毛线标签（${picked.length} 单）`);
         // v2.2.9.188 先按拣货单规则拿到排序后的单号，让标签页顺序与拣货单一一对应
         let ordered = picked;
         try {
+          exportStep(5, '正在按拣货单规则排序…');
           const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked }, { timeout: 30000 });
           if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
         } catch (_e) { /* 排序失败就用原顺序 */ }
@@ -805,25 +822,29 @@ window.OrderListView = {
         const batches = [];
         for (let i = 0; i < ordered.length; i += CHUNK) batches.push(ordered.slice(i, i + CHUNK));
         for (let bi = 0; bi < batches.length; bi += 1) {
-          try { window.ElementPlus.ElMessage.info({ message: `正在生成标签 ${bi + 1}/${batches.length} 批…`, duration: 2000 }); } catch (_e) { /* 忽略 */ }
+          exportStep(10 + (bi / batches.length) * 80, `正在生成标签 ${bi + 1}/${batches.length} 批（已拿到 ${items.length} 个）`);
           const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 120000);
           if (!res || res.ok !== true) {
             let msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
             if (res?.step === 'create') msg += ' —— 标签创建接口拒绝；若插件版本低于 2.2.9.189，请先升级插件再试';
-            return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 14000);
+            exportFail();
+            return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 0);
           }
           (res.items || []).forEach((it) => items.push(it));
           (res.failed || []).forEach((f) => failedAll.push(f));
         }
-        if (!items.length) return notify.error('导出毛线标签失败：插件未取到任何标签');
-        try { window.ElementPlus.ElMessage.info({ message: `已生成 ${items.length} 个标签，正在按顺序合并…`, duration: 8000 }); } catch (_e) { /* 忽略 */ }
+        if (!items.length) { exportFail(); return notify.error('导出毛线标签失败：插件未取到任何标签（所选订单可能都是已发货/已取消状态，标签接口不返回）', 0); }
+        exportStep(92, `已生成 ${items.length} 个标签，正在按顺序合并 PDF…`);
         // 服务端按「拣货单顺序」下载并合并
         const merged = await axios.post('/api/seller/orders/yarn-label-pdf', { order: ordered, items }, { responseType: 'blob', timeout: 300000 });
         downloadBlob(merged.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
         const failedCount = failedAll.length;
+        exportStep(100, `${items.length} 个标签${failedCount ? `，${failedCount} 单失败` : ''}`);
+        exportFinish();
         notify.success(`已导出 ${items.length} 个订单的毛线标签${failedCount ? `（${failedCount} 单失败）` : ''}，顺序与拣货单一致`);
       } catch (e) {
-        notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 200));
+        exportFail();
+        notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 240), 0);
       } finally { yarnLabelsBusy.value = false; }
     };
     const openPostingDialog = () => {
@@ -889,19 +910,23 @@ window.OrderListView = {
       const send = window.__zhumeng_send__;
       if (typeof send !== 'function') return notify.warning('检测不到采集插件，请确认浏览器已安装并启用');
       pickListBusy.value = true;
+      exportStart(`生成拣货单（${postingNumbers.length} 单）`);
       try {
-        // 状态别名要和所选订单一致：待备货 → awaiting_packaging，待发运 → awaiting_deliver
-        const statusAliases = [...new Set(sel.map((row) => String(row.status || ''))
-          .filter((s2) => ['awaiting_packaging', 'awaiting_deliver'].includes(s2)))];
+        // v2.2.9.200 状态别名用所选订单的全部状态（不再只限待备货/待发运），
+        //   让用户在「所有」tab 按筛选也能生成拣货单；报告接口会按实际状态返回。
+        const statusAliases = [...new Set(sel.map((row) => String(row.status || '')).filter(Boolean))];
+        exportStep(25, '插件正在向卖家后台创建拣货报告…');
         const res = await send('pickList.request', { postingNumbers, statusAliases }, 180000);
         if (!res || res.ok !== true) {
+          exportFail();
           const detail = res?.step ? `（失败步骤：${res.step}）` : '';
           const msg = res?.error
             || res?.create?.text
             || (res?.log && res.log.length && JSON.stringify(res.log[res.log.length - 1]))
             || '插件无返回（可能是插件版本过旧，请到 chrome://extensions 重新加载）';
-          return notify.error('生成拣货单失败' + detail + '：' + String(msg).slice(0, 300), 12000);
+          return notify.error('生成拣货单失败' + detail + '：' + String(msg).slice(0, 300), 0);
         }
+        exportStep(85, '报告已生成，正在下载 PDF…');
         const bin = atob(res.base64 || '');
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
@@ -909,9 +934,12 @@ window.OrderListView = {
         const url = URL.createObjectURL(blob);
         window.open(url, '_blank');
         setTimeout(() => URL.revokeObjectURL(url), 60000);
+        exportStep(100, `${Math.round((res.size || 0) / 1024)} KB`);
+        exportFinish();
         notify.success(`已生成 ${postingNumbers.length} 个订单的拣货单（${Math.round((res.size || 0) / 1024)} KB）`);
       } catch (e) {
-        notify.error('生成拣货单失败：' + String(e.message || e).slice(0, 200));
+        exportFail();
+        notify.error('生成拣货单失败：' + String(e.message || e).slice(0, 240), 0);
       } finally {
         pickListBusy.value = false;
       }
@@ -919,10 +947,9 @@ window.OrderListView = {
     const printLabels = async () => {
       const sel = selectedOrders.value || [];
       if (!sel.length) return notify.warning('请先勾选要打印面单的订单');
-      const eligible = sel.filter((row) => ['awaiting_packaging', 'awaiting_deliver'].includes(String(row.status || '')));
-      if (!eligible.length) {
-        return notify.warning(`所选 ${sel.length} 个订单都不是「待备货/待发运」状态，Ozon 不允许打印面单`);
-      }
+      // v2.2.9.200 去掉「只有待备货/待发运才能打印」的前端拦截：在「所有」tab 按筛选勾选，
+      //   能不能打由 Ozon 按单判定，打不了的单后端会跳过/报错，不该一刀切拦掉。
+      const eligible = sel;
       // 按店铺分组（凭证是按店铺的）
       const byStore = new Map();
       for (const row of eligible) {
@@ -933,18 +960,23 @@ window.OrderListView = {
       }
       if (!byStore.size) return notify.warning('所选订单没有关联店铺，无法打印');
       labelsPrinting.value = true;
+      exportStart(`打印面单（${sel.length} 单 / ${byStore.size} 个店铺）`);
       try {
         // v2.2.9.167 后端按 20 个/批调 Ozon，多批会返回 ZIP（单批返回 PDF）
         let lastBlob = null;
         let lastType = 'application/pdf';
         let batches = 1;
+        let storeIdx = 0;
         for (const [storeId, postings] of byStore) {
+          storeIdx += 1;
+          exportStep((storeIdx / byStore.size) * 85, `店铺 ${storeIdx}/${byStore.size}：正在拉取 ${postings.length} 单面单…`);
           const res = await axios.post('/api/seller/orders/labels', { store_id: storeId, posting_numbers: postings }, { responseType: 'blob', timeout: 600000 });
           const type = String(res.headers['content-type'] || '');
           if (res.headers['x-batch-count']) batches = Math.max(batches, Number(res.headers['x-batch-count']) || 1);
           lastType = type.includes('zip') ? 'application/zip' : 'application/pdf';
           lastBlob = lastBlob ? new Blob([lastBlob, res.data], { type: lastType }) : res.data;
         }
+        exportStep(92, '正在合并/下载面单文件…');
         const url = URL.createObjectURL(lastBlob);
         if (lastType === 'application/zip') {
           const a = document.createElement('a');
@@ -955,14 +987,17 @@ window.OrderListView = {
           window.open(url, '_blank');
         }
         setTimeout(() => URL.revokeObjectURL(url), 120000);
-        notify.success(`已生成 ${eligible.length} 个订单的面单（分 ${batches} 批）${eligible.length < sel.length ? `，${sel.length - eligible.length} 个状态不符已跳过` : ''}`);
+        exportStep(100, `分 ${batches} 批`);
+        exportFinish();
+        notify.success(`已生成 ${eligible.length} 个订单的面单（分 ${batches} 批）`);
       } catch (e) {
+        exportFail();
         let msg = e.message;
         try {
           if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg;
           else if (e.response?.data?.error) msg = e.response.data.error;
         } catch (_e2) { /* 保持原错误 */ }
-        notify.error('打印面单失败：' + String(msg).slice(0, 200));
+        notify.error('打印面单失败：' + String(msg).slice(0, 240), 0);
       } finally {
         labelsPrinting.value = false;
       }
@@ -1246,7 +1281,7 @@ window.OrderListView = {
       orders, displayedOrders, loading, summaryLoading, kpiLoading, activeTab, statusTabs, statusTabItems, pagination,
       selectedOrders, notes, batchLoading,
       postingFilter, postingDialog, openPostingDialog, applyPostingFilter, clearPostingFilter,
-      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
+      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, exportProgress, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
       lastBatchResult, hasFetched, orderEmptyText, shops, currentStoreName,
       storeScope, storeScopeOptions, onStoreScopeChange,
       detailDrawer, shipDialog,
@@ -1306,6 +1341,18 @@ window.OrderListView = {
             </el-button>
           </div>
         </div>
+
+        <!-- v2.2.9.200 导出/打印常驻进度条（替代一闪而过的 toast） -->
+        <transition name="el-fade-in">
+          <div v-if="exportProgress.visible" style="position:sticky; top:0; z-index:30; margin-bottom:14px; background:#111827; color:#fff; border-radius:8px; padding:12px 16px; box-shadow:0 6px 20px rgba(17,24,39,.25)">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:8px">
+              <span style="font-size:14px; font-weight:700">{{ exportProgress.label }}</span>
+              <span style="font-size:13px; opacity:.85">{{ exportProgress.percent }}%</span>
+            </div>
+            <el-progress :percentage="exportProgress.percent" :stroke-width="10" :show-text="false" :status="exportProgress.percent >= 100 ? 'success' : ''" />
+            <div v-if="exportProgress.detail" style="margin-top:6px; font-size:12px; opacity:.85">{{ exportProgress.detail }}</div>
+          </div>
+        </transition>
 
         <div style="border:1px solid #dfe7f1; border-radius:8px; background:#fff; padding:14px 16px; color:#475569; font-weight:600; margin-bottom:18px">
           {{ syncRangeText }}
