@@ -147,7 +147,7 @@ const MIN_YANDEX_COLLECT_PLUGIN_VERSION = "2.2.9.127";
 // 所以不受插件 token 里的「店铺作用域」限制。否则：插件 token 的店铺来自浏览器当时的店铺选择，
 // 用户一旦在店铺切换器里切过店铺（或在别的店铺页面点过授权），已经排队的任务会永远领不到、
 // 也不会被超时捞回，界面上只显示「等待本机插件采集」，完全无从判断。
-const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect", "ozon-patrol"];
+const WORKER_STORE_SCOPE_EXEMPT_KINDS = ["yandex-research", "yandex-collect", "ozon-patrol", "collect-external"];
 const WORKER_STORE_SCOPE_EXEMPT_SQL = `(${WORKER_STORE_SCOPE_EXEMPT_KINDS.map((k) => `'${k}'`).join(",")})`;
 // 已停用的采集端（扩展 ID 或 worker 名，逗号分隔，可用环境变量 DISABLED_WORKER_IDS 指定）。
 // 历史：这里曾默认拉黑 mjegcnmknbbdkhljbcgmdabgjfdlhegf（那台 Windows 上的旧插件副本）。
@@ -19663,25 +19663,83 @@ async function applyCollectExternalResults(job, results, userId) {
     if (!url) continue;
     const images = Array.isArray(r.images) ? r.images.filter(Boolean) : [];
     const attrs = r.attributes && typeof r.attributes === "object" ? r.attributes : {};
+    const skus = Array.isArray(r.skus) ? r.skus : [];
     const ok = r.ok !== false;
+    // 尺寸解析（cm → mm）
+    const dimsMatch = String(r.dimensionsText || "").match(/([\d.]+)\s*[x×*]\s*([\d.]+)\s*[x×*]\s*([\d.]+)/i);
+    const dims = dimsMatch ? [Number(dimsMatch[1]), Number(dimsMatch[2]), Number(dimsMatch[3])].map((v) => Math.round(v * 10)) : [null, null, null];
+    const weight = Number(r.weightGrams || 0) || null;
+    // v2.2.9.194 插件回传 skus → 多变体 variants（否则多变体表格采集后为空）
+    const variants = skus.length
+      ? skus.map((s) => ({
+          sku: String(s?.skuId || ""),
+          title: String(s?.spec || ""),
+          color_image: String(s?.image || ""),
+          main_image: String(s?.image || ""),
+          images: s?.image ? [String(s.image)] : [],
+          cost_price: Number(s?.priceCny || 0) || null,
+          price: null,
+          old_price: null,
+          weight: weight,
+          weight_unit: "g",
+          depth: dims[0],
+          width: dims[1],
+          height: dims[2],
+          dimension_unit: "mm",
+          merge: false,
+          color_name: String(s?.spec || ""),
+          color: "",
+          manufacturer_size: "",
+          russian_size: "",
+        }))
+      : [{
+          sku: "",
+          title: String(r.title || ""),
+          color_image: "",
+          main_image: images[0] || "",
+          images: images.slice(),
+          cost_price: Number(r.priceCny || 0) || null,
+          price: null,
+          old_price: null,
+          weight: weight,
+          weight_unit: "g",
+          depth: dims[0],
+          width: dims[1],
+          height: dims[2],
+          dimension_unit: "mm",
+          merge: false,
+          color_name: "",
+          color: "",
+          manufacturer_size: "",
+          russian_size: "",
+        }];
     await db.query(
       `UPDATE collect_items SET
          title = COALESCE(NULLIF($3,''), title),
          main_image = COALESCE(NULLIF($4,''), main_image),
          images = CASE WHEN jsonb_array_length($5::jsonb) > 0 THEN $5::jsonb ELSE images END,
-         price_cny = COALESCE($6, price_cny),
+         price_cny = COALESCE($6::numeric, price_cny),
          attributes = CASE WHEN $7::jsonb <> '{}'::jsonb THEN $7::jsonb ELSE attributes END,
-         weight = COALESCE($8, weight),
-         status = $9,
-         note = $10,
-         status_log = COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('to',$9,'reason',$10,'at',now())),
+         variants = $8::jsonb,
+         weight = COALESCE($9::integer, weight),
+         depth = COALESCE($10::integer, depth),
+         width = COALESCE($11::integer, width),
+         height = COALESCE($12::integer, height),
+         status = $13::text,
+         note = $14::text,
+         publish_status = CASE WHEN publish_status = '' THEN '未上传' ELSE publish_status END,
+         collect_started_at = COALESCE(collect_started_at, now()),
+         collect_finished_at = now(),
+         status_log = COALESCE(status_log,'[]'::jsonb) || jsonb_build_array(jsonb_build_object('to',$13::text,'reason',$14::text,'at',now())),
          updated_at = now()
        WHERE user_id = $1 AND source_value = $2`,
       [
         userId || job.user_id, url,
         String(r.title || ""), String((images[0]) || ""), JSON.stringify(images),
         Number(r.priceCny || 0) || null, JSON.stringify(attrs),
-        Number(r.weightGrams || 0) || null,
+        JSON.stringify(variants),
+        weight,
+        dims[0], dims[1], dims[2],
         ok ? "scraped" : "failed",
         ok ? "" : String(r.error || "采集失败").slice(0, 300),
       ],
@@ -21092,11 +21150,12 @@ app.post("/api/worker/jobs/:id/complete", async (req, res, next) => {
       return;
     }
     const job = req.body?.job && typeof req.body.job === "object" ? req.body.job : {};
-    const kind = existing.kind === "batch-ozon" || job.kind === "batch-ozon"
-      ? "batch-ozon"
-      : (existing.kind === "yandex-research" || job.kind === "yandex-research")
-        ? "yandex-research"
-        : "run";
+    // 只对真正的单品找货「run」任务跑服务器 AI 审核/生成 Excel；collect-external / ozon-patrol /
+    // yandex-collect 等各有独立收尾，不能误走 run 分支（否则相位错、还会触发不相关的终态处理）。
+    const NON_RUN_KINDS = new Set(["batch-ozon", "yandex-research", "yandex-collect", "ozon-patrol", "collect-external"]);
+    const kind = NON_RUN_KINDS.has(existing.kind)
+      ? existing.kind
+      : (NON_RUN_KINDS.has(job.kind) ? job.kind : "run");
     if (["done", "error"].includes(existing.status)) {
       await clearWorkerCurrentJobRefs(req.params.id);
       res.json({ success: true, job: existing, downloadUrl: existing.downloadUrl || "", terminal: true });
