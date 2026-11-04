@@ -119,6 +119,39 @@ window.CollectionBoxView = {
       drawer.visible = true;
     };
 
+    // ===== AI 能力（翻译标题 / AI智能填充，复用 /api/ai/* ）=====
+    const aiFilling = Vue.ref(false);
+    const translateTitle = async () => {
+      if (!drawer.form.title) return ElementPlus.ElMessage.warning('请先填写商品名称');
+      aiFilling.value = true;
+      try {
+        const res = await axios.post('/api/ai/translate', { text: drawer.form.title, target_lang: 'ru' });
+        drawer.form.title = res.data.translated || drawer.form.title;
+        ElementPlus.ElMessage.success('标题已翻译为俄语');
+      } catch (e) { ElementPlus.ElMessage.error('翻译失败：' + (e.response?.data?.error || e.message)); }
+      finally { aiFilling.value = false; }
+    };
+    const aiFill = async () => {
+      if (!drawer.form.title && !drawer.form.main_image) return ElementPlus.ElMessage.warning('请先填写标题或提供主图');
+      aiFilling.value = true;
+      try {
+        const res = await axios.post('/api/ai/analyze', {
+          title: drawer.form.title,
+          images: (drawer.form.images || []).filter(Boolean).slice(0, 5),
+          target_market: 'ozon',
+          store_id: currentStoreId.value,
+        });
+        const d = res.data?.data || {};
+        if (d.category_name) drawer.form.category_name = d.category_name;
+        if (d.brand) drawer.form.brand = d.brand;
+        if (d.product_type) drawer.form.attributes.type = d.product_type;
+        if (d.title_ru) drawer.form.title = d.title_ru;
+        if (d.description) drawer.form.description = d.description;
+        ElementPlus.ElMessage.success('AI 智能填充完成');
+      } catch (e) { ElementPlus.ElMessage.error('AI 填充失败：' + (e.response?.data?.error || e.message)); }
+      finally { aiFilling.value = false; }
+    };
+
     const suggestedPrice = Vue.computed(() => {
       if (!drawer.calc.cost_cny) return 0;
       const rate = 0.0862;
@@ -309,6 +342,7 @@ window.CollectionBoxView = {
       statusLabel, statusType, statusDescriptions, rowFailureReason, taskSummary,
       aiImg, aiImageSet,
       uploadShop, garmentGenders, openUploadShop, confirmUploadShop, addVariant, removeVariant,
+      aiFilling, translateTitle, aiFill,
     };
   },
   template: `
@@ -478,7 +512,13 @@ window.CollectionBoxView = {
 
         <el-divider content-position="left">必填信息</el-divider>
         <el-row :gutter="16">
-          <el-col :span="12"><el-form-item label="商品名称" required><el-input v-model="drawer.form.title" /></el-form-item></el-col>
+          <el-col :span="12"><el-form-item label="商品名称" required>
+            <el-input v-model="drawer.form.title" />
+            <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap">
+              <el-button size="small" :loading="aiFilling" @click="translateTitle">翻译标题</el-button>
+              <el-button size="small" type="primary" :loading="aiFilling" @click="aiFill">AI智能填充</el-button>
+            </div>
+          </el-form-item></el-col>
           <el-col :span="6"><el-form-item label="卖家ID"><el-input v-model="drawer.form.seller" /></el-form-item></el-col>
           <el-col :span="6"><el-form-item label="税率 VAT"><el-select v-model="drawer.form.vat" style="width:100%"><el-option value="0" label="0%" /><el-option value="0.1" label="10%" /><el-option value="0.2" label="20%" /></el-select></el-form-item></el-col>
         </el-row>
