@@ -768,6 +768,25 @@ window.OrderListView = {
       if (typeof send !== 'function') return notify.warning('检测不到采集插件，请确认浏览器已安装并启用');
       yarnLabelsBusy.value = true;
       try {
+        // v2.2.9.199 毛线标签流程依赖插件 2.2.9.189+（逐单生成 + 卖家后台网页接口）。
+        //   旧版插件（如 2.2.9.182）在 create 步骤直接失败，只报「失败步骤：create」，
+        //   用户根本不知道要去升级插件 → 先 ping 拿插件版本，太旧就直接给明确提示。
+        try {
+          const ping = await send('ping.request', {}, 8000);
+          const ver = String(ping?.version || ping?.background_version || '');
+          const cmpVer = (a, b) => {
+            const pa = String(a || '').split('.').map((x) => Number(x) || 0);
+            const pb = String(b || '').split('.').map((x) => Number(x) || 0);
+            for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+              if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) - (pb[i] || 0);
+            }
+            return 0;
+          };
+          if (ver && cmpVer(ver, '2.2.9.189') < 0) {
+            yarnLabelsBusy.value = false;
+            return notify.error(`毛线标签导出需要插件 2.2.9.189 或更高版本，你当前是 ${ver}。请点右上角「插件下载」重新下载并覆盖安装最新插件后再试。`, 18000);
+          }
+        } catch (_e) { /* ping 失败就继续走，让真实错误暴露出来 */ }
         // v2.2.9.188 先按拣货单规则拿到排序后的单号，让标签页顺序与拣货单一一对应
         let ordered = picked;
         try {
@@ -786,8 +805,9 @@ window.OrderListView = {
           try { window.ElementPlus.ElMessage.info({ message: `正在生成标签 ${bi + 1}/${batches.length} 批…`, duration: 2000 }); } catch (_e) { /* 忽略 */ }
           const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 120000);
           if (!res || res.ok !== true) {
-            const msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
-            return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 12000);
+            let msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
+            if (res?.step === 'create') msg += ' —— 标签创建接口拒绝；若插件版本低于 2.2.9.189，请先升级插件再试';
+            return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 14000);
           }
           (res.items || []).forEach((it) => items.push(it));
           (res.failed || []).forEach((f) => failedAll.push(f));
