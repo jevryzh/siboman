@@ -833,6 +833,28 @@ window.OrderListView = {
           (res.items || []).forEach((it) => items.push(it));
           (res.failed || []).forEach((f) => failedAll.push(f));
         }
+        // v2.2.9.202 失败自动重试一轮：个别单是插件轮询 PDF 超时/偶发失败，
+        //   再试一次通常就拿到了（用户实测 177 单里偶发 1 单没出来）。
+        if (failedAll.length) {
+          exportStep(85, `有 ${failedAll.length} 单失败，自动重试一轮…`);
+          const retryPn = [...new Set(failedAll.map((f) => String(f?.pn || '')).filter(Boolean))];
+          const retryBatches = [];
+          for (let i = 0; i < retryPn.length; i += CHUNK) retryBatches.push(retryPn.slice(i, i + CHUNK));
+          const stillFailed = [];
+          for (const batch of retryBatches) {
+            try {
+              const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batch }, 120000);
+              if (res && res.ok === true) {
+                (res.items || []).forEach((it) => items.push(it));
+                (res.failed || []).forEach((f) => stillFailed.push(f));
+              } else {
+                batch.forEach((pn) => stillFailed.push({ pn, err: String(res?.step || res?.error || 'retry_failed').slice(0, 60) }));
+              }
+            } catch (_e) { batch.forEach((pn) => stillFailed.push({ pn, err: 'retry_error' })); }
+          }
+          failedAll.length = 0;
+          stillFailed.forEach((f) => failedAll.push(f));
+        }
         if (!items.length) { exportFail(); return notify.error('导出毛线标签失败：插件未取到任何标签（所选订单可能都是已发货/已取消状态，标签接口不返回）', 0); }
         exportStep(92, `已生成 ${items.length} 个标签，正在按顺序合并 PDF…`);
         // 服务端按「拣货单顺序」下载并合并
