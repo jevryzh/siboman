@@ -63,10 +63,13 @@ export function feeTypes(entry) {
   return (entry.item_fees?.fees || []).flatMap((product) => product.fees.map((fee) => Number(fee.type_id)));
 }
 
-export function isFormalAccrual(entry) {
-  if (!completePosting(entry.unit_number)) return false;
+function isAcquiringFeeOnly(entry) {
   const types = feeTypes(entry);
-  return !types.length || !types.every((id) => id === 1);
+  return types.length > 0 && types.every((id) => id === 1);
+}
+
+export function isFormalAccrual(entry) {
+  return completePosting(entry.unit_number) && !isAcquiringFeeOnly(entry);
 }
 
 export function cancellationReason(order) {
@@ -96,7 +99,7 @@ export function validateAccrual(entry, date) {
   return { ...entry, accrual_id: String(entry.accrual_id), unit_number: String(entry.unit_number || '') };
 }
 
-export function buildSettlementReport({ month, accruals, orders, costs = [], settings = {}, defaultRate = null, coverage = null }) {
+export function buildSettlementReport({ month, accruals, orders, costs = [], settings = {}, defaultRate = null, coverage = null, byAccrualMonth = false }) {
   const { start, end } = monthBounds(month);
   const metadata = new Map(orders.map((o) => [o.posting_number, o]));
   const byParent = new Map();
@@ -106,34 +109,52 @@ export function buildSettlementReport({ month, accruals, orders, costs = [], set
     byParent.get(parent).push(order.posting_number);
   }
   const costMap = new Map(costs.map((c) => [c.posting_number, c]));
-  const latest = new Map();
-  const modes = new Map();
+  const latest = new Map(), firstSale = new Map(), firstFormal = new Map();
+  const rememberFirst = (index, posting, date) => {
+    if (!index.has(posting) || date < index.get(posting)) index.set(posting, date);
+  };
+  const whdPostings = new Set();
   const seen = new Set();
   for (const entry of accruals) {
     if (seen.has(entry.accrual_id)) throw fail('应计流水 ID 重复', 500);
     seen.add(entry.accrual_id);
-    if (entry.posting?.delivery_schema) modes.set(entry.unit_number, entry.posting.delivery_schema);
-    if (isFormalAccrual(entry) && entry.date > (latest.get(entry.unit_number) || '')) latest.set(entry.unit_number, entry.date);
+    if (entry.posting?.delivery_schema === 'Whd') whdPostings.add(entry.unit_number);
+    const formal = isFormalAccrual(entry);
+    if (formal && entry.date > (latest.get(entry.unit_number) || '')) latest.set(entry.unit_number, entry.date);
+    if (!byAccrualMonth) continue;
+    const amount = moneyCents(entry.total_amount.amount);
+    const children = byParent.get(entry.unit_number);
+    const posting = completePosting(entry.unit_number) ? entry.unit_number : children?.length === 1 ? children[0] : null;
+    if (posting && entry.posting && amount > 0) rememberFirst(firstSale, posting, entry.date);
+    if (formal && amount) {
+      const types = feeTypes(entry);
+      if (entry.posting || !types.length || !types.every((id) => ADVERTISING_TYPES.has(id))) rememberFirst(firstFormal, entry.unit_number, entry.date);
+    }
   }
   const states = new Map();
   const pending = [], shop = [], ledger = [];
   const state = (posting) => {
-    if (!states.has(posting)) states.set(posting, { positive: 0, negative: 0, pending_positive: false, pending_negative: false, entries: 0 });
+    if (!states.has(posting)) states.set(posting, { positive: 0, negative: 0, pending_positive: false, pending_non_acquiring_positive: false, pending_negative: false, date: '' });
     return states.get(posting);
   };
   const allocate = (posting, entry, amount, method) => {
     const sum = state(posting);
     sum.positive += Math.max(amount, 0);
     sum.negative += Math.max(-amount, 0);
-    sum.entries++;
+    if (entry.date > sum.date) sum.date = entry.date;
     const types = entry.posting ? (entry.posting.products || []).flatMap((p) => (p.delivery?.services || []).map((s) => Number(s.type_id))) : feeTypes(entry);
     ledger.push({ posting_number: posting, accrual_id: entry.accrual_id, date: entry.date, amount_rub: rub(amount), method, types: [...new Set(types)] });
   };
   const defer = (entry, amount, postings) => {
     const candidates = [...new Set(postings)];
     pending.push({ accrual_id: entry.accrual_id, date: entry.date, amount_rub: rub(amount), unit_number: entry.unit_number, postings: candidates });
+    const acquiringRefund = amount > 0 && !entry.posting && isAcquiringFeeOnly(entry);
     for (const posting of candidates) {
-      if (amount > 0) state(posting).pending_positive = true;
+      if (amount > 0) {
+        const sum = state(posting);
+        sum.pending_positive = true;
+        if (!acquiringRefund) sum.pending_non_acquiring_positive = true;
+      }
       if (amount < 0) state(posting).pending_negative = true;
     }
   };
@@ -170,31 +191,39 @@ export function buildSettlementReport({ month, accruals, orders, costs = [], set
   for (const [posting, sum] of states) {
     const settlement = latest.get(posting) || null;
     const order = metadata.get(posting);
-    if (!settlement || settlement < start || settlement > end) {
+    if (byAccrualMonth ? !sum.date : !settlement || settlement < start || settlement > end) {
       excluded.push({ posting_number: posting, settled_date: settlement, income_rub: rub(sum.positive), ozon_fees_rub: rub(sum.negative) });
       continue;
     }
     const cost = costMap.get(posting);
-    const purchase = cost?.purchase_cny == null ? null : Number(cost.purchase_cny);
-    const label = cost?.label_cny == null ? 1.5 : Number(cost.label_cny);
-    const income = !sum.positive && sum.pending_positive ? null : rub(sum.positive);
+    const isWhd = whdPostings.has(posting) || order?.schema === 'fbo';
+    const rawStatus = order?.status || '';
+    const closedWithoutSale = rawStatus.startsWith('cancelled') || rawStatus === 'returned';
+    // A later fee is not a new cost month, and an open posting's fees do not establish a sale.
+    const costMonth = (firstSale.get(posting) || (closedWithoutSale ? firstFormal.get(posting) : null))?.slice(0, 7) ?? null;
+    const costInMonth = !isWhd && (!byAccrualMonth || costMonth === month);
+    const purchase = !costInMonth ? 0 : cost?.purchase_cny == null ? null : Number(cost.purchase_cny);
+    const label = !costInMonth ? 0 : cost?.label_cny == null ? 1.5 : Number(cost.label_cny);
+    // A shared acquiring refund is not evidence of a sale on a cancelled posting.
+    const pendingIncome = sum.pending_positive && (!rawStatus.startsWith('cancelled') || sum.pending_non_acquiring_positive || !coverage?.complete);
+    const income = !sum.positive && pendingIncome ? null : rub(sum.positive);
     const fees = !sum.negative && sum.pending_negative ? null : rub(sum.negative);
     const missingMetadata = !order;
     const profitReady = purchase !== null && validRate && !sum.pending_positive && !sum.pending_negative && !missingMetadata && !!coverage?.complete;
-    const rawStatus = order?.status || '';
     rows.push({
       posting_number: posting, status: order?.substatus === 'posting_in_pickup_point' ? '待买家取件' : (STATUS_NAMES[rawStatus] || rawStatus || '资料待核对'), raw_status: rawStatus,
       ordered_at: order ? (order.schema === 'fbo' ? (order.created_at || order.in_process_at) : (order.in_process_at || order.created_at)) : null,
-      settled_date: settlement, order_type: modes.get(posting) === 'Whd' || order?.schema === 'fbo' ? 'WHD订单' : '正常销售订单',
+      settled_date: settlement, order_type: isWhd ? 'WHD订单' : '正常销售订单',
+      ...(byAccrualMonth ? { accrual_date: sum.date, cost_month: isWhd ? null : costMonth, cost_in_month: costInMonth } : {}),
       cancel_reason: order ? cancellationReason(order) : null, purchase_cny: purchase, label_cny: label,
       income_rub: income, ozon_fees_rub: fees, profit_cny: profitReady ? rounded((income - fees) * rate - purchase - label) : null,
-      pending_positive: sum.pending_positive, pending_negative: sum.pending_negative, metadata_missing: missingMetadata,
+      pending_positive: sum.pending_positive, pending_income: pendingIncome, pending_negative: sum.pending_negative, metadata_missing: missingMetadata,
       version: Number(cost?.version || 0), low_income: income !== null && income < 100,
     });
   }
-  rows.sort((a, b) => a.settled_date.localeCompare(b.settled_date) || a.posting_number.localeCompare(b.posting_number));
+  rows.sort((a, b) => (byAccrualMonth ? a.accrual_date.localeCompare(b.accrual_date) : a.settled_date.localeCompare(b.settled_date)) || a.posting_number.localeCompare(b.posting_number));
   const selected = new Set(rows.map((r) => r.posting_number));
-  const sum = (key) => rows.reduce((total, row) => total + moneyCents(row[key] ?? 0), 0);
+  const sum = (key, items = rows) => items.reduce((total, row) => total + moneyCents(row[key] ?? 0), 0);
   const advertisingAuto = -shop.filter((r) => r.is_advertising).reduce((total, r) => total + moneyCents(r.total_amount.amount), 0);
   const adManual = settings.advertising_amount == null ? null : Number(settings.advertising_amount);
   const adCny = adManual === null ? (validRate ? rounded(rub(advertisingAuto) * rate) : null) : settings.advertising_currency === 'CNY' ? adManual : validRate ? rounded(adManual * rate) : null;
@@ -206,19 +235,25 @@ export function buildSettlementReport({ month, accruals, orders, costs = [], set
   if (sourceAllocatedPositive !== sourcePositive || sourceAllocatedNegative !== sourceNegative) throw fail('月度流水未对平，请检查数据', 500);
   const missingPurchase = rows.filter((r) => r.purchase_cny === null).length;
   const missingMetadata = rows.filter((r) => r.metadata_missing).length;
-  const unresolvedParents = pending.filter((r) => !r.postings.length).length;
-  const ready = rows.length > 0 && validRate && !missingPurchase && !missingMetadata && !shared.length && !unresolvedParents && !!coverage?.complete;
-  const knownProfit = validRate && adCny !== null ? rounded((rub(sum('income_rub') - sum('ozon_fees_rub') + shopOther)) * rate - rub(sum('purchase_cny')) - rub(sum('label_cny')) - adCny) : null;
+  const unresolved = pending.filter((r) => !r.postings.length || (byAccrualMonth && !r.postings.some((id) => selected.has(id))));
+  const ready = rows.length > 0 && validRate && !missingPurchase && !missingMetadata && !shared.length && !unresolved.length && !!coverage?.complete;
+  // Exclude the whole uncosted order, not just its missing purchase amount. Explicit zero is maintained.
+  const profitRows = rows.filter((r) => r.profit_cny !== null);
+  const netRub = rub(sum('income_rub', profitRows) - sum('ozon_fees_rub', profitRows));
+  const afterAdvertising = adManual !== null && settings.advertising_currency === 'CNY'
+    ? netRub * rate - adManual : (netRub - adRub) * rate;
+  const knownProfit = validRate && adCny !== null && coverage?.complete ? rounded(afterAdvertising - rub(sum('purchase_cny', profitRows)) - rub(sum('label_cny', profitRows))) : null;
   return {
-    rows, pending, shop, excluded, ledger,
+    rows, pending, unresolved, shop, excluded, ledger,
     summary: {
       month, orders: rows.length, normal_orders: rows.filter((r) => r.order_type === '正常销售订单').length,
       whd_orders: rows.filter((r) => r.order_type === 'WHD订单').length, income_rub: rub(sum('income_rub')), ozon_fees_rub: rub(sum('ozon_fees_rub')),
       purchase_cny: rub(sum('purchase_cny')), label_cny: rub(sum('label_cny')), exchange_rate: validRate ? rate : null,
       advertising_auto_rub: rub(advertisingAuto), advertising_rub: adRub, advertising_cny: adCny, advertising_source: adManual === null ? 'api' : 'manual',
       other_shop_net_rub: rub(shopOther), profit_cny: ready ? knownProfit : null, known_cost_profit_cny: knownProfit,
+      profit_orders: profitRows.length, profit_excluded_orders: rows.length - profitRows.length,
       missing_purchase: missingPurchase, missing_metadata: missingMetadata, pending_rows: shared.length,
-      unresolved_parents: unresolvedParents,
+      unresolved_parents: unresolved.length,
       low_income_orders: rows.filter((r) => r.low_income).length, income_unknown_orders: rows.filter((r) => r.income_rub === null).length,
       source_positive_rub: rub(sourcePositive), source_negative_rub: rub(sourceNegative), reconciliation_difference_rub: 0,
       latest_formal_cutoff: accruals.reduce((latest, r) => r.date > latest ? r.date : latest, ''), coverage,

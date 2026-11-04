@@ -1,13 +1,15 @@
 import crypto from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
-  buildSettlementReport, csvCell, datesBetween, fail, financialDate, isFormalAccrual,
+  csvCell, datesBetween, fail, financialDate, isFormalAccrual,
   moneyCents, monthBounds, normalizeOrder, parentOf, shanghaiDate, validateAccrual,
 } from './ozon-settlement.js';
+import { businessDate, DEFAULT_AD_TIMEZONE, filterReportRows, matchOrderAdRows, monthlyAccrualReport, orderTimestamp, REPORT_FIELDS, settlementExceptions } from './statistics-daily-report.js';
+import { createPerformanceClient, openCredential, sealCredential } from './ozon-performance.js';
 
 const ACTIVE = "('queued','running')";
 const PREFIX = '/api/statistics';
-const SCHEDULE_HOUR = 2, SCHEDULE_MINUTE = 30;
+const SCHEDULE_HOUR = 8, SCHEDULE_MINUTE = 30;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const utcDay = (value) => value instanceof Date ? value.toISOString().slice(0, 10) : String(value).slice(0, 10);
 const serialMonth = (value) => Number(value.slice(0, 4)) * 12 + Number(value.slice(5, 7));
@@ -57,9 +59,32 @@ CREATE TABLE IF NOT EXISTS app_statistics_changes (
   payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), rolled_back_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_statistics_changes_store ON app_statistics_changes(user_id,store_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS app_statistics_ad_config (
+  user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
+  client_id TEXT NOT NULL, secret_cipher TEXT NOT NULL, business_timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+  version INTEGER NOT NULL DEFAULT 1, last_synced_at TIMESTAMPTZ, last_error TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(user_id,store_id)
+);
+CREATE TABLE IF NOT EXISTS app_statistics_ad_days (
+  user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
+  spend_date DATE NOT NULL, business_timezone TEXT NOT NULL, cpo_rub NUMERIC(16,2) NOT NULL, cpc_rub NUMERIC(16,2) NOT NULL,
+  confirmed_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(user_id,store_id,spend_date,business_timezone)
+);
+ALTER TABLE app_statistics_ad_days ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'performance';
+CREATE TABLE IF NOT EXISTS app_statistics_order_ad_reports (
+  user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
+  month TEXT NOT NULL, entries JSONB NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY(user_id,store_id,month)
+);
+CREATE TABLE IF NOT EXISTS app_statistics_order_days (
+  user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
+  ordered_date DATE NOT NULL, business_timezone TEXT NOT NULL, checked_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id,store_id,ordered_date,business_timezone)
+);
 `;
 
-export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defaultRate, notify = async () => {}, logger = console }) {
+export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defaultRate, credentialSecret = process.env.AUTH_SECRET,
+  performanceFactory = createPerformanceClient, notify = async () => {}, logger = console }) {
   const running = new Map();
   const reportCache = new Map();
   const revisions = new Map();
@@ -110,9 +135,15 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     const costs = await query('SELECT posting_number,purchase_cny,label_cny,version FROM app_statistics_costs WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
     const months = await query('SELECT * FROM app_statistics_months WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
     const days = await query('SELECT accrued_date::text AS accrued_date,checked_at FROM app_statistics_days WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
+    const adConfig = await query('SELECT client_id,business_timezone,version,last_synced_at,last_error FROM app_statistics_ad_config WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
+    const ads = await query('SELECT spend_date::text AS spend_date,business_timezone,cpo_rub,cpc_rub,confirmed_at,source FROM app_statistics_ad_days WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
+    const orderDays = await query('SELECT ordered_date::text AS ordered_date,business_timezone FROM app_statistics_order_days WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
+    const orderAdReports = await query('SELECT entries FROM app_statistics_order_ad_reports WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId]);
     const rate = await query(`SELECT rate FROM app_exchange_rates WHERE base_currency='RUB' AND quote_currency='CNY' ORDER BY effective_at DESC LIMIT 1`);
     const data = { accruals: raw.rows.map((r) => r.payload), orders: meta.rows.map((r) => r.payload), costs: costs.rows,
-      months: months.rows, days: days.rows, rate: rate.rows[0] ? Number(rate.rows[0].rate) : Number(defaultRate) };
+      months: months.rows, days: days.rows, rate: rate.rows[0] ? Number(rate.rows[0].rate) : Number(defaultRate),
+      adConfig: adConfig.rows[0] || null, adDays: ads.rows, orderDays: orderDays.rows,
+      orderAdEntries: orderAdReports.rows.flatMap((r) => r.entries) };
     // An older read must not refill the cache after a cost update invalidates it.
     if ((revisions.get(ctx.storeId) || 0) === revision) reportCache.set(ctx.storeId, { userId: ctx.userId, at: Date.now(), data });
     while (reportCache.size > 4) reportCache.delete(reportCache.keys().next().value);
@@ -122,17 +153,16 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     const { start, end } = monthBounds(month);
     const checkedCutoff = data.days.reduce((latest, d) => utcDay(d.accrued_date) > latest ? utcDay(d.accrued_date) : latest, '');
     const cutoff = checkedCutoff && checkedCutoff < financialDate() ? checkedCutoff : financialDate();
-    const expected = datesBetween(start, end < cutoff ? end : cutoff);
+    const expected = datesBetween(start, end < financialDate() ? end : financialDate());
     const done = new Map(data.days.map((d) => [utcDay(d.accrued_date), d.checked_at]));
     const missing = expected.filter((d) => !done.has(d));
-    // The forward window is necessary: a November posting must not stay in October.
-    const boundaryStart = new Date(Date.parse(end + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10);
-    const boundaryMissing = datesBetween(boundaryStart, cutoff).filter((d) => !done.has(d));
     const checked = expected.filter((d) => done.has(d)).map((d) => new Date(done.get(d)).getTime());
     const settings = data.months.find((s) => s.month === month) || {};
-    return buildSettlementReport({ month, accruals: data.accruals, orders: data.orders, costs: data.costs, settings, defaultRate: data.rate,
-      coverage: { complete: !missing.length && !boundaryMissing.length && !!expected.length, as_of_date: checkedCutoff ? cutoff : null, expected_days: expected.length, checked_days: expected.length - missing.length,
-        missing_days: missing, boundary_missing_days: boundaryMissing, last_updated_at: checked.length ? new Date(Math.min(...checked)).toISOString() : null } });
+    return monthlyAccrualReport({ month, accruals: data.accruals, orders: data.orders, costs: data.costs, settings, defaultRate: data.rate,
+      coverage: { complete: !missing.length && !!expected.length, as_of_date: checkedCutoff ? cutoff : null, expected_days: expected.length, checked_days: expected.length - missing.length,
+        missing_days: missing, boundary_missing_days: [], last_updated_at: checked.length ? new Date(Math.min(...checked)).toISOString() : null },
+      adDays: data.adDays, orderDays: data.orderDays, orderAdEntries: data.orderAdEntries,
+      timezone: data.adConfig?.business_timezone || DEFAULT_AD_TIMEZONE, configured: !!data.adConfig });
   }
   async function latestRun(ctx) {
     return (await query('SELECT * FROM app_statistics_runs WHERE user_id=$1 AND store_id=$2 ORDER BY started_at DESC LIMIT 1', [ctx.userId, ctx.storeId])).rows[0] || null;
@@ -192,7 +222,6 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
   }
   async function fetchOrders(ctx, start, id) {
     const raw = (await query('SELECT payload FROM app_statistics_accruals WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId])).rows.map((r) => r.payload);
-    const parents = new Set(raw.map((r) => parentOf(r.unit_number)).filter((p) => /^\d+-\d+$/.test(p)));
     const since = new Date(Date.parse(`${start}T00:00:00Z`) - 180 * 86400000).toISOString();
     let pages = 0;
     for (const schema of ['fbs', 'fbo']) {
@@ -204,7 +233,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
           with: { financial_data: false, analytics_data: false }, ...(schema === 'fbs' ? { dir: 'DESC' } : { sort_dir: 'desc' }),
         }, { storeId: ctx.storeId, userId: ctx.userId });
         if (!Array.isArray(body.postings)) throw fail('Ozon 订单列表响应结构异常', 502);
-        const items = body.postings.filter((p) => parents.has(parentOf(p.posting_number))).map((p) => normalizeOrder(p, schema));
+        const items = body.postings.map((p) => normalizeOrder(p, schema));
         await saveOrders(ctx, items);
         await heartbeat(id, { metadata_pages: ++pages, message: `核对 ${schema === 'fbs' ? '正常销售' : 'WHD'} 订单，第 ${page + 1} 页` });
         if (!body.has_next) break;
@@ -233,7 +262,56 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       if (!found) missing++;
       await heartbeat(id, { message: `核对订单详情 ${posting}` });
     }
+    const config = (await query('SELECT business_timezone FROM app_statistics_ad_config WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId])).rows[0];
+    const timezone = config?.business_timezone || DEFAULT_AD_TIMEZONE;
+    const firstDay = new Date(Date.parse(businessDate(since, timezone) + 'T00:00:00Z') + 86400000).toISOString().slice(0, 10);
+    const lastDay = new Date(Date.parse(businessDate(new Date(), timezone) + 'T00:00:00Z') - 86400000).toISOString().slice(0, 10);
+    await transaction(ctx, async (client) => {
+      await client.query(`INSERT INTO app_statistics_order_days(user_id,store_id,ordered_date,business_timezone)
+        SELECT $1,$2,day::date,$5 FROM generate_series($3::date,$4::date,interval '1 day') day
+        ON CONFLICT(user_id,store_id,ordered_date,business_timezone) DO UPDATE SET checked_at=now()`, [ctx.userId, ctx.storeId, firstDay, lastDay, timezone]);
+    });
     return missing;
+  }
+  async function syncAdvertising(ctx, id) {
+    const config = (await query('SELECT * FROM app_statistics_ad_config WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId])).rows[0];
+    if (!config) return false;
+    try {
+      const client = performanceFactory({ clientId: config.client_id, clientSecret: openCredential(config.secret_cipher, credentialSecret) });
+      const data = await loadData(ctx), today = businessDate(new Date(), config.business_timezone);
+      const cohortDates = [...new Set(data.orders.filter((o) => o.schema !== 'fbo').map((o) => businessDate(orderTimestamp(o), config.business_timezone)).filter((date) => date && date < today))].sort();
+      const done = new Set(data.adDays.filter((day) => day.business_timezone === config.business_timezone).map((d) => String(d.spend_date).slice(0, 10)));
+      const recheck = new Date(Date.parse(today + 'T00:00:00Z') - 7 * 86400000).toISOString().slice(0, 10);
+      const needed = cohortDates.filter((date) => !done.has(date) || date >= recheck);
+      while (needed.length) {
+        const start = needed.shift(); let end = start;
+        while (needed.length && Date.parse(needed[0]) - Date.parse(start) < 31 * 86400000) end = needed.shift();
+        await heartbeat(id, { message: `拉取 ${start} 至 ${end} 按订单付费及点击广告` });
+        const days = await client.daily(start, end);
+        if (!Array.isArray(days) || days.length !== datesBetween(start, end).length) throw fail('广告报表日期覆盖不完整', 502);
+        await transaction(ctx, async (connection) => {
+          // The credential may have changed while the external report was generated.
+          const current = (await connection.query('SELECT version FROM app_statistics_ad_config WHERE user_id=$1 AND store_id=$2 FOR UPDATE', [ctx.userId, ctx.storeId])).rows[0];
+          if (current?.version !== config.version) throw fail('广告授权已改变，请重新更新', 409);
+          for (const day of days) {
+            if (!datesBetween(start, end).includes(day.spend_date)) throw fail('广告报表返回了区间之外的日期', 502);
+            moneyCents(day.cpo_rub); moneyCents(day.cpc_rub);
+          }
+          if (new Set(days.map((d) => d.spend_date)).size !== days.length) throw fail('广告报表日期重复', 502);
+          const before = (await connection.query(`SELECT spend_date::text AS spend_date,cpo_rub,cpc_rub FROM app_statistics_ad_days
+            WHERE user_id=$1 AND store_id=$2 AND business_timezone=$3 AND spend_date BETWEEN $4 AND $5 FOR UPDATE`, [ctx.userId, ctx.storeId, config.business_timezone, start, end])).rows;
+          await audit(connection, ctx, 'sync_ads', start.slice(0, 7), '同步每日按订单付费及点击广告', { timezone: config.business_timezone, before, after: days });
+          await connection.query(`INSERT INTO app_statistics_ad_days(user_id,store_id,spend_date,business_timezone,cpo_rub,cpc_rub)
+            SELECT $1,$2,x.spend_date,$3,x.cpo_rub,x.cpc_rub FROM jsonb_to_recordset($4::jsonb) AS x(spend_date date,cpo_rub numeric,cpc_rub numeric)
+            ON CONFLICT(user_id,store_id,spend_date,business_timezone) DO UPDATE SET cpo_rub=EXCLUDED.cpo_rub,cpc_rub=EXCLUDED.cpc_rub,source='performance',confirmed_at=now()`, [ctx.userId, ctx.storeId, config.business_timezone, JSON.stringify(days)]);
+        });
+      }
+      await query("UPDATE app_statistics_ad_config SET last_synced_at=now(),last_error='' WHERE user_id=$1 AND store_id=$2 AND version=$3", [ctx.userId, ctx.storeId, config.version]);
+      clearCache(ctx.storeId); return true;
+    } catch (error) {
+      await query('UPDATE app_statistics_ad_config SET last_error=$3 WHERE user_id=$1 AND store_id=$2 AND version=$4', [ctx.userId, ctx.storeId, String(error.message).slice(0, 600), config.version]);
+      clearCache(ctx.storeId); throw error;
+    }
   }
   async function work(ctx, run) {
     const lock = await db.connect();
@@ -252,7 +330,8 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         await heartbeat(run.id, { days_done: i + 1 });
       }
       const missing = await fetchOrders(ctx, start, run.id);
-      const message = missing ? `应计流水已更新，${missing} 单资料待补充` : '应计流水、订单资料和广告费已更新';
+      const adsReady = await syncAdvertising(ctx, run.id);
+      const message = missing ? `应计流水已更新，${missing} 单资料待补充` : adsReady ? '应计流水、全部订单及每日广告费已更新' : '财务和订单已更新；广告可导入后台日报或配置Performance授权';
       await query(`UPDATE app_statistics_runs SET status='succeeded',message=$2,finished_at=now(),updated_at=now() WHERE id=$1`, [run.id, message]);
     } catch (error) {
       logger.error('[statistics-sync]', run.id, error.message);
@@ -328,7 +407,10 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     if (new Set(items.map((r) => r.posting_number)).size !== items.length) throw fail('批量数据中有重复订单号');
     const selected = new Map(report(await loadData(ctx), month).rows.map((r) => [r.posting_number, r]));
     const validated = items.map((item) => {
-      if (!selected.has(item.posting_number)) throw fail(`订单不在当前店铺所选结算月份：${item.posting_number}`);
+      const row = selected.get(item.posting_number);
+      if (!row) throw fail(`订单不在当前店铺所选应计月份：${item.posting_number}`);
+      if (row.order_type === 'WHD订单') throw fail(`WHD 订单不维护采购费和贴单费：${item.posting_number}`);
+      if (!row.cost_in_month) throw fail(`请在成本归属月维护订单费用：${item.posting_number}（${row.cost_month || '待结算'}）`);
       return { posting_number: item.posting_number, purchase_cny: amountInput(item.purchase_cny, '采购费用'),
         ...(Object.hasOwn(item, 'label_cny') ? { label_cny: amountInput(item.label_cny, '贴单费用', false) } : {}), version: versionInput(item.version) };
     });
@@ -367,7 +449,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     if (!UUID.test(id)) throw fail('无效的修改记录');
     return transaction(ctx, async (client) => {
       const change = (await client.query(`SELECT * FROM app_statistics_changes WHERE id=$1 AND user_id=$2 AND store_id=$3 FOR UPDATE`, [id, ctx.userId, ctx.storeId])).rows[0];
-      if (!change || !['costs', 'month'].includes(change.kind)) throw fail('找不到可回滚的修改记录', 404);
+      if (!change || !['costs', 'month', 'ad_import', 'order_ad_import'].includes(change.kind)) throw fail('找不到可回滚的修改记录', 404);
       if (change.rolled_back_at) throw fail('该修改已经回滚', 409);
       const { before, after } = change.payload;
       if (change.kind === 'costs') {
@@ -377,6 +459,24 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         const restored = before.map((r) => ({ ...r, version: versions.get(r.posting_number) + 1 }));
         await audit(client, ctx, 'rollback', change.month, `回滚 ${id}`, { original_id: id, before: current, after: restored });
         for (const row of restored) await client.query(`UPDATE app_statistics_costs SET purchase_cny=$4,label_cny=$5,version=$6,updated_at=now() WHERE user_id=$1 AND store_id=$2 AND posting_number=$3`, [ctx.userId, ctx.storeId, row.posting_number, row.purchase_cny, row.label_cny, row.version]);
+      } else if (change.kind === 'ad_import') {
+        const timezone = change.payload.timezone, dates = after.map((d) => d.spend_date);
+        const current = (await client.query(`SELECT spend_date::text AS spend_date,cpo_rub,cpc_rub,source FROM app_statistics_ad_days
+          WHERE user_id=$1 AND store_id=$2 AND business_timezone=$3 AND spend_date=ANY($4::date[]) FOR UPDATE`, [ctx.userId, ctx.storeId, timezone, dates])).rows;
+        const normalized = (items) => items.map((d) => ({ ...d, cpo_rub: moneyCents(d.cpo_rub) / 100, cpc_rub: moneyCents(d.cpc_rub) / 100 }));
+        if (adRevision(normalized(current)) !== adRevision(normalized(after))) throw fail('每日广告费之后又有修改，不能覆盖回滚', 409);
+        await audit(client, ctx, 'rollback', null, `回滚 ${id}`, { original_id: id, before: current, after: before });
+        await client.query('DELETE FROM app_statistics_ad_days WHERE user_id=$1 AND store_id=$2 AND business_timezone=$3 AND spend_date=ANY($4::date[])', [ctx.userId, ctx.storeId, timezone, dates]);
+        if (before.length) await client.query(`INSERT INTO app_statistics_ad_days(user_id,store_id,spend_date,business_timezone,cpo_rub,cpc_rub,source)
+          SELECT $1,$2,x.spend_date,$3,x.cpo_rub,x.cpc_rub,x.source FROM jsonb_to_recordset($4::jsonb) AS x(spend_date date,cpo_rub numeric,cpc_rub numeric,source text)`, [ctx.userId, ctx.storeId, timezone, JSON.stringify(before)]);
+      } else if (change.kind === 'order_ad_import') {
+        const current = (await client.query('SELECT entries,version FROM app_statistics_order_ad_reports WHERE user_id=$1 AND store_id=$2 AND month=$3 FOR UPDATE',
+          [ctx.userId, ctx.storeId, change.month])).rows[0];
+        if (current?.version !== after.version || !isDeepStrictEqual(current.entries, after.entries)) throw fail('逐单广告报表之后又有修改，不能覆盖回滚', 409);
+        await audit(client, ctx, 'rollback', change.month, `回滚 ${id}`, { original_id: id, before: current, after: before });
+        if (before) await client.query('UPDATE app_statistics_order_ad_reports SET entries=$4,version=version+1 WHERE user_id=$1 AND store_id=$2 AND month=$3',
+          [ctx.userId, ctx.storeId, change.month, JSON.stringify(before.entries)]);
+        else await client.query('DELETE FROM app_statistics_order_ad_reports WHERE user_id=$1 AND store_id=$2 AND month=$3', [ctx.userId, ctx.storeId, change.month]);
       } else {
         const current = (await client.query(`SELECT * FROM app_statistics_months WHERE user_id=$1 AND store_id=$2 AND month=$3 FOR UPDATE`, [ctx.userId, ctx.storeId, change.month])).rows[0];
         if (Number(current?.version) !== after.version) throw fail('本月设置之后又有修改，不能覆盖回滚', 409);
@@ -387,16 +487,92 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       return { success: true };
     });
   }
-  function filteredRows(rows, params) {
-    const search = String(params.search || '').toLowerCase().trim();
-    let filtered = rows.filter((r) => (!search || r.posting_number.toLowerCase().includes(search)) && (!params.status || (params.status === 'cancelled' ? r.raw_status.startsWith('cancelled') : r.raw_status === params.status))
-      && (!params.order_type || r.order_type === params.order_type) && (params.low_income !== '1' || r.low_income)
-      && (params.missing_cost !== '1' || r.purchase_cny === null));
-    const allowed = ['posting_number', 'status', 'ordered_at', 'settled_date', 'purchase_cny', 'label_cny', 'income_rub', 'ozon_fees_rub', 'profit_cny', 'cancel_reason', 'order_type'];
-    const sort = allowed.includes(params.sort) ? params.sort : 'settled_date';
-    const direction = params.direction === 'desc' ? -1 : 1;
-    filtered = [...filtered].sort((a, b) => a[sort] == null ? (b[sort] == null ? 0 : 1) : b[sort] == null ? -1 : direction * (typeof a[sort] === 'number' ? a[sort] - b[sort] : String(a[sort]).localeCompare(String(b[sort]))));
-    return filtered;
+  const filteredRows = filterReportRows;
+  function publicAdvertising(config) {
+    return { configured: !!config, client_id: config?.client_id || '', business_timezone: config?.business_timezone || DEFAULT_AD_TIMEZONE,
+      version: config?.version || 0, last_synced_at: config?.last_synced_at || null, last_error: config?.last_error || '' };
+  }
+  const adRevision = (days) => crypto.createHash('sha256').update(JSON.stringify([...days].sort((a, b) => a.spend_date.localeCompare(b.spend_date)).map((d) => [d.spend_date, moneyCents(d.cpo_rub), moneyCents(d.cpc_rub), d.source]))).digest('hex');
+  async function importAdvertising(ctx, body) {
+    const timezone = DEFAULT_AD_TIMEZONE, items = body.days;
+    if (!Array.isArray(items) || !items.length || items.length > 1100) throw fail('一次导入1至1100天广告费用');
+    const today = businessDate(new Date(), timezone);
+    const days = items.map((d) => {
+      const date = String(d.spend_date || '');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date || date >= today) throw fail('只能导入已结束日期的广告费');
+      validMonth(date.slice(0, 7));
+      return { spend_date: date, cpo_rub: moneyCents(d.cpo_rub) / 100, cpc_rub: moneyCents(d.cpc_rub) / 100 };
+    });
+    if (new Set(days.map((d) => d.spend_date)).size !== days.length) throw fail('导入广告日期重复');
+    return transaction(ctx, async (client) => {
+      const config = (await client.query('SELECT business_timezone FROM app_statistics_ad_config WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId])).rows[0];
+      if (config && config.business_timezone !== timezone) throw fail('后台日报按莫斯科时间统计，请先将广告时区设为Europe/Moscow');
+      const previous = (await client.query('SELECT spend_date::text AS spend_date,cpo_rub,cpc_rub,source FROM app_statistics_ad_days WHERE user_id=$1 AND store_id=$2 AND business_timezone=$3 FOR UPDATE', [ctx.userId, ctx.storeId, timezone])).rows;
+      if (body.revision !== adRevision(previous)) throw fail('每日广告费已改变，请重新读取后导入', 409);
+      const before = previous.filter((d) => days.some((x) => x.spend_date === d.spend_date));
+      const snapshot = await audit(client, ctx, 'ad_import', null, '导入后台每日广告费', { timezone, before, after: days.map((d) => ({ ...d, source: 'seller-report' })) });
+      await client.query(`INSERT INTO app_statistics_ad_days(user_id,store_id,spend_date,business_timezone,cpo_rub,cpc_rub,source)
+        SELECT $1,$2,x.spend_date,$3,x.cpo_rub,x.cpc_rub,'seller-report' FROM jsonb_to_recordset($4::jsonb) AS x(spend_date date,cpo_rub numeric,cpc_rub numeric)
+        ON CONFLICT(user_id,store_id,spend_date,business_timezone) DO UPDATE SET cpo_rub=EXCLUDED.cpo_rub,cpc_rub=EXCLUDED.cpc_rub,source=EXCLUDED.source,confirmed_at=now()`, [ctx.userId, ctx.storeId, timezone, JSON.stringify(days)]);
+      return { success: true, snapshot_id: snapshot, days: days.length };
+    });
+  }
+  async function saveAdvertising(ctx, body) {
+    const version = versionInput(body.version), timezone = String(body.business_timezone || DEFAULT_AD_TIMEZONE);
+    if (timezone !== DEFAULT_AD_TIMEZONE) throw fail('广告日报必须使用莫斯科业务时区');
+    const clientId = String(body.client_id || '').trim(), secret = body.client_secret;
+    if (!clientId || clientId.length > 300 || secret != null && (typeof secret !== 'string' || secret.length > 3000)) throw fail('广告授权参数无效');
+    return transaction(ctx, async (client) => {
+      const before = (await client.query('SELECT * FROM app_statistics_ad_config WHERE user_id=$1 AND store_id=$2 FOR UPDATE', [ctx.userId, ctx.storeId])).rows[0];
+      if (version !== (before?.version || 0)) throw fail('广告配置已改变，请刷新重试', 409);
+      if (!secret && (!before || before.client_id !== clientId)) throw fail('新增或更换Client ID时必须填写Client Secret');
+      const cipher = secret ? sealCredential(secret, credentialSecret) : before.secret_cipher;
+      await audit(client, ctx, 'ad_config', null, '更新Performance广告授权', { before: before ? { client_id: before.client_id, business_timezone: before.business_timezone, version: before.version } : null,
+        after: { client_id: clientId, business_timezone: timezone, version: version + 1 } });
+      await client.query(`INSERT INTO app_statistics_ad_config(user_id,store_id,client_id,secret_cipher,business_timezone,version)
+        VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(user_id,store_id) DO UPDATE SET client_id=EXCLUDED.client_id,secret_cipher=EXCLUDED.secret_cipher,
+        business_timezone=EXCLUDED.business_timezone,version=EXCLUDED.version,last_error='',updated_at=now()`, [ctx.userId, ctx.storeId, clientId, cipher, timezone, version + 1]);
+      return { success: true };
+    });
+  }
+  async function importOrderAdReport(ctx, body) {
+    const month = validMonth(String(body.month || '')), { start, end } = monthBounds(month);
+    if (end >= businessDate(new Date(), DEFAULT_AD_TIMEZONE)) throw fail('只能导入已结束月份的逐单广告报表');
+    const version = versionInput(body.version);
+    if (!Array.isArray(body.entries) || body.entries.length > 50000) throw fail('逐单广告报表格式错误或超过 50000 行');
+    const dates = datesBetween(start, end), totals = new Map(dates.map((date) => [date, 0])), seen = new Set();
+    const validId = (id) => typeof id === 'string' && /^\d{1,24}$/.test(id);
+    const entries = body.entries.map((entry) => {
+      const { date, order_number, sku, order_id, cents, quantity } = entry || {};
+      if (!totals.has(date) || typeof order_number !== 'string' || order_number.length > 64 || !/^\d+-\d+(?:-\d+)?$/.test(order_number)
+        || !validId(sku) || !validId(order_id) || !Number.isSafeInteger(cents) || Math.abs(cents) > 10000000000
+        || !Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 100000) throw fail('逐单广告明细的日期、订单号、SKU、数量或金额无效');
+      const key = JSON.stringify([date, order_number, sku, order_id, cents, quantity]);
+      if (seen.has(key)) throw fail('逐单广告报表存在重复记录');
+      seen.add(key); totals.set(date, totals.get(date) + cents);
+      return { date, order_number, sku, order_id, cents, quantity };
+    });
+    return transaction(ctx, async (client) => {
+      const daily = (await client.query(`SELECT spend_date::text AS spend_date,cpo_rub FROM app_statistics_ad_days
+        WHERE user_id=$1 AND store_id=$2 AND business_timezone=$3 AND spend_date BETWEEN $4 AND $5 FOR UPDATE`,
+        [ctx.userId, ctx.storeId, DEFAULT_AD_TIMEZONE, start, end])).rows;
+      const paid = new Map(daily.map((d) => [d.spend_date, moneyCents(d.cpo_rub)]));
+      const mismatch = dates.find((date) => paid.get(date) !== totals.get(date));
+      if (mismatch) throw fail(`逐单报表与广告日报的按订单付费未对平：${mismatch}`, 409);
+      const before = (await client.query('SELECT entries,version FROM app_statistics_order_ad_reports WHERE user_id=$1 AND store_id=$2 AND month=$3 FOR UPDATE',
+        [ctx.userId, ctx.storeId, month])).rows[0] || null;
+      if ((before?.version || 0) !== version) throw fail('逐单广告报表已更新，请重新核对版本', 409);
+      const after = { entries, version: version + 1 };
+      const snapshot = await audit(client, ctx, 'order_ad_import', month, '导入 Ozon 按订单付费原始报表', { before, after });
+      await client.query(`INSERT INTO app_statistics_order_ad_reports(user_id,store_id,month,entries,version) VALUES($1,$2,$3,$4,$5)
+        ON CONFLICT(user_id,store_id,month) DO UPDATE SET entries=EXCLUDED.entries,version=EXCLUDED.version`,
+        [ctx.userId, ctx.storeId, month, JSON.stringify(entries), after.version]);
+      const orders = (await client.query('SELECT payload FROM app_statistics_orders WHERE user_id=$1 AND store_id=$2', [ctx.userId, ctx.storeId])).rows;
+      const { centsByPosting, unmatched } = matchOrderAdRows(entries, orders.map((r) => r.payload));
+      return { success: true, snapshot_id: snapshot, entries: entries.length, matched_orders: centsByPosting.size,
+        matched_rub: [...centsByPosting.values()].reduce((n, c) => n + c, 0) / 100, unmatched_entries: unmatched.length,
+        unmatched_rub: unmatched.reduce((n, row) => n + row.cents, 0) / 100 };
+    });
   }
   function sendCsv(res, filename, rows) {
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -407,14 +583,19 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     const route = (method, url, action) => app[method](PREFIX + url, requireAuth, async (req, res, next) => {
       try { const ctx = await context(req); res.setHeader('Cache-Control', 'no-store'); await action(req, res, ctx); } catch (error) { next(error); }
     });
-    route('get', '/report', async (req, res, ctx) => {
-      const month = validMonth(String(req.query.month || shanghaiDate().slice(0, 7)));
-      const result = report(await loadData(ctx), month);
-      const rows = filteredRows(result.rows, req.query);
-      const size = Math.min(500, Math.max(1, parseInt(req.query.page_size, 10) || 100));
-      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-      res.json({ success: true, rows: rows.slice((page - 1) * size, page * size), total: rows.length, summary: result.summary, run: await latestRun(ctx), schedule: { time: '02:30', timezone: 'Asia/Shanghai', frequency: 'daily' } });
-    });
+    const reportRoute = async (req, res, ctx) => {
+      const params = (req.method === 'POST' ? req.body : req.query) || {};
+      const month = validMonth(String(params.month || shanghaiDate().slice(0, 7)));
+      const data = await loadData(ctx), result = report(data, month);
+      const rows = filteredRows(result.rows, params);
+      const size = Math.min(500, Math.max(1, parseInt(params.page_size, 10) || 100));
+      const page = Math.max(1, parseInt(params.page, 10) || 1);
+      res.json({ success: true, rows: rows.slice((page - 1) * size, page * size), total: rows.length, summary: result.summary, run: await latestRun(ctx),
+        advertising: { ...publicAdvertising(data.adConfig), ...result.advertising }, filter_catalog: REPORT_FIELDS,
+        schedule: { time: '08:30', timezone: 'Asia/Shanghai', frequency: 'daily' } });
+    };
+    route('get', '/report', reportRoute);
+    route('post', '/report', reportRoute);
     route('get', '/months', async (req, res, ctx) => {
       const from = validMonth(String(req.query.from || shanghaiDate().slice(0, 7)));
       const to = validMonth(String(req.query.to || shanghaiDate().slice(0, 7)));
@@ -426,28 +607,74 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       }
       res.json({ success: true, rows: summaries, run: await latestRun(ctx) });
     });
+    route('get', '/exceptions', async (req, res, ctx) => {
+      const month = validMonth(String(req.query.month || ''));
+      const result = report(await loadData(ctx), month);
+      const entries = settlementExceptions(result, String(req.query.group || 'total'), String(req.query.kind || ''));
+      const size = 100, page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      res.json({ rows: entries.slice((page - 1) * size, page * size), total: entries.length, page_size: size,
+        coverage_complete: result.summary.coverage.complete, exchange_rate: result.summary.exchange_rate });
+    });
     route('post', '/sync', async (req, res, ctx) => res.status(202).json({ success: true, run: await startSync(ctx, String(req.body.month || '')) }));
     route('patch', '/costs', async (req, res, ctx) => res.json(await saveCosts(ctx, req.body)));
     route('patch', '/month', async (req, res, ctx) => res.json(await saveMonth(ctx, req.body)));
+    route('get', '/advertising/config', async (req, res, ctx) => res.json(publicAdvertising((await loadData(ctx)).adConfig)));
+    route('patch', '/advertising/config', async (req, res, ctx) => res.json(await saveAdvertising(ctx, req.body)));
+    route('get', '/advertising/days', async (req, res, ctx) => {
+      const days = (await loadData(ctx)).adDays.filter((d) => d.business_timezone === DEFAULT_AD_TIMEZONE);
+      res.json({ days, revision: adRevision(days), business_timezone: DEFAULT_AD_TIMEZONE });
+    });
+    route('post', '/advertising/import', async (req, res, ctx) => res.json(await importAdvertising(ctx, req.body)));
+    route('post', '/advertising/order-report', async (req, res, ctx) => res.json(await importOrderAdReport(ctx, req.body)));
     route('get', '/changes', async (req, res, ctx) => {
       const result = await query(`SELECT id,kind,month,reason,created_at,rolled_back_at,
-        CASE WHEN kind='costs' THEN jsonb_array_length(payload->'after') ELSE 1 END AS affected
-        FROM app_statistics_changes WHERE user_id=$1 AND store_id=$2 AND kind IN ('costs','month','rollback') ORDER BY created_at DESC LIMIT 100`, [ctx.userId, ctx.storeId]);
+        CASE WHEN kind='costs' THEN jsonb_array_length(payload->'after') WHEN kind='order_ad_import' THEN jsonb_array_length(payload->'after'->'entries') ELSE 1 END AS affected
+        FROM app_statistics_changes WHERE user_id=$1 AND store_id=$2 AND kind IN ('costs','month','rollback','ad_import','order_ad_import') ORDER BY created_at DESC LIMIT 100`, [ctx.userId, ctx.storeId]);
       res.json({ success: true, rows: result.rows });
     });
     route('post', '/changes/:id/rollback', async (req, res, ctx) => res.json(await rollback(ctx, req.params.id)));
     route('get', '/ledger', async (req, res, ctx) => {
       const result = report(await loadData(ctx), validMonth(String(req.query.month || '')));
       const posting = String(req.query.posting_number || '');
-      if (!result.rows.some((r) => r.posting_number === posting)) throw fail('订单不在所选结算月份', 404);
+      if (!result.rows.some((r) => r.posting_number === posting)) throw fail('订单不在所选应计月份', 404);
       res.json({ success: true, rows: result.ledger.filter((r) => r.posting_number === posting), pending: result.pending.filter((r) => r.postings.includes(posting)) });
     });
-    route('get', '/export', async (req, res, ctx) => {
-      const month = validMonth(String(req.query.month || ''));
-      const result = report(await loadData(ctx), month);
-      sendCsv(res, `${ctx.store.name}-${month}-结算订单.csv`, [['订单号', '订单状态', '下单日期（北京时间）', '结算日', '采购费用（CNY，含采购运费）', '贴单费用（CNY）', '销售收入（RUB，含正向退费）', 'Ozon费用（RUB）', '毛利（CNY，未扣店铺广告）', '取消原因', '订单类型', '收支待分摊'],
-        ...filteredRows(result.rows, req.query).map((r) => [r.posting_number, r.status, r.ordered_at ? new Date(Date.parse(r.ordered_at) + 8 * 3600000).toISOString().slice(0, 19).replace('T', ' ') : '', r.settled_date, r.purchase_cny, r.label_cny, r.income_rub, r.ozon_fees_rub, r.profit_cny, r.cancel_reason, r.order_type, r.pending_positive || r.pending_negative ? '是' : '否'])]);
+    route('get', '/order-detail', async (req, res, ctx) => {
+      const posting = req.query.posting_number;
+      if (typeof posting !== 'string' || posting.length > 64 || !/^\d+-\d+-\d+$/.test(posting)) throw fail('请输入完整订单号');
+      const order = (await query('SELECT payload,updated_at FROM app_statistics_orders WHERE user_id=$1 AND store_id=$2 AND posting_number=$3',
+        [ctx.userId, ctx.storeId, posting])).rows[0];
+      if (!order) return res.json({ success: true, detail: null });
+      const products = Array.isArray(order.payload.products) ? order.payload.products : [];
+      const offerIds = [...new Set(products.map((p) => p.offer_id).filter(Boolean))];
+      const items = offerIds.length ? (await query('SELECT offer_id,name,image FROM app_products WHERE user_id=$1 AND store_id=$2 AND offer_id=ANY($3::text[])',
+        [ctx.userId, ctx.storeId, offerIds])).rows : [];
+      const catalog = new Map(items.map((p) => [p.offer_id, p]));
+      const cached = products.some((p) => !catalog.get(p.offer_id)?.image)
+        ? (await query("SELECT payload->'products' AS products FROM app_order_cache WHERE user_id=$1 AND store_id=$2 AND posting_number=$3",
+          [ctx.userId, ctx.storeId, posting])).rows[0]?.products : null;
+      res.json({ success: true, detail: { order_number: order.payload.order_number, updated_at: order.updated_at,
+        products: products.map((p) => {
+          const product = catalog.get(p.offer_id);
+          const fallback = Array.isArray(cached) && cached.find((item) => item && (p.offer_id && item.offer_id
+            ? p.offer_id === item.offer_id && (!p.sku || !item.sku || String(p.sku) === String(item.sku))
+            : p.sku && item.sku && String(p.sku) === String(item.sku)));
+          return { sku: p.sku, offer_id: p.offer_id, quantity: p.quantity, name: product?.name || fallback?.name || '',
+            image: product?.image || fallback?.image || '' };
+        }) } });
     });
+    const exportRoute = async (req, res, ctx) => {
+      const params = (req.method === 'POST' ? req.body : req.query) || {};
+      const month = validMonth(String(params.month || ''));
+      const result = report(await loadData(ctx), month);
+      sendCsv(res, `${ctx.store.name}-${month}-应计订单.csv`, [[...REPORT_FIELDS.map((field) => field.label), '成本归属月', '广告分摊日', '分摊订单数', '点击广告状态', '已归属 Ozon 净额（₽）', '实收说明'],
+        ...filteredRows(result.rows, params).map((r) => [...REPORT_FIELDS.map((field) => field.key === 'ordered_at'
+          ? (r.ordered_at ? new Date(Date.parse(r.ordered_at) + 8 * 3600000).toISOString().slice(0, 19).replace('T', ' ') : '') : r[field.key]),
+          r.cost_month, r.allocation_date, r.allocation_order_count, r.advertising_state, r.platform_net_rub,
+          [r.pending_positive || r.pending_negative ? '仅含已归属流水' : '', r.advertising_rub == null ? '按订单广告待核对' : ''].filter(Boolean).join('；')])]);
+    };
+    route('get', '/export', exportRoute);
+    route('post', '/export', exportRoute);
   }
   async function importSnapshot(ctx, { accruals, orders, days, month }) {
     validMonth(month);
@@ -459,5 +686,5 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         VALUES($1,$2,$3,'seed','succeeded','已导入逐笔核对过的 API 快照',$4,$4,now())`, [ctx.userId, ctx.storeId, month, days.length]);
     });
   }
-  return { init, register, start, stop, startSync, tick, loadData, report, saveCosts, saveMonth, rollback, replaceDay, saveOrders, importSnapshot, filteredRows };
+  return { init, register, start, stop, startSync, tick, loadData, report, saveCosts, saveMonth, saveAdvertising, importAdvertising, syncAdvertising, rollback, replaceDay, saveOrders, importSnapshot, filteredRows };
 }
