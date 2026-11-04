@@ -838,10 +838,21 @@ window.OrderListView = {
         // 服务端按「拣货单顺序」下载并合并
         const merged = await axios.post('/api/seller/orders/yarn-label-pdf', { order: ordered, items }, { responseType: 'blob', timeout: 300000 });
         downloadBlob(merged.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
-        const failedCount = failedAll.length;
-        exportStep(100, `${items.length} 个标签${failedCount ? `，${failedCount} 单失败` : ''}`);
+        exportStep(100, `${items.length} 个标签${failedAll.length ? `，${failedAll.length} 单失败` : ''}`);
         exportFinish();
-        notify.success(`已导出 ${items.length} 个订单的毛线标签${failedCount ? `（${failedCount} 单失败）` : ''}，顺序与拣货单一致`);
+        if (failedAll.length) {
+          // v2.2.9.201 失败明细必须列出来：之前只报「N 单失败」，用户没法知道是哪几单，
+          //   更没法只勾选失败单重试。
+          const detail = failedAll.slice(0, 40)
+            .map((f) => `${f.pn}${f.err ? `(${f.err})` : ''}`)
+            .join('、');
+          notify.warning(
+            `已导出 ${items.length} 个标签，但有 ${failedAll.length} 单没拿到标签：${detail}${failedAll.length > 40 ? ' …' : ''}。可只勾选这些单再导一次。`,
+            0,
+          );
+        } else {
+          notify.success(`已导出 ${items.length} 个订单的毛线标签，顺序与拣货单一致`);
+        }
       } catch (e) {
         exportFail();
         notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 240), 0);
