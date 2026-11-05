@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.189";
+const VERSION = "2.2.9.204";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5929,12 +5929,30 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
         if (!postingNumbers.length) return sendResponse({ ok: false, error: "没有传订单号" });
-        let tabs = await chrome.tabs.query({ url: "*://seller.ozon.ru/*" });
+        // v2.2.9.204 卖家后台可能停在中国站域名（ozonru.cn），或从 .ru 重定向过去：
+        //   只查 seller.ozon.ru 会漏掉已登录的标签页 → 新建标签被重定向 → 注入报
+        //   「Cannot access contents of the page, Extension manifest must request permission…」
+        let tabs = [];
+        for (const pattern of ["*://seller.ozon.ru/*", "*://*.ozonru.cn/*"]) {
+          const found = await chrome.tabs.query({ url: pattern });
+          if (found && found.length) { tabs = found; break; }
+        }
         let tab = tabs && tabs[0];
         if (!tab) {
           tab = await chrome.tabs.create({ url: "https://seller.ozon.ru/app/postings/crossborder/fbs", active: true });
           await new Promise((r) => setTimeout(r, 6000));
         }
+        // 注入前确认目标页确实是卖家后台：域名不在 ozon.ru / ozonru.cn 下（错误页、重定向页、别的站）
+        //   就先导航回去再注入，别白跑一轮 executeScript 抛权限错。
+        const SELLER_HOST_RE = /(^|\.)(ozon\.ru|ozonru\.cn)$/i;
+        try {
+          const cur = new URL(String(tab.url || ""));
+          if (!SELLER_HOST_RE.test(cur.hostname)) {
+            await chrome.tabs.update(tab.id, { url: "https://seller.ozon.ru/app/postings/crossborder/fbs" });
+            await new Promise((r) => setTimeout(r, 6000));
+            tab = await chrome.tabs.get(tab.id);
+          }
+        } catch (_e) { /* 拿不到 url 就照原样注入，让真实错误暴露 */ }
         const [inj] = await chrome.scripting.executeScript({
           target: { tabId: tab.id },
           func: async function (postingNumbers) {

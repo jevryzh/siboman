@@ -74,19 +74,27 @@ async function main() {
 
   const manifestVersion = String(manifest.version || "");
   const backgroundVersion = matchVersion(background, /\bconst\s+VERSION\s*=\s*["']([^"']+)["']/, "background VERSION");
-  const manifestUiVersion = matchVersion(storeView, /PLUGIN_MANIFEST_VERSION\s*=\s*['"]([^'"]+)/, "StoreManagement PLUGIN_MANIFEST_VERSION");
-  const zipUiVersion = matchVersion(storeView, /PLUGIN_ZIP_VERSION\s*=\s*['"]([^'"]+)/, "StoreManagement PLUGIN_ZIP_VERSION");
+  // v2.2.9.144 起 StoreManagement 的版本号改为运行时从 /api/version 读取（不再写死），
+  //   此时文件里没有字面量版本号；只要确认它确实走 API 读取，就按通过处理，否则仍要求字面量一致。
+  const storeViewUsesApiVersion = /\/api\/version/.test(storeView) && /pluginZipVersion/.test(storeView);
+  const manifestUiVersion = storeView.match(/PLUGIN_MANIFEST_VERSION\s*=\s*['"]([^'"]+)/)?.[1] || "";
+  const zipUiVersion = storeView.match(/PLUGIN_ZIP_VERSION\s*=\s*['"]([^'"]+)/)?.[1] || "";
   const bridgeVersion = bridge.match(/\bconst\s+VERSION\s*=\s*["']([^"']+)["']/)?.[1] || "";
 
   if (!manifestVersion) fail("manifest.json is missing version");
   if (backgroundVersion !== manifestVersion) fail(`background VERSION ${backgroundVersion || "(missing)"} does not match manifest ${manifestVersion}`);
-  if (manifestUiVersion !== manifestVersion) fail(`StoreManagement manifest UI version ${manifestUiVersion || "(missing)"} does not match manifest ${manifestVersion}`);
-  if (zipUiVersion !== manifestVersion) fail(`StoreManagement zip UI version ${zipUiVersion || "(missing)"} does not match manifest ${manifestVersion}`);
+  if (!storeViewUsesApiVersion && manifestUiVersion !== manifestVersion) fail(`StoreManagement manifest UI version ${manifestUiVersion || "(missing)"} does not match manifest ${manifestVersion}`);
+  if (!storeViewUsesApiVersion && zipUiVersion !== manifestVersion) fail(`StoreManagement zip UI version ${zipUiVersion || "(missing)"} does not match manifest ${manifestVersion}`);
+  if (storeViewUsesApiVersion && (manifestUiVersion || zipUiVersion)) {
+    fail("StoreManagement reads versions from /api/version but still hardcodes a literal version");
+  }
   if (!storeView.includes("PLUGIN_MANIFEST_VERSION")) fail("StoreManagement must expose PLUGIN_MANIFEST_VERSION");
   if (!storeView.includes("PLUGIN_ZIP_VERSION")) fail("StoreManagement must expose PLUGIN_ZIP_VERSION");
-  if (!storeView.includes(`${DOWNLOAD_PATH}?v=${"${PLUGIN_ZIP_VERSION}"}`) && !storeView.includes(`${DOWNLOAD_PATH}?v=${manifestVersion}`)) {
-    fail(`StoreManagement must download ${DOWNLOAD_PATH}?v=<PLUGIN_ZIP_VERSION>`);
-  }
+  // 允许 `${PLUGIN_ZIP_VERSION}` 与 `${PLUGIN_ZIP_VERSION.value ...}` 两种写法（后者是 Vue ref 的真实用法）
+  const downloadOk = storeView.includes(`${DOWNLOAD_PATH}?v=${"${PLUGIN_ZIP_VERSION}"}`)
+    || /extension\/zhumeng-collector\.zip\?v=\$\{PLUGIN_ZIP_VERSION[.}]/.test(storeView)
+    || storeView.includes(`${DOWNLOAD_PATH}?v=${manifestVersion}`);
+  if (!downloadOk) fail(`StoreManagement must download ${DOWNLOAD_PATH}?v=<PLUGIN_ZIP_VERSION>`);
   if (!storeView.includes(`v${manifestVersion} 修复`) && !storeView.includes(`v${manifestVersion} `)) {
     fail(`StoreManagement changelog does not include v${manifestVersion}`);
   }

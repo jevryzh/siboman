@@ -533,6 +533,34 @@ app.use(async (req, res, next) => {
 });
 
 app.use(express.json({ limit: process.env.JSON_LIMIT || "120mb" }));
+
+// v2.2.9.205 Ozon 下线的图片接入域名兜底：ir-N.ozonru.cn 已无公共 DNS 记录（1.1.1.1 / 8.8.8.8 均查不到），
+//   但同一条 /s3/... 路径在 ir-20.ozonstatic.cn 上仍返回 200（已实测）。
+//   只在响应序列化阶段改写 URL，不改数据库、不改上传的历史图；
+//   仅当响应体里出现该域名时才多做一次 stringify+parse，避免拖慢普通接口。
+const DEAD_OZON_IMAGE_HOST = /https:\/\/ir-\d+\.ozonru\.cn\//gi;
+const OZON_IMAGE_HOST_FALLBACK = "https://ir-20.ozonstatic.cn/";
+function rewriteDeadOzonImageHost(value) {
+  if (typeof value === "string") {
+    return value.includes("ozonru.cn/") ? value.replace(DEAD_OZON_IMAGE_HOST, OZON_IMAGE_HOST_FALLBACK) : value;
+  }
+  return value;
+}
+app.use((req, res, next) => {
+  const rawJson = res.json.bind(res);
+  res.json = (body) => {
+    try {
+      const serialized = JSON.stringify(body);
+      if (serialized && serialized.includes(".ozonru.cn/")) {
+        const fixed = serialized.replace(DEAD_OZON_IMAGE_HOST, OZON_IMAGE_HOST_FALLBACK);
+        if (fixed !== serialized) return rawJson(JSON.parse(fixed));
+      }
+    } catch (_e) { /* 序列化失败时按原样返回，不影响请求 */ }
+    return rawJson(body);
+  };
+  next();
+});
+
 app.use((req, res, next) => {
   if (!enforceScopedWorkerAccess(req, res)) return;
   next();
@@ -3645,47 +3673,71 @@ async function callYandexMarketAPI(apiPath, { method = "GET", query = {}, body, 
     error.statusCode = 503;
     throw error;
   }
-  let response;
   const requestBody = body !== undefined ? JSON.stringify(body) : undefined;
-  try {
-    response = await requestJsonOverHttps(`${YANDEX_MARKET_BASE_URL}${apiPath}${yandexQueryString(query)}`, {
-      method,
-      headers: {
-        "Api-Key": secret,
-        "Content-Type": "application/json",
-        Accept: "application/json",
-      },
-      body: requestBody,
-      timeoutMs,
-      family: 4,
-    });
-  } catch (requestError) {
-    if (/timeout/i.test(String(requestError?.message || ""))) {
-      const error = new Error(`Yandex Market API 请求超时(${timeoutMs}ms)：${apiPath}`);
-      error.statusCode = 504;
+  // v2.2.9.206 Yandex 接口会间歇性返回 500 INTERNAL_ERROR（实测连打 5 次有 3 次 500），
+  //   以前不重试 → 前端「Yandex 订单」进去就报 500。
+  //   这里对 GET 与 429/502/503 做最多 3 次退避重试；写操作（POST/PUT）只在网关类错误上重试，避免重复提交。
+  const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+  const MAX_ATTEMPTS = 3;
+  let lastError = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    let response;
+    try {
+      response = await requestJsonOverHttps(`${YANDEX_MARKET_BASE_URL}${apiPath}${yandexQueryString(query)}`, {
+        method,
+        headers: {
+          "Api-Key": secret,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        body: requestBody,
+        timeoutMs,
+        family: 4,
+      });
+    } catch (requestError) {
+      const isTimeout = /timeout/i.test(String(requestError?.message || ""));
+      const canRetry = attempt < MAX_ATTEMPTS && method === "GET";
+      if (canRetry) {
+        await new Promise((r) => setTimeout(r, 600 * attempt + Math.floor(Math.random() * 300)));
+        lastError = requestError;
+        continue;
+      }
+      if (isTimeout) {
+        const error = new Error(`Yandex Market API 请求超时(${timeoutMs}ms)：${apiPath}`);
+        error.statusCode = 504;
+        throw error;
+      }
+      throw requestError;
+    }
+    const text = response.text;
+    let payload = null;
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = { raw: text.slice(0, 4000) };
+      }
+    }
+    if (!response.ok) {
+      const detail = typeof payload === "object" && payload
+        ? JSON.stringify(payload).slice(0, 1500)
+        : String(text).slice(0, 1500);
+      const retryable = RETRYABLE_STATUS.has(response.status) && (method === "GET" || response.status !== 500);
+      if (retryable && attempt < MAX_ATTEMPTS) {
+        lastError = new Error(`Yandex Market API ${response.status} ${response.statusText || ""}：${detail}`);
+        await new Promise((r) => setTimeout(r, 600 * attempt + Math.floor(Math.random() * 300)));
+        continue;
+      }
+      const error = new Error(`Yandex Market API ${response.status} ${response.statusText || ""}：${detail}`);
+      // 5xx 是对方临时故障，按 503 返回，避免前端把它当成我们自己的 bug
+      error.statusCode = response.status >= 500 ? 503 : response.status;
+      error.payload = payload;
+      error.upstreamStatus = response.status;
       throw error;
     }
-    throw requestError;
+    return payload || {};
   }
-  const text = response.text;
-  let payload = null;
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch {
-      payload = { raw: text.slice(0, 4000) };
-    }
-  }
-  if (!response.ok) {
-    const detail = typeof payload === "object" && payload
-      ? JSON.stringify(payload).slice(0, 1500)
-      : String(text).slice(0, 1500);
-    const error = new Error(`Yandex Market API ${response.status} ${response.statusText || ""}：${detail}`);
-    error.statusCode = response.status;
-    error.payload = payload;
-    throw error;
-  }
-  return payload || {};
+  throw lastError || new Error(`Yandex Market API 请求失败：${apiPath}`);
 }
 
 async function getYandexMarketContext({ storeId = null, userId = null, refresh = false } = {}) {
@@ -5700,7 +5752,23 @@ const yandexStocksCache = new Map(); // storeKey -> {at, warehouses, offers, met
 const YANDEX_STOCKS_TTL_MS = 5 * 60 * 1000; // 缓存 5 分钟，配合后台循环预热
 let yandexStocksLoopStarted = false;
 
+// v2.2.9.206 同一店铺的并发预取会重复分页刷 Yandex（日志里同一页出现两次），
+//   既浪费配额也会把接口打到 500，连带「Yandex 订单」页面报错。
+//   这里按 storeKey 做单飞：同一时刻只允许一个预取在跑，后来者复用同一个 Promise。
+const yandexStocksInflight = new Map();
 async function fetchYandexStocksRaw(context) {
+  // 两个店铺可能挂在同一个 Yandex business 下，而一次预取会遍历该 business 的全部 campaign，
+  //   按 storeId 去重会各跑一遍 → 同一 campaign 被翻两次（日志 p15 出现两遍）。
+  //   所以按 businessId 单飞：同一 business 同一时刻只跑一个预取。
+  const lockKey = String(context.businessId || context.storeId || "default");
+  const running = yandexStocksInflight.get(lockKey);
+  if (running) return running;
+  const task = fetchYandexStocksRawOnce(context).finally(() => yandexStocksInflight.delete(lockKey));
+  yandexStocksInflight.set(lockKey, task);
+  return task;
+}
+
+async function fetchYandexStocksRawOnce(context) {
   const storeKey = String(context.storeId || context.businessId || "default");
   console.log("[yandex-stocks] 开始预取", storeKey, "campaign=", context.campaignId);
   // 仓库列表（business 级，含全部 campaign 的仓库）
@@ -7398,7 +7466,8 @@ function bulkPricingPublicBase() {
   return String(process.env.PUBLIC_BASE_URL || process.env.APP_BASE_URL || "https://test.renwz.cn").replace(/\/+$/, "");
 }
 async function proxyImageToPublicUrl(imgUrl, opts = {}) {
-  const url = String(imgUrl || "").trim();
+  // 死域名兜底：ir-N.ozonru.cn 已无解析，先改写到 ir-20.ozonstatic.cn 再下载
+  const url = rewriteDeadOzonImageHost(String(imgUrl || "").trim());
   if (!/^https?:\/\//i.test(url)) return "";
   try {
     const host = new URL(url).hostname.toLowerCase();
@@ -16507,6 +16576,23 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
 // v2.2.9.189 把「逐单生成」的标签 PDF 按指定顺序合并成一个文件。
 //   插件逐单调卖家后台生成标签（保证一单一份），把每单的 S3 链接传回来，
 //   服务端按前端给的顺序下载并合并 —— 这样标签页顺序与拣货单完全一致。
+// v2.2.9.204 标签 PDF 的 CDN 域名白名单放宽到中国站：
+//   原来只认 `https://ir-N.ozone.ru/`，若 Ozon 返回 ir-N.ozonru.cn / ir-N.ozonstatic.cn(.com)
+//   会被逐条 continue 掉 → 最终 400「下载标签失败（未取到任何 PDF）」，日志里也看不出原因。
+//   仍做 SSRF 防护：只允许白名单主机、https、无账号密码、非 443 端口一律拒绝。
+const LABEL_PDF_HOST_RE = /^(?:ir-\d+\.ozone\.ru|ir-\d+\.ozonru\.cn|ir-\d+\.ozonstatic\.cn|ir-\d+\.ozonstatic\.com|ir\.ozone\.ru|cdn1\.ozonusercontent\.com)$/i;
+const isLabelPdfUrl = (raw) => {
+  try {
+    const u = new URL(String(raw));
+    if (u.protocol !== "https:") return false;
+    if (u.username || u.password) return false;
+    if (u.port && u.port !== "443") return false;
+    return LABEL_PDF_HOST_RE.test(u.hostname);
+  } catch {
+    return false;
+  }
+};
+
 app.post("/api/seller/orders/yarn-label-pdf", requireAuth, async (req, res, next) => {
   try {
     const order = Array.isArray(req.body?.order) ? req.body.order.map(String) : [];
@@ -16518,18 +16604,30 @@ app.post("/api/seller/orders/yarn-label-pdf", requireAuth, async (req, res, next
     }
     const seq = order.length ? order.filter((pn) => urlByPn.has(pn)) : [...urlByPn.keys()];
     const bufs = [];
+    const rejectedHosts = new Set();
+    let fetchFailed = 0;
     for (const pn of seq) {
       const u = urlByPn.get(pn);
-      if (!/^https:\/\/ir-\d+\.ozone\.ru\//i.test(u)) continue;   // 只允许 Ozon CDN，防 SSRF
+      if (!isLabelPdfUrl(u)) {
+        // 记录被拒的域名，失败时直接告诉用户/日志是哪个 CDN 不在白名单，不用再翻代码
+        try { rejectedHosts.add(new URL(String(u)).hostname); } catch { rejectedHosts.add(String(u).slice(0, 40)); }
+        continue;
+      }
       try {
         const r = await fetch(u, { redirect: "follow" });
-        if (!r.ok) continue;
+        if (!r.ok) { fetchFailed += 1; continue; }
         const b = Buffer.from(await r.arrayBuffer());
-        if (b.slice(0, 4).toString() !== "%PDF") continue;
+        if (b.slice(0, 4).toString() !== "%PDF") { fetchFailed += 1; continue; }
         bufs.push(b);
-      } catch (_e) { /* 单个失败跳过 */ }
+      } catch (_e) { fetchFailed += 1; }
     }
-    if (!bufs.length) return res.status(400).json({ success: false, error: "下载标签失败（未取到任何 PDF）" });
+    if (!bufs.length) {
+      const bits = [];
+      if (rejectedHosts.size) bits.push(`${rejectedHosts.size} 个域名不在白名单：${[...rejectedHosts].slice(0, 3).join("、")}`);
+      if (fetchFailed) bits.push(`${fetchFailed} 个下载失败或不是 PDF`);
+      if (!bits.length) bits.push(`未收到任何标签链接（${items.length} 条 items 均无 url）`);
+      return res.status(400).json({ success: false, error: `下载标签失败：${bits.join("；")}` });
+    }
     const outDoc = await PDFDocument.create();
     for (const b of bufs) {
       const src = await PDFDocument.load(b, { ignoreEncryption: true });

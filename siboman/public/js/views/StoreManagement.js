@@ -46,6 +46,8 @@ window.StoreManagementView = {
     };
     // v2.2.9.144 版本号不再写死（以前固定成 2.2.9.127，插件升到 139 了这里还显示旧版本，
     //   连"插件版本一致"的判断和下载链接的缓存号都是错的）。统一从 /api/version 读。
+    // v2.2.9.204 标签导出：合并接口域名白名单加入中国站（ozonru.cn / ozonstatic.cn / ozonstatic.com），
+    //   插件侧 tab 查找与注入前域名校验同步放宽，修复「导出毛线标签」注入权限报错。
     const PLUGIN_MANIFEST_VERSION = Vue.ref('');
     const PLUGIN_ZIP_VERSION = Vue.ref('');
     const fetchPluginVersions = async () => {
