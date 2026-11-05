@@ -9,7 +9,7 @@ window.StatisticsAnalysisView = {
     const rows = ref([]), monthly = ref([]), summary = ref({}), run = ref(null), total = ref(0);
     const page = ref(1), pageSize = ref(100), search = ref(''), status = ref(''), orderType = ref('');
     const batchNumbers = ref([]), batchVisible = ref(false), batchText = ref(''), batchError = ref('');
-    const lowOnly = ref(false), missingOnly = ref(false), sort = ref('accrual_date'), direction = ref('asc');
+    const missingOnly = ref(false), unsettledOnly = ref(false), sort = ref('ordered_at'), direction = ref('asc');
     const selected = ref([]), table = ref(null), costVisible = ref(false), drafts = ref([]), fillAmount = ref(null), labelFillAmount = ref(null);
     const costError = ref(''), costScope = ref(null), uploadInput = ref(null), monthVisible = ref(false), costSource = ref('manual');
     const costPage = ref(1);
@@ -44,7 +44,7 @@ window.StatisticsAnalysisView = {
     function resetRule(rule) { rule.op = fieldType(rule) === 'text' ? 'contains' : 'eq'; rule.value = ''; rule.value2 = ''; }
     function addRule() { if (rules.value.length < 30) rules.value.push({ field: 'profit_cny', op: 'lt', value: 0, value2: '' }); }
     function queryRules() { appliedRules.value = rules.value.map((r) => ({ ...r })); applyFilter(); }
-    function resetFilters() { rules.value = []; appliedRules.value = []; batchNumbers.value = []; search.value = ''; status.value = ''; orderType.value = ''; lowOnly.value = false; missingOnly.value = false; applyFilter(); }
+    function resetFilters() { rules.value = []; appliedRules.value = []; batchNumbers.value = []; search.value = ''; status.value = ''; orderType.value = ''; missingOnly.value = false; unsettledOnly.value = false; applyFilter(); }
     let generation = 0, poll = null, stopped = false;
     const sid = () => window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '';
     const ctx = () => ({ store_id: sid(), month: month.value });
@@ -112,7 +112,7 @@ window.StatisticsAnalysisView = {
     const typeLabels = { 1: '收单手续费（正数为退回）', 3: '品牌推广', 4: '品牌推广接入', 19: '站外推广', 23: '站内广告', 33: '广告服务', 41: '点击广告', 49: 'Premium推广', 54: '商品推广', 59: '逆向物流', 67: '国际配送服务', 87: '社交媒体广告', 122: '国际运输合同组织服务', 123: 'Ozon物流平台接入服务', 130: '展示广告' };
     const feeName = (row) => row.types?.length ? row.types.map((id) => typeLabels[id] || `费用类型 ${id}`).join('、') : '订单结算汇总（内层费用不重复累计）';
     const filters = () => ({ ...ctx(), page: page.value, page_size: pageSize.value, search: search.value, status: status.value,
-      order_type: orderType.value, low_income: lowOnly.value ? '1' : '', missing_cost: missingOnly.value ? '1' : '', sort: sort.value, direction: direction.value, filters: JSON.stringify(appliedRules.value) });
+      order_type: orderType.value, missing_cost: missingOnly.value ? '1' : '', unsettled: unsettledOnly.value ? '1' : '', sort: sort.value, direction: direction.value, filters: JSON.stringify(appliedRules.value) });
     function requestOrders(url, options = {}) {
       const params = filters();
       return batchNumbers.value.length
@@ -457,6 +457,7 @@ window.StatisticsAnalysisView = {
       if (types.size !== 2) throw new Error('请导出未按推广类型筛选的「费用详细信息」报表，或用模板明确填入两类费用');
       return [...days.values()].sort((a,b) => a.spend_date.localeCompare(b.spend_date)).map((d) => ({ ...d, cpo_rub: d.cpo_rub / 100, cpc_rub: d.cpc_rub / 100 }));
     }
+    // 导入 Ozon「按订单支付」报表：CPO / CPC 两种模式一起导，重叠日期必须与已存一致
     async function readAds(event) {
       const file = event.target.files?.[0]; event.target.value = ''; if (!file) return;
       adsPasteVisible.value = false; invalidateAdsPreview();
@@ -528,11 +529,11 @@ window.StatisticsAnalysisView = {
     watch(month, () => { ledgerVisible.value = false; if (!month.value) return; page.value = 1; selected.value = []; table.value?.clearSelection(); load(); });
     watch(monthRange, () => { if (monthRange.value?.length === 2) load(); });
     onMounted(() => {
+      // 不做定时轮询，需要时用顶部刷新按钮手动刷新
       window.addEventListener('shop-changed', shopChanged); load();
-      poll = setInterval(() => { if (!document.hidden && !loading.value && !costVisible.value && !monthVisible.value && !adsVisible.value && !configVisible.value) load(tab.value === 'months' || !!activeRun.value); }, 15000);
     });
     onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); window.removeEventListener('shop-changed', shopChanged); });
-    return { tab, month, monthRange, loading, saving, syncing, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, lowOnly, missingOnly,
+    return { tab, month, monthRange, loading, saving, syncing, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
       selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changesVisible, changes, changesLoading,
       ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, activeRun, progress, money, dateTime, titleProfit, monthlyProfit, monthlyProfitEstimated, monthlyProfitNote, sortMonthlyProfit, monthlyReceipt, feeName, disabledMonth, costPage, costPageRows,
       ledgerError, orderTab, orderRow, orderDetail, detailLoading, detailLoaded, detailError, orderQuantity, copyOrderNumber, loadOrderDetail,
@@ -546,18 +547,17 @@ window.StatisticsAnalysisView = {
   template: `
   <section class="statistics-workbench">
     <header class="statistics-heading">
-      <div><h2>统计分析</h2><div class="statistics-meta">每日 08:30（北京时间）自动更新 <span v-if="summary.coverage?.last_updated_at">· 财务更新 {{dateTime(summary.coverage.last_updated_at)}}</span><span v-if="summary.coverage?.as_of_date"> · 应计核对至 {{summary.coverage.as_of_date}}</span></div></div>
+      <div><h2>统计分析</h2><div class="statistics-meta">每日 02:00 / 09:30（北京时间）自动更新 <span v-if="summary.coverage?.last_updated_at">· 财务更新 {{dateTime(summary.coverage.last_updated_at)}}</span><span v-if="summary.coverage?.as_of_date"> · 应计核对至 {{summary.coverage.as_of_date}}</span><span> · 每日广告（莫斯科）{{advertising.configured?'Performance':'日报导入'}}</span><span v-if="summary.missing_advertising" class="statistics-warning"> · {{summary.missing_advertising}} 单待核对</span><span v-if="advertising.last_error" class="statistics-warning"> · {{advertising.last_error}}</span></div></div>
       <div class="statistics-actions">
         <el-date-picker v-model="month" type="month" value-format="YYYY-MM" format="YYYY 年 MM 月" :clearable="false" :disabled-date="disabledMonth" aria-label="应计月份" style="width:170px"/>
         <el-tooltip content="刷新已同步的数据"><el-button :icon="'Refresh'" circle aria-label="刷新报表" @click="load()"/></el-tooltip>
-        <el-button type="primary" :icon="'RefreshRight'" :loading="syncing || activeRun" @click="syncNow">立即更新</el-button>
         <el-tooltip content="修改记录与回滚"><el-button :icon="'Clock'" circle aria-label="修改记录与回滚" @click="openChanges"/></el-tooltip>
+        <el-button :icon="'Upload'" @click="openAds">每日广告费</el-button>
+        <el-tooltip content="Performance API 授权（可选）"><el-button :icon="'Key'" circle aria-label="广告API授权" @click="openConfig"/></el-tooltip>
       </div>
     </header>
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="statistics-alert"/>
-    <div v-if="activeRun" class="statistics-sync" role="status"><el-icon class="is-loading"><Loading/></el-icon><span>{{run.message || '任务排队中'}}</span><span>{{run.days_done}} / {{run.days_total || '—'}} 天</span><el-progress :percentage="progress" :show-text="false" style="width:130px"/></div>
-    <el-alert v-else-if="run?.status === 'failed'" :title="'更新未完成：' + run.error" type="error" show-icon :closable="false" class="statistics-alert"/>
-    <div class="statistics-ad-status"><div><b>每日广告</b> · 莫斯科时间 · {{advertising.configured?'Performance 已配置':'后台日报导入'}}<span v-if="summary.missing_advertising" class="statistics-warning"> · {{summary.missing_advertising}} 单待核对</span><span v-if="advertising.last_synced_at"> · {{dateTime(advertising.last_synced_at)}}</span><span v-if="advertising.last_error" class="statistics-warning"> · {{advertising.last_error}}</span></div><div class="statistics-actions"><el-button :icon="'Upload'" @click="openAds">每日广告费</el-button><el-tooltip content="Performance API 授权（可选）"><el-button :icon="'Key'" circle aria-label="广告API授权" @click="openConfig"/></el-tooltip></div></div>
+    <el-alert v-if="run?.status === 'failed'" :title="'更新未完成：' + run.error" type="error" show-icon :closable="false" class="statistics-alert"/>
     <div class="statistics-metrics">
       <div><span>本月应计订单</span><strong>{{summary.orders ?? '—'}}<small>单</small></strong><small>WHD {{summary.whd_orders || 0}} 单</small></div>
       <div><span>销售收入 <small>RUB</small></span><strong>{{summary.coverage?.checked_days ? money(summary.income_rub) : '—'}}</strong><small>含正向手续费退回</small></div>
@@ -571,7 +571,7 @@ window.StatisticsAnalysisView = {
             <el-button :icon="'Filter'" :type="batchNumbers.length?'primary':'default'" plain @click="openBatch">批量订单号{{batchNumbers.length?' ('+batchNumbers.length+')':''}}</el-button>
             <el-select v-model="status" placeholder="全部状态" clearable @change="applyFilter" style="width:135px"><el-option label="已签收" value="delivered"/><el-option label="已取消" value="cancelled"/></el-select>
             <el-select v-model="orderType" placeholder="全部类型" clearable @change="applyFilter" style="width:155px"><el-option label="正常销售订单" value="正常销售订单"/><el-option label="WHD订单" value="WHD订单"/></el-select>
-            <el-checkbox v-model="lowOnly" @change="applyFilter">收入 &lt; 100</el-checkbox><el-checkbox v-model="missingOnly" @change="applyFilter">缺采购费</el-checkbox>
+            <el-checkbox v-model="missingOnly" @change="applyFilter">缺采购费</el-checkbox><el-checkbox v-model="unsettledOnly" @change="applyFilter">未结算</el-checkbox>
             <el-button :icon="'Search'" @click="applyFilter">查询</el-button>
             <el-button :icon="'Filter'" :type="appliedRules.length?'primary':'default'" plain @click="filterVisible=!filterVisible">筛选 {{appliedRules.length||''}}</el-button>
           </div>
@@ -599,34 +599,35 @@ window.StatisticsAnalysisView = {
           <div class="statistics-actions"><el-button :icon="'Plus'" :disabled="rules.length>=30" @click="addRule">条件</el-button><el-button :icon="'Search'" type="primary" @click="queryRules">应用筛选</el-button><el-tooltip content="清空全部筛选"><el-button :icon="'RefreshLeft'" circle aria-label="清空筛选" @click="resetFilters"/></el-tooltip><span class="statistics-meta">同时满足全部条件</span></div>
         </div>
         <div class="statistics-data-note" v-if="summary.coverage && !summary.coverage.complete">应计数据未完整同步：本月 {{summary.coverage.checked_days}} / {{summary.coverage.expected_days}} 天。毛利暂不结算。</div>
-        <el-table ref="table" :data="rows" v-loading="loading" row-key="posting_number" border stripe max-height="620" @selection-change="selected=$event" @sort-change="sortChanged" empty-text="所选月份暂无应计订单" class="statistics-orders">
-          <el-table-column type="selection" width="45" :reserve-selection="true" :selectable="canMaintainCosts"/>
-          <el-table-column prop="posting_number" label="订单号" width="224" fixed="left" sortable="custom">
+        <el-table ref="table" :data="rows" v-loading="loading" row-key="posting_number" border stripe max-height="calc(100vh - 400px)" @selection-change="selected=$event" @sort-change="sortChanged" empty-text="所选月份暂无应计订单" class="statistics-orders">
+          <el-table-column type="selection" width="40" :reserve-selection="true" :selectable="canMaintainCosts"/>
+          <el-table-column prop="posting_number" label="订单号" width="190" fixed="left" sortable="custom">
             <template #default="{row}"><div class="statistics-posting">
               <el-button type="primary" link @click="showLedger(row, $event)"><span class="statistics-posting-text">{{row.posting_number}}</span></el-button>
               <el-tooltip content="复制订单号"><el-button :icon="'CopyDocument'" circle text size="small" :aria-label="'复制订单号 '+row.posting_number" @click.stop="copyOrderNumber(row.posting_number)"/></el-tooltip>
             </div></template>
           </el-table-column>
-          <el-table-column prop="status" label="状态" width="105" sortable="custom"/>
-          <el-table-column prop="ordered_at" label="下单日期" width="180" sortable="custom"><template #default="{row}">{{dateTime(row.ordered_at)}}</template></el-table-column>
-          <el-table-column prop="accrual_date" label="本月最后应计日" width="142" sortable="custom"/>
-          <el-table-column prop="receipt_cny" label="实收 ¥" width="125" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_cny)}}<div v-if="row.receipt_cny!=null && (row.pending_positive || row.pending_negative || row.advertising_rub==null)" class="statistics-cell-note">按已归属</div></template></el-table-column>
-          <el-table-column prop="purchase_cny" label="采购费 ¥" width="125" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link :type="row.purchase_cny==null?'warning':'primary'" @click="openCosts([row])">{{row.purchase_cny==null?'待录入':money(row.purchase_cny)}}</el-button><span v-else>{{money(row.purchase_cny)}}</span><div v-if="row.cost_in_month===false && row.order_type!=='WHD订单'" class="statistics-cell-note">{{row.cost_month ? row.cost_month+' 计入' : '待正式入账'}}</div></template></el-table-column>
-          <el-table-column prop="label_cny" label="贴单费 ¥" width="110" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link type="primary" @click="openCosts([row])">{{money(row.label_cny)}}</el-button><span v-else>{{money(row.label_cny)}}</span></template></el-table-column>
-          <el-table-column prop="profit_cny" label="毛利 ¥" width="140" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.allocated_ad_rub==null?adStatus(row):row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'实收人民币减采购及贴单费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip><div class="statistics-cell-note">{{row.margin_pct==null?'—':money(row.margin_pct)+'%'}}</div></template></el-table-column>
-          <el-table-column prop="income_rub" label="销售收入 ₽" width="135" align="right" sortable="custom"><template #default="{row}"><span :class="{'statistics-warning':row.low_income}">{{money(row.income_rub)}}</span><el-tooltip v-if="row.pending_income ?? row.pending_positive" content="仅含已明确归属部分，另有收入待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
-          <el-table-column prop="ozon_fees_rub" label="代扣 ₽" width="130" align="right" sortable="custom"><template #default="{row}">{{money(row.ozon_fees_rub)}}<el-tooltip v-if="row.pending_negative" content="仅含已明确归属部分，另有费用待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
-          <el-table-column prop="advertising_rub" label="按订单广告 ₽" width="138" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_rub==null" class="statistics-warning">待核对</span><span v-else>{{money(row.advertising_rub)}}</span></template></el-table-column>
-          <el-table-column prop="allocated_ad_rub" label="点击广告分摊 ₽" width="155" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="adStatus(row)+(row.allocation_order_count?' · '+row.allocation_date+' / '+row.allocation_order_count+' 单':'')"><span :class="{'statistics-warning':row.allocated_ad_rub==null}">{{row.allocated_ad_rub==null?'待核对':money(row.allocated_ad_rub)}}</span></el-tooltip></template></el-table-column>
-          <el-table-column prop="receipt_rub" label="实收 ₽" width="130" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_rub)}}</template></el-table-column>
-          <el-table-column prop="cancel_reason" label="取消原因" min-width="280" show-overflow-tooltip sortable="custom"/>
-          <el-table-column prop="order_type" label="订单类型" width="150" sortable="custom"/>
+          <el-table-column prop="status" label="状态" width="76" sortable="custom"/>
+          <el-table-column prop="ordered_at" label="下单日期" width="92" sortable="custom"><template #default="{row}">{{dateTime(row.ordered_at).slice(0,10)}}</template></el-table-column>
+          <el-table-column prop="order_settled_date" label="结算日期" width="102" sortable="custom"><template #default="{row}">{{row.order_settled_date || '—'}}</template></el-table-column>
+          <el-table-column prop="receipt_cny" label="实收 ¥" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_cny)}}<div v-if="row.receipt_cny!=null && (row.pending_positive || row.pending_negative || row.advertising_rub==null)" class="statistics-cell-note">按已归属</div></template></el-table-column>
+          <el-table-column prop="purchase_cny" label="采购费 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link :type="row.purchase_cny==null?'warning':'primary'" @click="openCosts([row])">{{row.purchase_cny==null?'待录入':money(row.purchase_cny)}}</el-button><span v-else>{{money(row.purchase_cny)}}</span><div v-if="row.cost_in_month===false && row.order_type!=='WHD订单'" class="statistics-cell-note">{{row.cost_month ? row.cost_month+' 计入' : '待正式入账'}}</div></template></el-table-column>
+          <el-table-column prop="label_cny" label="贴单费 ¥" width="84" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link type="primary" @click="openCosts([row])">{{money(row.label_cny)}}</el-button><span v-else>{{money(row.label_cny)}}</span></template></el-table-column>
+          <el-table-column prop="profit_cny" label="毛利 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.allocated_ad_rub==null?adStatus(row):row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'实收人民币减采购及贴单费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip><div class="statistics-cell-note">{{row.margin_pct==null?'—':money(row.margin_pct)+'%'}}</div></template></el-table-column>
+          <el-table-column prop="income_rub" label="销售收入 ₽" width="104" align="right" sortable="custom"><template #default="{row}"><span :class="{'statistics-warning':row.low_income}">{{money(row.income_rub)}}</span><el-tooltip v-if="row.pending_income ?? row.pending_positive" content="仅含已明确归属部分，另有收入待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
+          <el-table-column prop="ozon_fees_rub" label="代扣 ₽" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.ozon_fees_rub)}}<el-tooltip v-if="row.pending_negative" content="仅含已明确归属部分，另有费用待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
+          <el-table-column prop="advertising_cpo_rub" label="推广-订单 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpo_rub==null" class="statistics-warning">待核对</span><span v-else>{{money(row.advertising_cpo_rub)}}</span></template></el-table-column>
+          <el-table-column prop="advertising_cpc_rub" label="推广-点击 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpc_rub==null" class="statistics-warning">待核对</span><span v-else>{{money(row.advertising_cpc_rub)}}</span></template></el-table-column>
+          <el-table-column prop="allocated_ad_rub" label="点击广告分摊 ₽" width="140" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="adStatus(row)+(row.allocation_order_count?' · '+row.allocation_date+' / '+row.allocation_order_count+' 单':'')"><span :class="{'statistics-warning':row.allocated_ad_rub==null}">{{row.allocated_ad_rub==null?'待核对':money(row.allocated_ad_rub)}}</span></el-tooltip></template></el-table-column>
+          <el-table-column prop="receipt_rub" label="实收 ₽" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_rub)}}</template></el-table-column>
+          <el-table-column prop="cancel_reason" label="取消原因" min-width="160" show-overflow-tooltip sortable="custom"/>
+          <el-table-column prop="order_type" label="订单类型" width="92" sortable="custom"/>
         </el-table>
         <div class="statistics-footer"><span>共 {{total}} 单 · 采购费含采购运费 · 贴单费默认 ¥1.50 / 单</span><el-pagination v-model:current-page="page" v-model:page-size="pageSize" :total="total" :page-sizes="[50,100,200,500]" layout="total, sizes, prev, pager, next" @current-change="load(false)" @size-change="applyFilter"/></div>
       </el-tab-pane>
       <el-tab-pane label="月度汇总" name="months">
         <div class="statistics-toolbar"><div class="statistics-filters"><el-date-picker v-model="monthRange" type="monthrange" value-format="YYYY-MM" format="YYYY-MM" start-placeholder="开始月份" end-placeholder="结束月份" :clearable="false" :disabled-date="disabledMonth" style="width:300px"/></div><div class="statistics-actions"><el-button :icon="'Setting'" @click="openMonth()">{{month}} 月度设置</el-button><el-tooltip content="导出月度汇总CSV"><el-button :icon="'Download'" circle aria-label="导出月度汇总" @click="exportMonths"/></el-tooltip></div></div>
-        <el-table :data="monthly" row-key="id" default-expand-all :tree-props="{children:'children'}" :row-class-name="({row})=>row.is_group?'statistics-month-child':'statistics-month-total'" border v-loading="loading" max-height="580" empty-text="暂无月份数据">
+        <el-table :data="monthly" row-key="id" default-expand-all :tree-props="{children:'children'}" :row-class-name="({row})=>row.is_group?'statistics-month-child':'statistics-month-total'" border v-loading="loading" max-height="calc(100vh - 380px)" empty-text="暂无月份数据">
           <el-table-column prop="label" label="月份" min-width="148" fixed="left" sortable/>
           <el-table-column prop="orders" label="订单数" width="78" align="right" sortable/>
           <el-table-column prop="income_rub" label="销售 ₽" min-width="112" align="right" sortable><template #default="{row}">{{row.coverage?.checked_days?money(row.income_rub):'未同步'}}</template></el-table-column>

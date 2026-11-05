@@ -5,8 +5,8 @@ export const REPORT_FIELDS = [
   { key: 'posting_number', label: '订单号', type: 'text' },
   { key: 'status', label: '状态', type: 'text' },
   { key: 'ordered_at', label: '下单日期', type: 'date' },
-  { key: 'accrual_date', label: '本月最后应计日', type: 'date' },
-  { key: 'settled_date', label: '结算日期', type: 'date' },
+  { key: 'order_settled_date', label: '结算日期', type: 'date' },
+  { key: 'settled_date', label: '末笔流水日', type: 'date' },
   { key: 'receipt_cny', label: '实收（¥）', type: 'number' },
   { key: 'purchase_cny', label: '采购（¥）', type: 'number' },
   { key: 'label_cny', label: '贴单（¥）', type: 'number' },
@@ -14,7 +14,8 @@ export const REPORT_FIELDS = [
   { key: 'margin_pct', label: '毛利率（%）', type: 'number' },
   { key: 'income_rub', label: '销售（₽）', type: 'number' },
   { key: 'ozon_fees_rub', label: '代扣（₽）', type: 'number' },
-  { key: 'advertising_rub', label: '按订单广告（₽）', type: 'number' },
+  { key: 'advertising_cpo_rub', label: '推广-订单（₽）', type: 'number' },
+  { key: 'advertising_cpc_rub', label: '推广-点击（₽）', type: 'number' },
   { key: 'allocated_ad_rub', label: '点击广告分摊（₽）', type: 'number' },
   { key: 'receipt_rub', label: '实收（₽）', type: 'number' },
   { key: 'cancel_reason', label: '取消原因', type: 'text' },
@@ -58,10 +59,17 @@ function attributedAds(entry, ledger, metadata) {
 }
 
 export function matchOrderAdRows(entries, orders) {
-  const candidates = new Map(), occurrences = new Map(), centsByPosting = new Map(), unmatched = [];
-  if (!entries.length) return { centsByPosting, unmatched };
+  const candidates = new Map(), occurrences = new Map(), centsByPosting = new Map(), cpoByPosting = new Map(), cpcByPosting = new Map(), unmatched = [];
+  // matchedRows：逐条记录「哪个包裹、哪一天、哪种模式、多少钱」，供写入结算明细用
+  const matchedRows = [];
+  if (!entries.length) return { centsByPosting, cpoByPosting, cpcByPosting, unmatched, matchedRows };
   const key = (order, sku) => `${order}:${sku}`;
-  const add = (posting, cents) => centsByPosting.set(posting, (centsByPosting.get(posting) || 0) + cents);
+  const add = (posting, cents, mode, date) => {
+    centsByPosting.set(posting, (centsByPosting.get(posting) || 0) + cents);
+    const target = mode === 'cpc' ? cpcByPosting : cpoByPosting;
+    target.set(posting, (target.get(posting) || 0) + cents);
+    if (date) matchedRows.push({ posting_number: posting, cents, mode, date });
+  };
   for (const order of orders) {
     const parent = order.posting_number.split('-').slice(0, 2).join('-');
     for (const product of order.products || []) {
@@ -82,12 +90,12 @@ export function matchOrderAdRows(entries, orders) {
     const count = matches.reduce((n, [, qty]) => n + qty, 0);
     if (matches.length === 1 && count >= entry.quantity) {
       const [posting] = matches[0];
-      add(posting, entry.cents);
+      add(posting, entry.cents, entry.mode, entry.date);
     } else if (matches.length > 1 && occurrences.get(k) === 1 && count === entry.quantity && entry.cents % count === 0) {
-      for (const [posting, qty] of matches) add(posting, entry.cents / count * qty);
+      for (const [posting, qty] of matches) add(posting, entry.cents / count * qty, entry.mode, entry.date);
     } else unmatched.push(entry);
   }
-  return { centsByPosting, unmatched };
+  return { centsByPosting, cpoByPosting, cpcByPosting, unmatched, matchedRows };
 }
 
 export function monthlyAccrualReport(options) {
@@ -99,7 +107,8 @@ export function dailySettlementReport(base, { month, orders = [], accruals = [],
   const metadata = new Map(orders.map((order) => [order.posting_number, order]));
   const withinMonth = (date) => date?.slice(0, 7) === month;
   const matchingEntries = byAccrualMonth ? orderAdEntries.filter((entry) => withinMonth(entry.date)) : orderAdEntries;
-  const { centsByPosting, unmatched } = matchOrderAdRows(matchingEntries, orders);
+  const { centsByPosting, cpoByPosting, cpcByPosting, unmatched } = matchOrderAdRows(matchingEntries, orders);
+  const hasAnyAd = cpoByPosting.size > 0 || cpcByPosting.size > 0;
   const whd = new Set(orders.filter((o) => o.schema === 'fbo').map((o) => o.posting_number));
   for (const entry of accruals) if (entry.posting?.delivery_schema === 'Whd') whd.add(entry.unit_number);
   const cohorts = new Map(), checked = new Set(orderDays.filter((d) => d.business_timezone === timezone).map((d) => String(d.ordered_date).slice(0, 10)));
@@ -168,6 +177,11 @@ export function dailySettlementReport(base, { month, orders = [], accruals = [],
     const receiptCny = receipt != null && base.summary.exchange_rate ? rounded(receipt * base.summary.exchange_rate) : null;
     const profit = receiptCny != null && row.purchase_cny != null ? rounded(receiptCny - row.purchase_cny - row.label_cny) : null;
     return { ...row, income_rub: sales, ozon_fees_rub: fees, advertising_rub: orderAd,
+      // 广告费按计费模式拆开：按订单付费 / 按点击付费
+      advertising_cpo_rub: isWhd && !byAccrualMonth ? 0 : hasAnyAd ? (cpoByPosting.get(row.posting_number) || 0) / 100 : null,
+      advertising_cpc_rub: isWhd && !byAccrualMonth ? 0 : hasAnyAd ? (cpcByPosting.get(row.posting_number) || 0) / 100 : null,
+      // 订单表上的结算日期（取消订单在被发现取消那天写入），供明细展示
+      order_settled_date: metadata.get(row.posting_number)?.settled_date ?? null,
       platform_net_rub: row.income_rub == null || row.ozon_fees_rub == null ? null : rounded(row.income_rub - row.ozon_fees_rub),
       allocated_ad_rub: allocated, receipt_rub: receipt, receipt_cny: receiptCny, profit_cny: profit,
       margin_pct: profit != null && sales > 0 && base.summary.exchange_rate ? rounded(profit / (sales * base.summary.exchange_rate) * 100) : null,
@@ -284,8 +298,10 @@ export function filterReportRows(rows, params = {}) {
     && (!search || row.posting_number.toLowerCase().includes(search))
     && (!params.status || (params.status === 'cancelled' ? row.raw_status.startsWith('cancelled') : row.raw_status === params.status))
     && (!params.order_type || row.order_type === params.order_type) && (params.low_income !== '1' || row.low_income)
-    && (params.missing_cost !== '1' || row.purchase_cny == null) && tests.every((test) => test(row)));
-  const key = catalog.has(params.sort) ? params.sort : (rows.some((row) => row.accrual_date) ? 'accrual_date' : 'settled_date'), direction = params.direction === 'desc' ? -1 : 1;
+    && (params.missing_cost !== '1' || row.purchase_cny == null)
+    && (params.unsettled !== '1' || row.order_settled_date == null)
+    && tests.every((test) => test(row)));
+  const key = catalog.has(params.sort) ? params.sort : 'ordered_at', direction = params.direction === 'desc' ? -1 : 1;
   return filtered.sort((a, b) => a[key] == null ? (b[key] == null ? 0 : 1) : b[key] == null ? -1
     : direction * (typeof a[key] === 'number' ? a[key] - b[key] : String(a[key]).localeCompare(String(b[key]))));
 }

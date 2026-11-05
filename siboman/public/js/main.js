@@ -186,6 +186,7 @@ const initApp = () => {
         if (path.includes('upload')) return 'upload';
         if (path.includes('listing-history')) return 'listing-history';
         if (path.includes('ai-generator')) return 'ai-generator';
+        if (path.includes('settlement-detail')) return 'settlement-detail';
         if (path.includes('statistics-analysis')) return 'statistics-analysis';
         if (path.includes('analytics')) return 'analytics';
         if (path.includes('data-screen')) return 'data-screen';
@@ -275,9 +276,11 @@ const initApp = () => {
             <el-menu-item index="#/sales-funnel" @click="goTo('#/sales-funnel')">
               <el-icon><TrendCharts /></el-icon><span>销售漏斗</span>
             </el-menu-item>
-            <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')">
-              <el-icon><DataAnalysis /></el-icon><span>统计分析</span>
-            </el-menu-item>
+            <el-sub-menu index="statistics">
+              <template #title><el-icon><DataAnalysis /></el-icon><span>统计分析</span></template>
+              <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')"><span>月度统计</span></el-menu-item>
+              <el-menu-item index="#/settlement-detail" @click="goTo('#/settlement-detail')"><span>结算明细</span></el-menu-item>
+            </el-sub-menu>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
             </el-menu-item>
@@ -329,6 +332,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'ai-generator'" class="erp-route-page"><ai-image-generator-view /></div>
             <div v-else-if="routeName === 'analytics'" class="erp-route-page"><analytics-center-view /></div>
             <div v-else-if="routeName === 'statistics-analysis'" class="erp-route-page"><statistics-analysis-view /></div>
+            <div v-else-if="routeName === 'settlement-detail'" class="erp-route-page"><settlement-detail-view /></div>
             <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
             <div v-else-if="routeName === 'market-discovery'" class="erp-route-page"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
@@ -371,6 +375,7 @@ const initApp = () => {
   register('ai-image-generator-view', window.AIImageGeneratorView);
   register('analytics-center-view', window.AnalyticsCenterView);
   register('statistics-analysis-view', window.StatisticsAnalysisView);
+  register('settlement-detail-view', window.SettlementDetailView);
   register('data-screen-view', window.DataScreenView);
   register('market-discovery-view', window.MarketDiscoveryView);
   register('store-management-view', window.StoreManagementView);
