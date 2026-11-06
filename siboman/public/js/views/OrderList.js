@@ -810,7 +810,7 @@ window.OrderListView = {
         let ordered = picked;
         try {
           exportStep(5, '正在按拣货单规则排序…');
-          const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked }, { timeout: 30000 });
+          const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked, store_ids: storeIds }, { timeout: 30000 });
           if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
         } catch (_e) { /* 排序失败就用原顺序 */ }
         // 单批最多 3 单；Ozon 的标签任务轮询可能很慢，10 单会耗尽插件消息通道的等待时间。
@@ -958,7 +958,9 @@ window.OrderListView = {
         list.push(pn);
       }
       const duplicated = raw.length - list.length;
-      if (duplicated > 0) notify.info(`已自动去掉 ${duplicated} 个重复单号`, 8000);
+      // Accio Work (2026-11-06)：notify 只有 success/warning/error，没有 info，
+      //   之前误用 notify.info 会抛 TypeError，导致「点查询没反应」（弹窗关不上、列表不刷新）。
+      if (duplicated > 0) notify.warning(`已自动去掉 ${duplicated} 个重复单号`, 8000);
       postingFilter.value = list.slice(0, 1000);
       postingDialog.visible = false;
       pagination.currentPage = 1;
@@ -1602,7 +1604,7 @@ window.OrderListView = {
         </div>
 
         <el-table :data="displayedOrders" v-loading="loading" element-loading-text="正在读取订单..." border size="large" :empty-text="orderEmptyText" :row-key="orderRowKey" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" @selection-change="onSelectionChange">
-          <el-table-column type="selection" width="52" :selectable="(row) => row.status !== 'cancelled'" />
+          <el-table-column type="selection" width="52" :selectable="(row) => true" />
           <el-table-column label="倒计时" width="110">
             <template #default="{ row }">
               <div :style="{ width:'64px', minHeight:'48px', border:'1px solid', borderRadius:'10px', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', fontWeight:800, ...deadlineBadgeStyle(row) }">

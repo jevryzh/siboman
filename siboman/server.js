@@ -15337,6 +15337,30 @@ app.post("/api/ai/analyze", requireAuth, async (req, res) => {
 });
 
 /**
+ * Accio Work (2026-11-06)：同一 Ozon 店铺（相同 client_id）可能被多个账号重复接入，
+ *   形成多条 app_stores 记录，订单分别缓存在各自 store_id 下。实测 HappyFriday
+ *   (client_id 3010672) 存在两条 store：eason 的 5a7e33fa 与 happyfriday 的 1629ee99，
+ *   各自缓存约 7800 单 → 每个账号只看得到一半，表现为「批量查询 199 vs 200」、
+ *   「导出毛线标签/拣货单拿不到数据」「图片时有时无」。
+ *   修法：订单读取/导出统一按「同一 client_id 的所有 store_id」归并，同店铺订单对所有管理账号可见。
+ *   （client_id 相同 = 同一个 Ozon 店铺，跨店铺无越权风险。）
+ */
+const resolveSharedStoreIds = async (db, storeIds) => {
+  const ids = (Array.isArray(storeIds) ? storeIds : [storeIds]).map(String).filter(Boolean);
+  if (!ids.length) return [];
+  const r = await db.query(
+    `SELECT DISTINCT s2.id
+       FROM app_stores s1
+       JOIN app_stores s2
+         ON s2.client_id = s1.client_id
+        AND s2.platform = COALESCE(NULLIF(s1.platform, ''), s2.platform)
+      WHERE s1.id = ANY($1::uuid[])`,
+    [ids],
+  );
+  return r.rows.map((x) => x.id);
+};
+
+/**
  * v0.3.3 订单列表 - 平铺金额 + 物理 JOIN 商品表拉图
  * 输入: {store_id, status, limit, offset, since, to}
  * 输出: 每单含 total_rub / total_cny / commission_cny / payout_cny / product_count / products[{image,name,offer_id,sku,quantity,price_cny}]
@@ -15427,11 +15451,16 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         }
       }
       const imageMap = new Map();
+      // Accio Work (2026-11-06)：同店铺多账号归并，按同一 client_id 的所有 store 取图
+      const enrichSharedIds = db ? await resolveSharedStoreIds(db, storeId) : [storeId];
+      const enrichScope = enrichSharedIds.length ? enrichSharedIds : [storeId];
       if (allOfferIds.size && db) {
         const joinRows = await db.query(
-          `SELECT offer_id, image, name, purchase_price_cny, source_url_1688 FROM app_products
-           WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])`,
-          [req.user.id, storeId, Array.from(allOfferIds)],
+          `SELECT DISTINCT ON (offer_id) offer_id, image, name, purchase_price_cny, source_url_1688
+             FROM app_products
+            WHERE store_id = ANY($1::uuid[]) AND offer_id = ANY($2::text[])
+            ORDER BY offer_id, (image IS NULL OR image = '') ASC`,
+          [enrichScope, Array.from(allOfferIds)],
         );
         for (const r of joinRows.rows) imageMap.set(r.offer_id, {
           image: r.image,
@@ -15446,8 +15475,8 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         const costRows = await db.query(
           `SELECT posting_number, offer_id, source_url_1688, outbound_cost_cny
              FROM app_order_costs
-            WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
-          [req.user.id, storeId, postingNumbers],
+            WHERE store_id = ANY($1::uuid[]) AND posting_number = ANY($2::text[])`,
+          [enrichScope, postingNumbers],
         );
         for (const r of costRows.rows) {
           orderCostMap.set(r.posting_number, {
@@ -15677,8 +15706,10 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       else if (!hasExplicitRange && cacheCount < 550) await syncCacheWindow(defaultCacheHistoryDays);
       await pruneCacheWindow(defaultCacheHistoryDays);
 
-      const where = ["user_id = $1", "store_id = $2"];
-      const params = [req.user.id, storeId];
+      // Accio Work (2026-11-06)：按同一 client_id 的所有 store 归并（同店铺多账号各见一半）
+      const sharedStoreIds = db ? await resolveSharedStoreIds(db, storeId) : [storeId];
+      const where = ["store_id = ANY($1::uuid[])"];
+      const params = [sharedStoreIds.length ? sharedStoreIds : [storeId]];
       if (req.body?.since) {
         params.push(req.body.since);
         where.push(`in_process_at >= $${params.length}`);
@@ -15737,8 +15768,8 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       if (postingFilter.length) {
         try {
           const foundRes = await db.query(
-            `SELECT posting_number FROM app_order_cache WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
-            [req.user.id, storeId, postingFilter],
+            `SELECT posting_number FROM app_order_cache WHERE store_id = ANY($1::uuid[]) AND posting_number = ANY($2::text[])`,
+            [sharedStoreIds.length ? sharedStoreIds : [storeId], postingFilter],
           );
           const foundSet = new Set(foundRes.rows.map((r) => String(r.posting_number)));
           missingPostings = postingFilter.filter((pn) => !foundSet.has(pn)).slice(0, 200);
@@ -15824,10 +15855,13 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
       const r = await db.query(
         // Accio Work (2026-11-06)：原来按 user_id 过滤商品，导致「订单所属店铺」与
         //   「商品导入人」不是同一个账号时（如 eason 导入、HappyFriday 运营 查看）
-        //   取不到 image → 订单列表图片全空。店铺权限已由 storeId 校验，这里只需按店铺取。
-        `SELECT offer_id, image, name, purchase_price_cny, source_url_1688
-           FROM app_products WHERE store_id=$1 AND offer_id = ANY($2::text[])`,
-        [storeId, offerIds],
+        //   取不到 image → 订单列表图片全空。这里按同一 client_id 的所有店铺取，
+        //   并优先保留有图的记录（同一 offer_id 可能被两个店铺重复导入）。
+        `SELECT DISTINCT ON (offer_id) offer_id, image, name, purchase_price_cny, source_url_1688
+           FROM app_products
+          WHERE store_id = ANY($1::uuid[]) AND offer_id = ANY($2::text[])
+          ORDER BY offer_id, (image IS NULL OR image = '') ASC`,
+        [sharedStoreIds.length ? sharedStoreIds : [storeId], offerIds],
       );
       const meta = new Map(r.rows.map(x => [x.offer_id, x]));
       p.products = p.products.map(pd => {
@@ -16487,28 +16521,30 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 5000)
       : [];
     if (!picked.length) return res.status(400).json({ success: false, error: "请先勾选要导出的订单" });
+    // Accio Work (2026-11-06)：同店铺多账号归并，避免各见一半
+    const sharedIds = await resolveSharedStoreIds(db, storeIds);
     // 先按「订单 × 色号」聚合，再按订单汇总成 12×1/18×1/26×1
     const result = await db.query(
       `WITH items AS (
-         SELECT c.posting_number AS pn,
-                substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-           FROM app_order_cache c
-           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-          WHERE c.user_id = $1
-            AND c.posting_number = ANY($2::text[])
-            AND COALESCE(p->>'name','') ILIKE '%пряж%'
-            AND COALESCE(p->>'offer_id','') <> ''
-          GROUP BY 1, 2
-       )
-       SELECT pn,
-              string_agg(color || '×' || qty, '/' ORDER BY color) AS color_qty,
-              SUM(qty)::int AS total_qty,
-              COUNT(*)::int AS color_kinds,
-              MIN(color) AS first_color
-         FROM items
-        GROUP BY pn`,
-      [req.user.id, picked],
+          SELECT c.posting_number AS pn,
+                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+            FROM app_order_cache c
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+           WHERE c.store_id = ANY($1::uuid[])
+             AND c.posting_number = ANY($2::text[])
+             AND COALESCE(p->>'name','') ILIKE '%пряж%'
+             AND COALESCE(p->>'offer_id','') <> ''
+           GROUP BY 1, 2
+        )
+        SELECT pn,
+               string_agg(color || '×' || qty, '/' ORDER BY color) AS color_qty,
+               SUM(qty)::int AS total_qty,
+               COUNT(*)::int AS color_kinds,
+               MIN(color) AS first_color
+          FROM items
+         GROUP BY pn`,
+      [sharedIds.length ? sharedIds : storeIds, picked],
     );
     // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
     // v2.2.9.175 Label = 订单号第一个 "-" **前面**那一段的末 4 位
@@ -16655,21 +16691,25 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
       ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 5000)
       : [];
     if (!picked.length) return res.json({ success: true, posting_numbers: [] });
+    // Accio Work (2026-11-06)：同店铺多账号归并（前端会带 store_ids）
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    const sharedIds = storeIds.length ? await resolveSharedStoreIds(db, storeIds) : [];
     const rows = await db.query(
       `WITH items AS (
-         SELECT c.posting_number AS pn,
-                substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-           FROM app_order_cache c
-           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-          WHERE c.user_id = $1
-            AND c.posting_number = ANY($2::text[])
-            AND COALESCE(p->>'name','') ILIKE '%пряж%'
-            AND COALESCE(p->>'offer_id','') <> ''
-          GROUP BY 1, 2
-       )
-       SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS kinds, MIN(color) AS c1 FROM items GROUP BY pn`,
-      [req.user.id, picked],
+          SELECT c.posting_number AS pn,
+                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+            FROM app_order_cache c
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+           WHERE ${sharedIds.length ? "c.store_id = ANY($1::uuid[])" : "c.user_id = $1"}
+             AND c.posting_number = ANY($2::text[])
+             AND COALESCE(p->>'name','') ILIKE '%пряж%'
+             AND COALESCE(p->>'offer_id','') <> ''
+           GROUP BY 1, 2
+        )
+        SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS kinds, MIN(color) AS c1 FROM items GROUP BY pn`,
+      [sharedIds.length ? sharedIds : req.user.id, picked],
     );
     const sorted = sortYarnOrderRows(rows.rows);
     res.json({ success: true, posting_numbers: sorted.map((r) => String(r.pn)) });
@@ -16717,37 +16757,41 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
       ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 5000)
       : [];
     if (!picked.length) return res.status(400).json({ success: false, error: "请先勾选要导出的订单" });
+    // Accio Work (2026-11-06)：同店铺多账号归并，避免各见一半
+    const sharedIds = await resolveSharedStoreIds(db, storeIds);
+    const scopeIds = sharedIds.length ? sharedIds : storeIds;
     const rows = await db.query(
       `SELECT DISTINCT c.posting_number
          FROM app_order_cache c
          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-        WHERE c.user_id = $1
+        WHERE c.store_id = ANY($1::uuid[])
           AND c.posting_number = ANY($2::text[])
           AND COALESCE(p->>'name','') ILIKE '%пряж%'`,
-      [req.user.id, picked],
+      [scopeIds, picked],
     );
     // 用和「导出毛线拣货单」**完全相同**的 SQL + 排序规则，保证两个文件的顺序一一对应
     const orderRows = await db.query(
       `WITH items AS (
-         SELECT c.posting_number AS pn,
-                substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-           FROM app_order_cache c
-           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-          WHERE c.user_id = $1
-            AND c.posting_number = ANY($2::text[])
-            AND COALESCE(p->>'name','') ILIKE '%пряж%'
-            AND COALESCE(p->>'offer_id','') <> ''
-          GROUP BY 1, 2
-       )
-       SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS color_kinds, MIN(color) AS first_color
-         FROM items GROUP BY pn`,
-      [req.user.id, picked],
+          SELECT c.posting_number AS pn,
+                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+            FROM app_order_cache c
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
+           WHERE c.store_id = ANY($1::uuid[])
+             AND c.posting_number = ANY($2::text[])
+             AND COALESCE(p->>'name','') ILIKE '%пряж%'
+             AND COALESCE(p->>'offer_id','') <> ''
+           GROUP BY 1, 2
+        )
+        SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS color_kinds, MIN(color) AS first_color
+          FROM items GROUP BY pn`,
+      [scopeIds, picked],
     );
     const sortedRows = sortYarnOrderRows(orderRows.rows);
     const postings = sortedRows.map((r) => String(r.pn));
     if (!postings.length) return res.status(400).json({ success: false, error: "没有符合条件的毛线订单" });
-    const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2`, [storeIds[0], req.user.id]);
+    // Accio Work (2026-11-06)：凭证只按 store 取（同店铺多账号），不再卡 user_id
+    const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id = ANY($1::uuid[])`, [scopeIds]);
     if (!creds.rowCount) return res.status(404).json({ success: false, error: "未找到店铺凭证" });
     const { client_id: clientId, api_key: apiKey } = creds.rows[0];
     // v2.2.9.181 Ozon 面单接口有「每秒请求数」限流（429），并发 8 会直接触发限流导致整批失败。
