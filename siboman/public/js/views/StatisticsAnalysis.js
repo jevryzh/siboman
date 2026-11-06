@@ -3,10 +3,17 @@ window.StatisticsAnalysisView = {
     const { ref, computed, onMounted, onBeforeUnmount, watch } = Vue;
     const today = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
     const offsetMonth = (month, delta) => { const d = new Date(month + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + delta); return d.toISOString().slice(0, 7); };
+    const shiftDay = (value, days) => new Date(Date.parse(`${value}T00:00:00Z`) + days * 86400000).toISOString().slice(0, 10);
     // 默认展示本月，切换月份时按所选月份重新取数
     const month = ref(today().slice(0, 7));
     const monthRange = ref([offsetMonth(today().slice(0, 7), -1), today().slice(0, 7)]);
     const tab = ref('orders'), loading = ref(false), saving = ref(false), syncing = ref(false), error = ref('');
+    // 订单表同步（这里才是订单维度：状态 / 结算日期），与应计原始数据页的应计流水同步分开
+    const orderSyncing = ref(false), orderLogLoading = ref(false), orderLogs = ref([]), orderLogLast = ref('');
+    // 订单同步的实时进度：{phase, progress, fetched, changed}
+    const orderSyncProgress = ref(null);
+    // 手动同步订单表用的区间：默认今天往前一周
+    const orderSyncRange = ref([shiftDay(today(), -7), today()]);
     const rows = ref([]), monthly = ref([]), summary = ref({}), run = ref(null), total = ref(0);
     const page = ref(1), pageSize = ref(100), search = ref(''), status = ref(''), orderType = ref(''), exporting = ref(false);
     // 主筛选栏常驻的两个日期区间：下单日期 / 结算日期
@@ -25,7 +32,9 @@ window.StatisticsAnalysisView = {
     const cookieVisible = ref(false), cookieSaving = ref(false), cookieInput = ref(''), webSession = ref(null);
     const costPageRows = computed(() => drafts.value.slice((costPage.value - 1) * 50, costPage.value * 50));
     const monthDraft = ref({}), monthScope = ref(null), settingsError = ref('');
-    const changesVisible = ref(false), changes = ref([]), changesLoading = ref(false);
+    // 记录中心：订单表同步记录 + 修改记录 合到一个弹窗，用标签切换
+    const recordsVisible = ref(false), recordsTab = ref('order');
+    const changes = ref([]), changesLoading = ref(false);
     const ledgerVisible = ref(false), ledgerLoading = ref(false), ledger = ref([]), ledgerPending = ref([]), ledgerOrder = ref('');
     const ledgerMonths = ref([]);
     const ledgerError = ref(''), orderTab = ref('fees'), orderRow = ref(null), orderDetail = ref(null);
@@ -196,6 +205,73 @@ window.StatisticsAnalysisView = {
         if (sameScope(scope)) { run.value = response.data.run; await load(); }
       } catch (e) { if (sameScope(scope)) error.value = message(e); }
       finally { syncing.value = false; }
+    }
+    // 同步订单表：按顶部区间拉订单（默认今天往前一周），再补一批非终态订单，回填状态与结算日期
+    // 后端把每一步写进 app_statistics_order_syncs(phase/progress)，这里边同步边轮询，实时画进度
+    let orderSyncTimer = null;
+    function stopOrderSyncPoll() { if (orderSyncTimer) { clearInterval(orderSyncTimer); orderSyncTimer = null; } }
+    async function pollOrderSync() {
+      try {
+        const r = await axios.get('/api/statistics/order-syncs', { params: { store_id: sid() } });
+        const running = (r.data.rows || []).find((row) => row.status === 'running');
+        if (!running) return;
+        orderSyncProgress.value = {
+          phase: running.phase || '正在同步…',
+          progress: Number(running.progress) || 0,
+          fetched: Number(running.fetched) || 0,
+          changed: Number(running.changed) || 0,
+          startedAt: running.started_at || '',
+        };
+      } catch { /* 轮询失败不影响同步本身，下一轮再试 */ }
+    }
+    async function syncOrdersNow() {
+      if (!sid() || orderSyncing.value) return;
+      const range = Array.isArray(orderSyncRange.value) ? orderSyncRange.value : [];
+      if (!range[0] || !range[1]) { ElementPlus.ElMessage.warning('请先选择订单同步区间'); return; }
+      orderSyncing.value = true; error.value = '';
+      orderSyncProgress.value = { phase: '正在启动同步…', progress: 1, fetched: 0, changed: 0, startedAt: '' };
+      stopOrderSyncPoll();
+      orderSyncTimer = setInterval(pollOrderSync, 1200);
+      try {
+        const { data } = await axios.post('/api/statistics/sync-orders', { store_id: sid(), from: range[0], to: range[1] });
+        orderSyncProgress.value = { phase: '同步完成，正在刷新表格…', progress: 100, fetched: data.fetched, changed: data.changed, startedAt: '' };
+        ElementPlus.ElMessage.success(`订单同步完成（${range[0]} ~ ${range[1]}）：读取 ${data.fetched} 单，更新 ${data.changed} 单`);
+        await load();
+      } catch (e) { error.value = message(e); }
+      finally {
+        stopOrderSyncPoll();
+        orderSyncing.value = false;
+        setTimeout(() => { if (!orderSyncing.value) orderSyncProgress.value = null; }, 1600);
+      }
+    }
+    async function loadOrderLogs() {
+      if (!sid()) return;
+      orderLogLoading.value = true;
+      try {
+        const r = await axios.get('/api/statistics/order-syncs', { params: { store_id: sid() } });
+        orderLogs.value = r.data.rows || [];
+        orderLogLast.value = r.data.last_succeeded_at || '';
+      } catch (e) { error.value = message(e); }
+      finally { orderLogLoading.value = false; }
+    }
+    function openRecords(tab = recordsTab.value || 'order') {
+      if (!sid()) return;
+      recordsTab.value = tab === 'change' ? 'change' : 'order';
+      recordsVisible.value = true;
+      loadOrderLogs();
+      if (recordsTab.value === 'change') loadChanges();
+    }
+    function loadChanges() {
+      changesLoading.value = true;
+      const store = sid();
+      axios.get('/api/statistics/changes', { params: { store_id: store } })
+        .then((response) => { if (store === sid()) changes.value = response.data.rows; })
+        .catch((e) => { error.value = message(e); })
+        .finally(() => { changesLoading.value = false; });
+    }
+    function recordsTabChanged(name) {
+      if (name === 'change' && !changes.value.length) loadChanges();
+      if (name === 'order' && !orderLogs.value.length) loadOrderLogs();
     }
     const canMaintainCosts = (row) => row.order_type !== 'WHD订单' && row.cost_in_month !== false;
     function openCosts(items = selected.value, source = 'manual') {
@@ -449,37 +525,54 @@ window.StatisticsAnalysisView = {
       } finally { cookieSaving.value = false; }
     }
     // 导入模板：与页面导出 CSV 同构，但只保留可回填的列，便于原样导入。
-    const TEMPLATE_HEAD = ['订单号', '采购费用（CNY，含采购运费）', '贴单费用（CNY）', '订单状态', '结算日', '销售收入（RUB）', 'Ozon费用（RUB）', '取消原因', '订单类型'];
+    const TEMPLATE_HEAD = ['订单号', '订单日期', '订单状态', '订单类型', '取消原因', '采购费用（CNY，含采购运费）', '贴单费用（CNY）'];
+    const TEMPLATE_MAX = 20000;
     const templateAmount = (value, label, rowNo) => {
       if (value == null || String(value).trim() === '') return null;
       const text = String(value).trim().replace(/[,，¥￥\s]/g, '');
       if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error(`第 ${rowNo} 行${label}无效：${String(value).trim().slice(0, 20)}`);
       return Number(text);
     };
+    // 按「结算明细」页当前的查询条件把命中的订单全部拉回来（供下载模板用），不受列表分页限制
+    async function queryAllRows() {
+      const params = filters(), size = 500, known = new Map();
+      for (let p = 1; p <= 400; p++) {
+        const base = { ...params, page: p, page_size: size };
+        const result = batchNumbers.value.length
+          ? await axios.post('/api/statistics/report', { ...base, posting_numbers: batchNumbers.value })
+          : await axios.get('/api/statistics/report', { params: base });
+        result.data.rows.forEach((row) => known.set(row.posting_number, row));
+        if (p * size >= result.data.total) return known;
+      }
+      throw new Error('命中的订单超过 20 万单，请缩小查询范围后再下载模板');
+    }
     async function downloadTemplate() {
       const scope = ctx();
       if (!scope.store_id) return;
       if (!window.XLSX) { error.value = 'Excel组件尚未加载，请刷新后重试'; return; }
       loading.value = true; error.value = '';
       try {
-        const known = await monthRows(scope);
-        if (!known) return;
-        const list = [...known.values()].filter(canMaintainCosts).sort((a, b) => String(a.settled_date).localeCompare(String(b.settled_date)) || a.posting_number.localeCompare(b.posting_number));
-        if (!list.length) throw new Error('所选月份暂无可维护费用的订单');
-        if (list.length > 5000) throw new Error(`本月共 ${list.length} 单，超过单次导入上限 5000 单，请分开维护`);
-        const sheet = XLSX.utils.aoa_to_sheet([TEMPLATE_HEAD, ...list.map((r) => [r.posting_number, r.purchase_cny ?? '', r.label_cny ?? '', r.status, r.settled_date, r.income_rub ?? '', r.ozon_fees_rub ?? '', r.cancel_reason ?? '', r.order_type])]);
-        sheet['!cols'] = [{ wch: 22 }, { wch: 24 }, { wch: 16 }, { wch: 10 }, { wch: 12 }, { wch: 15 }, { wch: 15 }, { wch: 30 }, { wch: 14 }];
+        const known = await queryAllRows();
+        if (!sameScope(scope)) return;
+        // 与导入保持同一口径：只要 7/1 之后的非 WHD 订单
+        const list = [...known.values()].filter(canMaintainCosts)
+          .sort((a, b) => String(a.ordered_at || '').localeCompare(String(b.ordered_at || '')) || a.posting_number.localeCompare(b.posting_number));
+        if (!list.length) throw new Error('当前查询条件下没有可维护采购/贴单的订单（WHD 订单不导入）');
+        const day = (value) => value ? new Date(Date.parse(value) + 8 * 3600000).toISOString().slice(0, 10) : '';
+        const sheet = XLSX.utils.aoa_to_sheet([TEMPLATE_HEAD, ...list.map((r) => [
+          r.posting_number, day(r.ordered_at), r.status, r.order_type, r.cancel_reason ?? '', r.purchase_cny ?? '', r.label_cny ?? ''])]);
+        sheet['!cols'] = [{ wch: 22 }, { wch: 12 }, { wch: 14 }, { wch: 14 }, { wch: 26 }, { wch: 24 }, { wch: 16 }];
         sheet['!freeze'] = { xSplit: '0', ySplit: '1' };
         const help = XLSX.utils.aoa_to_sheet([
           ['导入说明'], [''],
-          ['模板只含成本归属所选月份的非 WHD 订单，以及当前已维护的采购费/贴单费。'],
-          ['1. 只填写需要修改的金额，留空的单元格表示保持不变（不会清零）。'],
-          ['2. 采购费用 = 采购价 + 采购运费，单位人民币，最多两位小数。'],
-          ['3. 贴单费用按单收取，按实际金额填写；留空表示未录入，页面显示为空。'],
-          ['4. 文件首行必须含「订单号」，以及「采购费用」「贴单费用」中至少一列。'],
-          ['5. 单次最多 5000 单；保存前会弹出预览，确认后才写入，并保留修改快照可回滚。'],
-          ['6. 只导入贴单费时，采购费列可以整列留空，原有采购费不受影响。'],
-          ['7. 支持 .xlsx 与 .csv；订单成本必须归属当前店铺的所选月份，否则整批拒绝导入。'],
+          ['模板按「结算明细」页当前的查询条件导出，只含 2026-07-01 之后的非 WHD 订单，并带出已维护的采购费/贴单费。'],
+          ['1. 以「订单号」为准，只覆盖「采购费用」「贴单费用」两列；其余列仅供核对，改了不会导入。'],
+          ['2. 只填写需要修改的金额，留空的单元格表示保持不变（不会清零）。'],
+          ['3. 采购费用 = 采购价 + 采购运费，单位人民币，最多两位小数。'],
+          ['4. 贴单费用按单收取，按实际金额填写；留空表示不修改。'],
+          ['5. 只导入贴单费时，采购费列可以整列留空，原有采购费不受影响。'],
+          [`6. 单次最多 ${TEMPLATE_MAX} 单；保存前会弹出预览，确认后才写入，并保留修改快照可回滚。`],
+          ['7. 支持 .xlsx 与 .csv；WHD 订单会被自动跳过。'],
         ]);
         help['!cols'] = [{ wch: 96 }];
         const book = XLSX.utils.book_new();
@@ -519,10 +612,10 @@ window.StatisticsAnalysisView = {
           imported.push({ posting_number: id, ...(purchase === null ? {} : { purchase_cny: purchase }), ...(label === null ? {} : { label_cny: label }) });
         }
         if (!imported.length) throw new Error('没有读到要导入的金额，请填写“采购费用”或“贴单费用”后重试');
-        if (imported.length > 5000) throw new Error(`一次最多导入 5000 单，本次 ${imported.length} 单`);
+        if (imported.length > TEMPLATE_MAX) throw new Error(`一次最多导入 ${TEMPLATE_MAX} 单，本次 ${imported.length} 单`);
         const known = await monthRows(scope);
         if (!known) return;
-        for (const item of imported) if (!known.has(item.posting_number)) throw new Error(`订单成本不属于当前店铺的所选月份：${item.posting_number}`);
+        for (const item of imported) if (!known.has(item.posting_number)) throw new Error(`订单不在当前店铺的订单表里：${item.posting_number}`);
         const editable = imported.filter((item) => canMaintainCosts(known.get(item.posting_number)));
         const skipped = imported.length - editable.length;
         if (skipped) ElementPlus.ElMessage.info(`已跳过 ${skipped} 单：WHD 或成本不在所选月份`);
@@ -560,11 +653,9 @@ window.StatisticsAnalysisView = {
       finally { saving.value = false; }
     }
     async function openChanges() {
-      changesVisible.value = true; changesLoading.value = true;
-      const store = sid();
-      try { const response = await axios.get('/api/statistics/changes', { params: { store_id: store } }); if (store === sid()) changes.value = response.data.rows; }
-      catch (e) { error.value = message(e); }
-      finally { changesLoading.value = false; }
+      if (!sid()) return;
+      recordsVisible.value = true; recordsTab.value = 'change';
+      loadChanges();
     }
     async function rollback(item) {
       const store = sid();
@@ -784,10 +875,11 @@ window.StatisticsAnalysisView = {
     function disabledMonth(date) { const current = Number(today().slice(0, 4)) * 12 + Number(today().slice(5, 7)) - 1; const value = date.getFullYear() * 12 + date.getMonth(); return value > current || value < current - 36; }
     function shopChanged() {
       generation++; rows.value = []; monthly.value = []; summary.value = {}; run.value = null; selected.value = [];
-      costVisible.value = false; monthVisible.value = false; changesVisible.value = false; ledgerVisible.value = false;
+      costVisible.value = false; monthVisible.value = false; recordsVisible.value = false; ledgerVisible.value = false;
       exceptionVisible.value = false;
       adsVisible.value = false; configVisible.value = false; configDraft.value = {}; advertising.value = {}; rules.value = []; appliedRules.value = [];
       batchNumbers.value = []; batchVisible.value = false; batchText.value = '';
+      stopOrderSyncPoll(); orderSyncProgress.value = null;
       table.value?.clearSelection(); page.value = 1; load();
     }
     watch(month, () => { ledgerVisible.value = false; if (!month.value) return; loadSummary(); });
@@ -795,16 +887,16 @@ window.StatisticsAnalysisView = {
     watch(tab, (value) => { if (value === 'orders' && tableMonth.value !== month.value) applyFilter(); });
     watch(monthRange, () => { if (monthRange.value?.length === 2) load(); });
     onMounted(() => {
-      // 不做定时轮询，需要时用顶部刷新按钮手动刷新
+      // 不做定时轮询，进页面、切月份、同步完成后各拉一次
       window.addEventListener('shop-changed', shopChanged);
       window.addEventListener('message', onSettleProgress);
       load();
     });
-    onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); window.removeEventListener('shop-changed', shopChanged); window.removeEventListener('message', onSettleProgress); });
-    return { tab, month, monthRange, loading, saving, syncing, exporting, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
+    onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); stopOrderSyncPoll(); window.removeEventListener('shop-changed', shopChanged); window.removeEventListener('message', onSettleProgress); });
+    return { tab, month, monthRange, loading, saving, syncing, orderSyncing, orderSyncRange, orderSyncProgress, orderLogLoading, orderLogs, orderLogLast, syncOrdersNow, loadOrderLogs, recordsVisible, recordsTab, openRecords, recordsTabChanged, exporting, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
       settledSyncing, settledStage, settleRun, settleResult, settlePercent, settleProgressText, copyFailed, onSettleProgress, cookieVisible, cookieSaving, cookieInput, webSession, syncSettledDates, cookieFromBrowser, saveCookie, loadWebSession,
       orderDateRange, settleDateRange,
-      selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changesVisible, changes, changesLoading,
+      selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changes, changesLoading,
       ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, ledgerMonths, activeRun, progress, money, dateTime, titleProfit, monthlyProfit, monthlyProfitEstimated, monthlyProfitNote, sortMonthlyProfit, monthlyReceipt, feeName, disabledMonth, costPage, costPageRows,
       ledgerError, orderTab, orderRow, orderDetail, detailLoading, detailLoaded, detailError, orderQuantity, copyOrderNumber, loadOrderDetail,
       exceptionScope, exceptionVisible, exceptionLoading, exceptionError, exceptionPage, exceptions, monthlyIssues, openExceptions, loadExceptions, exceptionReason,
@@ -817,20 +909,34 @@ window.StatisticsAnalysisView = {
   template: `
   <section class="statistics-workbench">
     <header class="statistics-heading">
-      <div><h2>月度统计</h2><div class="statistics-meta">每日 02:00 / 09:30（北京时间）自动更新 <span v-if="summary.coverage?.last_updated_at">· 财务更新 {{dateTime(summary.coverage.last_updated_at)}}</span><span v-if="summary.coverage?.as_of_date"> · 应计核对至 {{summary.coverage.as_of_date}}</span><span> · 每日广告（莫斯科）{{advertising.configured?'Performance':'日报导入'}}</span><span v-if="summary.missing_advertising" class="statistics-warning"> · {{summary.missing_advertising}} 单待核对</span><span v-if="advertising.last_error" class="statistics-warning"> · {{advertising.last_error}}</span></div></div>
+      <div><div class="statistics-title-row"><h2>月结统计</h2><el-date-picker v-model="month" type="month" value-format="YYYY-MM" format="YYYY 年 MM 月" :clearable="false" :disabled-date="disabledMonth" aria-label="应计月份" style="width:170px"/></div><div class="statistics-meta">每日 02:00 / 09:30（北京时间）自动更新 <span v-if="summary.coverage?.last_updated_at">· 财务更新 {{dateTime(summary.coverage.last_updated_at)}}</span><span v-if="summary.coverage?.as_of_date"> · 应计核对至 {{summary.coverage.as_of_date}}</span><span> · 每日广告（莫斯科）{{advertising.configured?'Performance':'日报导入'}}</span><span v-if="summary.missing_advertising" class="statistics-warning"> · {{summary.missing_advertising}} 单待核对</span><span v-if="advertising.last_error" class="statistics-warning"> · {{advertising.last_error}}</span></div></div>
       <div class="statistics-actions">
-        <el-date-picker v-model="month" type="month" value-format="YYYY-MM" format="YYYY 年 MM 月" :clearable="false" :disabled-date="disabledMonth" aria-label="应计月份" style="width:170px"/>
-        <el-tooltip content="刷新已同步的数据"><el-button :icon="'Refresh'" circle aria-label="刷新报表" @click="load()"/></el-tooltip>
-        <el-tooltip content="修改记录与回滚"><el-button :icon="'Clock'" circle aria-label="修改记录与回滚" @click="openChanges"/></el-tooltip>
+        <span class="statistics-range-label">同步区间</span>
+        <el-date-picker v-model="orderSyncRange" type="daterange" value-format="YYYY-MM-DD" format="MM-DD" range-separator="至"
+          start-placeholder="开始" end-placeholder="结束" :clearable="false" unlink-panels aria-label="订单同步区间" style="width:230px"/>
+        <el-tooltip content="普通订单读 ERP 订单表，WHD 订单仍从 Ozon 拉取，更新状态与结算日期"><el-button :icon="'RefreshRight'" circle :loading="orderSyncing" aria-label="同步订单" @click="syncOrdersNow"/></el-tooltip>
+        <el-tooltip content="订单表同步记录与修改记录"><el-button :icon="'Document'" circle aria-label="记录" @click="openRecords()"/></el-tooltip>
       </div>
     </header>
+    <div v-if="orderSyncProgress" class="statistics-sync-progress">
+      <el-progress :percentage="orderSyncProgress.progress" :stroke-width="16" striped striped-flow
+        :status="orderSyncProgress.progress >= 100 ? 'success' : ''" style="width:340px"/>
+      <span class="statistics-sync-phase">{{orderSyncProgress.phase}}</span>
+      <span class="statistics-meta">已拉取 <b>{{orderSyncProgress.fetched}}</b> 单 · 更新 <b>{{orderSyncProgress.changed}}</b> 单</span>
+    </div>
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="statistics-alert"/>
     <el-alert v-if="run?.status === 'failed'" :title="'更新未完成：' + run.error" type="error" show-icon :closable="false" class="statistics-alert"/>
-    <div class="statistics-metrics">
-      <div><span>本月结算订单</span><strong>{{summary.settled_orders ?? '—'}}<small>单</small></strong><small>结算日期在本月 · WHD {{summary.settled_whd_orders || 0}} 单</small></div>
-      <div><span>销售收入 <small>RUB</small></span><strong>{{summary.coverage?.checked_days ? money(summary.income_rub) : '—'}}</strong><small>含正向手续费退回</small></div>
-      <div><span>代扣 <small>RUB</small></span><strong>{{summary.coverage?.checked_days ? money(summary.ozon_fees_rub) : '—'}}</strong><small>已剔除重复广告项</small></div>
-      <div><span>低于 100 卢布</span><strong class="statistics-warning">{{summary.low_income_orders ?? '—'}}<small>单</small></strong><small>另 {{summary.income_unknown_orders || 0}} 单收入待分摊</small></div>
+    <div class="statistics-metrics statistics-metrics-6">
+      <div><span>本月结算订单</span><strong>{{summary.settled_orders ?? '—'}}<small>单</small></strong><small>正常签收 {{summary.settled_delivered || 0}} · 已取消 {{summary.settled_cancelled || 0}} · WHD {{summary.settled_whd_orders || 0}}<span v-if="summary.settled_other"> · 其他 {{summary.settled_other}}</span></small></div>
+      <div><span>销售收入 <small>RUB</small></span><strong>{{summary.settled_orders ? money(summary.settled_income_rub) : '—'}}</strong><small>结算日期在本月的订单</small></div>
+      <div><span>代扣 <small>RUB</small></span><strong>{{summary.settled_orders ? money(summary.settled_fees_rub) : '—'}}</strong><small>同上，含主单级费用</small></div>
+      <div><span>推广 <small>RUB</small></span><strong>{{money(summary.settled_ad_rub)}}</strong><small>本月结算订单上的全部广告</small></div>
+      <div><span>采购 / 贴单 <small>CNY</small></span><strong>{{money(summary.settled_cost_cny)}}</strong>
+        <small>采购 {{money(summary.settled_purchase_cny)}} · {{summary.settled_purchase_missing || 0}} 单未录入</small>
+        <small>贴单 {{money(summary.settled_label_cny)}} · {{summary.settled_label_missing || 0}} 单未录入</small></div>
+      <div><span>毛利 <small>CNY</small></span><strong>{{money(summary.settled_profit_cny)}}<small v-if="summary.settled_margin_pct != null"> · {{summary.settled_margin_pct}}%</small></strong>
+        <small>毛利率 = 毛利 ÷ 销售</small>
+        <small v-if="summary.settled_incomplete" class="statistics-warning">{{summary.settled_incomplete}} 单还未能完全结算</small></div>
     </div>
     <el-tabs v-model="tab">
       <el-tab-pane label="结算明细" name="orders">
@@ -842,7 +948,7 @@ window.StatisticsAnalysisView = {
               start-placeholder="结算起" end-placeholder="结算止" @change="applyFilter" style="width:225px"/>
             <el-input v-model="search" placeholder="订单号" clearable @keyup.enter="applyFilter" @clear="applyFilter" style="width:165px"><template #prefix><el-icon><Search/></el-icon></template></el-input>
             <el-select v-model="status" placeholder="全部状态" clearable @change="applyFilter" style="width:122px"><el-option label="已签收" value="delivered"/><el-option label="已取消" value="cancelled"/></el-select>
-            <el-select v-model="orderType" placeholder="全部类型" clearable @change="applyFilter" style="width:138px"><el-option label="正常销售订单" value="正常销售订单"/><el-option label="WHD订单" value="WHD订单"/></el-select>
+            <el-select v-model="orderType" placeholder="全部类型" clearable @change="applyFilter" style="width:138px"><el-option label="正常销售订单" value="正常销售订单"/><el-option label="WHD订单" value="WHD订单"/><el-option label="主单级费用" value="主单级费用"/></el-select>
             <el-checkbox v-model="missingOnly" @change="applyFilter">缺采购</el-checkbox><el-checkbox v-model="unsettledOnly" @change="applyFilter">未结算</el-checkbox>
             <el-button :icon="'Search'" @click="applyFilter">查询</el-button>
             <el-button :icon="'Filter'" :type="appliedRules.length?'primary':'default'" plain @click="filterVisible=!filterVisible">筛选 {{appliedRules.length||''}}</el-button>
@@ -891,17 +997,17 @@ window.StatisticsAnalysisView = {
             </div></template>
           </el-table-column>
           <el-table-column prop="status" label="状态" width="76" sortable="custom"/>
-          <el-table-column prop="ordered_at" label="下单日期" width="92" sortable="custom"><template #default="{row}">{{dateTime(row.ordered_at).slice(0,10)}}</template></el-table-column>
+          <el-table-column prop="ordered_at" label="下单日期" width="92" sortable="custom"><template #default="{row}">{{row.loose_month ? (row.accrual_date || '—') : dateTime(row.ordered_at).slice(0,10)}}</template></el-table-column>
           <el-table-column prop="order_settled_date" label="结算日期" width="102" sortable="custom"><template #default="{row}">{{row.order_settled_date || '—'}}</template></el-table-column>
-          <el-table-column prop="receipt_cny" label="实收 ¥" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_cny)}}<div v-if="row.receipt_cny!=null && (row.pending_positive || row.pending_negative || row.advertising_rub==null)" class="statistics-cell-note">按已归属</div></template></el-table-column>
-          <el-table-column prop="purchase_cny" label="采购费 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link :type="row.purchase_cny==null?'warning':'primary'" @click="openCosts([row])">{{row.purchase_cny==null?'待录入':money(row.purchase_cny)}}</el-button><span v-else>{{money(row.purchase_cny)}}</span><div v-if="row.cost_in_month===false && row.order_type!=='WHD订单'" class="statistics-cell-note">{{row.cost_month ? row.cost_month+' 计入' : '待正式入账'}}</div></template></el-table-column>
+          <el-table-column prop="receipt_cny" label="实收 ¥" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_cny)}}<div v-if="row.receipt_cny!=null && !row.loose_month && (row.pending_positive || row.pending_negative || row.advertising_rub==null)" class="statistics-cell-note">按已归属</div></template></el-table-column>
+          <el-table-column prop="purchase_cny" label="采购费 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link :type="row.purchase_cny==null?'warning':'primary'" @click="openCosts([row])">{{row.purchase_cny==null?'待录入':money(row.purchase_cny)}}</el-button><span v-else>{{money(row.purchase_cny)}}</span><div v-if="row.cost_in_month===false && row.order_type!=='WHD订单' && !row.loose_month" class="statistics-cell-note">{{row.cost_month ? row.cost_month+' 计入' : '待正式入账'}}</div></template></el-table-column>
           <el-table-column prop="label_cny" label="贴单费 ¥" width="84" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link type="primary" @click="openCosts([row])">{{money(row.label_cny)}}</el-button><span v-else>{{money(row.label_cny)}}</span></template></el-table-column>
-          <el-table-column prop="profit_cny" label="毛利 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.order_type==='WHD订单'?'WHD 由 Ozon 仓发货，不计采购与贴单费':row.allocated_ad_rub==null?adStatus(row):row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'实收人民币减采购及贴单费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip><div class="statistics-cell-note">{{row.margin_pct==null?'—':money(row.margin_pct)+'%'}}</div></template></el-table-column>
+          <el-table-column prop="profit_cny" label="毛利 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.loose_month?'主单级费用：只有主单号，不计采购与贴单费':row.order_type==='WHD订单'?'WHD 由 Ozon 仓发货，不计采购与贴单费':row.allocated_ad_rub==null?adStatus(row):row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'实收人民币减采购及贴单费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip><div class="statistics-cell-note">{{row.loose_month?'':(row.margin_pct==null?'—':money(row.margin_pct)+'%')}}</div></template></el-table-column>
           <el-table-column prop="income_rub" label="销售收入 ₽" width="104" align="right" sortable="custom"><template #default="{row}"><span :class="{'statistics-warning':row.low_income}">{{money(row.income_rub)}}</span><el-tooltip v-if="row.pending_income ?? row.pending_positive" content="仅含已明确归属部分，另有收入待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
           <el-table-column prop="ozon_fees_rub" label="代扣 ₽" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.ozon_fees_rub)}}<el-tooltip v-if="row.pending_negative" content="仅含已明确归属部分，另有费用待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
-          <el-table-column prop="advertising_cpo_rub" label="推广-订单 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpo_rub==null" :class="row.no_accrual?'statistics-meta':'statistics-warning'">{{row.no_accrual?'—':'待核对'}}</span><span v-else>{{money(row.advertising_cpo_rub)}}</span></template></el-table-column>
-          <el-table-column prop="advertising_cpc_rub" label="推广-点击 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpc_rub==null" :class="row.no_accrual?'statistics-meta':'statistics-warning'">{{row.no_accrual?'—':'待核对'}}</span><span v-else>{{money(row.advertising_cpc_rub)}}</span></template></el-table-column>
-          <el-table-column prop="allocated_ad_rub" label="点击广告分摊 ₽" width="140" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="adStatus(row)+(row.allocation_order_count?' · '+row.allocation_date+' / '+row.allocation_order_count+' 单':'')"><span :class="{'statistics-warning':row.allocated_ad_rub==null&&!row.no_accrual,'statistics-meta':row.no_accrual}">{{row.allocated_ad_rub==null?(row.no_accrual?'—':'待核对'):money(row.allocated_ad_rub)}}</span></el-tooltip></template></el-table-column>
+          <el-table-column prop="advertising_cpo_rub" label="推广-订单 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpo_rub==null" :class="row.no_accrual?'statistics-meta':'statistics-warning'">{{(row.no_accrual||row.loose_month)?'—':'待核对'}}</span><span v-else>{{money(row.advertising_cpo_rub)}}</span></template></el-table-column>
+          <el-table-column prop="advertising_cpc_rub" label="推广-点击 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpc_rub==null" :class="row.no_accrual?'statistics-meta':'statistics-warning'">{{(row.no_accrual||row.loose_month)?'—':'待核对'}}</span><span v-else>{{money(row.advertising_cpc_rub)}}</span></template></el-table-column>
+          <el-table-column prop="allocated_ad_rub" label="点击广告分摊 ₽" width="140" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="adStatus(row)+(row.allocation_order_count?' · '+row.allocation_date+' / '+row.allocation_order_count+' 单':'')"><span :class="{'statistics-warning':row.allocated_ad_rub==null&&!row.no_accrual&&!row.loose_month,'statistics-meta':row.no_accrual}">{{row.allocated_ad_rub==null?((row.no_accrual||row.loose_month)?'—':'待核对'):money(row.allocated_ad_rub)}}</span></el-tooltip></template></el-table-column>
           <el-table-column prop="receipt_rub" label="实收 ₽" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_rub)}}</template></el-table-column>
           <el-table-column prop="cancel_reason" label="取消原因" min-width="160" show-overflow-tooltip sortable="custom"/>
           <el-table-column prop="order_type" label="订单类型" width="92" sortable="custom"/>
@@ -926,6 +1032,60 @@ window.StatisticsAnalysisView = {
         <div class="statistics-footer"><span>按结算日期整单归月 · 实收 ₽ = 销售 − 代扣 − 推广费用 · 毛利 ¥ = 实收 ¥ − 采购 − 贴单（未录入按 0 计并提示单数）· 毛利率 = 毛利 ÷ 销售 ¥</span></div>
       </el-tab-pane>
     </el-tabs>
+    <el-dialog v-model="recordsVisible" title="同步记录与修改记录" width="940px" top="6vh" class="statistics-dialog">
+      <el-tabs v-model="recordsTab" @tab-change="recordsTabChanged">
+        <el-tab-pane label="订单表同步" name="order">
+          <div class="statistics-meta" style="margin-bottom:10px">每 30 分钟自动同步一次：普通订单按顶部「同步区间」从 ERP 订单表读取，WHD 订单仍从 Ozon 拉取，把最新的状态与结算日期落进统计订单表。<span v-if="orderLogLast"> · 最近成功 {{orderLogLast}}</span></div>
+          <el-table :data="orderLogs" border size="small" max-height="420" v-loading="orderLogLoading" empty-text="还没有同步记录">
+            <el-table-column prop="started_at" label="开始时间" width="126"/>
+            <el-table-column prop="finished_at" label="完成时间" width="126"/>
+            <el-table-column label="方式" width="70">
+              <template #default="{row}">{{row.trigger === 'auto' ? '自动' : '手动'}}</template>
+            </el-table-column>
+            <el-table-column label="同步区间" width="180">
+              <template #default="{row}">
+                <span v-if="row.range_from">{{row.range_from.slice(5)}} ~ {{row.range_to.slice(5)}}</span>
+                <span v-else class="statistics-meta">最近一周</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="读取订单" width="88" align="right">
+              <template #default="{row}">{{row.fetched || 0}}</template>
+            </el-table-column>
+            <el-table-column label="更新订单" width="88" align="right">
+              <template #default="{row}">{{row.changed || 0}}</template>
+            </el-table-column>
+            <el-table-column label="结果" width="78">
+              <template #default="{row}">
+                <el-tag size="small" :type="row.status === 'succeeded' ? 'success' : row.status === 'failed' ? 'danger' : 'info'">
+                  {{row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : '进行中'}}
+                </el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column prop="message" label="说明" min-width="190" show-overflow-tooltip/>
+          </el-table>
+        </el-tab-pane>
+        <el-tab-pane label="修改记录" name="change">
+          <div class="statistics-meta" style="margin-bottom:10px">按月导出的采购 / 贴单费维护与回滚都记在这里，回滚会校验数据是否又被改过。</div>
+          <el-table :data="changes" border v-loading="changesLoading" max-height="420" empty-text="还没有修改记录">
+            <el-table-column prop="created_at" label="修改时间" min-width="170" sortable>
+              <template #default="{row}">{{dateTime(row.created_at)}}</template>
+            </el-table-column>
+            <el-table-column prop="month" label="月份" width="100" sortable/>
+            <el-table-column prop="reason" label="修改内容" min-width="220" show-overflow-tooltip sortable/>
+            <el-table-column prop="affected" label="条数" width="72" sortable/>
+            <el-table-column label="状态" width="92">
+              <template #default="{row}">{{row.rolled_back_at?'已回滚':row.kind==='rollback'?'回滚记录':'已保存'}}</template>
+            </el-table-column>
+            <el-table-column label="操作" width="72">
+              <template #default="{row}">
+                <el-tooltip content="恢复修改前的数值"><el-button v-if="!row.rolled_back_at && row.kind!=='rollback'" :icon="'RefreshLeft'" circle size="small" aria-label="回滚修改" @click="rollback(row)"/></el-tooltip>
+              </template>
+            </el-table-column>
+          </el-table>
+        </el-tab-pane>
+      </el-tabs>
+    </el-dialog>
+
     <el-dialog v-model="batchVisible" title="批量订单号" width="540px" class="statistics-dialog" :close-on-click-modal="false">
       <el-input v-model="batchText" type="textarea" :rows="8" aria-label="订单号列表" placeholder="粘贴 Excel 的订单号列，或用换行、逗号分隔" @input="batchError=''"/>
       <el-alert v-if="batchError" :title="batchError" type="error" :closable="false" class="statistics-alert"/>
@@ -967,7 +1127,6 @@ window.StatisticsAnalysisView = {
       </el-form>
       <template #footer><el-button @click="monthVisible=false" :disabled="saving">取消</el-button><el-button type="primary" :loading="saving" @click="saveMonth">保存</el-button></template>
     </el-dialog>
-    <el-dialog v-model="changesVisible" title="修改记录" width="950px" class="statistics-dialog"><el-table :data="changes" border v-loading="changesLoading" max-height="500"><el-table-column prop="created_at" label="修改时间" min-width="180" sortable><template #default="{row}">{{dateTime(row.created_at)}}</template></el-table-column><el-table-column prop="month" label="月份" width="110" sortable/><el-table-column prop="reason" label="修改内容" min-width="230" show-overflow-tooltip sortable/><el-table-column prop="affected" label="条数" width="80" sortable/><el-table-column label="状态" width="100"><template #default="{row}">{{row.rolled_back_at?'已回滚':row.kind==='rollback'?'回滚记录':'已保存'}}</template></el-table-column><el-table-column label="操作" width="80"><template #default="{row}"><el-tooltip content="恢复修改前的数值"><el-button v-if="!row.rolled_back_at && row.kind!=='rollback'" :icon="'RefreshLeft'" circle size="small" aria-label="回滚修改" @click="rollback(row)"/></el-tooltip></template></el-table-column></el-table></el-dialog>
     <el-dialog v-model="exceptionVisible" :title="exceptionScope?.title" width="980px" class="statistics-dialog">
       <el-alert v-if="exceptionError" :title="exceptionError" type="error" :closable="false" class="statistics-alert"/>
       <el-table v-else-if="exceptionScope?.kind==='unresolved'" :data="exceptions.rows" v-loading="exceptionLoading" border max-height="450" empty-text="没有未匹配流水">
@@ -990,11 +1149,11 @@ window.StatisticsAnalysisView = {
         <el-pagination v-model:current-page="exceptionPage" :page-size="exceptions.page_size" :total="exceptions.total" layout="prev, pager, next" @current-change="loadExceptions"/>
       </div>
     </el-dialog>
-    <el-dialog v-model="ledgerVisible" :title="'订单 '+ledgerOrder" width="980px" class="statistics-dialog" @close="hideProductZoom">
+    <el-dialog v-model="ledgerVisible" :title="(orderRow?.loose_month ? '主单级费用 ' : '订单 ') + ledgerOrder" width="980px" class="statistics-dialog" @close="hideProductZoom">
       <el-tabs v-model="orderTab" @tab-change="changeOrderTab">
         <el-tab-pane label="费用明细" name="fees">
           <div v-if="orderRow?.platform_net_rub!=null" class="statistics-toolbar statistics-meta"><span>已归属 Ozon 净额：₽{{money(orderRow.platform_net_rub)}}</span></div>
-          <div v-if="ledger.length" class="statistics-meta" style="margin:0 0 8px">共 {{ledger.length}} 笔流水，覆盖 {{ledgerMonths.length}} 个月 · 这里显示该订单的全期结算数据，不受上方月份筛选限制</div>
+          <div v-if="ledger.length" class="statistics-meta" style="margin:0 0 8px">共 {{ledger.length}} 笔流水，覆盖 {{ledgerMonths.length}} 个月 · {{orderRow?.loose_month ? '这里显示该主单号下的全部结算流水，不受上方月份筛选限制' : '这里显示该订单的全期结算数据，不受上方月份筛选限制'}}</div>
           <el-alert v-if="ledgerError" :title="ledgerError" type="error" :closable="false" class="statistics-alert"/>
           <el-table v-else :data="ledger" border v-loading="ledgerLoading" max-height="420" empty-text="该订单暂无结算流水（可能尚未结算，或不属于当前店铺）">
             <el-table-column prop="date" label="应计日期" width="130" sortable/>
@@ -1014,7 +1173,7 @@ window.StatisticsAnalysisView = {
             </el-collapse-item>
           </el-collapse>
         </el-tab-pane>
-        <el-tab-pane label="订单详情" name="detail">
+        <el-tab-pane v-if="!orderRow?.loose_month" label="订单详情" name="detail">
           <dl v-if="orderRow" class="statistics-order-facts">
             <div><dt>订单状态</dt><dd>{{orderRow.status}}</dd></div>
             <div><dt>订单类型</dt><dd>{{orderRow.order_type}}</dd></div>

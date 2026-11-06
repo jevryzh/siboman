@@ -163,6 +163,16 @@ const initApp = () => {
       Vue.onMounted(fetchInitData);
       Vue.onMounted(fetchPluginDownloadUrl);
 
+      // 面包屑显示用的中文名；没收录的路由保持原来的 slug，不影响其它页面
+      const ROUTE_LABELS = {
+        dashboard: '仪表盘', sourcing: '选品中心', collection: '采集箱', 'single-sourcing': '单品找货',
+        'single-sourcing-review': '单品审核', 'listing-history': '上架记录', 'ai-generator': 'AI 图片生成',
+        products: '商品管理', inventory: '库存管理', orders: '订单管理', upload: '批量上架',
+        'yandex-products': 'Yandex 商品', 'yandex-autolist': 'Yandex 自动上架', 'yandex-inventory': 'Yandex 库存',
+        'yandex-orders': 'Yandex 订单', 'ozon-patrol': '巡查跟卖', 'sales-funnel': '销售漏斗',
+        'statistics-analysis': '月结统计', 'settlement-detail': '应计原始数据',
+        'data-screen': '数据大屏', stores: '店铺管理', analytics: '统计分析', 'market-discovery': '选品发现',
+      };
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
         if (path === '#/selection') return 'sourcing';
@@ -214,7 +224,8 @@ const initApp = () => {
         }
       });
 
-      return { currentPath, routeName, isReady, currentUser, handleLogout, goTo, openImageSetConsole, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl, mobileNavOpen };
+      const routeLabel = Vue.computed(() => ROUTE_LABELS[routeName.value] || routeName.value);
+      return { currentPath, routeName, routeLabel, isReady, currentUser, handleLogout, goTo, openImageSetConsole, shops, currentStoreId, handleStoreChange, headerPlatform, buildInfo, envLabel, pluginDownloadUrl, mobileNavOpen };
     },
     template: `
       <el-container class="layout-container" :class="{'statistics-mobile-nav-open':mobileNavOpen}" v-loading="!isReady">
@@ -277,9 +288,9 @@ const initApp = () => {
               <el-icon><TrendCharts /></el-icon><span>销售漏斗</span>
             </el-menu-item>
             <el-sub-menu index="statistics">
-              <template #title><el-icon><DataAnalysis /></el-icon><span>统计分析</span></template>
-              <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')"><span>月度统计</span></el-menu-item>
-              <el-menu-item index="#/settlement-detail" @click="goTo('#/settlement-detail')"><span>店铺结算原始数据</span></el-menu-item>
+              <template #title><el-icon><DataAnalysis /></el-icon><span>店铺结算</span></template>
+              <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')"><span>月结统计</span></el-menu-item>
+              <el-menu-item index="#/settlement-detail" @click="goTo('#/settlement-detail')"><span>应计原始数据</span></el-menu-item>
             </el-sub-menu>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
@@ -294,7 +305,7 @@ const initApp = () => {
             <el-button v-if="routeName === 'statistics-analysis'" class="statistics-nav-toggle" :icon="'Menu'" circle :aria-label="mobileNavOpen?'关闭导航':'打开导航'" :aria-expanded="mobileNavOpen" title="导航" @click="mobileNavOpen=!mobileNavOpen" />
             <el-breadcrumb separator="/">
               <el-breadcrumb-item>逐梦 ERP</el-breadcrumb-item>
-              <el-breadcrumb-item>{{ routeName }}</el-breadcrumb-item>
+              <el-breadcrumb-item>{{ routeLabel }}</el-breadcrumb-item>
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
               <shop-switcher v-if="routeName !== 'orders' && routeName !== 'yandex-orders'" :platform="headerPlatform" @change="handleStoreChange" />

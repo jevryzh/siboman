@@ -1,4 +1,7 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { strFromU8, unzipSync } from 'fflate';
 import { isDeepStrictEqual } from 'node:util';
 import {
   cancellationReason, csvCell, datesBetween, fail, financialDate, isFormalAccrual,
@@ -36,10 +39,13 @@ CREATE TABLE IF NOT EXISTS app_statistics_orders (
 ALTER TABLE app_statistics_orders ADD COLUMN IF NOT EXISTS settled_date DATE;
 CREATE TABLE IF NOT EXISTS app_statistics_costs (
   user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
-  posting_number TEXT NOT NULL, purchase_cny NUMERIC(14,2), label_cny NUMERIC(14,2) NOT NULL DEFAULT 1.50,
+  posting_number TEXT NOT NULL, purchase_cny NUMERIC(14,2), label_cny NUMERIC(14,2),
   version INTEGER NOT NULL DEFAULT 1, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY(user_id,store_id,posting_number), CHECK(purchase_cny >= 0), CHECK(label_cny >= 0)
 );
+-- 贴单费不再默认 1.5：老库去掉 NOT NULL 与默认值，没录入就是空
+ALTER TABLE app_statistics_costs ALTER COLUMN label_cny DROP NOT NULL;
+ALTER TABLE app_statistics_costs ALTER COLUMN label_cny DROP DEFAULT;
 CREATE TABLE IF NOT EXISTS app_statistics_months (
   user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
   month TEXT NOT NULL, exchange_rate NUMERIC(12,6), advertising_amount NUMERIC(14,2),
@@ -122,6 +128,12 @@ CREATE TABLE IF NOT EXISTS app_statistics_order_syncs (
   message TEXT NOT NULL DEFAULT '', started_at TIMESTAMPTZ NOT NULL DEFAULT now(), finished_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_order_syncs_store ON app_statistics_order_syncs(user_id,store_id,started_at DESC);
+-- 手动同步时记录本次拉取的区间，方便回看「这批记录到底sync了哪几天」
+ALTER TABLE app_statistics_order_syncs ADD COLUMN IF NOT EXISTS range_from TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_statistics_order_syncs ADD COLUMN IF NOT EXISTS range_to TEXT NOT NULL DEFAULT '';
+-- 同步过程中的实时进度：阶段文案 + 百分比，前端轮询这一行画进度条
+ALTER TABLE app_statistics_order_syncs ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT '';
+ALTER TABLE app_statistics_order_syncs ADD COLUMN IF NOT EXISTS progress INTEGER NOT NULL DEFAULT 0;
 -- Ozon 卖家后台会话（网页版 cookie）：只用于补「取消日期」这类 Seller API 不提供的字段
 CREATE TABLE IF NOT EXISTS app_statistics_web_sessions (
   user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
@@ -131,6 +143,21 @@ CREATE TABLE IF NOT EXISTS app_statistics_web_sessions (
 );
 -- 卖家后台域名：中国站店铺是 seller.ozonru.cn
 ALTER TABLE app_statistics_web_sessions ADD COLUMN IF NOT EXISTS host TEXT NOT NULL DEFAULT 'seller.ozon.ru';
+-- SFTP 投递目录：按「店铺+日期」记账，同一天只导一次（重复扫描不会重复写）
+CREATE TABLE IF NOT EXISTS app_statistics_inbox_days (
+  user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
+  file_name TEXT NOT NULL, ad_date DATE NOT NULL, entries INTEGER NOT NULL DEFAULT 0,
+  message TEXT NOT NULL DEFAULT '', imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id, store_id, ad_date)
+);
+-- SFTP 报表投递目录：按文件 sha256 记账，保证同一份文件不会重复导入
+CREATE TABLE IF NOT EXISTS app_statistics_inbox_files (
+  user_id UUID NOT NULL REFERENCES app_users(id), store_id UUID NOT NULL REFERENCES app_stores(id),
+  file_name TEXT NOT NULL, sha256 TEXT NOT NULL, size BIGINT NOT NULL DEFAULT 0,
+  kind TEXT NOT NULL DEFAULT '', rows INTEGER NOT NULL DEFAULT 0, message TEXT NOT NULL DEFAULT '',
+  imported_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(user_id, store_id, file_name, sha256)
+);
 `;
 
 export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defaultRate, credentialSecret = process.env.AUTH_SECRET,
@@ -208,6 +235,20 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     pending.sort((a, b) => String(a.date).localeCompare(String(b.date)));
     return { rows, pending };
   }
+  // 主单级费用：只有主单号、拆不到具体包裹，直接列出该单号下的全部流水
+  function monthlyFeeLedgerRows(data, unit) {
+    const rub = (cents) => Number((cents / 100).toFixed(2));
+    const rows = [];
+    for (const entry of data.accruals) {
+      if (String(entry.unit_number || '') !== unit) continue;
+      const types = entry.non_item_fee ? [Number(entry.non_item_fee.type_id)]
+        : [...new Set((entry.item_fees?.fees || []).flatMap((part) => (part.fees || []).map((fee) => Number(fee.type_id))))];
+      rows.push({ posting_number: unit, accrual_id: entry.accrual_id, date: entry.date,
+        amount_rub: rub(moneyCents(entry.total_amount?.amount ?? 0)), method: '主单号流水', types });
+    }
+    rows.sort((a, b) => String(a.date).localeCompare(String(b.date)) || String(a.accrual_id).localeCompare(String(b.accrual_id)));
+    return { rows, pending: [] };
+  }
   // 订单维度聚合：把全部应计凭证按订单号归集（完整订单号 / 唯一主单号 / SKU 唯一匹配），
   // 与月份无关。收入=正数非广告凭证；代扣=负数非广告凭证（含品牌推广等实际扣款）；
   // 推广-订单=按订单付费(ad_report 54)；推广-点击=按点击付费(ad_report 41)；分摊来自 41 按日均摊表。
@@ -226,6 +267,21 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       if (!agg.has(posting)) agg.set(posting, { income: 0, fees: 0, cpo: 0, cpc: 0, alloc: 0, last_date: null });
       return agg.get(posting);
     };
+    // 同一 SKU 出现在同一主单的多个包裹里时，均摊到这些包裹；尾差按分补给前几个，
+    // 保证各份之和与原金额分毫不差（负数同理会摊成负值）。
+    const splitEven = (amount, count) => {
+      const sign = amount < 0 ? -1 : 1, abs = Math.abs(amount);
+      const base = Math.floor(abs / count), rest = abs - base * count;
+      return Array.from({ length: count }, (_, index) => sign * (base + (index < rest ? 1 : 0)));
+    };
+    const addLoose = (unit, month, cents, flows, date) => {
+      const key = `${unit}|${month}`;
+      const item = loose.get(key) || { unit, month, income: 0, fees: 0, flows: 0, last_date: null };
+      if (cents > 0) item.income += cents; else item.fees += -cents;
+      item.flows += flows;
+      if (date && (!item.last_date || date > item.last_date)) item.last_date = date;
+      loose.set(key, item);
+    };
     for (const entry of data.accruals) {
       const unit = String(entry.unit_number || '');
       const cents = moneyCents(entry.total_amount?.amount ?? 0);
@@ -233,27 +289,35 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const typeId = entry.non_item_fee?.type_id == null ? null : Number(entry.non_item_fee.type_id);
       const parts = entry.item_fees?.fees || [];
       const targets = [];
+      let residual = 0;
       if (metadata.has(unit)) targets.push({ posting: unit, cents });
       else {
         const children = siblings.get(unit) || [];
         if (children.length === 1) targets.push({ posting: children[0], cents });
-        else if (parts.length) {
+        else {
+          // 主单下多个包裹：按 SKU 找归属的包裹。命中多个就均摊，命中 0 个就留进残差，
+          // 不再像以前那样「只认唯一命中」，把共享 SKU 的那一段直接丢掉。
+          let allocated = 0;
           for (const part of parts) {
             const amount = (part.fees || []).reduce((n, fee) => n + moneyCents(fee.accrued?.amount ?? 0), 0);
             const hits = children.filter((posting) => (metadata.get(posting)?.products || []).some((product) => String(product.sku) === String(part.sku)));
-            if (hits.length === 1) targets.push({ posting: hits[0], cents: amount });
+            if (!hits.length) continue;
+            const shares = splitEven(amount, hits.length);
+            hits.forEach((posting, index) => targets.push({ posting, cents: shares[index] }));
+            allocated += amount;
           }
+          residual = cents - allocated;
         }
       }
+      const month = String(entry.date || '').slice(0, 7);
+      // 例外：ozon 账户级的 41/54 不能进 loose——41 已由按日分摊覆盖、54 已由逐单报表覆盖
+      const coveredElsewhere = source === 'ozon' && (typeId === 41 || typeId === 54);
       if (!targets.length) {
-        const centsLoose = moneyCents(entry.total_amount?.amount ?? 0);
-        const month = String(entry.date || '').slice(0, 7);
-        if (centsLoose && month && /^\d+-\d+$/.test(unit)) {
-          const item = loose.get(month) || { income: 0, fees: 0, flows: 0 };
-          if (centsLoose > 0) item.income += centsLoose; else item.fees += -centsLoose;
-          item.flows += 1;
-          loose.set(month, item);
-        }
+        // 挂不到任何一个包裹单的流水，按「单号+月份」单独成行，进「主单级费用」一起统计
+        if (cents && month && unit && !coveredElsewhere) addLoose(unit, month, cents, 1, String(entry.date));
+      } else if (residual > 0 && month && unit && !coveredElsewhere) {
+        // 有包裹归属、但仍有 SKU 在主单下匹配不到：残差进主单级费用，不再静默丢弃
+        addLoose(unit, month, residual, 0, String(entry.date));
       }
       for (const target of targets) {
         const row = slot(target.posting);
@@ -287,11 +351,13 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       // 实收卢布 = 销售 + 代扣（负） − 推广订单 − 推广点击 − 点击分摊
       const receipt = a ? rounded(income + fees - cpo - cpc - alloc) : null;
       const receiptCny = receipt != null && rate ? rounded(receipt * rate) : null;
-      // WHD（海外仓）由 Ozon 仓发货，不存在采购和贴单费用，历史上误录的成本一律不算
-      const cost = order.schema === 'fbo' ? null : costMap.get(order.posting_number);
-      const purchase = cost?.purchase_cny == null ? null : Number(cost.purchase_cny);
+      // WHD（海外仓）由 Ozon 仓发货，采集进来时采购和贴单就固定为 0，
+      // 所以它既不会被「缺采购」筛出来，毛利也不需要再扣这两项
+      const isWhd = order.schema === 'fbo';
+      const cost = isWhd ? null : costMap.get(order.posting_number);
+      const purchase = isWhd ? 0 : (cost?.purchase_cny == null ? null : Number(cost.purchase_cny));
       // 贴单费按实际录入值展示，没录就留空（不再默认 1.5）；算毛利时未录按 0 计
-      const label = cost?.label_cny == null ? null : Number(cost.label_cny);
+      const label = isWhd ? 0 : (cost?.label_cny == null ? null : Number(cost.label_cny));
       const profit = receiptCny != null && purchase != null ? rounded(receiptCny - purchase - (label ?? 0)) : null;
       return {
         posting_number: order.posting_number,
@@ -308,6 +374,8 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         advertising_rub: a ? rounded(cpo + cpc + alloc) : null,
         receipt_rub: receipt, receipt_cny: receiptCny,
         purchase_cny: purchase, label_cny: label, profit_cny: profit,
+        // 采购/贴单的乐观锁版本号：前端维护费用时要原样带回来，缺了会报「缺少有效版本号」
+        version: Number(cost?.version || 0),
         margin_pct: profit != null && receiptCny ? rounded(profit / receiptCny * 100) : null,
         platform_net_rub: a ? rounded(income + fees) : null,
         low_income: !!a && income < 100,
@@ -316,7 +384,29 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         advertising_state: a ? 'confirmed' : 'not_synced',
       };
     });
-    // 主单级、拆不到包裹的流水单独带出去，供月度汇总的「其他状态订单」使用
+    // 主单级、拆不到包裹的流水：明细页也要能看到，所以按「单号+月份」各生成一行虚拟记录。
+    // 它们没有结算日期，归月用应计日期，订单类型标成 MONTHLY_FEE_TYPE，供页面筛选。
+    for (const item of loose.values()) {
+      const income = item.income / 100, fees = -item.fees / 100;
+      const receipt = rounded(income + fees);
+      const receiptCny = rate ? rounded(receipt * rate) : null;
+      list.push({
+        posting_number: item.unit,
+        status: MONTHLY_FEE_TYPE, raw_status: 'loose',
+        ordered_at: item.last_date ? `${item.last_date}T00:00:00Z` : null,
+        settled_date: null, order_settled_date: null, accrual_date: item.last_date,
+        order_type: MONTHLY_FEE_TYPE, cancel_reason: '',
+        income_rub: income, ozon_fees_rub: fees,
+        advertising_cpo_rub: null, advertising_cpc_rub: null, allocated_ad_rub: null, advertising_rub: null,
+        receipt_rub: receipt, receipt_cny: receiptCny,
+        purchase_cny: null, label_cny: null, profit_cny: null, version: 0,
+        margin_pct: null, platform_net_rub: receipt, low_income: false, no_accrual: false,
+        metadata_missing: false, pending_positive: false, pending_negative: false,
+        // 挂不到具体订单 = 不维护采购/贴单，也不参与「缺采购」
+        cost_in_month: false, allocation_date: null, allocation_order_count: null,
+        advertising_state: 'not_synced', loose_month: item.month, loose_flows: item.flows,
+      });
+    }
     list.loose = loose;
     return list;
   }
@@ -361,6 +451,32 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       adDays: data.adDays, orderDays: data.orderDays, orderAdEntries: data.orderAdEntries, clickAllocs: data.clickAllocs,
       timezone: data.adConfig?.business_timezone || DEFAULT_AD_TIMEZONE, configured: !!data.adConfig });
   }
+  // 顶部指标卡：本月结算订单（按状态拆分）、推广、采购/贴单（含未录入单数）、毛利与毛利率
+  // 口径与「月度汇总」完全一致：直接取月度汇总那一行，保证两处数字一模一样
+  function settlementCards(data, month) {
+    const summary = settlementSummary(data);
+    const row = summary.find((item) => item.month === month) || {};
+    const group = (name) => (row.children || []).find((item) => item.group === name) || {};
+    const num = (value) => Number(value) || 0;
+    // 「未能完全结算」= 结算日期在本月、但还拿不到实收（没有应计流水）的订单
+    const incomplete = (summary.orderRows || []).filter((item) => String(item.order_settled_date || '').slice(0, 7) === month && item.receipt_cny == null).length;
+    return {
+      settled_orders: row.orders || 0,
+      settled_delivered: group('delivered').orders || 0,
+      settled_cancelled: group('cancelled').orders || 0,
+      settled_whd_orders: group('whd').orders || 0,
+      settled_other: group('other').orders || 0,
+      settled_income_rub: num(row.income_rub), settled_fees_rub: num(row.ozon_fees_rub),
+      settled_ad_rub: num(row.advertising_rub),
+      settled_purchase_cny: num(row.purchase_cny), settled_purchase_missing: num(row.missing_purchase),
+      settled_label_cny: num(row.label_cny), settled_label_missing: num(row.missing_label),
+      settled_cost_cny: rounded(num(row.purchase_cny) + num(row.label_cny)),
+      settled_profit_cny: num(row.profit_cny),
+      settled_margin_pct: row.margin_pct ?? null,
+      settled_incomplete: incomplete,
+    };
+  }
+
   // 月度汇总（新口径）：以订单表的结算日期归月，整单归月；未结算单独一行
   // 起点 2026-10，最后一条固定是「未结算」
   const SUMMARY_START = '2026-10';
@@ -382,16 +498,18 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     const buckets = new Map();
     const bucket = (key) => { if (!buckets.has(key)) buckets.set(key, empty()); return buckets.get(key); };
     for (const row of rows) {
-      const month = row.order_settled_date ? String(row.order_settled_date).slice(0, 7) : 'unsettled';
+      // 主单级费用行没有结算日期，按应计日期归月，固定落在「其他状态订单」组
+      const month = row.loose_month || (row.order_settled_date ? String(row.order_settled_date).slice(0, 7) : 'unsettled');
       const raw = String(row.raw_status || '');
-      const group = row.order_type === 'WHD订单' ? 'whd'
+      const group = row.loose_month ? 'other' : row.order_type === 'WHD订单' ? 'whd'
         : (raw.startsWith('cancelled') || raw === 'returned') ? 'cancelled'
         : raw === 'delivered' ? 'delivered' : 'other';
       // 未结算行里那些还没走完流程的单（在途/待发运等）只计入总量，不硬塞进「其他状态订单」组
       const pendingOnly = month === 'unsettled' && group === 'other';
       for (const key of pendingOnly ? [month] : [month, `${month}|${group}`]) {
         const b = bucket(key);
-        b.orders += 1;
+        // 主单级费用不是订单，只计流水笔数，不占「订单数」
+        if (row.loose_month) b.flows += row.loose_flows || 1; else b.orders += 1;
         if (pendingOnly) b.pending_orders += 1;
         b.income += moneyCents(row.income_rub ?? 0);
         b.fees += moneyCents(row.ozon_fees_rub ?? 0);
@@ -400,21 +518,11 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         b.receiptCny += moneyCents(row.receipt_cny ?? 0);
         b.purchase += moneyCents(row.purchase_cny ?? 0);
         b.label += moneyCents(row.label_cny ?? 0);
-        // WHD 由 Ozon 仓发货，本来就没有采购和贴单，不能算作「未录入」
-        if (row.order_type !== 'WHD订单') {
+        // WHD 由 Ozon 仓发货、主单级费用挂不到具体订单，两者都不算「未录入」
+        if (row.order_type !== 'WHD订单' && !row.loose_month) {
           if (row.purchase_cny == null) b.missing_purchase += 1;
           if (row.label_cny == null) b.missing_label += 1;
         }
-      }
-    }
-    // 「其他状态订单」= 结算数据里只挂主单号、拆不到具体包裹的流水（多为收单业务费），按应计日归月
-    for (const [month, item] of rows.loose || new Map()) {
-      if (!month || month < SUMMARY_START) continue;
-      for (const key of [month, `${month}|other`]) {
-        const b = bucket(key);
-        b.income += item.income;
-        b.fees -= item.fees;
-        b.flows += item.flows;
       }
     }
     const build = (key, label, isGroup, groupKey) => {
@@ -456,6 +564,8 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       ...build('unsettled', '未结算', false),
       children: SUMMARY_GROUPS.map(([group, name]) => build(`unsettled|${group}`, name, true, group)),
     });
+    // 顶部指标卡还要按「未能结算」逐单计数，把逐单行一并带出去，避免重复计算一遍
+    list.orderRows = rows;
     return list;
   }
   async function latestRun(ctx) {
@@ -520,19 +630,71 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
   // 订单表增量同步：拉最近 7 天的订单（新单 + 状态变化），再补查一批「非终态」订单的状态。
   // 结算明细的状态/商品等信息都直接读订单表，所以这里一更新，明细立刻跟着变。
   const ORDER_SYNC_MS = 30 * 60 * 1000;
-  async function syncOrdersNow(ctx, trigger = 'manual') {
-    const id = (await query(`INSERT INTO app_statistics_order_syncs(user_id,store_id,trigger) VALUES($1,$2,$3) RETURNING id`,
-      [ctx.userId, ctx.storeId, trigger])).rows[0].id;
+  // 手动同步可以指定区间；不传就按默认「今天往前一周」
+  const ORDER_SYNC_DAYS = 7, ORDER_SYNC_MAX_DAYS = 92;
+  function orderSyncWindow(range = {}) {
+    const day = (value) => /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) ? String(value) : '';
+    const to = day(range.to) || shanghaiDate();
+    const from = day(range.from) || new Date(Date.parse(`${to}T00:00:00Z`) - ORDER_SYNC_DAYS * 86400000).toISOString().slice(0, 10);
+    if (from > to) throw fail('同步区间的开始日期不能晚于结束日期', 400);
+    if (to > shanghaiDate()) throw fail('同步区间不能超过今天', 400);
+    const days = Math.round((Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86400000) + 1;
+    if (days > ORDER_SYNC_MAX_DAYS) throw fail(`同步区间最长 ${ORDER_SYNC_MAX_DAYS} 天，请分段同步`, 400);
+    return {
+      from, to, days,
+      since: new Date(`${from}T00:00:00+08:00`).toISOString(),
+      until: new Date(`${to}T23:59:59+08:00`).toISOString(),
+    };
+  }
+  // 订单表同步分两条来源：
+  //   ① 普通订单（FBS）—— 读 ERP 自己的订单表 app_order_cache，**不调 Ozon 接口**；
+  //   ② WHD 订单（FBO）—— ERP 订单表里没有这类单，仍按原来的方式从 Ozon 拉列表 + 补查非终态。
+  // 结算明细的状态与结算日期都读统计订单表，所以这里一更新，明细立刻跟着变。
+  async function syncOrdersNow(ctx, trigger = 'manual', range = {}) {
+    const syncRange = orderSyncWindow(range);
+    const id = (await query(`INSERT INTO app_statistics_order_syncs(user_id,store_id,trigger,range_from,range_to) VALUES($1,$2,$3,$4,$5) RETURNING id`,
+      [ctx.userId, ctx.storeId, trigger, syncRange.from, syncRange.to])).rows[0].id;
     let fetched = 0, changed = 0;
+    // 实时进度：前端轮询这一行画进度条。写失败不能影响同步本身。
+    const stage = (phase, progress) => query(`UPDATE app_statistics_order_syncs SET phase=$2,progress=$3,fetched=$4,changed=$5 WHERE id=$1`,
+      [id, String(phase).slice(0, 120), Math.max(0, Math.min(99, Math.round(progress))), fetched, changed]).catch(() => {});
+    const span = `(coalesce(in_process_at, created_at) AT TIME ZONE 'Asia/Shanghai')::date BETWEEN $3::date AND $4::date`;
     try {
-      const since = new Date(Date.now() - 7 * 86400000).toISOString(), to = new Date().toISOString();
-      for (const schema of ['fbs', 'fbo']) {
+      // WHD 单必须沿用统计表里已有的 schema；ERP 缓存不带 created_at，已有的要保留
+      const prior = new Map((await query(`SELECT posting_number, payload->>'schema' AS schema, payload->>'created_at' AS created_at FROM app_statistics_orders WHERE user_id=$1 AND store_id=$2`,
+        [ctx.userId, ctx.storeId])).rows.map((row) => [row.posting_number, row]));
+      // ① ERP 订单表：普通订单
+      const total = Number((await query(`SELECT count(*) AS c FROM app_order_cache WHERE user_id=$1 AND store_id=$2 AND ${span}`,
+        [ctx.userId, ctx.storeId, syncRange.from, syncRange.to])).rows[0].c) || 0;
+      await stage('正在读取 ERP 订单表', 3);
+      const PAGE = 300;
+      for (let offset = 0; offset < total; offset += PAGE) {
+        const rows = (await query(`SELECT posting_number, payload FROM app_order_cache WHERE user_id=$1 AND store_id=$2 AND ${span}
+          ORDER BY in_process_at NULLS LAST, posting_number LIMIT $5 OFFSET $6`,
+          [ctx.userId, ctx.storeId, syncRange.from, syncRange.to, PAGE, offset])).rows;
+        const items = [];
+        for (const row of rows) {
+          const old = prior.get(row.posting_number);
+          try {
+            items.push(normalizeOrder({ ...row.payload, posting_number: row.posting_number,
+              created_at: row.payload.created_at || old?.created_at || null }, old?.schema === 'fbo' ? 'fbo' : 'fbs'));
+          } catch { /* 单号不合法的跳过，不影响整批 */ }
+        }
+        fetched += items.length;
+        changed += await saveOrders(ctx, items);
+        const done = Math.min(offset + PAGE, total);
+        await stage(`正在读取 ERP 订单表 · ${done}/${total}`, 3 + 62 * (done / Math.max(1, total)));
+      }
+      // ② WHD 订单：ERP 表里没有，仍从 Ozon 拉（与改动前的口径一致）
+      await stage('正在同步 WHD 订单', 68);
+      for (const schema of ['fbo']) {
         let cursor = '';
         const seen = new Set();
         for (let page = 0; page < 100; page++) {
-          const body = await callOzon(schema === 'fbs' ? '/v4/posting/fbs/list' : '/v3/posting/fbo/list', {
-            cursor, filter: { since, to }, limit: 100,
-            with: { financial_data: false, analytics_data: false }, ...(schema === 'fbs' ? { dir: 'DESC' } : { sort_dir: 'desc' }),
+          await stage(`正在同步 WHD 订单 · 第 ${page + 1} 页`, 68 + 18 * (1 - Math.pow(0.72, page)));
+          const body = await callOzon('/v3/posting/fbo/list', {
+            cursor, filter: { since: syncRange.since, to: syncRange.until }, limit: 100,
+            with: { financial_data: false, analytics_data: false }, sort_dir: 'desc',
           }, { storeId: ctx.storeId, userId: ctx.userId });
           if (!Array.isArray(body.postings)) throw fail('Ozon 订单列表响应结构异常', 502);
           const items = body.postings.map((p) => normalizeOrder(p, schema));
@@ -544,30 +706,33 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
           seen.add(next); cursor = next;
         }
       }
-      // 老订单的状态变化（如运输中→签收、取消）不会出现在「最近 7 天」里，
-      // 按「最久没更新优先」每轮补查 120 单，几轮就能把非终态订单扫一遍。
+      // ③ WHD 非终态补查：状态变化不会出现在区间列表里，按「最久没更新优先」补 120 单
+      await stage('正在补查 WHD 非终态订单', 88);
       const stale = (await query(`SELECT payload FROM app_statistics_orders WHERE user_id=$1 AND store_id=$2
+        AND payload->>'schema'='fbo'
         AND coalesce(payload->>'status','') <> 'delivered' AND coalesce(payload->>'status','') NOT LIKE 'cancelled%'
         AND coalesce(payload->>'status','') <> 'returned'
         ORDER BY updated_at ASC LIMIT 120`, [ctx.userId, ctx.storeId])).rows.map((row) => row.payload);
-      for (const order of stale) {
-        const schema = order.schema === 'fbo' ? 'fbo' : 'fbs';
+      for (let index = 0; index < stale.length; index++) {
+        const order = stale[index];
         try {
-          const response = await callOzon(schema === 'fbs' ? '/v3/posting/fbs/get' : '/v2/posting/fbo/get',
+          const response = await callOzon('/v2/posting/fbo/get',
             { posting_number: order.posting_number, with: { financial_data: false, analytics_data: false } },
             { storeId: ctx.storeId, userId: ctx.userId });
-          changed += await saveOrders(ctx, [normalizeOrder(response.result || response, schema)]);
+          changed += await saveOrders(ctx, [normalizeOrder(response.result || response, 'fbo')]);
           fetched += 1;
         } catch { /* 单笔查不到就跳过，不影响整轮同步 */ }
+        if (index % 10 === 9) await stage(`正在补查 WHD 非终态订单 · ${index + 1}/${stale.length}`, 88 + 6 * ((index + 1) / stale.length));
       }
+      await stage('正在回填结算日期', 95);
       await updateSettledFromSales(ctx);
-      await query(`UPDATE app_statistics_order_syncs SET status='succeeded',fetched=$2,changed=$3,finished_at=now(),message=$4 WHERE id=$1`,
-        [id, fetched, changed, `拉取 ${fetched} 单 · 更新 ${changed} 单`]);
+      await query(`UPDATE app_statistics_order_syncs SET status='succeeded',fetched=$2,changed=$3,finished_at=now(),phase='同步完成',progress=100,message=$4 WHERE id=$1`,
+        [id, fetched, changed, `ERP 订单表 ${syncRange.from} ~ ${syncRange.to} · 读取 ${fetched} 单 · 更新 ${changed} 单`]);
       clearCache(ctx.storeId);
-      return { fetched, changed };
+      return { fetched, changed, from: syncRange.from, to: syncRange.to, days: syncRange.days, total };
     } catch (error) {
-      await query(`UPDATE app_statistics_order_syncs SET status='failed',fetched=$2,changed=$3,finished_at=now(),message=$4 WHERE id=$1`,
-        [id, fetched, changed, String(error.message || error).slice(0, 500)]).catch(() => {});
+      await query(`UPDATE app_statistics_order_syncs SET status='failed',fetched=$2,changed=$3,finished_at=now(),message=$4,phase=$5 WHERE id=$1`,
+        [id, fetched, changed, String(error.message || error).slice(0, 500), '同步失败']).catch(() => {});
       throw error;
     }
   }
@@ -1002,6 +1167,8 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
   }
   // 结算数据起点：Ozon 侧 2026-07-01 之前的账不再补拉
   const SYNC_MIN_DATE = '2026-07-01';
+  // 只有主单号、挂不到具体包裹的费用记录，在明细里用这个「订单类型」标识
+  const MONTHLY_FEE_TYPE = '主单级费用';
   function validateSyncRange(from, to) {
     const valid = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s) && Number.isFinite(Date.parse(s))
       && new Date(s).toISOString().slice(0, 10) === s;
@@ -1068,8 +1235,13 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     // 订单表增量同步：每 5 分钟检查一次，距上次超过 30 分钟才真正跑
     orderTimer = setInterval(() => orderSyncTick(), 5 * 60000); orderTimer.unref?.();
     setTimeout(() => orderSyncTick(), 90000).unref?.();
+    // SFTP 投递目录：每天 09:00 扫一次（D-2 / D-1 两天，缺文件或缺结算就跳过）
+    if (INBOX_DIR) {
+      inboxTimer = setInterval(inboxTick, 5 * 60000); inboxTimer.unref?.();
+      inboxTimer.unref?.();
+    }
   }
-  function stop() { if (timer) clearInterval(timer); timer = null; if (orderTimer) clearInterval(orderTimer); orderTimer = null; }
+  function stop() { if (timer) clearInterval(timer); timer = null; if (orderTimer) clearInterval(orderTimer); orderTimer = null; if (inboxTimer) clearInterval(inboxTimer); inboxTimer = null; }
   function amountInput(value, label, nullable = true) {
     if (value === null && nullable) return null;
     if (value === '' || value === undefined || typeof value === 'boolean') throw fail(`${label}不能为空`);
@@ -1084,7 +1256,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
   async function saveCosts(ctx, body) {
     const month = validMonth(String(body.month || ''));
     const items = body.items;
-    if (!Array.isArray(items) || !items.length || items.length > 5000) throw fail('一次可维护1至5000条订单');
+    if (!Array.isArray(items) || !items.length || items.length > 20000) throw fail('一次可维护1至20000条订单');
     if (new Set(items.map((r) => r.posting_number)).size !== items.length) throw fail('批量数据中有重复订单号');
     const data = await loadData(ctx);
     // 订单明细是全量订单表，维护费用不再限制在某个应计月份里
@@ -1100,8 +1272,9 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const before = (await client.query(`SELECT posting_number,purchase_cny,label_cny,version FROM app_statistics_costs WHERE user_id=$1 AND store_id=$2 AND posting_number=ANY($3::text[]) FOR UPDATE`, [ctx.userId, ctx.storeId, validated.map((r) => r.posting_number)])).rows;
       const old = new Map(before.map((r) => [r.posting_number, r]));
       for (const item of validated) if (Number(old.get(item.posting_number)?.version || 0) !== item.version) throw fail(`采购费已被修改，请刷新：${item.posting_number}`, 409);
-      const after = validated.map((r) => ({ ...r, label_cny: r.label_cny ?? Number(old.get(r.posting_number)?.label_cny ?? 1.5), version: r.version + 1 }));
-      const snapshot = validated.map((r) => old.get(r.posting_number) || { posting_number: r.posting_number, purchase_cny: null, label_cny: 1.5, version: 0 });
+      // 贴单费不设默认值：没填就保持旧值，旧值也没有就是空（null），不再兜底 1.5
+      const after = validated.map((r) => ({ ...r, label_cny: r.label_cny ?? (old.get(r.posting_number)?.label_cny ?? null), version: r.version + 1 }));
+      const snapshot = validated.map((r) => old.get(r.posting_number) || { posting_number: r.posting_number, purchase_cny: null, label_cny: null, version: 0 });
       const auditId = await audit(client, ctx, 'costs', month, String(body.reason || '维护订单采购费用（含采购运费）').slice(0, 300), { before: snapshot, after });
       await client.query(`INSERT INTO app_statistics_costs(user_id,store_id,posting_number,purchase_cny,label_cny,version)
         SELECT $1,$2,x.posting_number,x.purchase_cny,x.label_cny,x.version FROM jsonb_to_recordset($3::jsonb) AS x(posting_number text,purchase_cny numeric,label_cny numeric,version integer)
@@ -1305,7 +1478,12 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     if (!raw.length) throw fail('没有可导入的明细');
     if (raw.length > 100000) throw fail('单次最多导入 10 万行');
     const force = body?.force === true;
-    const entries = raw.map(normalizeAdEntry);
+    // 只导某一种模式时，校验/覆盖都要限定在该模式内，不能把另一种模式的历史明细一起删掉
+    const modes = Array.isArray(body?.modes) && body.modes.length
+      ? [...new Set(body.modes.map(String))].filter((mode) => mode === 'cpo' || mode === 'cpc')
+      : ['cpo', 'cpc'];
+    if (!modes.length) throw fail('导入模式无效');
+    const entries = raw.map(normalizeAdEntry).filter((entry) => modes.includes(entry.mode));
     const byDay = new Map();
     for (const entry of entries) {
       if (!byDay.has(entry.date)) byDay.set(entry.date, []);
@@ -1359,7 +1537,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       let inserted = 0, reused = 0, replaced = 0;
       for (const [date, list] of byDay) {
         const existing = (await client.query(`SELECT order_number, sku, mode, cents FROM app_statistics_order_ad_entries
-          WHERE user_id=$1 AND store_id=$2 AND ad_date=$3`, [ctx.userId, ctx.storeId, date])).rows;
+          WHERE user_id=$1 AND store_id=$2 AND ad_date=$3 AND mode = ANY($4::text[])`, [ctx.userId, ctx.storeId, date, modes])).rows;
         const oldMap = new Map(existing.map((r) => [`${r.order_number}|${r.sku}|${r.mode}`, Number(r.cents)]));
         const newMap = new Map(list.map((e) => [`${e.order_number}|${e.sku}|${e.mode}`, e.cents]));
         // 重叠：同一订单+SKU+模式的历史金额必须一致（历史数据不会变）
@@ -1369,7 +1547,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
           }
         }
         if (oldMap.size === newMap.size && [...oldMap].every(([key, cents]) => newMap.get(key) === cents)) { reused += 1; continue; }
-        await client.query(`DELETE FROM app_statistics_order_ad_entries WHERE user_id=$1 AND store_id=$2 AND ad_date=$3`, [ctx.userId, ctx.storeId, date]);
+        await client.query(`DELETE FROM app_statistics_order_ad_entries WHERE user_id=$1 AND store_id=$2 AND ad_date=$3 AND mode = ANY($4::text[])`, [ctx.userId, ctx.storeId, date, modes]);
         await client.query(`INSERT INTO app_statistics_order_ad_entries(user_id,store_id,ad_date,order_number,sku,mode,cents,quantity,ad_order_id)
           SELECT $1,$2,(x->>'date')::date,x->>'order_number',x->>'sku',x->>'mode',(x->>'cents')::bigint,(x->>'quantity')::int,x->>'order_id'
           FROM jsonb_array_elements($3::jsonb) x`, [ctx.userId, ctx.storeId, JSON.stringify(list)]);
@@ -1403,8 +1581,9 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const touchedDays = [...new Set(entries.map((e) => e.date))];
       if (touchedDays.length) {
         await client.query(`DELETE FROM app_statistics_accruals
-          WHERE user_id=$1 AND store_id=$2 AND accrued_date=ANY($3::date[]) AND payload->>'source'='ad_report'`,
-          [ctx.userId, ctx.storeId, touchedDays]);
+          WHERE user_id=$1 AND store_id=$2 AND accrued_date=ANY($3::date[]) AND payload->>'source'='ad_report'
+            AND split_part(accrual_id, ':', 4) = ANY($4::text[])`,
+          [ctx.userId, ctx.storeId, touchedDays, modes]);
       }
       if (adPayloads.length) {
         await client.query(`INSERT INTO app_statistics_accruals(user_id,store_id,accrual_id,accrued_date,payload)
@@ -1426,10 +1605,186 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
     res.send('\ufeff' + rows.map((row) => row.map(csvCell).join(',')).join('\r\n'));
   }
+  // ─────────────────── Ozon 报表投递目录（SFTP）───────────────────
+  // 财务把 Ozon 后台导出的「按订单付费」xlsx 通过 SFTP 丢到 <DIR>/<店铺>/incoming/。
+  // 每天 09:00（北京时间）扫一次，只看【前天 D-2】和【昨天 D-1】两天：
+  //   · 昨天的结算常常顺延一天才出账，所以两天都试，缺哪天就跳过哪天，绝不硬导；
+  //   · 目录里没有覆盖该日期的文件 → 跳过；
+  //   · 该日期在结算明细里还没有 54 凭证（未出账）→ 跳过，等第二天再来。
+  const INBOX_DIR = String(process.env.STATISTICS_INBOX_DIR || '').trim();
+  const INBOX_HOUR = Math.min(23, Math.max(0, Number(process.env.STATISTICS_INBOX_HOUR || 9)));
+  // 目录名 → 店铺ID 显式映射（同一店铺被重复连接时，避免把文件导进另一个同名店铺）
+  const INBOX_STORE_MAP = new Map(String(process.env.STATISTICS_INBOX_STORES || '').split(',')
+    .map((item) => item.split(':')).filter((pair) => pair.length === 2 && pair[0].trim() && pair[1].trim())
+    .map(([folder, id]) => [folder.trim().toLowerCase().replace(/[^a-z0-9]/g, ''), id.trim()]));
+  let inboxTimer = null, inboxRunning = false, inboxLastDay = '';
+
+  const xmlDecode = (value) => String(value || '')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  const colIndex = (letters) => [...letters].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+  const inboxNumber = (value) => Number(String(value ?? '').replace(/\s/g, '').replace(',', '.'));
+  // 报表里的日期有两种写法：账户级是 2026.10.30（年.月.日），逐单是 30.10.2026（日.月.年）
+  const inboxIso = (value) => {
+    const text = String(value || '').trim();
+    let match = /^(\d{4})\.(\d{2})\.(\d{2})$/.exec(text);
+    if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+    match = /^(\d{2})\.(\d{2})\.(\d{4})$/.exec(text);
+    if (match) return `${match[3]}-${match[2]}-${match[1]}`;
+    return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : '';
+  };
+  const inboxHead = (rows, label) => rows.findIndex((row) => row.some((cell) => String(cell || '').includes(label)));
+  const inboxCol = (header, label) => header.findIndex((cell) => String(cell || '').replace(/\s/g, '').includes(label));
+  const inboxDay = (offset) => {
+    const base = new Date(`${shanghaiDate()}T00:00:00Z`);
+    base.setUTCDate(base.getUTCDate() - offset);
+    return base.toISOString().slice(0, 10);
+  };
+
+  // 极简 xlsx 读取：fflate 解 zip，只取第一张工作表的文本单元格
+  function readXlsxRows(buffer) {
+    const files = unzipSync(new Uint8Array(buffer));
+    const shared = [];
+    const sharedXml = files['xl/sharedStrings.xml'] ? strFromU8(files['xl/sharedStrings.xml']) : '';
+    for (const match of sharedXml.matchAll(/<si>([\s\S]*?)<\/si>/g)) shared.push(xmlDecode(match[1].replace(/<[^>]+>/g, '')));
+    const sheet = Object.keys(files).filter((name) => /^xl\/worksheets\/sheet\d+\.xml$/.test(name)).sort()[0];
+    if (!sheet) throw fail('报表里找不到工作表', 422);
+    const rows = [];
+    for (const rowMatch of strFromU8(files[sheet]).matchAll(/<row[^>]*>([\s\S]*?)<\/row>/g)) {
+      const cells = [];
+      for (const cellMatch of rowMatch[1].matchAll(/<c r="([A-Z]+)\d+"([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g)) {
+        const attr = cellMatch[2] || '', inner = cellMatch[3] || '';
+        const raw = /<v>([\s\S]*?)<\/v>/.exec(inner);
+        const text = /<t[^>]*>([\s\S]*?)<\/t>/.exec(inner);
+        let value = '';
+        if (/t="s"/.test(attr) && raw) value = shared[Number(raw[1])] ?? '';
+        else if (text) value = xmlDecode(text[1]);
+        else if (raw) value = raw[1];
+        cells[colIndex(cellMatch[1])] = String(value).trim();
+      }
+      rows.push(cells);
+    }
+    return rows;
+  }
+
+  // 逐单报表（按订单付费）：日期 / 订单 ID / 订单号 / SKU / 数量 / 费用
+  function parseInboxOrders(rows, mode) {
+    const head = inboxHead(rows, '订单号');
+    if (head < 0) return [];
+    const header = rows[head];
+    const dateCol = inboxCol(header, '日期'), orderCol = inboxCol(header, '订单号'), skuCol = inboxCol(header, 'SKU');
+    const qtyCol = inboxCol(header, '数量'), feeCol = inboxCol(header, '费用'), idCol = inboxCol(header, '订单 ID');
+    if (dateCol < 0 || orderCol < 0 || skuCol < 0 || feeCol < 0) throw fail('逐单报表列不完整', 422);
+    const entries = [];
+    for (const row of rows.slice(head + 1)) {
+      const date = inboxIso(row[dateCol]);
+      const order = String(row[orderCol] || '').trim();
+      const sku = String(row[skuCol] || '').trim();
+      const fee = inboxNumber(row[feeCol]);
+      if (!date || !/^\d+-\d+(?:-\d+)?$/.test(order) || !/^\d{1,24}$/.test(sku) || !Number.isFinite(fee) || fee <= 0) continue;
+      entries.push({ date, order_number: order, sku, mode, cents: Math.round(Math.abs(fee) * 100),
+        quantity: Math.max(1, Number.parseInt(row[qtyCol], 10) || 1), order_id: idCol >= 0 ? String(row[idCol] || '').slice(0, 32) : '' });
+    }
+    return entries;
+  }
+
+  // 扫描投递目录：按「日期」逐天判断，缺文件/缺结算就跳过，绝不猜、不硬导
+  async function scanInbox({ trigger = 'auto', dryRun = false, storeId = null, dates = null, override = false } = {}) {
+    if (!db || !INBOX_DIR) return { skipped: 'disabled', dir: INBOX_DIR || null, days: [] };
+    if (inboxRunning) return { skipped: 'running', dir: INBOX_DIR, days: [] };
+    inboxRunning = true;
+    const targets = (Array.isArray(dates) && dates.length ? dates : [inboxDay(2), inboxDay(1)])
+      .map((date) => String(date).slice(0, 10)).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date));
+    const report = { dir: INBOX_DIR, trigger, dry_run: dryRun, targets, imported: 0, skipped: 0, failed: 0, days: [] };
+    try {
+      const all = (await query(`SELECT id,user_id,name FROM app_stores WHERE platform='ozon' AND active=TRUE`)).rows
+        .filter((store) => !storeId || store.id === storeId);
+      // 同一目录可能对应多个同名店铺（重复连接同一 Ozon 账号）：有映射按映射，没映射且不唯一就跳过
+      const folders = new Map();
+      for (const store of all) {
+        const folder = String(store.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        if (!folders.has(folder)) folders.set(folder, []);
+        folders.get(folder).push(store);
+      }
+      const stores = [];
+      for (const [folder, group] of folders) {
+        const mapped = INBOX_STORE_MAP.get(folder);
+        if (mapped) { const hit = group.find((store) => store.id === mapped); if (hit) stores.push(hit); continue; }
+        if (group.length === 1) { stores.push(group[0]); continue; }
+        logger.warn('[statistics-inbox]', `目录 ${folder} 对应 ${group.length} 个同名店铺，请用 STATISTICS_INBOX_STORES 指定，已跳过`);
+      }
+      for (const store of stores) {
+        const folder = String(store.name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        const dir = path.join(INBOX_DIR, folder, 'incoming');
+        let names = [];
+        try { names = (await fs.readdir(dir)).filter((name) => /按订单付费/.test(name) && /\.xlsx$/i.test(name) && !name.startsWith('~$')).sort(); }
+        catch { continue; }
+        const ctx = { userId: store.user_id, storeId: store.id };
+        for (const date of targets) {
+          const day = { date, store: folder, file: '', status: '', entries: 0, message: '' };
+          try {
+            if (!override) {
+              const done = (await query(`SELECT 1 FROM app_statistics_inbox_days WHERE user_id=$1 AND store_id=$2 AND ad_date=$3`,
+                [ctx.userId, ctx.storeId, date])).rows.length > 0;
+              if (done) { day.status = 'unchanged'; day.message = '该日期已导入过'; report.skipped++; report.days.push(day); continue; }
+            }
+            const file = names.find((name) => {
+              const range = /(\d{4}-\d{2}-\d{2})_(\d{4}-\d{2}-\d{2})/.exec(name);
+              return range && date >= range[1] && date <= range[2];
+            });
+            if (!file) { day.status = 'no-file'; day.message = '目录里没有覆盖该日期的逐单报表'; report.skipped++; report.days.push(day); continue; }
+            day.file = file;
+            // 该日期还没有 54 结算凭证 = 还没出账（常见于昨日顺延），这次不导
+            const settled = (await query(`SELECT 1 FROM app_statistics_accruals
+              WHERE user_id=$1 AND store_id=$2 AND accrued_date=$3 AND coalesce(payload->>'source','ozon')='ozon'
+                AND payload->'non_item_fee'->>'type_id'='54' LIMIT 1`, [ctx.userId, ctx.storeId, date])).rows.length > 0;
+            if (!settled) { day.status = 'no-settlement'; day.message = '该日期还没有 54 结算凭证（可能顺延），本次不导'; report.skipped++; report.days.push(day); continue; }
+            const rows = readXlsxRows(await fs.readFile(path.join(dir, file)));
+            const entries = parseInboxOrders(rows, 'cpo').filter((entry) => entry.date === date);
+            if (!entries.length) { day.status = 'no-entries'; day.message = '报表里没有该日期的明细'; report.skipped++; report.days.push(day); continue; }
+            day.entries = entries.length;
+            if (dryRun) { day.status = 'ready'; day.message = `${entries.length} 条待导入`; report.skipped++; report.days.push(day); continue; }
+            const result = await importOrderAdReport(ctx, { entries, force: true, modes: ['cpo'] });
+            await query(`INSERT INTO app_statistics_inbox_days(user_id,store_id,file_name,ad_date,entries,message)
+              VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT (user_id,store_id,ad_date) DO UPDATE
+              SET file_name=EXCLUDED.file_name, entries=EXCLUDED.entries, message=EXCLUDED.message, imported_at=now()`,
+              [ctx.userId, ctx.storeId, file, date, entries.length, `${entries.length} 条 / 写入 ${result.rows_written} 行`]);
+            clearCache(ctx.storeId);
+            day.status = 'imported';
+            day.message = `${entries.length} 条，写入 ${result.rows_written} 行，未匹配 ${result.unmatched_entries} 条`;
+            report.imported++;
+          } catch (error) {
+            day.status = 'failed';
+            day.message = String(error.message || error).slice(0, 300);
+            report.failed++;
+          }
+          report.days.push(day);
+        }
+      }
+      if (report.imported || report.failed) logger.info('[statistics-inbox]', JSON.stringify({ trigger, targets, imported: report.imported, failed: report.failed }));
+      return report;
+    } finally { inboxRunning = false; }
+  }
+
+  // 每天 09:00 左右跑一次（每 5 分钟看一眼，当天只跑一次；重启不会重复导，有入库记账兜底）
+  function inboxTick() {
+    if (!INBOX_DIR) return;
+    const now = new Date();
+    const shanghaiHour = Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Shanghai', hour: '2-digit', hour12: false }).format(now));
+    const today = shanghaiDate();
+    if (shanghaiHour !== INBOX_HOUR || inboxLastDay === today) return;
+    inboxLastDay = today;
+    scanInbox({ trigger: 'scheduled' }).catch((error) => logger.warn('[statistics-inbox]', error.message));
+  }
+
   function register(app, requireAuth) {
     const route = (method, url, action) => app[method](PREFIX + url, requireAuth, async (req, res, next) => {
       try { const ctx = await context(req); res.setHeader('Cache-Control', 'no-store'); await action(req, res, ctx); } catch (error) { next(error); }
     });
+    // 主单级费用行按「费用发生月」归月：选哪个月就只算该月发生的费用，
+    // 不能把 7/8/9/11 月的主单费用一起堆到当前月列表里
+    const scopeFeeRows = (rows, month) => rows.filter((row) => !row.loose_month || row.loose_month === month);
     const reportRoute = async (req, res, ctx) => {
       const params = (req.method === 'POST' ? req.body : req.query) || {};
       const month = validMonth(String(params.month || shanghaiDate().slice(0, 7)));
@@ -1437,14 +1792,12 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       // 订单明细 = 订单总表，有多少订单就展示多少（1:1），金额按订单号从结算明细全期关联，
       // 与月份无关；没有应计流水的订单也保留，金额留空等结算后自动补上。
       const rate = Number(result.summary.exchange_rate || data.rate) || data.rate;
-      const rows = filteredRows(buildOrderRows(data, rate), params);
+      const rows = scopeFeeRows(filteredRows(buildOrderRows(data, rate), params), month);
       const size = Math.min(500, Math.max(1, parseInt(params.page_size, 10) || 100));
       const page = Math.max(1, parseInt(params.page, 10) || 1);
       // 顶部「本月结算订单」按结算日期归月，只看 settled_date 落在所选月份的订单
-      const settledMonth = data.orders.filter((order) => String(order.settled_date || '').slice(0, 7) === month);
       res.json({ success: true, rows: rows.slice((page - 1) * size, page * size), total: rows.length,
-        summary: { ...result.summary, settled_orders: settledMonth.length,
-          settled_whd_orders: settledMonth.filter((order) => order.schema === 'fbo').length }, run: await latestRun(ctx),
+        summary: { ...result.summary, ...settlementCards(data, month) }, run: await latestRun(ctx),
         advertising: { ...publicAdvertising(data.adConfig), ...result.advertising }, filter_catalog: REPORT_FIELDS,
         schedule: { time: '02:00, 09:30', timezone: 'Asia/Shanghai', frequency: 'daily' } });
     };
@@ -1455,9 +1808,21 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const month = validMonth(String(req.query.month || shanghaiDate().slice(0, 7)));
       const data = await loadData(ctx);
       const result = report(data, month);
-      const settled = data.orders.filter((order) => String(order.settled_date || '').slice(0, 7) === month);
+      const rate = Number(result.summary.exchange_rate || data.rate) || data.rate;
       res.json({ success: true, run: await latestRun(ctx),
-        summary: { ...result.summary, settled_orders: settled.length, settled_whd_orders: settled.filter((order) => order.schema === 'fbo').length } });
+        summary: { ...result.summary, ...settlementCards(data, month) } });
+    });
+    // SFTP 投递目录：已导入文件清单 + 手动触发扫描（dry=true 只解析不入库）
+    route('get', '/inbox', async (req, res, ctx) => {
+      const rows = (await query(`SELECT to_char(ad_date,'YYYY-MM-DD') AS ad_date,file_name,entries,message,imported_at
+        FROM app_statistics_inbox_days WHERE user_id=$1 AND store_id=$2 ORDER BY ad_date DESC LIMIT 60`,
+        [ctx.userId, ctx.storeId])).rows;
+      res.json({ success: true, dir: INBOX_DIR || null, hour: INBOX_HOUR, targets: [inboxDay(2), inboxDay(1)], days: rows });
+    });
+    route('post', '/inbox/scan', async (req, res, ctx) => {
+      const dates = Array.isArray(req.body?.dates) ? req.body.dates : null;
+      res.json({ success: true, ...(await scanInbox({ trigger: 'manual', dryRun: req.body?.dry === true,
+        storeId: ctx.storeId, dates, override: req.body?.override === true })) });
     });
     route('get', '/months', async (req, res, ctx) => {
       // 新口径：按订单的结算日期归月，起点 2026-10，末尾固定「未结算」
@@ -1477,10 +1842,14 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const month = String(req.body?.month || (range ? range.from.slice(0, 7) : ''));
       res.status(202).json({ success: true, run: await startSync(ctx, month, 'manual', range) });
     });
-    // 订单表增量同步（只拉订单，不动结算流水）：每 30 分钟自动跑一次，也可手动触发
-    route('post', '/sync-orders', async (req, res, ctx) => res.json({ success: true, ...(await syncOrdersNow(ctx, 'manual')) }));
+    // 订单表增量同步（只拉订单，不动结算流水）：每 30 分钟自动跑一次，也可手动触发。
+    // 手动触发可带 from / to（YYYY-MM-DD），不传就按「今天往前一周」。
+    route('post', '/sync-orders', async (req, res, ctx) => {
+      const body = req.body || {};
+      res.json({ success: true, ...(await syncOrdersNow(ctx, 'manual', { from: body.from, to: body.to })) });
+    });
     route('get', '/order-syncs', async (req, res, ctx) => {
-      const rows = (await query(`SELECT id,trigger,status,fetched,changed,message,
+      const rows = (await query(`SELECT id,trigger,status,fetched,changed,message,range_from,range_to,phase,progress,
         to_char(started_at AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS started_at,
         to_char(finished_at AT TIME ZONE 'Asia/Shanghai','MM-DD HH24:MI') AS finished_at
         FROM app_statistics_order_syncs WHERE user_id=$1 AND store_id=$2 ORDER BY started_at DESC LIMIT 50`,
@@ -1762,7 +2131,13 @@ WITH base AS (
         AND ($5::text IS NULL OR unit_number ILIKE $5)) AS ad_cpo,
     (SELECT coalesce(sum(amount),0) FROM grouped
       WHERE source = 'ad_report' AND type_id = 41
-        AND ($5::text IS NULL OR unit_number ILIKE $5)) AS ad_cpc
+        AND ($5::text IS NULL OR unit_number ILIKE $5)) AS ad_cpc,
+    -- 区间内有 54 结算、却完全没有逐单报表的日子：广告投入算不准，宁可留空也不给错数
+    (SELECT count(*) FROM (
+       SELECT accrued_date FROM grouped WHERE source = 'ozon' AND type_id = 54
+       EXCEPT
+       SELECT accrued_date FROM grouped WHERE source = 'ad_report'
+    ) miss) AS ad_missing_days
 )
 SELECT m.unit_number, to_char(m.accrued_date, 'YYYY-MM-DD') AS accrued_date, m.type_id, m.category, m.source, m.entries, m.amount,
        CASE WHEN m.source = 'ad_report' THEN '广告明细'
@@ -1775,7 +2150,7 @@ SELECT m.unit_number, to_char(m.accrued_date, 'YYYY-MM-DD') AS accrued_date, m.t
        s.income_total, s.net_total, s.sale_total, s.commission_total,
        s.delivery_total, s.return_sale, s.return_commission, s.fee_refund, s.income_rows_total,
        s.ad_total_ozon, s.ad_shop, s.ad_click, s.ad_brand,
-       s.ad_attributed, s.ad_cpo, s.ad_cpc
+       s.ad_attributed, s.ad_cpo, s.ad_cpc, s.ad_missing_days
 FROM grouped m CROSS JOIN summary s
 WHERE ($5::text IS NULL OR m.unit_number ILIKE $5)
   AND ($6::int IS NULL OR m.type_id = $6)
@@ -1799,6 +2174,9 @@ LIMIT $9 OFFSET $10`;
       const adShop = hasImport ? adShopImport : adShopSettle;
       const adClick = num(first.ad_click), adBrand = num(first.ad_brand);
       const adSettle = num(first.ad_total_ozon) + (posting ? adAttributed : 0);
+      // 广告投入固定按投放口径：逐单报表（订单+点击）+ 41 点击 + 3 品牌。
+      // 缺逐单报表的日子按 0 计（不拿结算 54 兜底），金额照常显示，缺失天数回传前端标注
+      const adMissingDays = num(first.ad_missing_days);
       const adTotal = hasImport ? (adShop + adClick + adBrand) : adSettle;
       // 实收 = 买家实付 + 佣金 + 内嵌配送费 + 手续费退回 − 同组相抵 + 退货销售额 − 退货佣金
       const deliveryTotal = num(first.delivery_total), feeRefund = num(first.fee_refund);
@@ -1818,6 +2196,8 @@ LIMIT $9 OFFSET $10`;
           income_adjust_rub: income - (saleTotal + commission),
           ad_rub: adTotal, ad_shop_rub: adShop, ad_click_rub: adClick, ad_brand_rub: adBrand,
           ad_attributed_rub: adAttributed, ad_cpo_rub: num(first.ad_cpo), ad_cpc_rub: num(first.ad_cpc),
+          // 缺逐单报表的天数（这些天不计入广告投入，前端标注出来）
+          ad_missing_days: adMissingDays,
           // 结算口径（含跨月顺延）仅作参考，不参与扣减
           ad_settlement_rub: adSettle,
           // 订单收入 = 净额（收入−代扣，不含广告）+ 广告（广告以负数存放）= Ozon 报表合计
@@ -1858,12 +2238,19 @@ LIMIT $9 OFFSET $10`;
     route('post', '/changes/:id/rollback', async (req, res, ctx) => res.json(await rollback(ctx, req.params.id)));
     route('get', '/ledger', async (req, res, ctx) => {
       const posting = String(req.query.posting_number || '');
+      // 主单级费用：两段号，直接列出该单号下的全部流水
+      if (/^\d+-\d+$/.test(posting)) {
+        const { rows, pending } = monthlyFeeLedgerRows(await loadData(ctx), posting);
+        return res.json({ success: true, rows, pending, months: [...new Set(rows.map((row) => String(row.date).slice(0, 7)))].sort() });
+      }
       if (!/^\d+-\d+-\d+$/.test(posting)) throw fail('请输入完整订单号');
       const { rows, pending } = orderLedgerRows(await loadData(ctx), posting);
       res.json({ success: true, rows, pending, months: [...new Set(rows.map((row) => String(row.date).slice(0, 7)))].sort() });
     });
     route('get', '/order-detail', async (req, res, ctx) => {
       const posting = req.query.posting_number;
+      // 主单级费用没有包裹级订单资料
+      if (typeof posting === 'string' && /^\d+-\d+$/.test(posting)) return res.json({ success: true, detail: null });
       if (typeof posting !== 'string' || posting.length > 64 || !/^\d+-\d+-\d+$/.test(posting)) throw fail('请输入完整订单号');
       const order = (await query('SELECT payload,updated_at FROM app_statistics_orders WHERE user_id=$1 AND store_id=$2 AND posting_number=$3',
         [ctx.userId, ctx.storeId, posting])).rows[0];
@@ -1891,7 +2278,7 @@ LIMIT $9 OFFSET $10`;
       const month = validMonth(String(params.month || shanghaiDate().slice(0, 7)));
       const data = await loadData(ctx), result = report(data, month);
       const rate = Number(result.summary.exchange_rate || data.rate) || data.rate;
-      const rows = filteredRows(buildOrderRows(data, rate), params);
+      const rows = scopeFeeRows(filteredRows(buildOrderRows(data, rate), params), month);
       // 留痕：导出失败时能直接从日志看出前端传了什么条件、命中了多少行
       logger.info('[statistics-export]', JSON.stringify({ store: ctx.storeId, month, rows: rows.length,
         status: params.status || null, unsettled: params.unsettled || null, order_type: params.order_type || null,
@@ -1916,5 +2303,5 @@ LIMIT $9 OFFSET $10`;
         VALUES($1,$2,$3,'seed','succeeded','已导入逐笔核对过的 API 快照',$4,$4,now())`, [ctx.userId, ctx.storeId, month, days.length]);
     });
   }
-  return { init, register, start, stop, startSync, tick, loadData, report, saveCosts, saveMonth, saveAdvertising, importAdvertising, syncAdvertising, rollback, replaceDay, saveOrders, importSnapshot, filteredRows, rebuildClickAllocations, orderLedgerRows, buildOrderRows, orderAggregates, settlementSummary };
+  return { init, register, start, stop, scanInbox, startSync, tick, loadData, report, saveCosts, saveMonth, saveAdvertising, importAdvertising, syncAdvertising, rollback, replaceDay, saveOrders, importSnapshot, filteredRows, rebuildClickAllocations, orderLedgerRows, buildOrderRows, orderAggregates, settlementSummary };
 }

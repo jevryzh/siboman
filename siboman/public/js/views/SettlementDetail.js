@@ -42,29 +42,45 @@ window.SettlementDetailView = {
     const rows = ref([]), total = ref(0), summary = ref({}), run = ref(null);
     const page = ref(1), pageSize = ref(100), loading = ref(false), syncing = ref(false), exporting = ref(false), error = ref('');
     const orderAdBusy = ref(false), orderAdInput = ref(null);
-    const logVisible = ref(false), logLoading = ref(false), orderSyncs = ref([]), orderSyncLast = ref('');
+    const logVisible = ref(false), logLoading = ref(false), syncRuns = ref([]), syncMissingDates = ref([]), syncLast = ref('');
     const adLogVisible = ref(false), adLogLoading = ref(false), adDays = ref([]), adMissing = ref([]), adSummary = ref({});
     const checkVisible = ref(false), checkRows = ref([]), checkMessage = ref(''), checkTotal = ref(0), pendingEntries = ref([]);
     const posting = ref(''), typeId = ref(''), category = ref(''), source = ref('');
     const stopped = false;
 
-    const typeName = (id) => id == null ? '订单汇总' : (TYPE_LABELS[id] || `费用类型 ${id}`);
+    const typeName = (id, source) => {
+      if (id == null) return '订单汇总';
+      // 逐单报表的行虽然也记 54/41，但它和 Ozon 结算的 54/41 是两笔不同来源的钱，必须分开展示
+      if (source === 'ad_report') {
+        if (Number(id) === 54) return '逐单 · 按订单';
+        if (Number(id) === 41) return '逐单 · 按点击';
+        return '逐单 · 广告';
+      }
+      return TYPE_LABELS[id] || `费用类型 ${id}`;
+    };
     const categoryName = (code) => CATEGORY_LABELS[code] || code || '—';
-    const typeOptions = Object.entries(TYPE_LABELS).map(([value, label]) => ({ value, label }));
+    const typeOptions = [
+      ...Object.entries(TYPE_LABELS).map(([value, label]) => ({ value, label })),
+      { value: 'ad:54', label: '逐单 · 按订单（54）' },
+      { value: 'ad:41', label: '逐单 · 按点击（41）' },
+    ];
     const activeRun = computed(() => run.value && ['queued', 'running'].includes(run.value.status));
     const progress = computed(() => run.value?.days_total ? Math.min(99, Math.round(run.value.days_done / run.value.days_total * 100)) : 0);
     const lastUpdated = computed(() => run.value?.finished_at ? new Date(run.value.finished_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—');
 
-    // 广告卡片的分层数据：总额 → 54（逐单报表拆成订单/点击）→ 41 → 3 → 跨月顺延
-    // 没有导入逐单报表时，54 直接取结算口径
+    // 广告卡片 = 投放口径：逐单报表（按订单 + 按点击）+ 41 点击 + 3 品牌。广告都是扣款，展示绝对值
+    // 缺逐单报表的天不计入（按 0 计），金额照常显示，缺失天数在这里标注出来
     const adItems = computed(() => {
       const s = summary.value || {};
       const abs = (v) => Math.abs(Number(v || 0));
       const cpo = abs(s.ad_cpo_rub), cpc = abs(s.ad_cpc_rub);
       const hasImport = cpo + cpc > 0.01;
-      const total = abs(s.ad_rub), settlement = abs(s.ad_settlement_rub);
-      return { shop: abs(s.ad_shop_rub), cpo, cpc, click: abs(s.ad_click_rub), brand: abs(s.ad_brand_rub),
-        hasImport, total, settlement, delayed: total - settlement };
+      const missing = Number(s.ad_missing_days || 0);
+      const total = s.ad_rub == null ? null : abs(s.ad_rub);
+      const settlement = abs(s.ad_settlement_rub);
+      return { shop: abs(s.ad_shop_rub), shopLabel: hasImport ? '逐单合计' : '54 商品推广', cpo, cpc,
+        click: abs(s.ad_click_rub), brand: abs(s.ad_brand_rub),
+        hasImport, missing, total, settlement, delayed: total == null ? 0 : total - settlement };
     });
     // 广告明细弹层：移入即展开，移出收起；点一下可钉住
     const adTipOpen = ref(false), adTipPinned = ref(false);
@@ -84,9 +100,14 @@ window.SettlementDetailView = {
       const [from, to] = accrualRange.value?.length === 2 ? accrualRange.value : defaultQueryRange();
       const params = { store_id: sid(), page: page.value, page_size: pageSize.value, from, to };
       if (posting.value.trim()) params.posting = posting.value.trim();
-      if (typeId.value !== '') params.type_id = typeId.value;
+      if (typeId.value !== '') {
+        // 「类型」里选了逐单项时，同时把来源锁到 ad_report（后端无需新增参数）
+        const scoped = /^ad:(\d+)$/.exec(String(typeId.value));
+        if (scoped) { params.type_id = scoped[1]; params.source = 'ad_report'; }
+        else params.type_id = typeId.value;
+      }
       if (category.value) params.category = category.value;
-      if (source.value) params.source = source.value;
+      if (source.value && !params.source) params.source = source.value;
       return params;
     }
 
@@ -118,13 +139,17 @@ window.SettlementDetailView = {
     }
 
     async function syncNow() {
-      if (!sid()) return;
-      // 只同步订单表：拉最近 7 天订单 + 补查一批非终态订单，然后把状态/结算日期同步到明细
+      if (!sid() || syncing.value) return;
+      // 按页面左上的「同步区间」去 Ozon 应计接口拉结算流水（钱），拉完整区间的每一天
+      const [from, to] = Array.isArray(dateRange.value) && dateRange.value.length === 2 ? dateRange.value : [];
+      if (!from || !to) { ElementPlus.ElMessage.warning('请先选择同步区间'); return; }
       syncing.value = true; error.value = '';
       try {
-        const { data } = await axios.post('/api/statistics/sync-orders', { store_id: sid() });
-        ElementPlus.ElMessage.success(`订单同步完成：拉取 ${data.fetched} 单，更新 ${data.changed} 单`);
-        await load();
+        const { data } = await axios.post('/api/statistics/sync', { store_id: sid(), from, to });
+        const total = Number(data?.run?.days_total || 0);
+        ElementPlus.ElMessage.success(`已提交同步：${from} ~ ${to}${total ? `（${total} 天）` : ''}，完成后自动刷新`);
+        await waitRun();
+        ElementPlus.ElMessage.success('店铺结算数据同步完成');
       } catch (e) { error.value = message(e); }
       finally { syncing.value = false; }
     }
@@ -159,9 +184,11 @@ window.SettlementDetailView = {
       if (!sid()) return;
       logVisible.value = true; logLoading.value = true;
       try {
-        const r = await axios.get('/api/statistics/order-syncs', { params: { store_id: sid() } });
-        orderSyncs.value = r.data.rows || [];
-        orderSyncLast.value = r.data.last_succeeded_at || '';
+        const r = await axios.get('/api/statistics/sync-log', { params: { store_id: sid() } });
+        syncRuns.value = r.data.runs || [];
+        syncMissingDates.value = r.data.missing_dates || [];
+        const last = (r.data.runs || []).find((x) => x.status === 'succeeded');
+        syncLast.value = last?.finished_at || '';
       } catch (e) { error.value = message(e); }
       finally { logLoading.value = false; }
     }
@@ -204,14 +231,14 @@ window.SettlementDetailView = {
         for (const row of all) {
           lines.push([
             row.accrued_date, row.unit_number || '', row.source === 'ad_report' ? '逐单广告' : 'Ozon',
-            row.unit_type, typeName(row.type_id), row.type_id == null ? '' : row.type_id,
+            row.unit_type, typeName(row.type_id, row.source), row.type_id == null ? '' : row.type_id,
             categoryName(row.category), row.entries, row.amount,
           ].map(csvCell).join(','));
         }
         const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
-        link.href = url; link.download = `店铺结算原始数据_${params.from}_${params.to}.csv`;
+        link.href = url; link.download = `应计原始数据_${params.from}_${params.to}.csv`;
         document.body.appendChild(link); link.click(); link.remove();
         URL.revokeObjectURL(url);
         ElementPlus.ElMessage.success(`已导出 ${all.length.toLocaleString('zh-CN')} 行`);
@@ -301,7 +328,7 @@ window.SettlementDetailView = {
       adTipOpen, adEnter, adLeave, adToggle, adVisibleChange, incTipOpen, incEnter, incLeave, incToggle, incVisibleChange,
       typeName, categoryName, money, load, applyFilter, resetFilters, rangeChanged, pageChanged,
       syncNow, copyUnit, exportCsv, orderAdBusy, orderAdInput, importOrderAd,
-      logVisible, logLoading, orderSyncs, orderSyncLast, openLog,
+      logVisible, logLoading, syncRuns, syncMissingDates, syncLast, openLog,
       adLogVisible, adLogLoading, adDays, adMissing, adSummary, openAdLog,
       checkVisible, checkRows, checkMessage, checkTotal, forceImport };
   },
@@ -310,8 +337,8 @@ window.SettlementDetailView = {
   <section class="statistics-workbench statistics-settlement">
     <header class="statistics-heading">
       <div>
-        <h2>店铺结算原始数据</h2>
-        <div class="statistics-meta">Ozon 应计原始数据 · 按订单号+应计日+费用项目归并 · 默认查最近一个月，按应计日倒序<span v-if="orderSyncLast"> · 订单同步 {{orderSyncLast}}</span></div>
+        <h2>应计原始数据</h2>
+        <div class="statistics-meta">Ozon 应计原始数据 · 按订单号+应计日+费用项目归并 · 默认查最近一个月，按应计日倒序<span v-if="syncLast"> · 最近同步 {{syncLast}}</span></div>
       </div>
       <div class="statistics-actions">
         <span class="statistics-range-label">同步区间</span>
@@ -319,12 +346,12 @@ window.SettlementDetailView = {
           range-separator="至" start-placeholder="开始" end-placeholder="结束"
           :clearable="false" :disabled-date="(d) => d < new Date(MIN_DATE) || d > new Date()"
           @change="rangeChanged" style="width:250px"/>
-        <el-tooltip content="同步 Ozon 订单表的增量数据（最近 7 天 + 非终态订单），并更新订单状态与结算日期" placement="bottom">
-          <el-button type="primary" :icon="'Refresh'" :loading="syncing" @click="syncNow">
-            {{syncing ? '同步中…' : '同步订单'}}
+        <el-tooltip content="按左侧区间，从 Ozon 应计接口拉取店铺结算流水（收入 / 代扣 / 广告），逐天同步" placement="bottom">
+          <el-button type="primary" :icon="'Refresh'" :loading="syncing" :disabled="!!activeRun" @click="syncNow">
+            {{syncing || activeRun ? '同步中…' : '同步'}}
           </el-button>
         </el-tooltip>
-        <el-button :icon="'Document'" @click="openLog">订单表同步记录</el-button>
+        <el-tooltip content="应计接口的拉取记录与未同步日期" placement="bottom"><el-button :icon="'Document'" @click="openLog">历史</el-button></el-tooltip>
       </div>
     </header>
 
@@ -356,28 +383,30 @@ window.SettlementDetailView = {
       </div>
       <div><span>扣费合计</span><strong>{{money(summary.expense_rub)}}<small>₽</small></strong><small>不含佣金与广告</small></div>
       <div><span>净额</span><strong>{{money(summary.net_rub)}}<small>₽</small></strong><small>实收 − 扣费</small></div>
-      <div class="statistics-ad-card"><span>广告投入</span><strong class="statistics-negative">{{money(Math.abs(summary.ad_rub || 0))}}<small>₽</small></strong>
+      <div class="statistics-ad-card"><span>广告投入<em v-if="adItems.missing" class="statistics-ad-missing">缺 {{adItems.missing}} 天逐单</em></span><strong class="statistics-negative">{{money(Math.abs(summary.ad_rub || 0))}}<small>₽</small></strong>
         <el-popover :visible="adTipOpen" placement="bottom-start" :width="300" trigger="click" popper-class="statistics-ad-pop"
           @update:visible="adVisibleChange">
           <template #reference>
             <div class="statistics-ad-summary" @mouseenter="adEnter" @mouseleave="adLeave" @click.stop="adToggle">
-              <span>订单 <b>{{money(adItems.shop)}}</b></span>
-              <span>点击 <b>{{money(adItems.click)}}</b></span>
+              <span>{{adItems.shopLabel}} <b>{{money(adItems.shop)}}</b></span>
+              <span>41 点击 <b>{{money(adItems.click)}}</b></span>
+              <span v-if="adItems.missing" class="statistics-ad-missing">缺 {{adItems.missing}} 天逐单，未计入</span>
             </div>
           </template>
           <div class="statistics-ad-detail">
-            <div class="ad-head">广告构成 · ₽</div>
-            <div class="ad-row"><span>54 商品推广</span><b>{{money(adItems.shop)}}</b></div>
-            <div v-if="adItems.hasImport" class="ad-row sub"><span>订单</span><b>{{money(adItems.cpo)}}</b></div>
-            <div v-if="Math.abs(adItems.cpc) >= 0.01" class="ad-row sub"><span>点击</span><b>{{money(adItems.cpc)}}</b></div>
-            <div v-if="Math.abs(adItems.click) >= 0.01" class="ad-row"><span>41 点击消耗</span><b>{{money(adItems.click)}}</b></div>
+            <div class="ad-head">广告构成 · ₽（投放口径）</div>
+            <div class="ad-row"><span>{{adItems.hasImport ? '逐单合计（54 商品推广）' : '54 商品推广'}}</span><b>{{money(adItems.shop)}}</b></div>
+            <div v-if="adItems.hasImport" class="ad-row sub"><span>逐单 · 按订单</span><b>{{money(adItems.cpo)}}</b></div>
+            <div v-if="Math.abs(adItems.cpc) >= 0.01" class="ad-row sub"><span>逐单 · 按点击</span><b>{{money(adItems.cpc)}}</b></div>
+            <div v-if="Math.abs(adItems.click) >= 0.01" class="ad-row"><span>41 点击广告（结算）</span><b>{{money(adItems.click)}}</b></div>
             <div v-if="Math.abs(adItems.brand) >= 0.01" class="ad-row"><span>3 品牌推广</span><b>{{money(adItems.brand)}}</b></div>
             <div class="ad-total"><span>合计</span><b>{{money(adItems.total)}}</b></div>
-            <div v-if="Math.abs(adItems.delayed) >= 0.01" class="ad-note">含月末延迟入账 {{money(adItems.delayed)}}；按 Ozon 结算口径为 {{money(adItems.settlement)}}</div>
+            <div v-if="adItems.missing" class="ad-note">有 {{adItems.missing}} 天没有导入逐单报表，这些天的广告未计入（按 0 计）；仅作参考：Ozon 结算口径为 {{money(adItems.settlement)}}</div>
+            <div v-if="!adItems.missing && Math.abs(adItems.delayed) >= 0.01" class="ad-note">含月末延迟入账 {{money(adItems.delayed)}}；按 Ozon 结算口径为 {{money(adItems.settlement)}}</div>
           </div>
         </el-popover>
       </div>
-      <div><span>订单收入</span><strong :class="{'statistics-negative': (summary.order_income_rub || 0) < 0}">{{money(summary.order_income_rub)}}<small>₽</small></strong><small>净额 − 广告投入</small></div>
+      <div><span>订单收入</span><strong :class="{'statistics-negative': (summary.order_income_rub || 0) < 0}">{{money(summary.order_income_rub)}}<small v-if="summary.order_income_rub != null">₽</small></strong><small>净额 − 广告投入</small></div>
     </div>
 
     <div class="statistics-toolbar">
@@ -422,7 +451,7 @@ window.SettlementDetailView = {
         </template>
       </el-table-column>
       <el-table-column label="费用项目" min-width="190">
-        <template #default="{row}"><span :class="{'statistics-warning': row.type_id == null}">{{typeName(row.type_id)}}</span></template>
+        <template #default="{row}"><span :class="{'statistics-warning': row.type_id == null}">{{typeName(row.type_id, row.source)}}</span></template>
       </el-table-column>
       <el-table-column label="项目ID" width="78" align="right">
         <template #default="{row}"><span style="font-family:ui-monospace,monospace;color:#64748b">{{row.type_id == null ? '—' : row.type_id}}</span></template>
@@ -444,29 +473,38 @@ window.SettlementDetailView = {
         :page-sizes="[50,100,200,500]" layout="sizes, prev, pager, next, jumper"
         @size-change="pageChanged" @current-change="pageChanged"/>
     </div>
-    <el-dialog v-model="logVisible" title="订单表同步记录" width="880px" top="6vh" class="statistics-dialog">
+    <el-dialog v-model="logVisible" title="历史同步结果" width="900px" top="6vh" class="statistics-dialog">
       <div v-loading="logLoading">
-        <div class="statistics-meta" style="margin-bottom:10px">每 30 分钟自动同步一次：拉最近 7 天的订单（新单 + 状态变化），再补查一批非终态订单；订单状态一变，上面的结算明细立刻跟着变。<span v-if="orderSyncLast"> · 最近成功 {{orderSyncLast}}</span></div>
-        <el-table :data="orderSyncs" border size="small" max-height="440" empty-text="还没有同步记录">
-          <el-table-column prop="started_at" label="开始时间" width="140"/>
-          <el-table-column prop="finished_at" label="完成时间" width="140"/>
-          <el-table-column label="方式" width="78">
-            <template #default="{row}">{{row.trigger === 'auto' ? '自动' : '手动'}}</template>
+        <div class="statistics-meta" style="margin-bottom:8px">
+          这里只记录 Ozon 应计接口（结算流水）的拉取任务：每天 02:00 / 09:30 自动跑，也可用顶部「同步」按区间手动触发。
+          <span v-if="syncLast"> · 最近成功 {{syncLast}}</span>
+        </div>
+        <div v-if="syncMissingDates.length" class="statistics-data-note" style="margin-bottom:10px">
+          还有 {{syncMissingDates.length}} 天从未同步过：{{syncMissingDates.slice(0, 12).join('、')}}{{syncMissingDates.length > 12 ? ' …' : ''}}
+        </div>
+        <el-table :data="syncRuns" border size="small" max-height="440" empty-text="还没有同步记录">
+          <el-table-column prop="started_at" label="开始时间" width="136"/>
+          <el-table-column prop="finished_at" label="完成时间" width="136"/>
+          <el-table-column label="方式" width="70">
+            <template #default="{row}">{{row.trigger === 'manual' ? '手动' : '自动'}}</template>
           </el-table-column>
-          <el-table-column label="拉取订单" width="96" align="right">
-            <template #default="{row}">{{row.fetched || 0}}</template>
+          <el-table-column label="同步区间" width="176">
+            <template #default="{row}">{{row.from_date}} ~ {{row.to_date}}</template>
           </el-table-column>
-          <el-table-column label="更新订单" width="96" align="right">
-            <template #default="{row}">{{row.changed || 0}}</template>
+          <el-table-column label="天数" width="86" align="right">
+            <template #default="{row}">{{row.days_done || 0}}/{{row.days_total || 0}}</template>
           </el-table-column>
-          <el-table-column label="结果" width="82">
+          <el-table-column label="记录数" width="86" align="right">
+            <template #default="{row}">{{row.records == null ? '—' : row.records}}</template>
+          </el-table-column>
+          <el-table-column label="结果" width="78">
             <template #default="{row}">
               <el-tag size="small" :type="row.status === 'succeeded' ? 'success' : row.status === 'failed' ? 'danger' : 'info'">
                 {{row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '失败' : '进行中'}}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="message" label="说明" min-width="220" show-overflow-tooltip/>
+          <el-table-column prop="message" label="说明" min-width="200" show-overflow-tooltip/>
         </el-table>
       </div>
     </el-dialog>

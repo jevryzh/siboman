@@ -324,7 +324,7 @@ export function settlementExceptions(report, group, kind) {
     pending: (row) => row.pending_positive || row.pending_negative,
     ads: (row) => row.allocated_ad_rub == null,
     order_ads: (row) => row.advertising_rub == null,
-    purchase: (row) => row.purchase_cny == null,
+    purchase: (row) => row.purchase_cny == null && !row.loose_month,
     metadata: (row) => row.metadata_missing,
   };
   if (!Object.hasOwn(filters, kind)) throw fail('未知核对类型');
@@ -378,8 +378,10 @@ export function filterReportRows(rows, params = {}) {
     && (!search || row.posting_number.toLowerCase().includes(search))
     && (!params.status || (params.status === 'cancelled' ? row.raw_status.startsWith('cancelled') : row.raw_status === params.status))
     && (!params.order_type || row.order_type === params.order_type) && (params.low_income !== '1' || row.low_income)
-    && (params.missing_cost !== '1' || row.purchase_cny == null)
-    && (params.unsettled !== '1' || row.order_settled_date == null)
+    // 主单级费用行（loose_month 有值）挂不到具体订单、也没有结算概念：
+    // 既不进「缺采购」，也不进「未结算」
+    && (params.missing_cost !== '1' || (row.purchase_cny == null && !row.loose_month))
+    && (params.unsettled !== '1' || (row.order_settled_date == null && !row.loose_month))
     && tests.every((test) => test(row)));
   const key = catalog.has(params.sort) ? params.sort : 'ordered_at', direction = params.direction === 'desc' ? -1 : 1;
   return filtered.sort((a, b) => a[key] == null ? (b[key] == null ? 0 : 1) : b[key] == null ? -1
