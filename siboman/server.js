@@ -18,6 +18,7 @@ import https from "node:https";
 import net from "node:net";
 import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
 import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
+import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16507,19 +16508,7 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       const head = String(posting || "").split("-")[0];
       return head.slice(-4).padStart(4, "0");
     };
-    // v2.2.9.174 排序：单色在前（按色号，同色号按数量从小到大），混色最后
-    const sorted = result.rows.slice().sort((a, b) => {
-      const aMixed = Number(a.color_kinds) > 1 ? 1 : 0;
-      const bMixed = Number(b.color_kinds) > 1 ? 1 : 0;
-      if (aMixed !== bMixed) return aMixed - bMixed;
-      const ca = String(a.first_color || "").padStart(4, "0");
-      const cb = String(b.first_color || "").padStart(4, "0");
-      if (ca !== cb) return ca < cb ? -1 : 1;
-      const qa = Number(a.total_qty || 0);
-      const qb = Number(b.total_qty || 0);
-      if (qa !== qb) return qa - qb;
-      return String(a.pn) < String(b.pn) ? -1 : 1;
-    });
+    const sorted = sortYarnOrderRows(result.rows);
     const items = sorted.map((r) => ({
       shipment: r.pn,
       colorQty: r.color_qty,
@@ -16664,15 +16653,7 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
        SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS kinds, MIN(color) AS c1 FROM items GROUP BY pn`,
       [req.user.id, picked],
     );
-    const sorted = rows.rows.slice().sort((a, b) => {
-      const am = Number(a.kinds) > 1 ? 1 : 0, bm = Number(b.kinds) > 1 ? 1 : 0;
-      if (am !== bm) return am - bm;
-      const ca = String(a.c1 || "").padStart(4, "0"), cb = String(b.c1 || "").padStart(4, "0");
-      if (ca !== cb) return ca < cb ? -1 : 1;
-      const qa = Number(a.total_qty || 0), qb = Number(b.total_qty || 0);
-      if (qa !== qb) return qa - qb;
-      return String(a.pn) < String(b.pn) ? -1 : 1;
-    });
+    const sorted = sortYarnOrderRows(rows.rows);
     res.json({ success: true, posting_numbers: sorted.map((r) => String(r.pn)) });
   } catch (error) { next(error); }
 });
@@ -16715,17 +16696,7 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
          FROM items GROUP BY pn`,
       [req.user.id, picked],
     );
-    const sortedRows = orderRows.rows.slice().sort((a, b) => {
-      const aMixed = Number(a.color_kinds) > 1 ? 1 : 0;
-      const bMixed = Number(b.color_kinds) > 1 ? 1 : 0;
-      if (aMixed !== bMixed) return aMixed - bMixed;
-      const ca = String(a.first_color || "").padStart(4, "0");
-      const cb = String(b.first_color || "").padStart(4, "0");
-      if (ca !== cb) return ca < cb ? -1 : 1;
-      const qa = Number(a.total_qty || 0), qb = Number(b.total_qty || 0);
-      if (qa !== qb) return qa - qb;
-      return String(a.pn) < String(b.pn) ? -1 : 1;
-    });
+    const sortedRows = sortYarnOrderRows(orderRows.rows);
     const postings = sortedRows.map((r) => String(r.pn));
     if (!postings.length) return res.status(400).json({ success: false, error: "没有符合条件的毛线订单" });
     const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2`, [storeIds[0], req.user.id]);
