@@ -15761,6 +15761,27 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         source_status: row.source_status,
         status: row.display_status || row.payload?.status || row.source_status,
       }));
+      // Codex: older cached postings have no image, while the synced product table does.
+      const missingImageOffers = [...new Set(orders.flatMap((order) => (order.products || [])
+        .filter((product) => !product.image && product.offer_id)
+        .map((product) => String(product.offer_id))))];
+      if (missingImageOffers.length) {
+        const imageRows = await db.query(
+          `SELECT DISTINCT ON (offer_id) offer_id,
+                  COALESCE(NULLIF(image, ''), NULLIF(images->>0, '')) AS image
+             FROM app_products
+            WHERE user_id = $1 AND store_id = $2 AND offer_id = ANY($3::text[])
+              AND COALESCE(NULLIF(image, ''), NULLIF(images->>0, '')) IS NOT NULL
+            ORDER BY offer_id, updated_at DESC`,
+          [req.user.id, storeId, missingImageOffers],
+        );
+        const imageByOffer = new Map(imageRows.rows.map((row) => [row.offer_id, row.image]));
+        for (const order of orders) {
+          for (const product of (order.products || [])) {
+            if (!product.image) product.image = imageByOffer.get(String(product.offer_id)) || '';
+          }
+        }
+      }
       console.log(`[OrdersCache] store=${storeId} mode=${syncMode || "cache"} status=${status || "all"} limit=${limit} offset=${offset} total=${countRes.rows[0]?.count || 0}`);
       return res.json({
         success: true,
@@ -16745,8 +16766,7 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     const creds = await db.query(`SELECT client_id, api_key FROM app_stores WHERE id=$1 AND user_id=$2`, [storeIds[0], req.user.id]);
     if (!creds.rowCount) return res.status(404).json({ success: false, error: "未找到店铺凭证" });
     const { client_id: clientId, api_key: apiKey } = creds.rows[0];
-    // v2.2.9.181 Ozon 面单接口有「每秒请求数」限流（429），并发 8 会直接触发限流导致整批失败。
-    //   降到 3 + 429 指数退避重试，失败时把真实原因带回去（之前一律吞成"未返回任何标签"）。
+    // Codex: keep requests paced, but report 429 immediately without retrying.
     // Codex: 逐单模式用于不依赖插件的有序导出；整批接口的页序不能保证与拣货单一致。
     const orderedSingle = req.body?.ordered_single === true;
     if (orderedSingle && req.body?.async_job === true) {
@@ -16785,32 +16805,34 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     const chunks = [];
     for (let i = 0; i < postings.length; i += CHUNK) chunks.push(postings.slice(i, i + CHUNK));
     const fetchChunk = async (batch) => {
-      for (let attempt = 0; attempt < 5; attempt += 1) {
-        const r = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
-          method: "POST",
-          headers: { "Client-Id": clientId, "Api-Key": apiKey, "Content-Type": "application/json", Accept: "application/pdf, application/json" },
-          body: JSON.stringify({ posting_number: batch }),
-        });
-        const buf = Buffer.from(await r.arrayBuffer());
-        const ct = r.headers.get("content-type") || "";
-        if (r.ok && !ct.includes("json") && buf.slice(0, 4).toString() === "%PDF") return { ok: true, buf };
-        const text = buf.toString("utf8").slice(0, 200);
-        if (r.status === 429) { await new Promise((x) => setTimeout(x, 1200 * (attempt + 1))); continue; }
-        return { ok: false, err: `HTTP ${r.status} ${text}` };
-      }
-      return { ok: false, err: "HTTP 429 限流重试 5 次仍失败" };
+      const r = await fetch(`${OZON_SELLER_BASE_URL}/v2/posting/fbs/package-label`, {
+        method: "POST",
+        headers: { "Client-Id": clientId, "Api-Key": apiKey, "Content-Type": "application/json", Accept: "application/pdf, application/json" },
+        body: JSON.stringify({ posting_number: batch }),
+      });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const ct = r.headers.get("content-type") || "";
+      if (r.ok && !ct.includes("json") && buf.slice(0, 4).toString() === "%PDF") return { ok: true, buf };
+      return { ok: false, status: r.status, err: `HTTP ${r.status} ${buf.toString("utf8").slice(0, 200)}` };
     };
     // 并发取，但**按批次下标排序后再合并**，确保标签顺序与拣货单一致
     const slots = new Array(chunks.length).fill(null);
     let failed = 0;
     let firstErr = "";
+    let rateLimited = false;
     for (let i = 0; i < chunks.length; i += CONCURRENCY) {
       const wave = chunks.slice(i, i + CONCURRENCY);
       const out = await Promise.all(wave.map((b) => fetchChunk(b).catch((e) => ({ ok: false, err: String(e.message || e).slice(0, 150) }))));
       out.forEach((o, k) => {
         if (o.ok) slots[i + k] = o.buf;
-        else { failed += 1; if (!firstErr) firstErr = o.err || ''; }
+        else {
+          failed += 1;
+          if (!firstErr) firstErr = o.err || '';
+          if (o.status === 429) rateLimited = true;
+        }
       });
+      // Codex: Ozon 限流后立即停止，不继续请求剩余批次或返回不完整标签。
+      if (rateLimited) return res.status(429).json({ success: false, error: `Ozon 标签接口限流：${firstErr}。已停止本次导出。` });
       await new Promise((x) => setTimeout(x, 350));
     }
     const pdfs = slots.filter(Boolean);

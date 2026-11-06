@@ -15,9 +15,6 @@ const fetchImpl = async (_url, options) => {
   const posting = JSON.parse(options.body).posting_number[0];
   attempts[posting] = (attempts[posting] || 0) + 1;
   if (posting === 'A') await new Promise((resolve) => setTimeout(resolve, 10));
-  if (posting === 'B' && attempts[posting] <= 6) {
-    return { status: 429, ok: false, headers: { get: () => 'application/json' }, arrayBuffer: async () => Buffer.from('{"error":"rate limit"}') };
-  }
   return { status: 200, ok: true, headers: { get: () => 'application/pdf' }, arrayBuffer: async () => pdfs[posting] };
 };
 const result = await buildOrderedYarnLabels(['A', 'B', 'C'], {
@@ -26,12 +23,21 @@ const result = await buildOrderedYarnLabels(['A', 'B', 'C'], {
 });
 const merged = await PDFDocument.load(result);
 assert.deepEqual(merged.getPages().map((page) => page.getWidth()), [101, 102, 103]);
-assert.equal(attempts.B, 7);
+assert.equal(attempts.B, 1);
 assert.equal(progress.at(-1).completed, 3);
-assert.equal(progress.at(-1).rateLimited, 6);
+assert.equal(progress.at(-1).rateLimited, 0);
 assert.ok(delays.includes(2000));
-assert.ok(delays.includes(5000));
-assert.ok(delays.some((ms) => ms >= 15000));
+
+const limitedAttempts = [];
+await assert.rejects(buildOrderedYarnLabels(['A', 'limited', 'C'], {
+  baseUrl: 'https://example.test', clientId: 'test', apiKey: 'test', sleep: async () => {},
+  fetchImpl: async (_url, options) => {
+    const posting = JSON.parse(options.body).posting_number[0];
+    limitedAttempts.push(posting);
+    return { status: 429, ok: false, headers: { get: () => 'application/json' }, arrayBuffer: async () => Buffer.from('{"error":"rate limit"}') };
+  },
+}), /货件 A 获取标签失败：HTTP 429.*没有生成不完整的 PDF/);
+assert.deepEqual(limitedAttempts, ['A']);
 
 await assert.rejects(buildOrderedYarnLabels(['A', 'bad', 'C'], {
   baseUrl: 'https://example.test', clientId: 'test', apiKey: 'test', sleep: async () => {},
@@ -41,4 +47,4 @@ await assert.rejects(buildOrderedYarnLabels(['A', 'bad', 'C'], {
     return { status: 200, ok: true, headers: { get: () => 'application/pdf' }, arrayBuffer: async () => pdfs[posting] };
   },
 }), /货件 bad 获取标签失败.*没有生成不完整的 PDF/);
-console.log('yarn label async export order, retry, and failure: OK');
+console.log('yarn label async export order, no retry, and failure: OK');

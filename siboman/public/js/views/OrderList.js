@@ -62,6 +62,20 @@ window.OrderListView = {
     // v0.3.3 详情抽屉 & 发货对话框
     const detailDrawer = Vue.reactive({ visible: false, loading: false, order: null });
     const shipDialog = Vue.reactive({ visible: false, loading: false, store_id: '', posting_number: '', products: [] });
+    const productHover = Vue.reactive({ visible: false, image: '', name: '', left: 0, top: 0 });
+    const moveProductHover = (event) => {
+      const width = Math.min(280, window.innerWidth - 16);
+      productHover.left = Math.max(8, Math.min(event.clientX + 16, window.innerWidth - width - 8));
+      productHover.top = Math.max(8, Math.min(event.clientY + 16, window.innerHeight - width - 38));
+    };
+    const showProductHover = (event, product) => {
+      if (!product?.image) return;
+      productHover.image = product.image;
+      productHover.name = product.local_name || product.name || '';
+      moveProductHover(event);
+      productHover.visible = true;
+    };
+    const hideProductHover = () => { productHover.visible = false; };
 
     // 动态取店铺 ID
     const getStoreId = () => {
@@ -688,6 +702,11 @@ window.OrderListView = {
           posting_number: row.posting_number,
         });
         detailDrawer.order = res.data.order;
+        const listImages = new Map((row.products || []).filter((product) => product.image)
+          .map((product) => [String(product.offer_id || product.sku), product.image]));
+        for (const product of (detailDrawer.order?.products || [])) {
+          if (!product.image) product.image = listImages.get(String(product.offer_id || product.sku)) || '';
+        }
       } catch (e) {
         notify.error('获取详情失败: ' + (e.response?.data?.error || e.message));
       } finally {
@@ -907,7 +926,7 @@ window.OrderListView = {
           const status = (await axios.get(`/api/seller/orders/yarn-label-jobs/${encodeURIComponent(jobId)}`, { timeout: 15000 })).data;
           const done = Number(status.completed || 0);
           const total = Number(status.total || picked.length);
-          exportStep(2 + (done / total) * 90, `已获取 ${done}/${total} 单${status.rate_limited ? `，Ozon 限流重试 ${status.rate_limited} 次` : ''}${done === total && status.status === 'running' ? '，正在合并 PDF…' : ''}`);
+          exportStep(2 + (done / total) * 90, `已获取 ${done}/${total} 单${done === total && status.status === 'running' ? '，正在合并 PDF…' : ''}`);
           if (status.status === 'done') break;
           if (status.status === 'failed') throw new Error(status.error || '标签任务失败');
           if (Date.now() > deadline) throw new Error(`任务仍在后台运行（编号 ${jobId}），可稍后重新点击同一批订单继续查看进度`);
@@ -1347,6 +1366,7 @@ window.OrderListView = {
     Vue.onBeforeUnmount(() => {
       window.removeEventListener('shop-changed', onShopChanged);
       if (autoSyncTimer) clearInterval(autoSyncTimer);
+      hideProductHover();
     });
 
     Vue.onMounted(() => {
@@ -1362,6 +1382,7 @@ window.OrderListView = {
       lastBatchResult, hasFetched, orderEmptyText, shops, currentStoreName,
       storeScope, storeScopeOptions, onStoreScopeChange,
       detailDrawer, shipDialog,
+      productHover, showProductHover, moveProductHover, hideProductHover,
       fetchOrders, fetchOrderSummary, fetchOrderKpis, refreshOrderDashboard, pullLatestOrders, refreshInProgressOrders,
       onPageChange, onPageSizeChange, toBeijingTime,
       openSyncWindowDialog, saveSyncWindow, resetSyncWindow, openDetail, openShipDialog, confirmShip, statusTagType, statusText,
@@ -1383,6 +1404,12 @@ window.OrderListView = {
   },
   template: `
     <div class="order-list-v3" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px">
+      <el-teleport to="body">
+        <div v-if="productHover.visible" :style="{ position: 'fixed', left: productHover.left + 'px', top: productHover.top + 'px', zIndex: 10000, width: 'min(280px, calc(100vw - 16px))', padding: '10px', boxSizing: 'border-box', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '6px', boxShadow: '0 12px 32px rgba(15,23,42,.22)', pointerEvents: 'none' }">
+          <img :src="productHover.image" :alt="productHover.name" style="display:block; width:100%; aspect-ratio:1; object-fit:contain" />
+          <div style="font-size:12px; color:#334155; line-height:18px; margin-top:6px; max-height:36px; overflow:hidden; overflow-wrap:anywhere">{{ productHover.name }}</div>
+        </div>
+      </el-teleport>
             <!-- v2.2.9.169 批量单号筛选 -->
         <el-dialog v-model="postingDialog.visible" title="按单号批量查询" width="560px">
           <div style="font-size:13px; color:#64748b; margin-bottom:8px">
@@ -1608,7 +1635,7 @@ window.OrderListView = {
           <el-table-column label="商品" min-width="390">
             <template #default="{ row }">
               <div style="display:flex; gap:12px; align-items:center; min-width:0">
-                <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; flex-shrink:0; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="primaryProduct(row).image ? [primaryProduct(row).image] : []">
+                <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; flex-shrink:0; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="primaryProduct(row).image ? [primaryProduct(row).image] : []" @mouseenter="showProductHover($event, primaryProduct(row))" @mousemove="moveProductHover" @mouseleave="hideProductHover" @click="hideProductHover">
                   <template #error>
                     <div style="width:58px; height:58px; background:#f1f5f9; display:flex; align-items:center; justify-content:center">
                       <el-icon color="#cbd5e1"><Picture /></el-icon>
@@ -1924,7 +1951,7 @@ window.OrderListView = {
             <el-table :data="detailDrawer.order.products || []" size="small" border stripe>
               <el-table-column label="图" width="60">
                 <template #default="{ row }">
-                  <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []" />
+                  <el-image :src="row.image" style="width:40px; height:40px; border-radius:4px" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="row.image ? [row.image] : []" @mouseenter="showProductHover($event, row)" @mousemove="moveProductHover" @mouseleave="hideProductHover" @click="hideProductHover" />
                 </template>
               </el-table-column>
               <el-table-column label="商品" min-width="220">
