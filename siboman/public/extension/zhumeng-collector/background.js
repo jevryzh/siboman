@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.212";
+const VERSION = "2.2.9.213";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -6182,18 +6182,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               "x-o3-language": "zh-Hans",
               "x-o3-page-type": "CbPostingsFbs",
             };
-            const post = async (path, body) => {
-              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
-              const t = await r.text();
-              let j = null; try { j = JSON.parse(t); } catch (_e) {}
-              return { status: r.status, json: j, text: t.slice(0, 200) };
+            // Codex 修改：卖家后台偶尔超过 5 秒才响应，按单限时，避免浏览器消息通道被拖垮。
+            const post = async (path, body, step, deadline) => {
+              const remaining = deadline - Date.now();
+              if (remaining <= 1500) throw new Error(`${step} 整单等待超时`);
+              const timeoutMs = Math.min(15000, remaining - 1000);
+              try {
+                const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+                const t = await r.text();
+                let j = null; try { j = JSON.parse(t); } catch (_e) {}
+                return { status: r.status, json: j, text: t.slice(0, 200) };
+              } catch (e) {
+                const detail = String((e && e.message) || e);
+                if (/timed out|timeout|超时/i.test(detail)) throw new Error(`${step} 响应超时（${Math.ceil(timeoutMs / 1000)} 秒）`);
+                throw new Error(`${step} ${detail}`);
+              }
             };
             // Codex: 不在插件里长时间重试 429；按单返回错误，避免消息通道先关闭。
             const results = new Array(postingNumbers.length);
             for (let k = 0; k < postingNumbers.length; k += 1) {
               const pn = postingNumbers[k];
               try {
-                const create = await post("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] });
+                const deadline = Date.now() + 45000;
+                const create = await post("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] }, "create", deadline);
                 const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
                 if (!taskId) {
                   // 把后台返回的原文带回去，前端才知道是 429 还是 403
@@ -6203,8 +6214,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 let url = "";
                 let pollError = "";
                 for (let i = 0; i < 12 && !url; i += 1) {
-                  await sleep(i === 0 ? 900 : 1200);
-                  const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+                  const waitMs = i === 0 ? 900 : 1200;
+                  if (deadline - Date.now() <= waitMs + 1500) { pollError = "任务在 45 秒内未生成标签"; break; }
+                  await sleep(waitMs);
+                  const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId }, "get", deadline);
                   if (st.status === 429 || st.status >= 400) { pollError = `get ${st.status} ${st.text}`; break; }
                   const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
                   if (m) url = m[0].replace(/\\\//g, "/");

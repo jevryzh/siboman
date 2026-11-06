@@ -800,9 +800,9 @@ window.OrderListView = {
             }
             return 0;
           };
-          if (ver && cmpVer(ver, '2.2.9.189') < 0) {
+          if (ver && cmpVer(ver, '2.2.9.213') < 0) {
             yarnLabelsBusy.value = false;
-            return notify.error(`毛线标签导出需要插件 2.2.9.189 或更高版本，你当前是 ${ver}。请点右上角「插件下载」重新下载并覆盖安装最新插件后再试。`, 18000);
+            return notify.error(`毛线标签导出需要插件 2.2.9.213 或更高版本，你当前是 ${ver}。请点右上角「插件下载」重新下载并覆盖安装最新插件后再试。`, 18000);
           }
         } catch (_e) { /* ping 失败就继续走，让真实错误暴露出来 */ }
         exportStart(`导出毛线标签（${picked.length} 单）`);
@@ -858,15 +858,17 @@ window.OrderListView = {
         }
         if (!items.length) {
           exportFail();
-          // Accio Work (2026-11-06)：把插件回传的真实失败原因打出来，
-          //   之前统一报「未取到任何标签」，把 create 429 限流掩盖成了状态问题。
+          // Codex 修改：保留插件真实失败原因，超时不能误报成订单已发货/已取消。
           const detail = failedAll.slice(0, 5).map((f) => `${f.pn}${f.err ? `(${f.err})` : ''}`).join('、');
           const limited = /429|rate limit/i.test(detail);
+          const timedOut = /timed out|timeout|超时/i.test(detail);
           return notify.error(
             `导出毛线标签失败：插件未取到任何标签${detail ? `（${detail}）` : ''}。`
             + (limited
               ? '卖家后台标签接口触发限流（429），请等 1–2 分钟再试；仍不行就减少勾选数量分批导出。'
-              : '所选订单可能都是已发货/已取消状态，标签接口不返回。'),
+              : timedOut
+                ? '卖家后台标签接口响应超时，请确认登录状态后再试；若持续超时，请记录订单号和失败步骤。'
+                : '请检查上述失败原因及订单在卖家后台的标签状态。'),
             0,
           );
         }
