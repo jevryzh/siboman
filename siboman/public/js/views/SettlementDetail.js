@@ -43,9 +43,6 @@ window.SettlementDetailView = {
     const page = ref(1), pageSize = ref(100), loading = ref(false), syncing = ref(false), exporting = ref(false), error = ref('');
     const orderAdBusy = ref(false), orderAdInput = ref(null);
     const logVisible = ref(false), logLoading = ref(false), orderSyncs = ref([]), orderSyncLast = ref('');
-    // 同步结算日期：取消时间只有 Ozon 网页后台有，Seller API 不返回，所以要单独走一次后台会话
-    const settledSyncing = ref(false), settledStage = ref(''), settledMissing = ref([]);
-    const cookieVisible = ref(false), cookieSaving = ref(false), cookieInput = ref(''), webSession = ref(null);
     const adLogVisible = ref(false), adLogLoading = ref(false), adDays = ref([]), adMissing = ref([]), adSummary = ref({});
     const checkVisible = ref(false), checkRows = ref([]), checkMessage = ref(''), checkTotal = ref(0), pendingEntries = ref([]);
     const posting = ref(''), typeId = ref(''), category = ref(''), source = ref('');
@@ -131,107 +128,6 @@ window.SettlementDetailView = {
       } catch (e) { error.value = message(e); }
       finally { syncing.value = false; }
     }
-
-    // 与采集插件通信（插件有 cookies 权限，能读到 ozon.ru 的 HttpOnly cookie）
-    function sendToPlugin(kind, extra = {}, timeoutMs = 10000) {
-      const send = window.__zhumeng_send__;
-      if (typeof send !== 'function') return Promise.resolve(null);
-      return send(kind, extra, timeoutMs);
-    }
-
-    // 同步结算日期：FBS/FBP 由服务端调后台接口；WHD 没有取消时间字段，由插件在「退货和取消」里取
-    async function syncSettledDates() {
-      if (!sid() || settledSyncing.value) return;
-      settledSyncing.value = true; settledStage.value = '同步 FBS 取消单…'; error.value = '';
-      try {
-        const params = queryParams();
-        const { data } = await axios.post('/api/statistics/sync-settled', {
-          store_id: sid(), from: params.from, to: params.to,
-          posting: params.posting || '', type_id: params.type_id ?? '', category: params.category || '', source: params.source || '',
-        });
-        let updated = Number(data.updated || 0);
-        let whdSaved = 0, whdMissing = 0, whdNote = '';
-        const whdList = Array.isArray(data.whd) ? data.whd : [];
-        if (!data.fbs_total && !whdList.length) {
-          ElementPlus.ElMessage.info('当前筛选范围内没有「已取消且缺结算日期」的订单');
-          await load();
-          return;
-        }
-        if (whdList.length) {
-          // 插件按单号逐个打开「退货和取消」页，单次调用控制在 30 单左右，避免 Service Worker 超时
-          const chunkSize = 30;
-          let whdError = '';
-          for (let i = 0; i < whdList.length; i += chunkSize) {
-            const chunk = whdList.slice(i, i + chunkSize);
-            settledStage.value = `取 WHD 取消日期 ${Math.min(i + chunk.length, whdList.length)}/${whdList.length}…`;
-            const resp = await sendToPlugin('whdCancel.request', { postings: chunk }, 300000);
-            if (!resp) { whdError = '没检测到采集插件（需 2.2.9.205+），可手动粘贴 cookie 或先安装插件'; break; }
-            if (!resp.ok) { whdError = resp.error || '插件无返回'; break; }
-            whdMissing += Array.isArray(resp.missing) ? resp.missing.length : 0;
-            const items = Object.entries(resp.rows || {}).map(([posting_number, row]) => ({ posting_number, date: row.date }));
-            if (items.length) {
-              const saved = await axios.post('/api/statistics/sync-settled-whd', { store_id: sid(), items });
-              whdSaved += Number(saved.data.updated || 0);
-            }
-          }
-          if (whdError) whdNote = `；WHD 未完成：${whdError}`;
-        }
-        const parts = [`已更新 FBS ${updated} 单`];
-        if (whdList.length) parts.push(`WHD ${whdSaved} 单`);
-        if (whdMissing) parts.push(`WHD ${whdMissing} 单后台无取消记录`);
-        ElementPlus.ElMessage.success(parts.join('，') + (whdNote ? `（${whdNote.replace(/^；/, '')}）` : ''));
-        await load();
-      } catch (e) {
-        const res = e?.response;
-        if (res?.data?.code === 'WEB_SESSION_REQUIRED' || res?.status === 409) {
-          cookieVisible.value = true;
-          ElementPlus.ElMessage.warning(res?.data?.error || 'Ozon 后台会话已失效，请重新获取');
-        } else {
-          error.value = message(e);
-          ElementPlus.ElMessage.error(message(e));
-        }
-      } finally { settledSyncing.value = false; settledStage.value = ''; }
-    }
-
-    async function loadWebSession() {
-      try { webSession.value = (await axios.get('/api/statistics/web-session', { params: { store_id: sid() } })).data; }
-      catch (e) { webSession.value = null; }
-    }
-
-    async function saveCookiePayload(payload) {
-      await axios.post('/api/statistics/web-session', { store_id: sid(), ...payload });
-      cookieVisible.value = false; cookieInput.value = '';
-      await loadWebSession();
-    }
-
-    // 一键：从当前浏览器（插件）取 cookie，不用手抄
-    async function cookieFromBrowser() {
-      if (cookieSaving.value) return;
-      cookieSaving.value = true;
-      try {
-        const resp = await sendToPlugin('ozonCookies.request', {}, 15000);
-        if (!resp) throw new Error('没检测到采集插件：请确认插件已安装并启用（2.2.9.205+），或手动粘贴 cookie');
-        if (!resp.ok || !resp.cookie) throw new Error(resp.error || '浏览器里没有 Ozon 登录态，请先在 Chrome 登录卖家后台');
-        await saveCookiePayload({ cookie: resp.cookie, host: resp.host || '', company_id: resp.company_id || '' });
-        ElementPlus.ElMessage.success(`已从浏览器取到 ${resp.count || ''} 个 cookie 并校验通过`);
-        await syncSettledDates();
-      } catch (e) {
-        ElementPlus.ElMessage.error(e?.response?.data?.error || e?.message || '获取失败');
-      } finally { cookieSaving.value = false; }
-    }
-
-    async function saveCookie() {
-      if (!cookieInput.value.trim()) { ElementPlus.ElMessage.warning('请先粘贴 cookie'); return; }
-      cookieSaving.value = true;
-      try {
-        await saveCookiePayload({ cookie: cookieInput.value });
-        ElementPlus.ElMessage.success('会话已保存并校验通过，开始同步…');
-        await syncSettledDates();
-      } catch (e) {
-        ElementPlus.ElMessage.error(e?.response?.data?.error || e?.message || 'cookie 校验失败');
-      } finally { cookieSaving.value = false; }
-    }
-
 
     async function forceImport() {
       if (!pendingEntries.value.length) return;
@@ -395,7 +291,6 @@ window.SettlementDetailView = {
     onMounted(() => {
       window.addEventListener('shop-changed', shopChanged);
       load();
-      loadWebSession();
     });
     onBeforeUnmount(() => {
       window.removeEventListener('shop-changed', shopChanged);
@@ -407,8 +302,6 @@ window.SettlementDetailView = {
       typeName, categoryName, money, load, applyFilter, resetFilters, rangeChanged, pageChanged,
       syncNow, copyUnit, exportCsv, orderAdBusy, orderAdInput, importOrderAd,
       logVisible, logLoading, orderSyncs, orderSyncLast, openLog,
-      settledSyncing, settledMissing, settledStage, syncSettledDates,
-      cookieVisible, cookieSaving, cookieInput, webSession, loadWebSession, saveCookie, cookieFromBrowser,
       adLogVisible, adLogLoading, adDays, adMissing, adSummary, openAdLog,
       checkVisible, checkRows, checkMessage, checkTotal, forceImport };
   },
@@ -431,14 +324,7 @@ window.SettlementDetailView = {
             {{syncing ? '同步中…' : '同步订单'}}
           </el-button>
         </el-tooltip>
-        <el-tooltip content="按当前筛选结果，把「已取消且缺结算日期」的订单补齐：正常单取后台取消时间，WHD 单取「退货和取消」的状态日期" placement="bottom">
-          <el-button type="primary" plain :icon="'Calendar'" :loading="settledSyncing" @click="syncSettledDates">
-            {{settledSyncing ? (settledStage || '补齐中…') : '同步结算日期'}}
-          </el-button>
-        </el-tooltip>
-        <el-tooltip content="订单表同步记录" placement="bottom">
-          <el-button :icon="'Clock'" circle aria-label="订单表同步记录" @click="openLog"/>
-        </el-tooltip>
+        <el-button :icon="'Document'" @click="openLog">订单表同步记录</el-button>
       </div>
     </header>
 
@@ -583,28 +469,6 @@ window.SettlementDetailView = {
           <el-table-column prop="message" label="说明" min-width="220" show-overflow-tooltip/>
         </el-table>
       </div>
-    </el-dialog>
-
-    <el-dialog v-model="cookieVisible" title="需要 Ozon 后台会话" width="720px" top="8vh" class="statistics-dialog">
-      <el-alert type="warning" :closable="false" show-icon
-        title="取消时间只有卖家后台网页里有，Seller API 不返回，所以这一步要用一次后台会话"/>
-      <div class="statistics-meta" style="margin:10px 0 10px;line-height:1.8;white-space:normal">
-        点下面 <b>「从浏览器获取」</b>：采集插件用 Chrome 的 cookies 权限直接读出你在浏览器里的 ozon.ru 登录态，
-        不用手抄。cookie 加密存库，只用于按订单号查取消日期；过期后再点一次即可。<br>
-        <span v-if="webSession && webSession.updated_at">当前会话保存于 {{webSession.updated_at}}（{{webSession.host}}），已失效。</span>
-        <span v-if="webSession && webSession.last_error">最近一次错误：{{webSession.last_error}}</span>
-      </div>
-      <el-divider style="margin:6px 0 12px"><span style="font-size:12px;color:#94a3b8">或手动粘贴</span></el-divider>
-      <el-input v-model="cookieInput" type="textarea" :rows="4"
-        placeholder="在已登录的卖家后台 F12 → Network → 任一请求 → 复制 Request Headers 里的 Cookie 整行"/>
-      <div class="statistics-meta" style="margin-top:8px;white-space:normal">
-        没装采集插件的机器上，也可以在项目目录执行 <b>npm run ozon-cookie</b> 自动取（会弹一次钥匙串授权，点「允许」）。
-      </div>
-      <template #footer>
-        <el-button @click="cookieVisible = false">取消</el-button>
-        <el-button :loading="cookieSaving" @click="saveCookie">粘贴的 cookie 保存并同步</el-button>
-        <el-button type="primary" :loading="cookieSaving" @click="cookieFromBrowser">从浏览器获取</el-button>
-      </template>
     </el-dialog>
 
     <el-dialog v-model="adLogVisible" title="逐单广告" width="940px" top="4vh" class="statistics-dialog">
