@@ -21,10 +21,10 @@ const fetch = async (path, options) => {
   if (body.task_id === 'B') throw new Error('temporary failure');
   return { status: 200, text: async () => JSON.stringify({ url: `https://cdn.example.com/${body.task_id}.pdf` }) };
 };
-const fn = vm.runInNewContext(`(${fnSource})`, { document: { cookie: 'sc_company_id=123' }, fetch, setTimeout });
+const fn = vm.runInNewContext(`(${fnSource})`, { document: { cookie: 'sc_company_id=123' }, fetch, setTimeout, AbortSignal });
 const result = await fn(['A', 'B', 'C', 'D']);
 assert.equal(result.ok, true);
-assert.ok(maximum <= 2, `at most 2 concurrent tasks, got ${maximum}`);
+assert.ok(maximum <= 1, `at most 1 concurrent task, got ${maximum}`);
 assert.deepEqual(Array.from(result.items, (item) => item.pn), ['A', 'C', 'D']);
 assert.deepEqual(Array.from(result.failed, (item) => item.pn), ['B']);
 console.log('yarn label parallel order and failure isolation: OK');

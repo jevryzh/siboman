@@ -473,6 +473,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>Codex 修改 · v2.2.9.212 毛线标签移除插件端限流自动重试，单次任务限时等待；通信中断即停止后续请求并下载已完成标签。拣货单及待备货清单独立验证。</li>
             <li>Codex 修改 · v2.2.9.210 毛线标签逐单任务改为限量并行，按拣货单顺序返回；另增无需插件的 API 逐单导出备选入口。批量上架和拣货单未调整。</li>
             <li>✅ v2.2.9.127 销售漏斗面板已从本插件移出，改为独立的 Chrome 插件（独立安装、单独使用，不需要本插件和 ERP）。它直接用页面会话调 Ozon 自己的 analytics 接口，所以不需要 Premium、也不需要 Api-Key。本插件因此移除了该内容脚本、erpFunnel 消息处理器。</li>
             <li>✅ v2.2.9.126 销售漏斗面板改为「跟随当前登录的 Ozon 账号」：从页面 localStorage.vuex / cookie sc_company_id 读出 company_id（= 店铺 Client-Id）带给 ERP，反查对应店铺。以前面板固定在 ERP 顶栏选中的店铺，会出现「页面登录 Three Latte、面板却显示 Yulanfang」的错位。</li>

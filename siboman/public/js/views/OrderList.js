@@ -813,8 +813,8 @@ window.OrderListView = {
           const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked, store_ids: storeIds }, { timeout: 30000 });
           if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
         } catch (_e) { /* 排序失败就用原顺序 */ }
-        // 单批最多 3 单；Ozon 的标签任务轮询可能很慢，10 单会耗尽插件消息通道的等待时间。
-        const CHUNK = 3;
+        // Codex: 每次只交给插件一单；标签任务慢时不让多单共用一个消息通道。
+        const CHUNK = 1;
         const isClosedChannel = (res) => {
           const error = String(res?.error || '');
           return !res || /message channel closed|message port closed|before a response was received|receiving end does not exist/i.test(error);
@@ -824,42 +824,37 @@ window.OrderListView = {
         const batches = [];
         for (let i = 0; i < ordered.length; i += CHUNK) batches.push(ordered.slice(i, i + CHUNK));
         for (let bi = 0; bi < batches.length; bi += 1) {
+          // Codex: pace one task at a time; stop the batch on seller rate limits.
+          if (bi) await new Promise((resolve) => setTimeout(resolve, 1200));
           exportStep(10 + (bi / batches.length) * 80, `正在生成标签 ${bi + 1}/${batches.length} 批（已拿到 ${items.length} 个）`);
-          const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 120000);
+          let res;
+          try {
+            res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 60000);
+          } catch (e) {
+            res = { error: String(e?.message || e) };
+          }
           if (!res || res.ok !== true) {
             if (isClosedChannel(res)) {
               batches[bi].forEach((pn) => failedAll.push({ pn, err: '插件通信中断' }));
-              continue;
+              notify.warning('插件通信中断，已停止后续请求；已生成的标签将继续下载。请检查插件是否已更新并保持卖家后台打开。', 12000);
+              break;
             }
             let msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
             if (res?.step === 'create') msg += ' —— 标签创建接口拒绝；若插件版本低于 2.2.9.189，请先升级插件再试';
-            exportFail();
-            return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 0);
+            batches[bi].forEach((pn) => failedAll.push({ pn, err: String(msg).slice(0, 160) }));
+            if (!items.length) {
+              exportFail();
+              return notify.error(`导出毛线标签失败（第 ${bi + 1} 批）：` + String(msg).slice(0, 240), 0);
+            }
+            notify.warning(`第 ${bi + 1} 批失败，已停止后续请求；已生成的标签将继续下载：${String(msg).slice(0, 160)}`, 12000);
+            break;
           }
           (res.items || []).forEach((it) => items.push(it));
           (res.failed || []).forEach((f) => failedAll.push(f));
-        }
-        // v2.2.9.202 失败自动重试一轮：个别单是插件轮询 PDF 超时/偶发失败，
-        //   再试一次通常就拿到了（用户实测 177 单里偶发 1 单没出来）。
-        if (failedAll.length) {
-          exportStep(85, `有 ${failedAll.length} 单失败，自动重试一轮…`);
-          const retryPn = [...new Set(failedAll.map((f) => String(f?.pn || '')).filter(Boolean))];
-          const retryBatches = [];
-          for (let i = 0; i < retryPn.length; i += 1) retryBatches.push(retryPn.slice(i, i + 1));
-          const stillFailed = [];
-          for (const batch of retryBatches) {
-            try {
-              const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batch }, 120000);
-              if (res && res.ok === true) {
-                (res.items || []).forEach((it) => items.push(it));
-                (res.failed || []).forEach((f) => stillFailed.push(f));
-              } else {
-                batch.forEach((pn) => stillFailed.push({ pn, err: String(res?.step || res?.error || 'retry_failed').slice(0, 60) }));
-              }
-            } catch (e) { batch.forEach((pn) => stillFailed.push({ pn, err: String(e?.message || 'retry_error').slice(0, 60) })); }
+          if ((res.failed || []).some((f) => /429|rate limit/i.test(String(f.err || '')))) {
+            notify.warning('卖家后台标签接口限流，已停止后续请求；已生成的标签将继续下载。请稍后再导出剩余订单。', 12000);
+            break;
           }
-          failedAll.length = 0;
-          stillFailed.forEach((f) => failedAll.push(f));
         }
         if (!items.length) {
           exportFail();

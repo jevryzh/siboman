@@ -17,17 +17,17 @@ const item = (n) => [
   { v: "01×1", s: "colorqty" }, { v: 1, s: "qty" }, { v: "6789", s: "label" }, { v: "", s: "blank" },
 ];
 const rows = [header];
-for (let i = 1; i <= 24; i += 1) rows.push([...item(i), ...item(i + 24).slice(0, 5)]);
-rows.push(header, [...item(49), ...item(50).slice(0, 5)]);
-const rowHeights = Object.fromEntries(rows.map((_, i) => [i, i === 0 || i === 25 ? 25 : 31]));
+for (let i = 1; i <= 26; i += 1) rows.push([...item(i), ...item(i + 26).slice(0, 5)]);
+rows.push(header, [...item(53), ...item(54).slice(0, 5)]);
+const rowHeights = Object.fromEntries(rows.map((_, i) => [i, i === 0 || i === 27 ? 25 : 28]));
 const workbook = context.make("A4双列表", rows, {
   colWidths: [3.8, 12.8, 11.4, 4, 7, 1.4, 3.8, 12.8, 11.4, 4, 7],
-  rowHeights, printLayout: "a4-portrait", pageBreakRows: [25],
+  rowHeights, printLayout: "a4-portrait", pageBreakRows: [27],
 });
 const sheet = new TextDecoder().decode(unzipSync(workbook)["xl/worksheets/sheet1.xml"]);
 assert.match(sheet, /<pageSetUpPr fitToPage="1"\/>/);
 assert.match(sheet, /<pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"\/>/);
-assert.match(sheet, /<rowBreaks count="1" manualBreakCount="1"><brk id="25"/);
-assert.match(sheet, /<dimension ref="A1:K27"\/>/);
+assert.match(sheet, /<rowBreaks count="1" manualBreakCount="1"><brk id="27"/);
+assert.match(sheet, /<dimension ref="A1:K29"\/>/);
 if (process.argv[2]) writeFileSync(process.argv[2], workbook);
 console.log("Yarn picklist A4 print metadata passed");

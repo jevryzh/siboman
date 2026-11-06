@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.211";
+const VERSION = "2.2.9.212";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -6183,49 +6183,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               "x-o3-page-type": "CbPostingsFbs",
             };
             const post = async (path, body) => {
-              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body) });
+              const r = await fetch(path, { method: "POST", credentials: "include", headers: H, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
               const t = await r.text();
               let j = null; try { j = JSON.parse(t); } catch (_e) {}
               return { status: r.status, json: j, text: t.slice(0, 200) };
             };
-            // Accio Work (2026-11-06)：卖家后台标签接口会按秒限流，
-            //   原来 2 个 worker 并行、每单 create 只发一次，撞到 429 就直接记失败 →
-            //   前端表现成「已拿到 0 个」。这里改成串行 + 429 退避重试 + 单间隔。
+            // Codex: 不在插件里长时间重试 429；按单返回错误，避免消息通道先关闭。
             const results = new Array(postingNumbers.length);
-            const GAP = 700;                    // 单与单之间最小间隔
-            const RETRY = [3000, 6000, 12000];   // create/get 命中 429 的退避
-            const postRetry = async (path, body) => {
-              let last = null;
-              for (let attempt = 0; attempt <= RETRY.length; attempt += 1) {
-                const r = await post(path, body);
-                last = r;
-                if (r.status !== 429 && r.status < 500) return r;
-                if (attempt < RETRY.length) await sleep(RETRY[attempt]);
-              }
-              return last;
-            };
             for (let k = 0; k < postingNumbers.length; k += 1) {
               const pn = postingNumbers[k];
               try {
-                const create = await postRetry("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] });
+                const create = await post("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] });
                 const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
                 if (!taskId) {
                   // 把后台返回的原文带回去，前端才知道是 429 还是 403
                   results[k] = { pn, err: `create ${create.status}${create.text ? " " + create.text.slice(0, 60) : ""}` };
-                  await sleep(GAP); continue;
+                  continue;
                 }
                 let url = "";
+                let pollError = "";
                 for (let i = 0; i < 12 && !url; i += 1) {
-                  await sleep(i === 0 ? 600 : 900);
-                  const st = await postRetry("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+                  await sleep(i === 0 ? 900 : 1200);
+                  const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+                  if (st.status === 429 || st.status >= 400) { pollError = `get ${st.status} ${st.text}`; break; }
                   const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
                   if (m) url = m[0].replace(/\\\//g, "/");
                 }
-                results[k] = url ? { pn, url } : { pn, err: "no_url", taskId };
+                results[k] = url ? { pn, url } : { pn, err: pollError || "no_url", taskId };
               } catch (e) {
                 results[k] = { pn, err: String((e && e.message) || e).slice(0, 120) };
               }
-              await sleep(GAP);
             }
             const items = results.filter((it) => it && it.url);
             const failed = results.filter((it) => it && !it.url);

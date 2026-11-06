@@ -16477,7 +16477,7 @@ function buildXlsx(sheetName, rows, opts = {}) {
     `<xf numFmtId="0" fontId="6" fillId="0" borderId="1" xfId="0" applyFont="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>`,
   ].join("");
   const stylesXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`
-    + `<fonts count="6">`
+    + `<fonts count="7">`
     + `<font><sz val="11"/><name val="Arial"/></font>`
     + `<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/></font>`
     + `<font><sz val="10"/><color rgb="FF1F2937"/><name val="Arial"/></font>`
@@ -16520,7 +16520,7 @@ function buildXlsx(sheetName, rows, opts = {}) {
 //   ① Color×Qty = 各色号×该色号数量，混色用 / 连接（12×1/18×1/26×1）
 //   ② Qty = 该订单里毛线的**总数量**
 //   ③ Label = 订单号第一个 "-" 之后的 4 位（**客户号**，保留前导 0，如 0060）
-//   ④ 版式/字体/配色对齐用户模板「A4双列表」：每页 48 个（24 行 × 双栏）
+//   ④ 版式/字体/配色对齐用户模板「A4双列表」：每页 52 个（26 行 × 双栏）
 app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res, next) => {
   try {
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
@@ -16571,8 +16571,9 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       qty: Number(r.total_qty || 0),
       label: labelOf(r.pn),
     }));
-    const PER_PAGE = 48;
-    const PER_COL = 24;
+    // Codex: keep the A4 print height while avoiding a nearly empty overflow page at 49-52 orders.
+    const PER_PAGE = 52;
+    const PER_COL = 26;
     const H = (t) => ({ v: t, s: "header" });
     const rows = [];
     const rowHeights = {};
@@ -16587,7 +16588,7 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       for (let i = 0; i < leftCount; i += 1) {
         const left = slice[i];
         const right = slice[i + leftCount];
-        rowHeights[rows.length] = 31;
+        rowHeights[rows.length] = 28;
         rows.push([
           left ? { v: page * PER_PAGE + i + 1, s: "no" } : { v: "", s: "blank" },
           left ? { v: left.shipment, s: "shipment" } : { v: "", s: "blank" },
@@ -16906,69 +16907,6 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
   } catch (error) { next(error); }
 });
 
-app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res, next) => {
-  try {
-    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
-      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
-    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
-    const status = String(req.body?.status || "awaiting_deliver");
-    const result = await db.query(
-      `SELECT c.posting_number,
-              COALESCE(p->>'offer_id','') AS offer_id,
-              COALESCE((p->>'quantity')::int, 1) AS qty
-         FROM app_order_cache c
-         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-        WHERE c.user_id = $1
-          AND c.store_id = ANY($2::uuid[])
-          AND COALESCE(NULLIF(c.display_status,''), c.status) = $3
-          AND COALESCE(p->>'name','') ILIKE '%пряж%'
-          AND COALESCE(p->>'offer_id','') <> ''
-        ORDER BY COALESCE(p->>'offer_id',''), c.posting_number`,
-      [req.user.id, storeIds, status],
-    );
-    // 短码 = 货件号前段末 4 位，去掉前导 0（用户模板里的 Label 列就是这个规律）
-    const shortLabel = (posting) => {
-      const head = String(posting || "").split("-")[0].replace(/\D/g, "");
-      const tail = head.slice(-4);
-      return Number(tail) || 0;
-    };
-    const items = result.rows.map((r) => {
-      const variant = String(r.offer_id).split("-").pop();
-      return {
-        shipment: r.posting_number,
-        colorQty: `${variant}×${r.qty}`,
-        qty: Number(r.qty || 0),
-        label: shortLabel(r.posting_number),
-      };
-    });
-    // A4 双栏：每页 1 空行 + 表头 + 24 行数据 + 2 空行
-    const PER_PAGE = 48;
-    const PER_COL = 24;
-    const HEAD = ["No.", "Shipment", "Color×Qty", "Qty", "Label"];
-    const rows = [];
-    for (let page = 0; page * PER_PAGE < items.length; page += 1) {
-      const slice = items.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
-      rows.push([]);
-      rows.push([...HEAD, "", ...HEAD]);
-      for (let i = 0; i < PER_COL; i += 1) {
-        const left = slice[i];
-        const right = slice[i + PER_COL];
-        const leftRow = left ? [page * PER_PAGE + i + 1, left.shipment, left.colorQty, left.qty, left.label] : [];
-        const rightRow = right ? [page * PER_PAGE + PER_COL + i + 1, right.shipment, right.colorQty, right.qty, right.label] : [];
-        rows.push([...leftRow, "", ...rightRow]);
-      }
-      rows.push([], []);
-    }
-    const buf = buildXlsx("A4双列表", rows);
-    const fname = `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`;
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
-    res.setHeader("X-Item-Count", String(items.length));
-    res.setHeader("X-Page-Count", String(Math.ceil(items.length / PER_PAGE) || 1));
-    res.send(buf);
-  } catch (error) { next(error); }
-});
-
 app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, next) => {
   try {
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
@@ -16990,7 +16928,9 @@ app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, 
           GROUP BY 1
        ), pending AS (
          SELECT COALESCE(p->>'offer_id','') AS sku,
-                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty,
+                (array_agg(c.posting_number ORDER BY c.in_process_at ASC NULLS LAST, c.posting_number ASC))[1] AS first_posting_number,
+                (array_agg(c.posting_number ORDER BY c.in_process_at DESC NULLS LAST, c.posting_number DESC))[1] AS last_posting_number
            FROM app_order_cache c
            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
           WHERE c.user_id = $1
@@ -17000,18 +16940,20 @@ app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, 
             AND COALESCE(p->>'name','') ILIKE '%пряж%'
           GROUP BY 1
        )
-       SELECT a.sku, a.name, COALESCE(p.qty, 0)::int AS qty
+       SELECT a.sku, a.name, COALESCE(p.qty, 0)::int AS qty,
+              p.first_posting_number, p.last_posting_number
          FROM all_sku a
          LEFT JOIN pending p ON p.sku = a.sku
         ORDER BY a.sku`,
       [req.user.id, storeIds],
     );
     const totalQty = result.rows.reduce((n, r) => n + Number(r.qty || 0), 0);
-    const rows = [["序号", "货号（SKU）", "商品名称", "类别", "数量(个)"]];
+    // Codex: each SKU shows its earliest and latest pending order by order time.
+    const rows = [["序号", "货号（SKU）", "商品名称", "类别", "数量(个)", "开始订单号", "结束订单号"]];
     result.rows.forEach((r, i) => {
-      rows.push([i + 1, r.sku, r.name || "", "毛线", Number(r.qty || 0)]);
+      rows.push([i + 1, r.sku, r.name || "", "毛线", Number(r.qty || 0), r.first_posting_number || "", r.last_posting_number || ""]);
     });
-    rows.push(["", "合计", "", "", totalQty]);
+    rows.push(["", "合计", "", "", totalQty, "", ""]);
     const buf = buildXlsx("待备货毛线数量", rows);
     const fname = `待备货毛线数量_${new Date().toISOString().slice(0, 10)}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
