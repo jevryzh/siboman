@@ -894,18 +894,32 @@ window.OrderListView = {
       yarnLabelsBusy.value = true;
       exportStart(`API 导出毛线标签（${picked.length} 单）`);
       try {
-        exportStep(10, '正在逐单获取 Ozon 标签…');
-        // Codex: 服务端逐单请求官方接口并按拣货单顺序合并，不依赖浏览器插件。
+        exportStep(2, '正在启动标签任务…');
+        // Codex: background job reports progress without holding one HTTP request open past the gateway timeout.
         const res = await axios.post('/api/seller/orders/yarn-labels', {
-          store_ids: storeIds, posting_numbers: picked, ordered_single: true,
-        }, { responseType: 'blob', timeout: 600000 });
+          store_ids: storeIds, posting_numbers: picked, ordered_single: true, async_job: true,
+        }, { timeout: 30000 });
+        const jobId = res.data?.job_id;
+        if (!jobId) throw new Error('服务端未返回标签任务编号');
+        const deadline = Date.now() + 30 * 60 * 1000;
+        while (true) {
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+          const status = (await axios.get(`/api/seller/orders/yarn-label-jobs/${encodeURIComponent(jobId)}`, { timeout: 15000 })).data;
+          const done = Number(status.completed || 0);
+          const total = Number(status.total || picked.length);
+          exportStep(2 + (done / total) * 90, `已获取 ${done}/${total} 单${status.rate_limited ? `，Ozon 限流重试 ${status.rate_limited} 次` : ''}${done === total && status.status === 'running' ? '，正在合并 PDF…' : ''}`);
+          if (status.status === 'done') break;
+          if (status.status === 'failed') throw new Error(status.error || '标签任务失败');
+          if (Date.now() > deadline) throw new Error(`任务仍在后台运行（编号 ${jobId}），可稍后重新点击同一批订单继续查看进度`);
+        }
         exportStep(95, '正在下载 PDF…');
-        downloadBlob(res.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
+        const pdf = await axios.get(`/api/seller/orders/yarn-label-jobs/${encodeURIComponent(jobId)}/download`, { responseType: 'blob', timeout: 60000 });
+        downloadBlob(pdf.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
         exportFinish();
-        notify.success(`已导出 ${res.headers['x-item-count'] || picked.length} 单毛线标签，顺序与拣货单一致`);
+        notify.success(`已导出 ${pdf.headers['x-item-count'] || picked.length} 单毛线标签，顺序与拣货单一致`);
       } catch (e) {
         exportFail();
-        let msg = e.message;
+        let msg = e.response?.data?.error || e.message;
         try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
         notify.error('API 导出毛线标签失败：' + String(msg).slice(0, 240), 0);
       } finally { yarnLabelsBusy.value = false; }

@@ -19,6 +19,7 @@ import net from "node:net";
 import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
 import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
+import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16409,6 +16410,8 @@ function buildXlsx(sheetName, rows, opts = {}) {
     return `<row r="${ri + 1}"${h ? ` ht="${h}" customHeight="1"` : ""}>${cells}</row>`;
   }).join("");
   const cols = (opts.colWidths || []).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("");
+  const printLayout = opts.printLayout === "a4-portrait";
+  const pageBreaks = (opts.pageBreakRows || []).map((row) => `<brk id="${row}" max="16383" man="1"/>`).join("");
   const STYLE_XFS = [
     `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>`,
     // header: 白字加粗 + 蓝底 + 边框 + 居中
@@ -16446,8 +16449,12 @@ function buildXlsx(sheetName, rows, opts = {}) {
     + `<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>`
     + `</styleSheet>`;
   const sheetXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">`
+    + (printLayout ? `<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><dimension ref="A1:K${rows.length}"/>` : "")
     + (cols ? `<cols>${cols}</cols>` : "")
-    + `<sheetData>${body}</sheetData></worksheet>`;
+    + `<sheetData>${body}</sheetData>`
+    + (printLayout ? `<printOptions horizontalCentered="1"/><pageMargins left="0.18" right="0.18" top="0.2" bottom="0.2" header="0" footer="0"/><pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"/>` : "")
+    + (pageBreaks ? `<rowBreaks count="${opts.pageBreakRows.length}" manualBreakCount="${opts.pageBreakRows.length}">${pageBreaks}</rowBreaks>` : "")
+    + `</worksheet>`;
   const files = {
     "[Content_Types].xml": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>`,
     "_rels/.rels": `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
@@ -16520,16 +16527,18 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     const H = (t) => ({ v: t, s: "header" });
     const rows = [];
     const rowHeights = {};
+    const pageBreakRows = [];
     for (let page = 0; page * PER_PAGE < items.length; page += 1) {
+      if (page) pageBreakRows.push(rows.length);
       const slice = items.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
-      rowHeights[rows.length] = 10;                                  // 页首空行
-      rows.push([{ v: "", s: "blank" }]);
-      rowHeights[rows.length] = 24;                                  // 表头
+      rowHeights[rows.length] = 25;
       rows.push([H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label"), H(""), H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label")]);
-      for (let i = 0; i < PER_COL; i += 1) {
+      // Codex: balance the last sheet across two columns without padding it with empty print rows.
+      const leftCount = Math.min(PER_COL, Math.ceil(slice.length / 2));
+      for (let i = 0; i < leftCount; i += 1) {
         const left = slice[i];
-        const right = slice[i + PER_COL];
-        rowHeights[rows.length] = 28;
+        const right = slice[i + leftCount];
+        rowHeights[rows.length] = 31;
         rows.push([
           left ? { v: page * PER_PAGE + i + 1, s: "no" } : { v: "", s: "blank" },
           left ? { v: left.shipment, s: "shipment" } : { v: "", s: "blank" },
@@ -16537,19 +16546,19 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
           left ? { v: left.qty, s: "qty" } : { v: "", s: "blank" },
           left ? { v: left.label, s: "label" } : { v: "", s: "blank" },
           { v: "", s: "blank" },
-          right ? { v: page * PER_PAGE + PER_COL + i + 1, s: "no" } : { v: "", s: "blank" },
+          right ? { v: page * PER_PAGE + leftCount + i + 1, s: "no" } : { v: "", s: "blank" },
           right ? { v: right.shipment, s: "shipment" } : { v: "", s: "blank" },
           right ? { v: right.colorQty, s: right.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
           right ? { v: right.qty, s: "qty" } : { v: "", s: "blank" },
           right ? { v: right.label, s: "label" } : { v: "", s: "blank" },
         ]);
       }
-      rowHeights[rows.length] = 12; rows.push([{ v: "", s: "blank" }]);
-      rowHeights[rows.length] = 12; rows.push([{ v: "", s: "blank" }]);
     }
     const buf = buildXlsx("A4双列表", rows, {
       colWidths: [3.8, 12.8, 11.4, 4.0, 7.0, 1.4, 3.8, 12.8, 11.4, 4.0, 7.0],
       rowHeights,
+      printLayout: "a4-portrait",
+      pageBreakRows,
     });
     const fname = `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
@@ -16664,6 +16673,34 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
   } catch (error) { next(error); }
 });
 
+// Codex: long Ozon label exports run outside the HTTP request; Nginx may time out before a 199-order PDF is ready.
+const yarnLabelJobs = new Map();
+const pruneYarnLabelJobs = () => {
+  const now = Date.now();
+  for (const [id, job] of yarnLabelJobs) {
+    if (job.status !== "running" && now - job.updatedAt > 60 * 60 * 1000) yarnLabelJobs.delete(id);
+  }
+};
+
+app.get("/api/seller/orders/yarn-label-jobs/:id", requireAuth, (req, res) => {
+  pruneYarnLabelJobs();
+  const job = yarnLabelJobs.get(req.params.id);
+  if (!job || job.userId !== req.user.id) return res.status(404).json({ success: false, error: "标签任务不存在或已过期" });
+  res.json({ success: true, id: job.id, status: job.status, total: job.total,
+    completed: job.completed, rate_limited: job.rateLimited, error: job.error });
+});
+
+app.get("/api/seller/orders/yarn-label-jobs/:id/download", requireAuth, (req, res) => {
+  pruneYarnLabelJobs();
+  const job = yarnLabelJobs.get(req.params.id);
+  if (!job || job.userId !== req.user.id) return res.status(404).json({ success: false, error: "标签任务不存在或已过期" });
+  if (job.status !== "done" || !job.pdf) return res.status(409).json({ success: false, error: "标签 PDF 尚未生成" });
+  res.setHeader("Content-Type", "application/pdf");
+  res.setHeader("Content-Disposition", `attachment; filename="yarn-labels-${job.id}.pdf"`);
+  res.setHeader("X-Item-Count", String(job.total));
+  res.send(job.pdf);
+});
+
 app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) => {
   try {
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
@@ -16712,6 +16749,38 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     //   降到 3 + 429 指数退避重试，失败时把真实原因带回去（之前一律吞成"未返回任何标签"）。
     // Codex: 逐单模式用于不依赖插件的有序导出；整批接口的页序不能保证与拣货单一致。
     const orderedSingle = req.body?.ordered_single === true;
+    if (orderedSingle && req.body?.async_job === true) {
+      if (postings.length > 500) return res.status(400).json({ success: false, error: "单次最多导出 500 单，请分批选择" });
+      pruneYarnLabelJobs();
+      const running = [...yarnLabelJobs.values()].find((job) => job.userId === req.user.id && job.status === "running");
+      if (running) {
+        if (running.storeId === storeIds[0] && running.postings.join("\n") === postings.join("\n")) {
+          return res.status(202).json({ success: true, job_id: running.id, total: running.total });
+        }
+        return res.status(409).json({ success: false, error: `已有 ${running.completed}/${running.total} 单的标签任务在运行，请等待完成后重试` });
+      }
+      const job = { id: crypto.randomUUID(), userId: req.user.id, storeId: storeIds[0], postings,
+        total: postings.length, completed: 0, rateLimited: 0, status: "running", error: null, pdf: null, updatedAt: Date.now() };
+      yarnLabelJobs.set(job.id, job);
+      void buildOrderedYarnLabels(postings, {
+        baseUrl: OZON_SELLER_BASE_URL, clientId, apiKey,
+        onProgress: ({ completed, rateLimited }) => {
+          job.completed = completed;
+          job.rateLimited = rateLimited;
+          job.updatedAt = Date.now();
+        },
+      }).then((pdf) => {
+        job.pdf = pdf;
+        job.status = "done";
+        job.updatedAt = Date.now();
+      }).catch((error) => {
+        job.error = String(error.message || error).slice(0, 350);
+        job.status = "failed";
+        job.updatedAt = Date.now();
+        console.warn(`[Codex yarn labels] job ${job.id} failed: ${job.error}`);
+      });
+      return res.status(202).json({ success: true, job_id: job.id, total: job.total });
+    }
     const CHUNK = orderedSingle ? 1 : 20, CONCURRENCY = orderedSingle ? 2 : 3;
     const chunks = [];
     for (let i = 0; i < postings.length; i += CHUNK) chunks.push(postings.slice(i, i + CHUNK));
