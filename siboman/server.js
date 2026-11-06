@@ -16686,8 +16686,10 @@ app.get("/api/seller/orders/yarn-label-jobs/:id", requireAuth, (req, res) => {
   pruneYarnLabelJobs();
   const job = yarnLabelJobs.get(req.params.id);
   if (!job || job.userId !== req.user.id) return res.status(404).json({ success: false, error: "标签任务不存在或已过期" });
+  // Accio Work (2026-11-06)：返回未取到的货件号，前端可提示「N 单未取到」
   res.json({ success: true, id: job.id, status: job.status, total: job.total,
-    completed: job.completed, rate_limited: job.rateLimited, error: job.error });
+    completed: job.completed, rate_limited: job.rateLimited, error: job.error,
+    missing: Array.isArray(job.missing) ? job.missing : [] });
 });
 
 app.get("/api/seller/orders/yarn-label-jobs/:id/download", requireAuth, (req, res) => {
@@ -16762,8 +16764,11 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
       const job = { id: crypto.randomUUID(), userId: req.user.id, storeId: storeIds[0], postings,
         total: postings.length, completed: 0, rateLimited: 0, status: "running", error: null, pdf: null, updatedAt: Date.now() };
       yarnLabelJobs.set(job.id, job);
+      // Accio Work (2026-11-06)：允许部分成功——个别货件被限流时保留已取到的标签，
+      //   并把未取到的货件号回传给前端（job.missing），不再让 192 单整份作废。
       void buildOrderedYarnLabels(postings, {
         baseUrl: OZON_SELLER_BASE_URL, clientId, apiKey,
+        allowPartial: true,
         onProgress: ({ completed, rateLimited }) => {
           job.completed = completed;
           job.rateLimited = rateLimited;
@@ -16771,13 +16776,17 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
         },
       }).then((pdf) => {
         job.pdf = pdf;
+        job.missing = Array.isArray(pdf.missing) ? pdf.missing : [];
         job.status = "done";
         job.updatedAt = Date.now();
+        if (job.missing.length) {
+          console.warn(`[Accio Work yarn labels] job ${job.id} done with ${job.missing.length} missing: ${job.missing.slice(0, 10).join(", ")}`);
+        }
       }).catch((error) => {
         job.error = String(error.message || error).slice(0, 350);
         job.status = "failed";
         job.updatedAt = Date.now();
-        console.warn(`[Codex yarn labels] job ${job.id} failed: ${job.error}`);
+        console.warn(`[Accio Work yarn labels] job ${job.id} failed: ${job.error}`);
       });
       return res.status(202).json({ success: true, job_id: job.id, total: job.total });
     }
