@@ -15822,9 +15822,12 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
     if (db && Array.isArray(p.products) && p.products.length) {
       const offerIds = p.products.map(x => x.offer_id).filter(Boolean);
       const r = await db.query(
+        // Accio Work (2026-11-06)：原来按 user_id 过滤商品，导致「订单所属店铺」与
+        //   「商品导入人」不是同一个账号时（如 eason 导入、HappyFriday 运营 查看）
+        //   取不到 image → 订单列表图片全空。店铺权限已由 storeId 校验，这里只需按店铺取。
         `SELECT offer_id, image, name, purchase_price_cny, source_url_1688
-           FROM app_products WHERE user_id=$1 AND store_id=$2 AND offer_id = ANY($3::text[])`,
-        [req.user.id, storeId, offerIds],
+           FROM app_products WHERE store_id=$1 AND offer_id = ANY($2::text[])`,
+        [storeId, offerIds],
       );
       const meta = new Map(r.rows.map(x => [x.offer_id, x]));
       p.products = p.products.map(pd => {

@@ -861,7 +861,20 @@ window.OrderListView = {
           failedAll.length = 0;
           stillFailed.forEach((f) => failedAll.push(f));
         }
-        if (!items.length) { exportFail(); return notify.error('导出毛线标签失败：插件未取到任何标签（所选订单可能都是已发货/已取消状态，标签接口不返回）', 0); }
+        if (!items.length) {
+          exportFail();
+          // Accio Work (2026-11-06)：把插件回传的真实失败原因打出来，
+          //   之前统一报「未取到任何标签」，把 create 429 限流掩盖成了状态问题。
+          const detail = failedAll.slice(0, 5).map((f) => `${f.pn}${f.err ? `(${f.err})` : ''}`).join('、');
+          const limited = /429|rate limit/i.test(detail);
+          return notify.error(
+            `导出毛线标签失败：插件未取到任何标签${detail ? `（${detail}）` : ''}。`
+            + (limited
+              ? '卖家后台标签接口触发限流（429），请等 1–2 分钟再试；仍不行就减少勾选数量分批导出。'
+              : '所选订单可能都是已发货/已取消状态，标签接口不返回。'),
+            0,
+          );
+        }
         exportStep(92, `已生成 ${items.length} 个标签，正在按顺序合并 PDF…`);
         // 服务端按「拣货单顺序」下载并合并
         const merged = await axios.post('/api/seller/orders/yarn-label-pdf', { order: ordered, items }, { responseType: 'blob', timeout: 300000 });
@@ -929,8 +942,24 @@ window.OrderListView = {
       postingDialog.visible = true;
     };
     const applyPostingFilter = () => {
-      const list = String(postingDialog.text || '').split(/[\s,，;；、]+/).map((x) => x.trim()).filter(Boolean);
-      postingFilter.value = [...new Set(list)].slice(0, 1000);
+      // Accio Work (2026-11-06)：先清掉零宽字符/BOM，再统一去重，
+      //   避免 Chrome/Firefox 因粘贴内容里的隐形字符导致条数不一致（199 vs 200）。
+      const raw = String(postingDialog.text || '')
+        .replace(/[\u200b\u200c\u200d\ufeff]/g, '')
+        .split(/[\s,，;；、]+/)
+        .map((x) => x.trim())
+        .filter(Boolean);
+      const seen = new Set();
+      const list = [];
+      for (const pn of raw) {
+        const key = pn.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        list.push(pn);
+      }
+      const duplicated = raw.length - list.length;
+      if (duplicated > 0) notify.info(`已自动去掉 ${duplicated} 个重复单号`, 8000);
+      postingFilter.value = list.slice(0, 1000);
       postingDialog.visible = false;
       pagination.currentPage = 1;
       fetchOrders();
