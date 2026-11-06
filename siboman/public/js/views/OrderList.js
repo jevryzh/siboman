@@ -813,10 +813,12 @@ window.OrderListView = {
           const sorted = await axios.post('/api/seller/orders/yarn-sorted-postings', { posting_numbers: picked }, { timeout: 30000 });
           if (Array.isArray(sorted.data?.posting_numbers) && sorted.data.posting_numbers.length) ordered = sorted.data.posting_numbers;
         } catch (_e) { /* 排序失败就用原顺序 */ }
-        // v2.2.9.190 分批调插件：MV3 后台服务在长任务中会被浏览器回收，
-        //   一次 165 单（每单 2 个请求、约 4 分钟）必然被中断 → 界面一直转、导不出来。
-        //   改为每批 10 单，前端循环，每批约 15 秒，稳定可控。
-        const CHUNK = 10;
+        // 单批最多 3 单；Ozon 的标签任务轮询可能很慢，10 单会耗尽插件消息通道的等待时间。
+        const CHUNK = 3;
+        const isClosedChannel = (res) => {
+          const error = String(res?.error || '');
+          return !res || /message channel closed|message port closed|before a response was received|receiving end does not exist/i.test(error);
+        };
         const items = [];
         const failedAll = [];
         const batches = [];
@@ -825,6 +827,10 @@ window.OrderListView = {
           exportStep(10 + (bi / batches.length) * 80, `正在生成标签 ${bi + 1}/${batches.length} 批（已拿到 ${items.length} 个）`);
           const res = await send('printLabels.request', { storeId: storeIds[0], postingNumbers: batches[bi] }, 120000);
           if (!res || res.ok !== true) {
+            if (isClosedChannel(res)) {
+              batches[bi].forEach((pn) => failedAll.push({ pn, err: '插件通信中断' }));
+              continue;
+            }
             let msg = res?.error || (res?.step ? `失败步骤：${res.step}` : '') + ' ' + String(res?.createText || res?.lastText || res?.tabUrl || '').slice(0, 160);
             if (res?.step === 'create') msg += ' —— 标签创建接口拒绝；若插件版本低于 2.2.9.189，请先升级插件再试';
             exportFail();
@@ -839,7 +845,7 @@ window.OrderListView = {
           exportStep(85, `有 ${failedAll.length} 单失败，自动重试一轮…`);
           const retryPn = [...new Set(failedAll.map((f) => String(f?.pn || '')).filter(Boolean))];
           const retryBatches = [];
-          for (let i = 0; i < retryPn.length; i += CHUNK) retryBatches.push(retryPn.slice(i, i + CHUNK));
+          for (let i = 0; i < retryPn.length; i += 1) retryBatches.push(retryPn.slice(i, i + 1));
           const stillFailed = [];
           for (const batch of retryBatches) {
             try {
@@ -850,7 +856,7 @@ window.OrderListView = {
               } else {
                 batch.forEach((pn) => stillFailed.push({ pn, err: String(res?.step || res?.error || 'retry_failed').slice(0, 60) }));
               }
-            } catch (_e) { batch.forEach((pn) => stillFailed.push({ pn, err: 'retry_error' })); }
+            } catch (e) { batch.forEach((pn) => stillFailed.push({ pn, err: String(e?.message || 'retry_error').slice(0, 60) })); }
           }
           failedAll.length = 0;
           stillFailed.forEach((f) => failedAll.push(f));
