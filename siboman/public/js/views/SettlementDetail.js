@@ -42,93 +42,7 @@ window.SettlementDetailView = {
     const rows = ref([]), total = ref(0), summary = ref({}), run = ref(null);
     const page = ref(1), pageSize = ref(100), loading = ref(false), syncing = ref(false), exporting = ref(false), error = ref('');
     const orderAdBusy = ref(false), orderAdInput = ref(null);
-    const logVisible = ref(false), logLoading = ref(false), syncRuns = ref([]), missingDates = ref([]), logToday = ref('');
-    const adLogVisible = ref(false), adLogLoading = ref(false), adDays = ref([]), adMissing = ref([]), adSummary = ref({});
-    const checkVisible = ref(false), checkRows = ref([]), checkMessage = ref(''), checkTotal = ref(0), pendingEntries = ref([]);
-    const posting = ref(''), typeId = ref(''), category = ref(''), source = ref('');
-    const stopped = false;
-
-    const typeName = (id) => id == null ? '订单汇总' : (TYPE_LABELS[id] || `费用类型 ${id}`);
-    const categoryName = (code) => CATEGORY_LABELS[code] || code || '—';
-    const typeOptions = Object.entries(TYPE_LABELS).map(([value, label]) => ({ value, label }));
-    const activeRun = computed(() => run.value && ['queued', 'running'].includes(run.value.status));
-    const progress = computed(() => run.value?.days_total ? Math.min(99, Math.round(run.value.days_done / run.value.days_total * 100)) : 0);
-    const lastUpdated = computed(() => run.value?.finished_at ? new Date(run.value.finished_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '—');
-
-    // 广告卡片的分层数据：总额 → 54（逐单报表拆成订单/点击）→ 41 → 3 → 跨月顺延
-    // 没有导入逐单报表时，54 直接取结算口径
-    const adItems = computed(() => {
-      const s = summary.value || {};
-      const abs = (v) => Math.abs(Number(v || 0));
-      const cpo = abs(s.ad_cpo_rub), cpc = abs(s.ad_cpc_rub);
-      const hasImport = cpo + cpc > 0.01;
-      const total = abs(s.ad_rub), settlement = abs(s.ad_settlement_rub);
-      return { shop: abs(s.ad_shop_rub), cpo, cpc, click: abs(s.ad_click_rub), brand: abs(s.ad_brand_rub),
-        hasImport, total, settlement, delayed: total - settlement };
-    });
-    // 广告明细弹层：移入即展开，移出收起；点一下可钉住
-    const adTipOpen = ref(false), adTipPinned = ref(false);
-    function adEnter() { adTipOpen.value = true; }
-    function adLeave() { if (!adTipPinned.value) adTipOpen.value = false; }
-    function adToggle() { adTipPinned.value = !adTipPinned.value; adTipOpen.value = adTipPinned.value; }
-    function adVisibleChange(v) { if (!v) { adTipOpen.value = false; adTipPinned.value = false; } }
-    // 收款合计的悬浮明细：买家实付 / 佣金 / 调整 / 实收
-    const incTipOpen = ref(false), incTipPinned = ref(false);
-    function incEnter() { incTipOpen.value = true; }
-    function incLeave() { if (!incTipPinned.value) incTipOpen.value = false; }
-    function incToggle() { incTipPinned.value = !incTipPinned.value; incTipOpen.value = incTipPinned.value; }
-    function incVisibleChange(v) { if (!v) { incTipOpen.value = false; incTipPinned.value = false; } }
-
-    function queryParams() {
-      // 顶部日期区间只用于「立即更新」的拉取周期；表格按筛选区的「应计日期」区间查询
-      const [from, to] = accrualRange.value?.length === 2 ? accrualRange.value : defaultQueryRange();
-      const params = { store_id: sid(), page: page.value, page_size: pageSize.value, from, to };
-      if (posting.value.trim()) params.posting = posting.value.trim();
-      if (typeId.value !== '') params.type_id = typeId.value;
-      if (category.value) params.category = category.value;
-      if (source.value) params.source = source.value;
-      return params;
-    }
-
-    async function load() {
-      if (!sid()) return;
-      loading.value = true; error.value = '';
-      try {
-        const response = await axios.get('/api/statistics/accruals', { params: queryParams() });
-        rows.value = response.data.rows || [];
-        total.value = response.data.total || 0;
-        summary.value = response.data.summary || {};
-        run.value = response.data.run || null;
-      } catch (e) { error.value = message(e); }
-      finally { loading.value = false; }
-    }
-
-    function applyFilter() { page.value = 1; load(); }
-    function resetFilters() { posting.value = ''; typeId.value = ''; category.value = ''; source.value = ''; accrualRange.value = defaultQueryRange(); page.value = 1; load(); }
-    // 顶部区间只影响同步，改它不刷新表格
-    function rangeChanged() { rangeTouched.value = true; }
-    function pageChanged() { load(); }
-
-    async function waitRun() {
-      for (let i = 0; i < 200 && !stopped; i++) {
-        await new Promise((resolve) => setTimeout(resolve, 3000));
-        await load();
-        if (!['queued', 'running'].includes(run.value?.status || '')) return;
-      }
-    }
-
-    async function syncNow() {
-      if (!sid() || !dateRange.value?.[0]) return;
-      // 顶部区间就是这个按钮要拉的周期
-      const from = dateRange.value[0], to = dateRange.value[1];
-      syncing.value = true; error.value = '';
-      try {
-        await axios.post('/api/statistics/sync', { store_id: sid(), from, to });
-        await waitRun();
-      } catch (e) { error.value = message(e); }
-      finally { syncing.value = false; }
-    }
-
+    const logVisible = ref(false), logLoading = ref(false), orderSyncs = ref([]), orderSyncLast = ref('');
     async function forceImport() {
       if (!pendingEntries.value.length) return;
       checkVisible.value = false; orderAdBusy.value = true;
@@ -136,7 +50,7 @@ window.SettlementDetailView = {
         const response = await axios.post('/api/statistics/advertising/order-report',
           { store_id: sid(), entries: pendingEntries.value, force: true });
         const data = response.data;
-        ElementPlus.ElMessage.success(`导入完成：写入 ${data.days_written} 天 / ${data.rows_written} 条，未变 ${data.days_unchanged} 天`);
+        ElementPlus.ElMessage.success(`导入完成：写入 ${data.days_written} 天 / ${data.rows_written} 条，未变 ${data.days_unchanged} 天${data.click_alloc ? `；41 点击广告已重算 ${data.click_alloc.days} 天` : ''}`);
         await load();
         await openAdLog();
       } catch (e) {
@@ -159,10 +73,9 @@ window.SettlementDetailView = {
       if (!sid()) return;
       logVisible.value = true; logLoading.value = true;
       try {
-        const r = await axios.get('/api/statistics/sync-log', { params: { store_id: sid() } });
-        missingDates.value = r.data.missing_dates || [];
-        syncRuns.value = r.data.runs || [];
-        logToday.value = r.data.today || '';
+        const r = await axios.get('/api/statistics/order-syncs', { params: { store_id: sid() } });
+        orderSyncs.value = r.data.rows || [];
+        orderSyncLast.value = r.data.last_succeeded_at || '';
       } catch (e) { error.value = message(e); }
       finally { logLoading.value = false; }
     }
@@ -212,7 +125,7 @@ window.SettlementDetailView = {
         const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
-        link.href = url; link.download = `结算明细_${params.from}_${params.to}.csv`;
+        link.href = url; link.download = `店铺结算原始数据_${params.from}_${params.to}.csv`;
         document.body.appendChild(link); link.click(); link.remove();
         URL.revokeObjectURL(url);
         ElementPlus.ElMessage.success(`已导出 ${all.length.toLocaleString('zh-CN')} 行`);
@@ -276,6 +189,7 @@ window.SettlementDetailView = {
         }
         const data = response.data;
         ElementPlus.ElMessage.success(`导入完成：写入 ${data.days_written} 天 / ${data.rows_written} 条，未变 ${data.days_unchanged} 天，匹配 ${data.matched_orders} 单 · ₽${money(data.matched_rub)}`);
+        if (data.click_alloc) ElementPlus.ElMessage.info(`41 点击广告已按日重算：${data.click_alloc.days} 天 / ${data.click_alloc.rows} 单 · ₽${money(data.click_alloc.amount_rub)}`);
         if (data.unmatched_entries) ElementPlus.ElMessage.warning(`有 ${data.unmatched_entries} 条未能归到订单（₽${money(data.unmatched_rub)}）`);
         if (data.shifted_days) ElementPlus.ElMessage.info(`${data.shifted_days} 天因结算日顺延已自动平衡（相邻两天差额互相抵消）`);
         await load();
@@ -301,7 +215,7 @@ window.SettlementDetailView = {
       adTipOpen, adEnter, adLeave, adToggle, adVisibleChange, incTipOpen, incEnter, incLeave, incToggle, incVisibleChange,
       typeName, categoryName, money, load, applyFilter, resetFilters, rangeChanged, pageChanged,
       syncNow, copyUnit, exportCsv, orderAdBusy, orderAdInput, importOrderAd,
-      logVisible, logLoading, syncRuns, missingDates, logToday, openLog,
+      logVisible, logLoading, orderSyncs, orderSyncLast, openLog,
       adLogVisible, adLogLoading, adDays, adMissing, adSummary, openAdLog,
       checkVisible, checkRows, checkMessage, checkTotal, forceImport };
   },
@@ -310,8 +224,8 @@ window.SettlementDetailView = {
   <section class="statistics-workbench statistics-settlement">
     <header class="statistics-heading">
       <div>
-        <h2>结算明细</h2>
-        <div class="statistics-meta">Ozon 应计原始数据 · 按订单号+应计日+费用项目归并 · 默认查最近一个月，按应计日倒序<span v-if="run?.finished_at"> · 同步 {{lastUpdated}}</span><span v-if="activeRun"> · 同步中 {{run.days_done}}/{{run.days_total}}</span></div>
+        <h2>店铺结算原始数据</h2>
+        <div class="statistics-meta">Ozon 应计原始数据 · 按订单号+应计日+费用项目归并 · 默认查最近一个月，按应计日倒序<span v-if="orderSyncLast"> · 订单同步 {{orderSyncLast}}</span></div>
       </div>
       <div class="statistics-actions">
         <span class="statistics-range-label">同步区间</span>
@@ -319,12 +233,14 @@ window.SettlementDetailView = {
           range-separator="至" start-placeholder="开始" end-placeholder="结束"
           :clearable="false" :disabled-date="(d) => d < new Date(MIN_DATE) || d > new Date()"
           @change="rangeChanged" style="width:250px"/>
-        <el-tooltip content="按左侧日期区间拉取结算数据" placement="bottom">
-          <el-button type="primary" :icon="'Refresh'" :loading="syncing" :disabled="activeRun" @click="syncNow">
-            {{activeRun ? '同步中…' : '立即更新'}}
+        <el-tooltip content="同步 Ozon 订单表的增量数据（最近 7 天 + 非终态订单），并更新订单状态与结算日期" placement="bottom">
+          <el-button type="primary" :icon="'Refresh'" :loading="syncing" @click="syncNow">
+            {{syncing ? '同步中…' : '同步订单'}}
           </el-button>
         </el-tooltip>
-        <el-button :icon="'Document'" @click="openLog">同步记录</el-button>
+        <el-tooltip content="订单表同步记录" placement="bottom">
+          <el-button :icon="'Clock'" circle aria-label="订单表同步记录" @click="openLog"/>
+        </el-tooltip>
       </div>
     </header>
 
@@ -444,27 +360,20 @@ window.SettlementDetailView = {
         :page-sizes="[50,100,200,500]" layout="sizes, prev, pager, next, jumper"
         @size-change="pageChanged" @current-change="pageChanged"/>
     </div>
-    <el-dialog v-model="logVisible" title="同步记录" width="920px" top="6vh" class="statistics-dialog">
+    <el-dialog v-model="logVisible" title="订单表同步记录" width="880px" top="6vh" class="statistics-dialog">
       <div v-loading="logLoading">
-        <div v-if="missingDates.length" class="statistics-data-note" style="max-height:120px;overflow:auto">
-          <b>未同步日期（{{missingDates.length}} 天）</b>
-          <div style="margin-top:4px;font-family:ui-monospace,monospace">{{missingDates.join('、')}}</div>
-        </div>
-        <el-alert v-else type="success" :closable="false" show-icon
-          :title="'2026-07-01 至 ' + (logToday || '今天') + ' 全部日期均已同步'" style="margin-bottom:10px"/>
-        <el-table :data="syncRuns" border size="small" max-height="430" empty-text="还没有同步记录">
-          <el-table-column prop="started_at" label="开始时间" width="150"/>
-          <el-table-column label="同步范围" min-width="190">
-            <template #default="{row}">{{row.from_date}} ~ {{row.to_date}}</template>
+        <div class="statistics-meta" style="margin-bottom:10px">每 30 分钟自动同步一次：拉最近 7 天的订单（新单 + 状态变化），再补查一批非终态订单；订单状态一变，上面的结算明细立刻跟着变。<span v-if="orderSyncLast"> · 最近成功 {{orderSyncLast}}</span></div>
+        <el-table :data="orderSyncs" border size="small" max-height="440" empty-text="还没有同步记录">
+          <el-table-column prop="started_at" label="开始时间" width="140"/>
+          <el-table-column prop="finished_at" label="完成时间" width="140"/>
+          <el-table-column label="方式" width="78">
+            <template #default="{row}">{{row.trigger === 'auto' ? '自动' : '手动'}}</template>
           </el-table-column>
-          <el-table-column label="天数" width="72" align="right">
-            <template #default="{row}">{{row.days_done || 0}}/{{row.days_total || 0}}</template>
+          <el-table-column label="拉取订单" width="96" align="right">
+            <template #default="{row}">{{row.fetched || 0}}</template>
           </el-table-column>
-          <el-table-column label="数据条数" width="92" align="right">
-            <template #default="{row}">{{row.records == null ? '—' : Number(row.records).toLocaleString('zh-CN')}}</template>
-          </el-table-column>
-          <el-table-column label="方式" width="72">
-            <template #default="{row}">{{row.trigger === 'daily' ? '自动' : '手动'}}</template>
+          <el-table-column label="更新订单" width="96" align="right">
+            <template #default="{row}">{{row.changed || 0}}</template>
           </el-table-column>
           <el-table-column label="结果" width="82">
             <template #default="{row}">
@@ -473,9 +382,7 @@ window.SettlementDetailView = {
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="说明" min-width="210" show-overflow-tooltip>
-            <template #default="{row}">{{row.status === 'failed' ? (row.error || row.message) : row.message}}</template>
-          </el-table-column>
+          <el-table-column prop="message" label="说明" min-width="220" show-overflow-tooltip/>
         </el-table>
       </div>
     </el-dialog>

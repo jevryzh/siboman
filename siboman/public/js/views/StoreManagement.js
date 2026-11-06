@@ -48,6 +48,14 @@ window.StoreManagementView = {
     //   连"插件版本一致"的判断和下载链接的缓存号都是错的）。统一从 /api/version 读。
     // v2.2.9.204 标签导出：合并接口域名白名单加入中国站（ozonru.cn / ozonstatic.cn / ozonstatic.com），
     //   插件侧 tab 查找与注入前域名校验同步放宽，修复「导出毛线标签」注入权限报错。
+    // v2.2.9.205 结算日期：新增 ozonCookies（用插件 cookies 权限读卖家后台登录态，免手抄）与
+    //   whdCancel（在「退货和取消」里按单号取 WHD 订单的取消日期，只到日）。
+    // v2.2.9.206 结算日期：新增 ozonCancel（在卖家后台页面内批量调订单接口取 FBS 取消时间），
+    //   避开服务端直连被 Ozon 机器人校验/会话绑 IP 挡掉的问题。
+    // v2.2.9.207 结算日期：改按「已取消 + 时间窗」拉全量再本地匹配（按单号过滤会漏单），
+    //   并在 ERP 上给出逐段进度与成功/失败明细。
+    // v2.2.9.208 结算日期：插件逐单/逐页回推进度（之前按批回报，WHD 不足一批时长时间停在 0/N）。
+    // v2.2.9.209 结算日期：逐个 seller 标签页探测，避免多店铺时选到别家标签页导致 403、0 命中。
     const PLUGIN_MANIFEST_VERSION = Vue.ref('');
     const PLUGIN_ZIP_VERSION = Vue.ref('');
     const fetchPluginVersions = async () => {

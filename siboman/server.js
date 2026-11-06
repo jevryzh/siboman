@@ -27663,7 +27663,7 @@ app.use((err, req, res, next) => {
   const status = Number(err?.statusCode || err?.status || 500);
   const message = String(err?.message || "服务器内部错误");
   if (status >= 500) console.error(`[error] ${req.method} ${req.originalUrl}:`, err?.stack || message);
-  res.status(status).json({ success: false, error: message });
+  res.status(status).json({ success: false, error: message, ...(err?.code ? { code: err.code } : {}) });
 });
 
 if (process.argv[1] === __filename) {

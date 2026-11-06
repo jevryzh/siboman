@@ -15,7 +15,7 @@
   "use strict";
   const PROTO = "__zhumeng_proto";
   const PROTO_VAL = "zhumeng-v1";
-  const VERSION = "2.2.9.204";
+  const VERSION = "2.2.9.209";
 
   console.log(`[逐梦采集器 v${VERSION}][ISO] 启动, 监听 window message`);
 
@@ -32,6 +32,14 @@
   }
 
   // 监听 main world dispatch (via postMessage) 的 request
+  // 进度事件：后台把「第几个/共几个」推过来，转给页面（不是 request/response）
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.action !== "settleProgress") return;
+    window.postMessage({ [PROTO]: PROTO_VAL, kind: "settleProgress.event",
+      phase: msg.phase || "", done: msg.done || 0, total: msg.total || 0,
+      scanned: msg.scanned || 0, hit: msg.hit || 0, ts: Date.now() }, "*");
+  });
+
   window.addEventListener("message", async (event) => {
     const data = event.data;
     if (!data || typeof data !== "object" || data[PROTO] !== PROTO_VAL) return;
@@ -80,6 +88,38 @@
         replyToMain(reqId, "pickList.response", resp || { ok: false, error: "插件无返回" });
       } catch (e) {
         replyToMain(reqId, "pickList.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    if (kind === "ozonCookies.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "ozonCookies" });
+        replyToMain(reqId, "ozonCookies.response", resp || { ok: false, error: "插件无返回" });
+      } catch (e) {
+        replyToMain(reqId, "ozonCookies.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    // v2.2.9.209 FBS 取消时间：在卖家后台标签页里批量调后台订单接口
+    if (kind === "ozonCancel.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "ozonCancelDates", postings: data.postings || [], companyId: data.companyId || "", from: data.from || "", to: data.to || "" });
+        replyToMain(reqId, "ozonCancel.response", resp || { ok: false, error: "插件无返回" });
+      } catch (e) {
+        replyToMain(reqId, "ozonCancel.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    // v2.2.9.209 WHD 取消日期：在卖家后台标签页里按单号查「退货和取消」
+    if (kind === "whdCancel.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({ action: "whdCancelDates", postings: data.postings || [] });
+        replyToMain(reqId, "whdCancel.response", resp || { ok: false, error: "插件无返回" });
+      } catch (e) {
+        replyToMain(reqId, "whdCancel.response", { ok: false, error: e.message });
       }
       return;
     }

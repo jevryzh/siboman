@@ -103,33 +103,104 @@ export function monthlyAccrualReport(options) {
   return dailySettlementReport(buildSettlementReport(scoped), scoped);
 }
 
-export function dailySettlementReport(base, { month, orders = [], accruals = [], adDays = [], orderDays = [], orderAdEntries = [], timezone = DEFAULT_AD_TIMEZONE, now = new Date(), configured = false, byAccrualMonth = false } = {}) {
+export function dailySettlementReport(base, { month, orders = [], accruals = [], adDays = [], orderDays = [], orderAdEntries = [], clickAllocs = [], timezone = DEFAULT_AD_TIMEZONE, now = new Date(), configured = false, byAccrualMonth = false } = {}) {
   const metadata = new Map(orders.map((order) => [order.posting_number, order]));
   const withinMonth = (date) => date?.slice(0, 7) === month;
   const matchingEntries = byAccrualMonth ? orderAdEntries.filter((entry) => withinMonth(entry.date)) : orderAdEntries;
   const { centsByPosting, cpoByPosting, cpcByPosting, unmatched } = matchOrderAdRows(matchingEntries, orders);
   const hasAnyAd = cpoByPosting.size > 0 || cpcByPosting.size > 0;
+  // 月度口径：推广-订单 / 推广-点击 直接取结算明细里 source=ad_report 的凭证
+  //   54 = 商品推广·按订单付费，41 = 商品推广·按点击付费
+  // 按包裹号关联；凭证只挂了主单号时，若该主单只有一个包裹就归到包裹上
+  const adjCpo = new Map(), adjCpc = new Map();
+  if (byAccrualMonth) {
+    const siblings = new Map();
+    for (const order of metadata.values()) {
+      const parent = parentOf(order.posting_number);
+      if (!siblings.has(parent)) siblings.set(parent, []);
+      siblings.get(parent).push(order.posting_number);
+    }
+    for (const entry of accruals) {
+      if ((entry.source || 'ozon') !== 'ad_report') continue;
+      const day = String(entry.date || '').slice(0, 10);
+      if (!withinMonth(day)) continue;
+      const typeId = entry.non_item_fee?.type_id;
+      if (typeId !== 54 && typeId !== 41) continue;
+      let unit = entry.unit_number;
+      if (!unit) continue;
+      if (!metadata.has(unit)) {
+        const list = siblings.get(unit);
+        if (!list || list.length !== 1) continue;
+        unit = list[0];
+      }
+      const cents = Math.round(Math.abs(Number(entry.non_item_fee?.accrued?.amount ?? entry.total_amount?.amount ?? 0)) * 100);
+      const target = typeId === 54 ? adjCpo : adjCpc;
+      target.set(unit, (target.get(unit) || 0) + cents);
+    }
+  }
+  const cpoMap = byAccrualMonth ? adjCpo : cpoByPosting;
+  const cpcMap = byAccrualMonth ? adjCpc : cpcByPosting;
+  const hasOrderAd = byAccrualMonth ? adjCpo.size + adjCpc.size > 0 : hasAnyAd;
   const whd = new Set(orders.filter((o) => o.schema === 'fbo').map((o) => o.posting_number));
   for (const entry of accruals) if (entry.posting?.delivery_schema === 'Whd') whd.add(entry.unit_number);
   const cohorts = new Map(), checked = new Set(orderDays.filter((d) => d.business_timezone === timezone).map((d) => String(d.ordered_date).slice(0, 10)));
+  // 分母取「本月报表里出现过的订单」：没有应计流水的订单在报表里没有行，分到它身上也显示不出来
+  const visible = new Set(base.rows.map((row) => row.posting_number));
   for (const order of metadata.values()) {
+    // 月度口径下点击广告按「当天全部订单」平分：取消、在途、签收都算在分母里，
+    // 因为这些订单共同消耗了当天的点击流量，漏掉任何一类都会让单均成本偏低。
+    // WHD（海外仓）订单不参与平分，与日报口径保持一致。
     if (whd.has(order.posting_number)) continue;
+    if (byAccrualMonth && !visible.has(order.posting_number)) continue;
     const date = businessDate(orderTimestamp(order), timezone);
     if (!date || (byAccrualMonth && !withinMonth(date))) continue;
     if (!cohorts.has(date)) cohorts.set(date, []);
     cohorts.get(date).push(order.posting_number);
   }
   const daily = new Map(adDays.filter((d) => d.business_timezone === timezone).map((d) => [String(d.spend_date).slice(0, 10), d]));
+  // 结算明细里的 type 41 点击广告：活动级扣费，没有订单归属，只能按应计日平分到当天订单
+  const clickByDate = new Map();
+  if (byAccrualMonth) {
+    for (const entry of accruals) {
+      if ((entry.source || 'ozon') !== 'ozon') continue;
+      if (Number(entry.non_item_fee?.type_id) !== CLICK_AD) continue;
+      const day = String(entry.date || '').slice(0, 10);
+      if (!withinMonth(day)) continue;
+      // 结算里 41 记为负数（扣费），分摊到订单时按正的成本口径记
+      const cents = Math.abs(moneyCents(entry.non_item_fee?.accrued?.amount ?? entry.total_amount?.amount ?? 0));
+      if (cents) clickByDate.set(day, (clickByDate.get(day) || 0) + cents);
+    }
+  }
   const shares = new Map(), today = businessDate(now, timezone), unallocated = [];
-  for (const [date, day] of daily) {
-    if (byAccrualMonth && !withinMonth(date)) continue;
-    if (date >= today || !checked.has(date)) continue;
+  // 导入广告明细 / 同步结算流水后会把 41 的分摊结果落库（app_statistics_click_allocations），
+  // 这里优先用它；库里没有的日期才按当前规则现算，两者结果一致但库里的更快且可追溯。
+  const allocByDate = new Map();
+  if (byAccrualMonth) for (const row of clickAllocs) {
+    const day = String(row.ad_date || row.date || '').slice(0, 10);
+    if (!day || !withinMonth(day)) continue;
+    if (!allocByDate.has(day)) allocByDate.set(day, new Map());
+    allocByDate.get(day).set(row.order_number, { amount: Number(row.cents) / 100, count: Number(row.order_count) || 0 });
+  }
+  // 只有库里的分摊与报表当天的订单集合完全一致时才采用，否则回退现算，
+  // 避免库里多出/缺少订单导致总额缺口或出现「待核对」
+  const allocUsed = new Set();
+  for (const [day, byOrder] of allocByDate) {
+    const members = cohorts.get(day) || [];
+    if (!members.length || members.length !== byOrder.size || !members.every((posting) => byOrder.has(posting))) continue;
+    for (const [posting, share] of byOrder) shares.set(posting, share);
+    allocUsed.add(day);
+  }
+  const spread = (date, budget) => {
     const members = [...(cohorts.get(date) || [])].sort();
-    const budget = moneyCents(day.cpc_rub);
-    if (!members.length) { if (budget) unallocated.push({ date, amount_rub: budget / 100 }); continue; }
+    if (!members.length) { if (budget) unallocated.push({ date, amount_rub: budget / 100 }); return; }
     const sign = budget < 0 ? -1 : 1, amount = Math.abs(budget), perOrder = Math.floor(amount / members.length), remainder = amount % members.length;
     members.forEach((posting, index) => shares.set(posting, { amount: sign * (perOrder + (index < remainder ? 1 : 0)) / 100, count: members.length }));
+  };
+  if (!byAccrualMonth) for (const [date, day] of daily) {
+    if (date >= today || !checked.has(date)) continue;
+    spread(date, moneyCents(day.cpc_rub));
   }
+  for (const [date, cents] of clickByDate) if (!allocUsed.has(date)) spread(date, cents);
   let orderAdsChecked = false;
   const unresolvedOrderNumbers = new Set(unmatched.map((entry) => entry.order_number));
   const adsWithoutFinance = new Map();
@@ -165,9 +236,16 @@ export function dailySettlementReport(base, { month, orders = [], accruals = [],
     const adjustment = adjustments.get(row.posting_number) || { sales: 0, fees: 0, cpo: null };
     const sales = row.income_rub == null ? null : (moneyCents(row.income_rub) + adjustment.sales) / 100;
     const fees = row.ozon_fees_rub == null ? null : (moneyCents(row.ozon_fees_rub) + adjustment.fees) / 100;
-    const adState = isWhd ? 'whd_excluded' : otherClickMonth ? 'other_month' : !date ? 'missing_date' : date >= today ? 'pending_day'
+    const adState = isWhd ? 'whd_excluded' : otherClickMonth ? 'other_month' : !date ? 'missing_date'
+      : byAccrualMonth ? 'confirmed'
+      : date >= today ? 'pending_day'
       : !daily.has(date) ? (configured ? 'not_synced' : 'missing_config') : !checked.has(date) ? 'incomplete_cohort' : !share ? 'not_synced' : 'confirmed';
-    const allocated = isWhd || otherClickMonth ? 0 : share?.amount ?? null;
+    // 月度口径下点击广告 = 41 按应计日平分（优先取落库结果），当天没有 41 就是 0；WHD 订单不参与
+    const allocated = isWhd ? 0
+      : otherClickMonth ? 0
+      : share ? share.amount
+      : byAccrualMonth ? (date && (allocUsed.has(date) || clickByDate.has(date)) ? null : 0)
+      : null;
     // Use the posted charge when available; the same fee must not be counted from both sources.
     const orderAdCents = adjustment.cpo ?? centsByPosting.get(row.posting_number);
     const zeroOrderAd = orderAdsChecked && !unresolvedOrderNumbers.has(row.posting_number) && !unresolvedOrderNumbers.has(parentOf(row.posting_number));
@@ -178,8 +256,8 @@ export function dailySettlementReport(base, { month, orders = [], accruals = [],
     const profit = receiptCny != null && row.purchase_cny != null ? rounded(receiptCny - row.purchase_cny - row.label_cny) : null;
     return { ...row, income_rub: sales, ozon_fees_rub: fees, advertising_rub: orderAd,
       // 广告费按计费模式拆开：按订单付费 / 按点击付费
-      advertising_cpo_rub: isWhd && !byAccrualMonth ? 0 : hasAnyAd ? (cpoByPosting.get(row.posting_number) || 0) / 100 : null,
-      advertising_cpc_rub: isWhd && !byAccrualMonth ? 0 : hasAnyAd ? (cpcByPosting.get(row.posting_number) || 0) / 100 : null,
+      advertising_cpo_rub: isWhd && !byAccrualMonth ? 0 : hasOrderAd ? (cpoMap.get(row.posting_number) || 0) / 100 : null,
+      advertising_cpc_rub: isWhd && !byAccrualMonth ? 0 : hasOrderAd ? (cpcMap.get(row.posting_number) || 0) / 100 : null,
       // 订单表上的结算日期（取消订单在被发现取消那天写入），供明细展示
       order_settled_date: metadata.get(row.posting_number)?.settled_date ?? null,
       platform_net_rub: row.income_rub == null || row.ozon_fees_rub == null ? null : rounded(row.income_rub - row.ozon_fees_rub),
@@ -255,8 +333,10 @@ export function settlementExceptions(report, group, kind) {
 
 export function filterReportRows(rows, params = {}) {
   let postings = null;
-  if (params.posting_numbers !== undefined) {
-    const numbers = params.posting_numbers;
+  // 空数组 / null 视为「没有批量筛选」，不能当成非法输入拒绝掉（导出与列表请求都会带上这个字段）
+  const batchList = params.posting_numbers;
+  if (Array.isArray(batchList) ? batchList.length > 0 : batchList !== undefined && batchList !== null) {
+    const numbers = batchList;
     if (!Array.isArray(numbers) || !numbers.length || numbers.length > 5000) throw fail('批量订单号须为 1 至 5000 个');
     if (numbers.some((number) => typeof number !== 'string' || number.length > 64 || !/^\d+-\d+-\d+$/.test(number))) throw fail('批量筛选需要完整订单号');
     postings = new Set(numbers);

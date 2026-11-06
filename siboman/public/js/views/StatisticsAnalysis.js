@@ -3,20 +3,31 @@ window.StatisticsAnalysisView = {
     const { ref, computed, onMounted, onBeforeUnmount, watch } = Vue;
     const today = () => new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
     const offsetMonth = (month, delta) => { const d = new Date(month + '-01T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() + delta); return d.toISOString().slice(0, 7); };
-    const month = ref(offsetMonth(today().slice(0, 7), -1));
-    const monthRange = ref([month.value, today().slice(0, 7)]);
+    // 默认展示本月，切换月份时按所选月份重新取数
+    const month = ref(today().slice(0, 7));
+    const monthRange = ref([offsetMonth(today().slice(0, 7), -1), today().slice(0, 7)]);
     const tab = ref('orders'), loading = ref(false), saving = ref(false), syncing = ref(false), error = ref('');
     const rows = ref([]), monthly = ref([]), summary = ref({}), run = ref(null), total = ref(0);
-    const page = ref(1), pageSize = ref(100), search = ref(''), status = ref(''), orderType = ref('');
+    const page = ref(1), pageSize = ref(100), search = ref(''), status = ref(''), orderType = ref(''), exporting = ref(false);
+    // 主筛选栏常驻的两个日期区间：下单日期 / 结算日期
+    const orderDateRange = ref([]), settleDateRange = ref([]);
     const batchNumbers = ref([]), batchVisible = ref(false), batchText = ref(''), batchError = ref('');
     const missingOnly = ref(false), unsettledOnly = ref(false), sort = ref('ordered_at'), direction = ref('asc');
     const selected = ref([]), table = ref(null), costVisible = ref(false), drafts = ref([]), fillAmount = ref(null), labelFillAmount = ref(null);
     const costError = ref(''), costScope = ref(null), uploadInput = ref(null), monthVisible = ref(false), costSource = ref('manual');
     const costPage = ref(1);
+    // 同步结算日期：正常单取 Ozon 后台取消时间，WHD 单由插件在「退货和取消」页取（只到日）
+    const settledSyncing = ref(false), settledStage = ref('');
+    // 进度：{phase, done, total}；结果：{ok, fail, groups:[{label, ok, fail, reason, postings}]}
+    const settleRun = ref(null);
+    const settlePluginVersion = ref("");
+    const settleResult = ref({ visible: false, ok: 0, fail: 0, groups: [], requested: 0 });
+    const cookieVisible = ref(false), cookieSaving = ref(false), cookieInput = ref(''), webSession = ref(null);
     const costPageRows = computed(() => drafts.value.slice((costPage.value - 1) * 50, costPage.value * 50));
     const monthDraft = ref({}), monthScope = ref(null), settingsError = ref('');
     const changesVisible = ref(false), changes = ref([]), changesLoading = ref(false);
     const ledgerVisible = ref(false), ledgerLoading = ref(false), ledger = ref([]), ledgerPending = ref([]), ledgerOrder = ref('');
+    const ledgerMonths = ref([]);
     const ledgerError = ref(''), orderTab = ref('fees'), orderRow = ref(null), orderDetail = ref(null);
     const detailLoading = ref(false), detailLoaded = ref(false), detailError = ref('');
     const exceptionScope = ref(null), exceptionVisible = ref(false), exceptionLoading = ref(false), exceptionError = ref('');
@@ -44,11 +55,13 @@ window.StatisticsAnalysisView = {
     function resetRule(rule) { rule.op = fieldType(rule) === 'text' ? 'contains' : 'eq'; rule.value = ''; rule.value2 = ''; }
     function addRule() { if (rules.value.length < 30) rules.value.push({ field: 'profit_cny', op: 'lt', value: 0, value2: '' }); }
     function queryRules() { appliedRules.value = rules.value.map((r) => ({ ...r })); applyFilter(); }
-    function resetFilters() { rules.value = []; appliedRules.value = []; batchNumbers.value = []; search.value = ''; status.value = ''; orderType.value = ''; missingOnly.value = false; unsettledOnly.value = false; applyFilter(); }
+    function resetFilters() { rules.value = []; appliedRules.value = []; batchNumbers.value = []; search.value = ''; status.value = ''; orderType.value = ''; missingOnly.value = false; unsettledOnly.value = false; orderDateRange.value = []; settleDateRange.value = []; applyFilter(); }
     let generation = 0, poll = null, stopped = false;
     const sid = () => window.getCurrentStoreId?.() || localStorage.getItem('currentStoreId') || '';
-    const ctx = () => ({ store_id: sid(), month: month.value });
-    const sameScope = (scope) => scope && scope.store_id === sid() && scope.month === month.value;
+    // 顶部卡片跟着月份选择器走；下方订单明细用 tableMonth（切月份时不重载，切回该 tab 才跟随）
+    const tableMonth = ref(month.value);
+    const ctx = () => ({ store_id: sid(), month: tableMonth.value });
+    const sameScope = (scope) => scope && scope.store_id === sid();
     const money = (value) => value == null ? '—' : Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const dateTime = (value) => value ? new Intl.DateTimeFormat('zh-CN', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(value)) : '—';
     const message = (e) => e?.response?.data?.error || e?.message || '请求失败';
@@ -111,8 +124,17 @@ window.StatisticsAnalysisView = {
     const monthlyReceipt = (row, currency) => row['receipt_' + currency] ?? row['known_receipt_' + currency] ?? null;
     const typeLabels = { 1: '收单手续费（正数为退回）', 3: '品牌推广', 4: '品牌推广接入', 19: '站外推广', 23: '站内广告', 33: '广告服务', 41: '点击广告', 49: 'Premium推广', 54: '商品推广', 59: '逆向物流', 67: '国际配送服务', 87: '社交媒体广告', 122: '国际运输合同组织服务', 123: 'Ozon物流平台接入服务', 130: '展示广告' };
     const feeName = (row) => row.types?.length ? row.types.map((id) => typeLabels[id] || `费用类型 ${id}`).join('、') : '订单结算汇总（内层费用不重复累计）';
+    // 下单日期 / 结算日期两个区间控件不在规则面板里，查询时合并成两条 between 规则一起提交
+    const activeRules = () => {
+      const list = [...appliedRules.value];
+      const [of, ot] = orderDateRange.value || [];
+      if (of && ot) list.push({ field: 'ordered_at', op: 'between', value: of, value2: ot });
+      const [sf, st] = settleDateRange.value || [];
+      if (sf && st) list.push({ field: 'order_settled_date', op: 'between', value: sf, value2: st });
+      return list;
+    };
     const filters = () => ({ ...ctx(), page: page.value, page_size: pageSize.value, search: search.value, status: status.value,
-      order_type: orderType.value, missing_cost: missingOnly.value ? '1' : '', unsettled: unsettledOnly.value ? '1' : '', sort: sort.value, direction: direction.value, filters: JSON.stringify(appliedRules.value) });
+      order_type: orderType.value, missing_cost: missingOnly.value ? '1' : '', unsettled: unsettledOnly.value ? '1' : '', sort: sort.value, direction: direction.value, filters: JSON.stringify(activeRules()) });
     function requestOrders(url, options = {}) {
       const params = filters();
       return batchNumbers.value.length
@@ -140,7 +162,9 @@ window.StatisticsAnalysisView = {
       try {
         const response = await requestOrders('/api/statistics/report');
         if (token !== generation || !sameScope(scope)) return;
-        rows.value = response.data.rows; summary.value = response.data.summary; total.value = response.data.total; run.value = response.data.run;
+        rows.value = response.data.rows; total.value = response.data.total; run.value = response.data.run;
+        // 表格月份与顶部月份不一致时（切换了月份但还没重载表格），不要用表格结果覆盖顶部卡片
+        if (scope.month === month.value) summary.value = response.data.summary;
         fieldCatalog.value = response.data.filter_catalog || []; advertising.value = response.data.advertising || {};
         if (all && monthRange.value?.length === 2) {
           const result = await axios.get('/api/statistics/months', { params: { store_id: scope.store_id, from: monthRange.value[0], to: monthRange.value[1] } });
@@ -150,7 +174,18 @@ window.StatisticsAnalysisView = {
       } catch (e) { if (token === generation && sameScope(scope)) error.value = message(e); }
       finally { if (token === generation) loading.value = false; }
     }
-    function applyFilter() { page.value = 1; selected.value = []; table.value?.clearSelection(); load(false); }
+    // 只刷新顶部指标卡：切月份时不动下方两个 tab 的数据，也不触发表格的 loading 遮罩
+    let summaryRequest = 0;
+    async function loadSummary() {
+      if (!sid() || !month.value || stopped) return;
+      const scope = { store_id: sid(), month: month.value }, request = ++summaryRequest;
+      try {
+        const { data } = await axios.get('/api/statistics/summary', { params: { store_id: scope.store_id, month: scope.month } });
+        if (request !== summaryRequest || !sameScope(scope) || scope.month !== month.value) return;
+        summary.value = data.summary; run.value = data.run;
+      } catch (e) { if (request === summaryRequest && sameScope(scope)) error.value = message(e); }
+    }
+    function applyFilter() { tableMonth.value = month.value; page.value = 1; selected.value = []; table.value?.clearSelection(); load(false); }
     function sortChanged({ prop, order }) { sort.value = prop || 'accrual_date'; direction.value = order === 'descending' ? 'desc' : 'asc'; applyFilter(); }
     async function syncNow() {
       const scope = ctx();
@@ -200,18 +235,218 @@ window.StatisticsAnalysisView = {
       if (!sameScope(costScope.value)) { costError.value = '店铺或月份已改变，请重新打开'; return; }
       const invalid = drafts.value.some((r) => r.purchase_cny != null && (!Number.isFinite(r.purchase_cny) || r.purchase_cny < 0));
       if (invalid) { costError.value = '采购费用必须为空或大于等于0'; return; }
-      const badLabel = drafts.value.some((r) => r.label_cny == null || !Number.isFinite(r.label_cny) || r.label_cny < 0);
-      if (badLabel) { costError.value = '贴单费用必须填写且大于等于0（默认 ¥1.50，包含取消单）'; return; }
+      const badLabel = drafts.value.some((r) => r.label_cny != null && (!Number.isFinite(r.label_cny) || r.label_cny < 0));
+      if (badLabel) { costError.value = '贴单费用必须为空或大于等于0'; return; }
       try {
         await ElementPlus.ElMessageBox.confirm(`保存 ${costScope.value.month} 共 ${drafts.value.length} 单的采购费/贴单费？采购费为空的订单将保持待核算，修改前会保留快照。`, '确认批量维护', { type: 'warning', confirmButtonText: '保存', cancelButtonText: '取消' });
         if (!sameScope(costScope.value)) return;
         saving.value = true; costError.value = '';
         await axios.patch('/api/statistics/costs', { ...costScope.value, reason: costSource.value === 'import' ? '导入采购费/贴单费' : '批量维护采购费/贴单费',
-          items: drafts.value.map((r) => ({ posting_number: r.posting_number, purchase_cny: r.purchase_cny ?? null, label_cny: r.label_cny, version: r.version })) });
+          items: drafts.value.map((r) => ({ posting_number: r.posting_number, purchase_cny: r.purchase_cny ?? null, label_cny: r.label_cny ?? null, version: r.version })) });
         costVisible.value = false; selected.value = []; table.value?.clearSelection();
         ElementPlus.ElMessage.success('采购费/贴单费已保存，修改快照已保留'); await load();
       } catch (e) { if (e !== 'cancel' && e !== 'close') costError.value = message(e); }
       finally { saving.value = false; }
+    }
+    // ── 同步结算日期（取消单）───────────────────────────────────────────────
+    // Ozon Seller API 不返回取消时间，只能走卖家后台；cookie 由采集插件从浏览器直接读取。
+    function sendToPlugin(kind, extra = {}, timeoutMs = 10000) {
+      const send = window.__zhumeng_send__;
+      if (typeof send !== "function") return Promise.resolve(null);
+      return send(kind, extra, timeoutMs);
+    }
+    async function loadWebSession() {
+      try { webSession.value = (await axios.get("/api/statistics/web-session", { params: { store_id: sid() } })).data; }
+      catch (_e) { webSession.value = null; }
+    }
+    // 插件逐单/逐页推的进度（content-bridge 转成 window message）
+    function onSettleProgress(event) {
+      const data = event?.data;
+      if (!data || typeof data !== "object" || data.kind !== "settleProgress.event") return;
+      if (!settleRun.value) return;
+      if (data.phase === "whd" && data.total) {
+        settleRun.value = { phase: "取 WHD 取消日期", done: data.done || 0, total: data.total, hit: data.hit || 0 };
+      } else if (data.phase === "fbs") {
+        settleRun.value = { phase: `拉取正常单取消时间（已拉到 ${data.scanned || 0} 单）`, done: data.done || 0, total: 0, scanned: data.scanned || 0 };
+      }
+    }
+    function settleProgressText() {
+      const run = settleRun.value;
+      if (!run) return "";
+      if (!run.total) return `${run.phase}（第 ${run.done || 1} 批）`;
+      const pct = Math.min(100, Math.round(run.done / run.total * 100));
+      return `${run.phase} ${run.done}/${run.total}（${pct}%）`;
+    }
+    function settlePercent() {
+      const run = settleRun.value;
+      if (!run || !run.total) return 0;
+      return Math.min(100, Math.round(run.done / run.total * 100));
+    }
+    // 把插件返回原样报给服务端（只打日志，方便定位「为什么没写入」）
+    function reportPluginResult(kind, payload, elapsed) {
+      try {
+        axios.post("/api/statistics/sync-settled-report", {
+          store_id: sid(), kind, elapsed_ms: elapsed,
+          version: settlePluginVersion.value, ...payload,
+        }).catch(() => {});
+      } catch (_e) { /* 忽略 */ }
+    }
+    // 版本比较：2.2.9.209 > 2.2.9.206
+    function versionAtLeast(version, target) {
+      const left = String(version || "").split(".").map((n) => parseInt(n, 10) || 0);
+      const right = String(target || "").split(".").map((n) => parseInt(n, 10) || 0);
+      for (let i = 0; i < Math.max(left.length, right.length); i += 1) {
+        const a = left[i] || 0, b = right[i] || 0;
+        if (a !== b) return a > b;
+      }
+      return true;
+    }
+    // 动手前先确认插件在线且版本够新，避免旧插件没有对应指令、前端干等 5 分钟超时
+    async function ensurePluginReady() {
+      const ping = await sendToPlugin("ping.request", {}, 5000);
+      reportPluginResult("ping", { ok: ping?.ok === true, error: ping ? "" : "ping 无响应", version: ping?.version || "" }, 0);
+      if (!ping || !ping.ok) return { ok: false, error: "没检测到采集插件：请在「店铺管理」下载并启用（需 2.2.9.209）" };
+      const version = String(ping.version || "");
+      if (!versionAtLeast(version, "2.2.9.206")) {
+        return { ok: false, error: `页面里的插件脚本还是旧版（${version || "未知"}）：扩展更新后必须刷新本页面（Cmd+Shift+R）才能加载新脚本` };
+      }
+      settlePluginVersion.value = version;
+      return { ok: true, version };
+    }
+    async function syncSettledDates() {
+      if (!sid() || settledSyncing.value) return;
+      settledSyncing.value = true; error.value = ""; settleResult.value = { visible: false, ok: 0, fail: 0, groups: [], requested: 0 };
+      settleRun.value = { phase: "检查插件", done: 0, total: 0 };
+      try {
+        const plugin = await ensurePluginReady();
+        if (!plugin.ok) {
+          settleRun.value = null;
+          ElementPlus.ElMessage.error(plugin.error);
+          return;
+        }
+        settleRun.value = { phase: "统计待补订单", done: 0, total: 0 };
+        const body = { ...filters(), posting_numbers: batchNumbers.value.length ? batchNumbers.value : undefined, plan: true };
+        const { data } = await axios.post("/api/statistics/sync-settled", body);
+        const fbsList = Array.isArray(data.fbs) ? data.fbs : [];
+        const whdList = Array.isArray(data.whd) ? data.whd : [];
+        if (!fbsList.length && !whdList.length) {
+          settleRun.value = null;
+          ElementPlus.ElMessage.info("当前筛选条件下没有「已取消且缺结算日期」的订单");
+          return;
+        }
+        const groups = [];
+        let fbsSaved = 0, whdSaved = 0;
+
+        if (fbsList.length) {
+          settleRun.value = { phase: "拉取正常单取消时间", done: 0, total: fbsList.length };
+          const startedAt = Date.now();
+          const resp = await sendToPlugin("ozonCancel.request",
+            { postings: fbsList, companyId: data.company_id || "", from: data.range?.from, to: data.range?.to }, 120000);
+          reportPluginResult("fbs", {
+            ok: resp?.ok === true, error: resp?.error || (resp ? "" : "插件无返回（超时或未安装）"),
+            total: fbsList.length, scanned: resp?.scanned || 0,
+            rows: resp ? Object.keys(resp.rows || {}).length : 0,
+            missing: Array.isArray(resp?.missing) ? resp.missing.length : 0,
+            pages: resp?.pages, tabs: resp?.tabs,
+          }, Date.now() - startedAt);
+          if (!resp) {
+            groups.push({ label: "正常销售订单", ok: 0, fail: fbsList.length, reason: "没检测到采集插件（需 2.2.9.207+）", postings: fbsList.slice(0, 200) });
+          } else if (!resp.ok) {
+            groups.push({ label: "正常销售订单", ok: 0, fail: fbsList.length, reason: `取数失败：${resp.error || "插件无返回"}`, postings: fbsList.slice(0, 200) });
+          } else {
+            const items = Object.entries(resp.rows || {}).map(([posting_number, iso]) =>
+              ({ posting_number, date: new Date(Date.parse(iso) + 8 * 3600000).toISOString().slice(0, 10) }));
+            if (items.length) {
+              const saved = await axios.post("/api/statistics/sync-settled-whd", { store_id: sid(), schema: "fbs", items });
+              fbsSaved = Number(saved.data.updated || 0);
+            }
+            const missing = Array.isArray(resp.missing) ? resp.missing : [];
+            const scanned = Number(resp.scanned || 0);
+            const pages = Array.isArray(resp.pages) ? resp.pages.length : 0;
+            groups.push({ label: "正常销售订单", ok: fbsSaved, fail: missing.length,
+              reason: missing.length
+                ? `后台扫到 ${scanned} 单${pages ? `（${pages} 页）` : ""}，其中没有这 ${missing.length} 单（已归档、或不属于当前公司）`
+                : `后台扫到 ${scanned} 单，全部命中`,
+              postings: missing.slice(0, 200) });
+            settleRun.value = { phase: "拉取正常单取消时间", done: fbsList.length, total: fbsList.length };
+          }
+        }
+
+        if (whdList.length) {
+          const chunkSize = 5;
+          const whdMissing = [];
+          let whdError = "";
+          for (let i = 0; i < whdList.length; i += chunkSize) {
+            const chunk = whdList.slice(i, i + chunkSize);
+            settleRun.value = { phase: "取 WHD 取消日期", done: i, total: whdList.length };
+            const resp = await sendToPlugin("whdCancel.request", { postings: chunk }, 300000);
+            if (!resp) { whdError = "没检测到采集插件（需 2.2.9.207+）"; whdMissing.push(...chunk); break; }
+            if (!resp.ok) { whdError = `取数失败：${resp.error || "插件无返回"}`; whdMissing.push(...chunk); break; }
+            if (Array.isArray(resp.missing)) whdMissing.push(...resp.missing);
+            const items = Object.entries(resp.rows || {}).map(([posting_number, row]) => ({ posting_number, date: row.date }));
+            if (items.length) {
+              const saved = await axios.post("/api/statistics/sync-settled-whd", { store_id: sid(), schema: "whd", items });
+              whdSaved += Number(saved.data.updated || 0);
+            }
+            settleRun.value = { phase: "取 WHD 取消日期", done: Math.min(i + chunk.length, whdList.length), total: whdList.length };
+          }
+          groups.push({ label: "WHD 订单", ok: whdSaved, fail: whdMissing.length,
+            reason: whdError || (whdMissing.length ? "「退货和取消」页没有这些单的记录（未走退货流程，多为下单即取消）" : ""),
+            postings: whdMissing.slice(0, 200) });
+        }
+
+        const totalOk = fbsSaved + whdSaved;
+        const totalFail = groups.reduce((sum, group) => sum + group.fail, 0);
+        settleResult.value = { visible: true, ok: totalOk, fail: totalFail, groups, requested: fbsList.length + whdList.length };
+        ElementPlus.ElMessage.success(`同步完成：成功 ${totalOk} 单，未取到 ${totalFail} 单`);
+        // 结算日期变了，订单明细和「月度汇总」都要重算
+        await load(true);
+      } catch (e) {
+        const res = e?.response;
+        if (res?.data?.code === "WEB_SESSION_REQUIRED" || res?.status === 409) {
+          cookieVisible.value = true; loadWebSession();
+          ElementPlus.ElMessage.warning(res?.data?.error || "Ozon 后台会话已失效，请重新获取");
+        } else {
+          error.value = message(e);
+          ElementPlus.ElMessage.error(message(e));
+        }
+      } finally { settledSyncing.value = false; settledStage.value = ""; settleRun.value = null; }
+    }
+    function copyFailed(rows) {
+      const text = (rows || []).join("\\n");
+      if (!text) return;
+      navigator.clipboard?.writeText(text).then(() => ElementPlus.ElMessage.success("已复制失败订单号")).catch(() => {});
+    }
+    async function saveCookiePayload(payload) {
+      await axios.post("/api/statistics/web-session", { store_id: sid(), ...payload });
+      cookieVisible.value = false; cookieInput.value = "";
+      await loadWebSession();
+    }
+    // 一键：插件用 cookies 权限读浏览器里已登录的 Ozon 会话
+    async function cookieFromBrowser() {
+      if (cookieSaving.value) return;
+      cookieSaving.value = true;
+      try {
+        const resp = await sendToPlugin("ozonCookies.request", {}, 15000);
+        if (!resp) throw new Error("没检测到采集插件（需 2.2.9.205+）：请先安装/更新插件，或手动粘贴 cookie");
+        if (!resp.ok || !resp.cookie) throw new Error(resp.error || "浏览器里没有 Ozon 登录态，请先在 Chrome 登录卖家后台");
+        await saveCookiePayload({ cookie: resp.cookie, host: resp.host || "", company_id: resp.company_id || "" });
+        ElementPlus.ElMessage.success(`已从浏览器取到 ${resp.count || ""} 个 cookie 并校验通过`);
+        await syncSettledDates();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e?.response?.data?.error || e?.message || "获取失败");
+      } finally { cookieSaving.value = false; }
+    }
+    async function saveCookie() {
+      if (!cookieInput.value.trim()) { ElementPlus.ElMessage.warning("请先粘贴 cookie"); return; }
+      cookieSaving.value = true;
+      try {
+        await saveCookiePayload({ cookie: cookieInput.value });
+        ElementPlus.ElMessage.success("会话已保存并校验通过，开始同步…");
+        await syncSettledDates();
+      } catch (e) {
+        ElementPlus.ElMessage.error(e?.response?.data?.error || e?.message || "cookie 校验失败");
+      } finally { cookieSaving.value = false; }
     }
     // 导入模板：与页面导出 CSV 同构，但只保留可回填的列，便于原样导入。
     const TEMPLATE_HEAD = ['订单号', '采购费用（CNY，含采购运费）', '贴单费用（CNY）', '订单状态', '结算日', '销售收入（RUB）', 'Ozon费用（RUB）', '取消原因', '订单类型'];
@@ -240,7 +475,7 @@ window.StatisticsAnalysisView = {
           ['模板只含成本归属所选月份的非 WHD 订单，以及当前已维护的采购费/贴单费。'],
           ['1. 只填写需要修改的金额，留空的单元格表示保持不变（不会清零）。'],
           ['2. 采购费用 = 采购价 + 采购运费，单位人民币，最多两位小数。'],
-          ['3. 贴单费用按单收取，默认 1.50 元，包含取消单；实际不同时按订单填写。'],
+          ['3. 贴单费用按单收取，按实际金额填写；留空表示未录入，页面显示为空。'],
           ['4. 文件首行必须含「订单号」，以及「采购费用」「贴单费用」中至少一列。'],
           ['5. 单次最多 5000 单；保存前会弹出预览，确认后才写入，并保留修改快照可回滚。'],
           ['6. 只导入贴单费时，采购费列可以整列留空，原有采购费不受影响。'],
@@ -355,12 +590,14 @@ window.StatisticsAnalysisView = {
       const selection = window.getSelection?.();
       if (event?.detail && selection && !selection.isCollapsed && selection.containsNode(event.currentTarget, true)) return;
       const scope = { store_id: sid(), month: reportMonth }, request = ++orderRequest;
-      ledgerOrder.value = row.posting_number; ledger.value = []; ledgerPending.value = []; ledgerError.value = '';
+      ledgerOrder.value = row.posting_number; ledger.value = []; ledgerPending.value = []; ledgerError.value = ''; ledgerMonths.value = [];
       orderTab.value = 'fees'; orderRow.value = row; orderDetail.value = null; detailLoaded.value = false; detailLoading.value = false; detailError.value = '';
       ledgerVisible.value = true; ledgerLoading.value = true;
       try {
-        const response = await axios.get('/api/statistics/ledger', { params: { ...scope, posting_number: row.posting_number } });
-        if (currentOrder(scope, request)) { ledger.value = response.data.rows; ledgerPending.value = response.data.pending; }
+        const response = await axios.get('/api/statistics/ledger', { params: { store_id: scope.store_id, posting_number: row.posting_number } });
+        if (currentOrder(scope, request)) {
+          ledger.value = response.data.rows; ledgerPending.value = response.data.pending; ledgerMonths.value = response.data.months || [];
+        }
       } catch (e) { if (currentOrder(scope, request)) ledgerError.value = message(e); }
       finally { if (currentOrder(scope, request)) ledgerLoading.value = false; }
     }
@@ -389,14 +626,39 @@ window.StatisticsAnalysisView = {
     }
     function hideProductZoom() { productZoom.value = null; }
     function changeOrderTab() { hideProductZoom(); loadOrderDetail(); }
-    async function exportOrders() {
-      const scope = ctx();
+    // 把导出失败的真实原因显示出来：HTTP 状态 + 后端返回的中文提示，避免一律显示同一句模糊文案
+    async function exportFailureText(e) {
+      const response = e?.response;
+      if (!response) return `导出失败：${e?.message || '网络异常或服务器无响应'}，请稍后重试`;
+      let detail = '';
       try {
-        const response = await requestOrders('/api/statistics/export', { responseType: 'blob' });
+        const data = response.data;
+        if (data instanceof Blob) {
+          const text = await data.text();
+          try { const json = JSON.parse(text); detail = json.error || json.message || ''; }
+          catch { detail = String(text).slice(0, 160); }
+        } else if (typeof data === 'string') detail = data.slice(0, 160);
+        else if (data?.error) detail = data.error;
+      } catch { /* 读不出错误体就不再追问 */ }
+      return `导出失败（HTTP ${response.status}）${detail ? '：' + detail : ''}`;
+    }
+    async function exportOrders() {
+      if (!sid() || exporting.value) return;
+      const scope = ctx();
+      exporting.value = true; error.value = '';
+      try {
+        // 改用 POST：筛选条件走请求体，避免长 URL、中文与特殊字符在 query 里被截断
+        const response = await axios.post('/api/statistics/export', { ...filters(), posting_numbers: batchNumbers.value.length ? batchNumbers.value : undefined }, { responseType: 'blob' });
         if (!sameScope(scope)) return;
-        const url = URL.createObjectURL(response.data), anchor = document.createElement('a');
-        anchor.href = url; anchor.download = `${scope.month}-应计订单.csv`; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
-      } catch (e) { error.value = '导出失败，请确认月份数据已加载后重试'; }
+        const blob = response.data instanceof Blob ? response.data : new Blob([response.data], { type: 'text/csv;charset=utf-8' });
+        const url = URL.createObjectURL(blob), anchor = document.createElement('a');
+        anchor.href = url; anchor.download = `${scope.month}-结算明细.csv`;
+        document.body.appendChild(anchor); anchor.click(); anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      } catch (e) {
+        console.error('[结算明细导出]', e);
+        error.value = await exportFailureText(e);
+      } finally { exporting.value = false; }
     }
     async function openAds() {
       const scope = ctx(); adsScope.value = scope; adsError.value = ''; adsDraft.value = []; adsExisting.value = []; adsRevision.value = ''; adsVisible.value = true;
@@ -511,8 +773,10 @@ window.StatisticsAnalysisView = {
       } catch (e) { configError.value = message(e); } finally { saving.value = false; }
     }
     function exportMonths() {
-      const cells = [['月份', '分类', '订单数', '销售₽', '代扣₽', '已归属广告费₽', '实收₽', '实收¥', '采购¥', '贴单¥', '毛利¥', '待补采购费', '点击费待核对', '实收₽待核对', '实收¥待核对', '毛利计入订单数', '订单广告待核对', '已归属按订单广告₽', '点击广告分摊₽', '未纳入订单明细的已归属广告₽'],
-        ...monthly.value.flatMap((r) => [r, ...(r.children || [])]).map((r) => [r.month, r.is_group ? r.label : '合计', r.orders, r.income_rub, r.ozon_fees_rub, r.advertising_rub, monthlyReceipt(r, 'rub'), monthlyReceipt(r, 'cny'), r.purchase_cny, r.label_cny, monthlyProfit(r), r.missing_purchase, r.missing_advertising, r.missing_receipt_rub, r.missing_receipt_cny, r.profit_orders, r.missing_order_advertising, r.order_ad_rub, r.allocated_ad_rub, r.ad_without_finance_rub])];
+      const header = ['月份', '分类', '订单数', '销售₽', '代扣₽', '推广费用₽', '实收₽', '实收¥', '采购¥', '贴单¥', '毛利¥', '毛利率%', '采购未录入单数', '贴单未录入单数'];
+      const cells = [header, ...monthly.value.flatMap((r) => [r, ...(r.children || [])]).map((r) => [
+        r.month, r.is_group ? r.label : '合计', r.orders, r.income_rub, r.ozon_fees_rub, r.advertising_rub,
+        r.receipt_rub, r.receipt_cny, r.purchase_cny, r.label_cny, r.profit_cny, r.margin_pct, r.missing_purchase, r.missing_label])];
       const csv = cells.map((r) => r.map((v) => `"${String(v ?? '').replaceAll('"', '""')}"`).join(',')).join('\r\n');
       const url = URL.createObjectURL(new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }));
       const anchor = document.createElement('a'); anchor.href = url; anchor.download = '月度汇总.csv'; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -526,16 +790,22 @@ window.StatisticsAnalysisView = {
       batchNumbers.value = []; batchVisible.value = false; batchText.value = '';
       table.value?.clearSelection(); page.value = 1; load();
     }
-    watch(month, () => { ledgerVisible.value = false; if (!month.value) return; page.value = 1; selected.value = []; table.value?.clearSelection(); load(); });
+    watch(month, () => { ledgerVisible.value = false; if (!month.value) return; loadSummary(); });
+    // 月份选择器只改顶部统计；切回订单明细时，若月份变过才跟着重载
+    watch(tab, (value) => { if (value === 'orders' && tableMonth.value !== month.value) applyFilter(); });
     watch(monthRange, () => { if (monthRange.value?.length === 2) load(); });
     onMounted(() => {
       // 不做定时轮询，需要时用顶部刷新按钮手动刷新
-      window.addEventListener('shop-changed', shopChanged); load();
+      window.addEventListener('shop-changed', shopChanged);
+      window.addEventListener('message', onSettleProgress);
+      load();
     });
-    onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); window.removeEventListener('shop-changed', shopChanged); });
-    return { tab, month, monthRange, loading, saving, syncing, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
+    onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); window.removeEventListener('shop-changed', shopChanged); window.removeEventListener('message', onSettleProgress); });
+    return { tab, month, monthRange, loading, saving, syncing, exporting, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
+      settledSyncing, settledStage, settleRun, settleResult, settlePercent, settleProgressText, copyFailed, onSettleProgress, cookieVisible, cookieSaving, cookieInput, webSession, syncSettledDates, cookieFromBrowser, saveCookie, loadWebSession,
+      orderDateRange, settleDateRange,
       selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changesVisible, changes, changesLoading,
-      ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, activeRun, progress, money, dateTime, titleProfit, monthlyProfit, monthlyProfitEstimated, monthlyProfitNote, sortMonthlyProfit, monthlyReceipt, feeName, disabledMonth, costPage, costPageRows,
+      ledgerVisible, ledgerLoading, ledger, ledgerPending, ledgerOrder, ledgerMonths, activeRun, progress, money, dateTime, titleProfit, monthlyProfit, monthlyProfitEstimated, monthlyProfitNote, sortMonthlyProfit, monthlyReceipt, feeName, disabledMonth, costPage, costPageRows,
       ledgerError, orderTab, orderRow, orderDetail, detailLoading, detailLoaded, detailError, orderQuantity, copyOrderNumber, loadOrderDetail,
       exceptionScope, exceptionVisible, exceptionLoading, exceptionError, exceptionPage, exceptions, monthlyIssues, openExceptions, loadExceptions, exceptionReason,
       productZoom, showProductZoom, moveProductZoom, hideProductZoom, changeOrderTab,
@@ -547,44 +817,57 @@ window.StatisticsAnalysisView = {
   template: `
   <section class="statistics-workbench">
     <header class="statistics-heading">
-      <div><h2>统计分析</h2><div class="statistics-meta">每日 02:00 / 09:30（北京时间）自动更新 <span v-if="summary.coverage?.last_updated_at">· 财务更新 {{dateTime(summary.coverage.last_updated_at)}}</span><span v-if="summary.coverage?.as_of_date"> · 应计核对至 {{summary.coverage.as_of_date}}</span><span> · 每日广告（莫斯科）{{advertising.configured?'Performance':'日报导入'}}</span><span v-if="summary.missing_advertising" class="statistics-warning"> · {{summary.missing_advertising}} 单待核对</span><span v-if="advertising.last_error" class="statistics-warning"> · {{advertising.last_error}}</span></div></div>
+      <div><h2>月度统计</h2><div class="statistics-meta">每日 02:00 / 09:30（北京时间）自动更新 <span v-if="summary.coverage?.last_updated_at">· 财务更新 {{dateTime(summary.coverage.last_updated_at)}}</span><span v-if="summary.coverage?.as_of_date"> · 应计核对至 {{summary.coverage.as_of_date}}</span><span> · 每日广告（莫斯科）{{advertising.configured?'Performance':'日报导入'}}</span><span v-if="summary.missing_advertising" class="statistics-warning"> · {{summary.missing_advertising}} 单待核对</span><span v-if="advertising.last_error" class="statistics-warning"> · {{advertising.last_error}}</span></div></div>
       <div class="statistics-actions">
         <el-date-picker v-model="month" type="month" value-format="YYYY-MM" format="YYYY 年 MM 月" :clearable="false" :disabled-date="disabledMonth" aria-label="应计月份" style="width:170px"/>
         <el-tooltip content="刷新已同步的数据"><el-button :icon="'Refresh'" circle aria-label="刷新报表" @click="load()"/></el-tooltip>
         <el-tooltip content="修改记录与回滚"><el-button :icon="'Clock'" circle aria-label="修改记录与回滚" @click="openChanges"/></el-tooltip>
-        <el-button :icon="'Upload'" @click="openAds">每日广告费</el-button>
-        <el-tooltip content="Performance API 授权（可选）"><el-button :icon="'Key'" circle aria-label="广告API授权" @click="openConfig"/></el-tooltip>
       </div>
     </header>
     <el-alert v-if="error" :title="error" type="error" show-icon :closable="false" class="statistics-alert"/>
     <el-alert v-if="run?.status === 'failed'" :title="'更新未完成：' + run.error" type="error" show-icon :closable="false" class="statistics-alert"/>
     <div class="statistics-metrics">
-      <div><span>本月应计订单</span><strong>{{summary.orders ?? '—'}}<small>单</small></strong><small>WHD {{summary.whd_orders || 0}} 单</small></div>
+      <div><span>本月结算订单</span><strong>{{summary.settled_orders ?? '—'}}<small>单</small></strong><small>结算日期在本月 · WHD {{summary.settled_whd_orders || 0}} 单</small></div>
       <div><span>销售收入 <small>RUB</small></span><strong>{{summary.coverage?.checked_days ? money(summary.income_rub) : '—'}}</strong><small>含正向手续费退回</small></div>
       <div><span>代扣 <small>RUB</small></span><strong>{{summary.coverage?.checked_days ? money(summary.ozon_fees_rub) : '—'}}</strong><small>已剔除重复广告项</small></div>
       <div><span>低于 100 卢布</span><strong class="statistics-warning">{{summary.low_income_orders ?? '—'}}<small>单</small></strong><small>另 {{summary.income_unknown_orders || 0}} 单收入待分摊</small></div>
     </div>
     <el-tabs v-model="tab">
-      <el-tab-pane label="订单明细" name="orders">
+      <el-tab-pane label="结算明细" name="orders">
         <div class="statistics-toolbar">
-          <div class="statistics-filters"><el-input v-model="search" placeholder="订单号" clearable @keyup.enter="applyFilter" @clear="applyFilter" style="width:215px"><template #prefix><el-icon><Search/></el-icon></template></el-input>
-            <el-button :icon="'Filter'" :type="batchNumbers.length?'primary':'default'" plain @click="openBatch">批量订单号{{batchNumbers.length?' ('+batchNumbers.length+')':''}}</el-button>
-            <el-select v-model="status" placeholder="全部状态" clearable @change="applyFilter" style="width:135px"><el-option label="已签收" value="delivered"/><el-option label="已取消" value="cancelled"/></el-select>
-            <el-select v-model="orderType" placeholder="全部类型" clearable @change="applyFilter" style="width:155px"><el-option label="正常销售订单" value="正常销售订单"/><el-option label="WHD订单" value="WHD订单"/></el-select>
-            <el-checkbox v-model="missingOnly" @change="applyFilter">缺采购费</el-checkbox><el-checkbox v-model="unsettledOnly" @change="applyFilter">未结算</el-checkbox>
+          <div class="statistics-filters">
+            <el-date-picker v-model="orderDateRange" type="daterange" value-format="YYYY-MM-DD" format="MM-DD" unlink-panels clearable
+              start-placeholder="下单起" end-placeholder="下单止" @change="applyFilter" style="width:225px"/>
+            <el-date-picker v-model="settleDateRange" type="daterange" value-format="YYYY-MM-DD" format="MM-DD" unlink-panels clearable
+              start-placeholder="结算起" end-placeholder="结算止" @change="applyFilter" style="width:225px"/>
+            <el-input v-model="search" placeholder="订单号" clearable @keyup.enter="applyFilter" @clear="applyFilter" style="width:165px"><template #prefix><el-icon><Search/></el-icon></template></el-input>
+            <el-select v-model="status" placeholder="全部状态" clearable @change="applyFilter" style="width:122px"><el-option label="已签收" value="delivered"/><el-option label="已取消" value="cancelled"/></el-select>
+            <el-select v-model="orderType" placeholder="全部类型" clearable @change="applyFilter" style="width:138px"><el-option label="正常销售订单" value="正常销售订单"/><el-option label="WHD订单" value="WHD订单"/></el-select>
+            <el-checkbox v-model="missingOnly" @change="applyFilter">缺采购</el-checkbox><el-checkbox v-model="unsettledOnly" @change="applyFilter">未结算</el-checkbox>
             <el-button :icon="'Search'" @click="applyFilter">查询</el-button>
             <el-button :icon="'Filter'" :type="appliedRules.length?'primary':'default'" plain @click="filterVisible=!filterVisible">筛选 {{appliedRules.length||''}}</el-button>
-          </div>
-          <div class="statistics-actions"><el-button :icon="'EditPen'" :disabled="!selected.length" @click="openCosts()">批量维护 ({{selected.length}})</el-button>
-            <el-button :icon="'Upload'" @click="uploadInput.click()">导入采购/贴单费</el-button><el-tooltip content="下载非 WHD 订单的采购/贴单费模板"><el-button :icon="'Document'" circle aria-label="下载导入模板" @click="downloadTemplate"/></el-tooltip><el-tooltip content="导出当前筛选的全部订单"><el-button :icon="'Download'" circle aria-label="导出订单CSV" @click="exportOrders"/></el-tooltip>
+            <el-tooltip :content="exporting?'正在生成 CSV…':'导出当前筛选的全部订单'"><el-button :icon="'Download'" circle :loading="exporting" aria-label="导出订单CSV" @click="exportOrders"/></el-tooltip>
+            <el-button :icon="'EditPen'" :disabled="!selected.length" @click="openCosts()">批量维护 ({{selected.length}})</el-button>
+            <el-button :icon="'Upload'" @click="uploadInput.click()">导入采购</el-button>
+            <el-tooltip content="下载非 WHD 订单的采购/贴单费模板"><el-button :icon="'Document'" circle aria-label="下载导入模板" @click="downloadTemplate"/></el-tooltip>
+            <el-tooltip :content="settledSyncing ? (settledStage || '同步中…') : '同步结算日期（补齐已取消订单的取消日期）'"><el-button :icon="'Calendar'" circle :loading="settledSyncing" aria-label="同步结算日期" @click="syncSettledDates"/></el-tooltip>
             <input ref="uploadInput" type="file" accept=".csv,.xlsx,.xls" hidden @change="importCosts"/>
           </div>
+        </div>
+        <div v-if="settleRun" class="statistics-actions" style="margin-top:8px">
+          <el-progress v-if="settleRun.total" :percentage="settlePercent()" :stroke-width="14" striped striped-flow style="width:320px"/>
+          <el-progress v-else :percentage="100" :show-text="false" :stroke-width="14" striped striped-flow :duration="3" style="width:320px"/>
+          <span class="statistics-meta">{{settleProgressText()}}</span>
         </div>
         <div v-if="batchNumbers.length" class="statistics-actions">
           <span class="statistics-meta">已筛选 {{batchNumbers.length}} 个订单号<span v-if="!loading && !error">，匹配 {{total}} 单</span></span>
           <el-button link type="primary" @click="clearBatch">清除批量筛选</el-button>
         </div>
         <div v-if="filterVisible" class="statistics-rule-panel">
+          <div class="statistics-actions" style="margin-bottom:8px">
+            <el-button :icon="'Filter'" :type="batchNumbers.length?'primary':'default'" plain @click="openBatch">批量订单号{{batchNumbers.length?' ('+batchNumbers.length+')':''}}</el-button>
+            <span class="statistics-meta">粘贴多个完整订单号做批量筛选，与下方条件是「同时满足」</span>
+          </div>
           <div v-for="(rule,index) in rules" :key="index" class="statistics-rule">
             <el-select v-model="rule.field" aria-label="筛选字段" @change="resetRule(rule)"><el-option v-for="field in fieldCatalog" :key="field.key" :label="field.label" :value="field.key"/></el-select>
             <el-select v-model="rule.op" aria-label="比较条件"><el-option v-for="op in operators(rule)" :key="op.value" :label="op.label" :value="op.value"/></el-select>
@@ -613,39 +896,34 @@ window.StatisticsAnalysisView = {
           <el-table-column prop="receipt_cny" label="实收 ¥" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_cny)}}<div v-if="row.receipt_cny!=null && (row.pending_positive || row.pending_negative || row.advertising_rub==null)" class="statistics-cell-note">按已归属</div></template></el-table-column>
           <el-table-column prop="purchase_cny" label="采购费 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link :type="row.purchase_cny==null?'warning':'primary'" @click="openCosts([row])">{{row.purchase_cny==null?'待录入':money(row.purchase_cny)}}</el-button><span v-else>{{money(row.purchase_cny)}}</span><div v-if="row.cost_in_month===false && row.order_type!=='WHD订单'" class="statistics-cell-note">{{row.cost_month ? row.cost_month+' 计入' : '待正式入账'}}</div></template></el-table-column>
           <el-table-column prop="label_cny" label="贴单费 ¥" width="84" align="right" sortable="custom"><template #default="{row}"><el-button v-if="canMaintainCosts(row)" link type="primary" @click="openCosts([row])">{{money(row.label_cny)}}</el-button><span v-else>{{money(row.label_cny)}}</span></template></el-table-column>
-          <el-table-column prop="profit_cny" label="毛利 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.allocated_ad_rub==null?adStatus(row):row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'实收人民币减采购及贴单费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip><div class="statistics-cell-note">{{row.margin_pct==null?'—':money(row.margin_pct)+'%'}}</div></template></el-table-column>
+          <el-table-column prop="profit_cny" label="毛利 ¥" width="92" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="row.order_type==='WHD订单'?'WHD 由 Ozon 仓发货，不计采购与贴单费':row.allocated_ad_rub==null?adStatus(row):row.purchase_cny==null?'采购费待补充':row.pending_negative||row.pending_positive?'收支待分摊':'实收人民币减采购及贴单费'"><span :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</span></el-tooltip><div class="statistics-cell-note">{{row.margin_pct==null?'—':money(row.margin_pct)+'%'}}</div></template></el-table-column>
           <el-table-column prop="income_rub" label="销售收入 ₽" width="104" align="right" sortable="custom"><template #default="{row}"><span :class="{'statistics-warning':row.low_income}">{{money(row.income_rub)}}</span><el-tooltip v-if="row.pending_income ?? row.pending_positive" content="仅含已明确归属部分，另有收入待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
           <el-table-column prop="ozon_fees_rub" label="代扣 ₽" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.ozon_fees_rub)}}<el-tooltip v-if="row.pending_negative" content="仅含已明确归属部分，另有费用待分摊"><el-icon class="statistics-warning"><Warning/></el-icon></el-tooltip></template></el-table-column>
-          <el-table-column prop="advertising_cpo_rub" label="推广-订单 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpo_rub==null" class="statistics-warning">待核对</span><span v-else>{{money(row.advertising_cpo_rub)}}</span></template></el-table-column>
-          <el-table-column prop="advertising_cpc_rub" label="推广-点击 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpc_rub==null" class="statistics-warning">待核对</span><span v-else>{{money(row.advertising_cpc_rub)}}</span></template></el-table-column>
-          <el-table-column prop="allocated_ad_rub" label="点击广告分摊 ₽" width="140" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="adStatus(row)+(row.allocation_order_count?' · '+row.allocation_date+' / '+row.allocation_order_count+' 单':'')"><span :class="{'statistics-warning':row.allocated_ad_rub==null}">{{row.allocated_ad_rub==null?'待核对':money(row.allocated_ad_rub)}}</span></el-tooltip></template></el-table-column>
+          <el-table-column prop="advertising_cpo_rub" label="推广-订单 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpo_rub==null" :class="row.no_accrual?'statistics-meta':'statistics-warning'">{{row.no_accrual?'—':'待核对'}}</span><span v-else>{{money(row.advertising_cpo_rub)}}</span></template></el-table-column>
+          <el-table-column prop="advertising_cpc_rub" label="推广-点击 ₽" width="112" align="right" sortable="custom"><template #default="{row}"><span v-if="row.advertising_cpc_rub==null" :class="row.no_accrual?'statistics-meta':'statistics-warning'">{{row.no_accrual?'—':'待核对'}}</span><span v-else>{{money(row.advertising_cpc_rub)}}</span></template></el-table-column>
+          <el-table-column prop="allocated_ad_rub" label="点击广告分摊 ₽" width="140" align="right" sortable="custom"><template #default="{row}"><el-tooltip :content="adStatus(row)+(row.allocation_order_count?' · '+row.allocation_date+' / '+row.allocation_order_count+' 单':'')"><span :class="{'statistics-warning':row.allocated_ad_rub==null&&!row.no_accrual,'statistics-meta':row.no_accrual}">{{row.allocated_ad_rub==null?(row.no_accrual?'—':'待核对'):money(row.allocated_ad_rub)}}</span></el-tooltip></template></el-table-column>
           <el-table-column prop="receipt_rub" label="实收 ₽" width="88" align="right" sortable="custom"><template #default="{row}">{{money(row.receipt_rub)}}</template></el-table-column>
           <el-table-column prop="cancel_reason" label="取消原因" min-width="160" show-overflow-tooltip sortable="custom"/>
           <el-table-column prop="order_type" label="订单类型" width="92" sortable="custom"/>
         </el-table>
-        <div class="statistics-footer"><span>共 {{total}} 单 · 采购费含采购运费 · 贴单费默认 ¥1.50 / 单</span><el-pagination v-model:current-page="page" v-model:page-size="pageSize" :total="total" :page-sizes="[50,100,200,500]" layout="total, sizes, prev, pager, next" @current-change="load(false)" @size-change="applyFilter"/></div>
+        <div class="statistics-footer"><span>共 {{total}} 单 · 采购费含采购运费 · 贴单费按实际录入</span><el-pagination v-model:current-page="page" v-model:page-size="pageSize" :total="total" :page-sizes="[50,100,200,500]" layout="total, sizes, prev, pager, next" @current-change="load(false)" @size-change="applyFilter"/></div>
       </el-tab-pane>
       <el-tab-pane label="月度汇总" name="months">
         <div class="statistics-toolbar"><div class="statistics-filters"><el-date-picker v-model="monthRange" type="monthrange" value-format="YYYY-MM" format="YYYY-MM" start-placeholder="开始月份" end-placeholder="结束月份" :clearable="false" :disabled-date="disabledMonth" style="width:300px"/></div><div class="statistics-actions"><el-button :icon="'Setting'" @click="openMonth()">{{month}} 月度设置</el-button><el-tooltip content="导出月度汇总CSV"><el-button :icon="'Download'" circle aria-label="导出月度汇总" @click="exportMonths"/></el-tooltip></div></div>
         <el-table :data="monthly" row-key="id" default-expand-all :tree-props="{children:'children'}" :row-class-name="({row})=>row.is_group?'statistics-month-child':'statistics-month-total'" border v-loading="loading" max-height="calc(100vh - 380px)" empty-text="暂无月份数据">
-          <el-table-column prop="label" label="月份" min-width="148" fixed="left" sortable/>
-          <el-table-column prop="orders" label="订单数" width="78" align="right" sortable/>
-          <el-table-column prop="income_rub" label="销售 ₽" min-width="112" align="right" sortable><template #default="{row}">{{row.coverage?.checked_days?money(row.income_rub):'未同步'}}</template></el-table-column>
-          <el-table-column prop="ozon_fees_rub" label="代扣 ₽" min-width="107" align="right" sortable><template #default="{row}">{{row.coverage?.checked_days?money(row.ozon_fees_rub):'—'}}</template></el-table-column>
-          <el-table-column prop="advertising_rub" label="明细内广告 ₽" min-width="120" align="right" sortable><template #default="{row}">{{money(row.advertising_rub)}}<div class="statistics-issue-links" v-if="row.missing_advertising"><el-button type="primary" size="small" link @click="openExceptions(row,'ads')">{{row.missing_advertising}} 单待核对</el-button></div><div v-if="row.ad_without_finance_orders" class="statistics-cell-note">未纳入订单明细的广告 · ₽{{money(row.ad_without_finance_rub)}}</div><div v-if="row.unmatched_order_ad_rows" class="statistics-cell-note">按单广告未匹配 {{row.unmatched_order_ad_rows}} 条 · ₽{{money(row.unmatched_order_ad_rub)}}</div></template></el-table-column>
-          <el-table-column prop="known_receipt_rub" label="实收 ₽" min-width="112" align="right" sortable><template #default="{row}">{{money(monthlyReceipt(row, 'rub'))}}<div class="statistics-issue-links" v-if="row.missing_receipt_rub"><el-button type="primary" size="small" link @click="openExceptions(row,'receipt_rub')">{{row.missing_receipt_rub}} 单待核对</el-button></div></template></el-table-column>
-          <el-table-column prop="known_receipt_cny" label="实收 ¥" min-width="104" align="right" sortable><template #default="{row}">{{money(monthlyReceipt(row, 'cny'))}}<div class="statistics-issue-links" v-if="row.missing_receipt_cny"><el-button type="primary" size="small" link @click="openExceptions(row,'receipt_cny')">{{row.missing_receipt_cny}} 单待核对</el-button></div></template></el-table-column>
-          <el-table-column prop="purchase_cny" label="采购 ¥" min-width="104" align="right" sortable><template #default="{row}">{{money(row.purchase_cny)}}<div class="statistics-cell-note" v-if="row.missing_purchase">{{row.missing_purchase}} 单待录入</div></template></el-table-column>
-          <el-table-column prop="label_cny" label="贴单 ¥" min-width="88" align="right" sortable><template #default="{row}">{{money(row.label_cny)}}</template></el-table-column>
-          <el-table-column prop="profit_cny" label="毛利 ¥" min-width="178" align="right" sortable :sort-method="sortMonthlyProfit"><template #default="{row}">
-            <b :class="{'statistics-negative':monthlyProfit(row)<0}">{{money(monthlyProfit(row))}}</b>
-            <div class="statistics-cell-note statistics-warning">{{monthlyProfitNote(row)||titleProfit(row)}}</div>
-            <div class="statistics-issue-links">
-              <el-button v-for="issue in monthlyIssues(row)" :key="issue.kind" type="primary" size="small" link @click="openExceptions(row,issue.kind)">{{issue.label}}</el-button>
-            </div>
-          </template></el-table-column>
+          <el-table-column prop="label" label="月份" min-width="150" fixed="left" sortable><template #default="{row}">{{row.label}}<div class="statistics-cell-note" v-if="row.pending_orders">{{row.pending_orders}} 单在途，未拆组</div></template></el-table-column>
+          <el-table-column prop="orders" label="订单数" width="92" align="right" sortable><template #default="{row}">{{row.group === 'other' && !row.orders ? (row.flows || 0) + ' 笔' : row.orders}}</template></el-table-column>
+          <el-table-column prop="income_rub" label="销售 ₽" min-width="112" align="right" sortable><template #default="{row}">{{money(row.income_rub)}}</template></el-table-column>
+          <el-table-column prop="ozon_fees_rub" label="代扣 ₽" min-width="108" align="right" sortable><template #default="{row}">{{money(row.ozon_fees_rub)}}</template></el-table-column>
+          <el-table-column prop="advertising_rub" label="推广费用 ₽" min-width="120" align="right" sortable><template #default="{row}">{{money(row.advertising_rub)}}</template></el-table-column>
+          <el-table-column prop="receipt_rub" label="实收 ₽" min-width="112" align="right" sortable><template #default="{row}">{{money(row.receipt_rub)}}</template></el-table-column>
+          <el-table-column prop="receipt_cny" label="实收 ¥" min-width="104" align="right" sortable><template #default="{row}">{{money(row.receipt_cny)}}</template></el-table-column>
+          <el-table-column prop="purchase_cny" label="采购 ¥" min-width="108" align="right" sortable><template #default="{row}">{{money(row.purchase_cny)}}<div class="statistics-cell-note statistics-warning" v-if="row.missing_purchase">{{row.missing_purchase}} 单未录入</div></template></el-table-column>
+          <el-table-column prop="label_cny" label="贴单 ¥" min-width="100" align="right" sortable><template #default="{row}">{{money(row.label_cny)}}<div class="statistics-cell-note statistics-warning" v-if="row.missing_label">{{row.missing_label}} 单未录入</div></template></el-table-column>
+          <el-table-column prop="profit_cny" label="毛利 ¥" min-width="112" align="right" sortable><template #default="{row}"><b :class="{'statistics-negative':row.profit_cny<0}">{{money(row.profit_cny)}}</b></template></el-table-column>
+          <el-table-column prop="margin_pct" label="毛利率" min-width="92" align="right" sortable><template #default="{row}">{{row.margin_pct==null?'—':money(row.margin_pct)+'%'}}</template></el-table-column>
         </el-table>
-        <div class="statistics-footer"><span>实收与毛利仅含已归属收支。点击费按莫斯科日分摊，订单广告只计入对应订单。</span></div>
+        <div class="statistics-footer"><span>按结算日期整单归月 · 实收 ₽ = 销售 − 代扣 − 推广费用 · 毛利 ¥ = 实收 ¥ − 采购 − 贴单（未录入按 0 计并提示单数）· 毛利率 = 毛利 ÷ 销售 ¥</span></div>
       </el-tab-pane>
     </el-tabs>
     <el-dialog v-model="batchVisible" title="批量订单号" width="540px" class="statistics-dialog" :close-on-click-modal="false">
@@ -716,8 +994,9 @@ window.StatisticsAnalysisView = {
       <el-tabs v-model="orderTab" @tab-change="changeOrderTab">
         <el-tab-pane label="费用明细" name="fees">
           <div v-if="orderRow?.platform_net_rub!=null" class="statistics-toolbar statistics-meta"><span>已归属 Ozon 净额：₽{{money(orderRow.platform_net_rub)}}</span></div>
+          <div v-if="ledger.length" class="statistics-meta" style="margin:0 0 8px">共 {{ledger.length}} 笔流水，覆盖 {{ledgerMonths.length}} 个月 · 这里显示该订单的全期结算数据，不受上方月份筛选限制</div>
           <el-alert v-if="ledgerError" :title="ledgerError" type="error" :closable="false" class="statistics-alert"/>
-          <el-table v-else :data="ledger" border v-loading="ledgerLoading" max-height="420">
+          <el-table v-else :data="ledger" border v-loading="ledgerLoading" max-height="420" empty-text="该订单暂无结算流水（可能尚未结算，或不属于当前店铺）">
             <el-table-column prop="date" label="应计日期" width="130" sortable/>
             <el-table-column prop="accrual_id" label="流水 ID" width="170" sortable/>
             <el-table-column label="费用项目" min-width="280"><template #default="{row}">{{feeName(row)}}</template></el-table-column>
@@ -773,6 +1052,46 @@ window.StatisticsAnalysisView = {
         </el-tab-pane>
       </el-tabs>
       <template #footer><el-button :icon="'CopyDocument'" @click="copyOrderNumber(ledgerOrder)">复制订单号</el-button></template>
+    </el-dialog>
+    <el-dialog v-model="settleResult.visible" title="同步结算日期结果" width="760px" top="8vh" class="statistics-dialog">
+      <div v-if="settleResult" class="statistics-metrics statistics-metrics-dialog" style="margin-bottom:12px">
+        <div><span>本次待补</span><strong>{{settleResult.requested}}<small>单</small></strong></div>
+        <div><span>成功</span><strong style="color:#15803d">{{settleResult.ok}}<small>单</small></strong></div>
+        <div><span>未取到</span><strong :style="{color: settleResult.fail ? '#b45309' : '#94a3b8'}">{{settleResult.fail}}<small>单</small></strong></div>
+      </div>
+      <el-table :data="settleResult.groups" border size="small" empty-text="没有分组">
+        <el-table-column prop="label" label="类型" width="130"/>
+        <el-table-column label="成功" width="80" align="right">
+          <template #default="{row}">{{row.ok}}</template>
+        </el-table-column>
+        <el-table-column label="未取到" width="90" align="right">
+          <template #default="{row}"><span :style="{color: row.fail ? '#b45309' : '#94a3b8'}">{{row.fail}}</span></template>
+        </el-table-column>
+        <el-table-column prop="reason" label="失败原因" min-width="260" show-overflow-tooltip/>
+      </el-table>
+      <div v-for="group in settleResult.groups.filter(g => g.fail)" :key="group.label" style="margin-top:12px">
+        <div class="statistics-actions" style="margin-bottom:4px">
+          <span class="statistics-meta"><b>{{group.label}}</b> 未取到 {{group.postings.length}} 单（最多展示 200 个）</span>
+          <el-button link type="primary" :icon="'CopyDocument'" @click="copyFailed(group.postings)">复制单号</el-button>
+        </div>
+        <div class="statistics-meta" style="max-height:110px;overflow:auto;font-family:ui-monospace,monospace;line-height:1.7">{{group.postings.join('  ')}}</div>
+      </div>
+      <template #footer><el-button type="primary" @click="settleResult.visible = false">知道了</el-button></template>
+    </el-dialog>
+    <el-dialog v-model="cookieVisible" title="需要 Ozon 后台会话" width="720px" top="8vh" class="statistics-dialog">
+      <el-alert type="warning" :closable="false" show-icon title="取消时间只有卖家后台网页里有，Seller API 不返回，这一步要用一次后台会话"/>
+      <div class="statistics-meta" style="margin:10px 0;line-height:1.8;white-space:normal">
+        点 <b>「从浏览器获取」</b>：采集插件用 Chrome 的 cookies 权限直接读出你浏览器里的 ozon.ru 登录态，不用手抄。<br>
+        <span v-if="webSession && webSession.updated_at">当前会话保存于 {{webSession.updated_at}}（{{webSession.host}}），已失效。</span>
+        <span v-if="webSession && webSession.last_error">最近一次错误：{{webSession.last_error}}</span>
+      </div>
+      <el-divider style="margin:6px 0 12px"><span style="font-size:12px;color:#94a3b8">或手动粘贴</span></el-divider>
+      <el-input v-model="cookieInput" type="textarea" :rows="4" placeholder="卖家后台 F12 → Network → 任一请求 → 复制 Request Headers 里的 Cookie 整行"/>
+      <template #footer>
+        <el-button @click="cookieVisible = false">取消</el-button>
+        <el-button :loading="cookieSaving" @click="saveCookie">粘贴的 cookie 保存并同步</el-button>
+        <el-button type="primary" :loading="cookieSaving" @click="cookieFromBrowser">从浏览器获取</el-button>
+      </template>
     </el-dialog>
     <teleport to="body">
       <figure v-if="productZoom && ledgerVisible" class="statistics-product-zoom" aria-hidden="true" :style="{left:productZoom.x+'px',top:productZoom.y+'px','--preview-size':productZoom.size+'px',margin:0}">

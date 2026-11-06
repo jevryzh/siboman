@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.204";
+const VERSION = "2.2.9.209";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -5899,12 +5899,227 @@ async function collectRichContentFromOzonPage(sku) {
 
 
 // ========== 消息监听 ==========
+// ── v2.2.9.209：退货和取消（WHD 取消日期）辅助 ────────────────────────────────
+// 列出所有卖家后台标签页（多店铺时每个店一个标签页，不能只取第一个）
+async function listSellerTabs() {
+  const found = [];
+  for (const pattern of ["*://seller.ozon.ru/*", "*://*.ozonru.cn/*"]) {
+    const tabs = await chrome.tabs.query({ url: pattern });
+    for (const tab of tabs || []) if (tab.id && !found.some((item) => item.id === tab.id)) found.push(tab);
+  }
+  return found;
+}
+
+// 找一个已登录的卖家后台标签页；没有就后台开一个，不抢焦点
+async function ensureSellerTab() {
+  for (const pattern of ["*://seller.ozon.ru/*", "*://*.ozonru.cn/*"]) {
+    const tabs = await chrome.tabs.query({ url: pattern });
+    if (tabs && tabs.length) return tabs[0];
+  }
+  const tab = await chrome.tabs.create({ url: "https://seller.ozon.ru/app/returns/main", active: false });
+  await sleep(6000);
+  const login = await chrome.scripting.executeScript({
+    target: { tabId: tab.id },
+    func: () => location.href,
+  }).catch(() => null);
+  const href = String(login?.[0]?.result || "");
+  if (/signin|registration/.test(href)) throw new Error("卖家后台未登录，请先在浏览器登录 seller.ozon.ru");
+  return tab;
+}
+
+// 把进度推回 ERP 页面（content-bridge-iso 收到后转给页面）
+async function notifyErpProgress(payload) {
+  try {
+    const tabs = await chrome.tabs.query({ url: ["*://test.renwz.cn/*", "*://xm.renwz.cn/*", "*://47.104.86.62/*"] });
+    for (const tab of tabs) {
+      if (!tab.id) continue;
+      try { await chrome.tabs.sendMessage(tab.id, { action: "settleProgress", ...payload }); } catch (_e) { /* 页面没加载好就跳过 */ }
+    }
+  } catch (_e) { /* 忽略 */ }
+}
+
+// 按单号打开「退货和取消」并取那一行（模式/状态日期/状态）
+async function extractCancelRow(tabId, posting) {
+  const filters = encodeURIComponent(JSON.stringify([{ single: { field: "PostingNumber", value: posting } }]));
+  const url = `https://seller.ozon.ru/app/returns/main?tab=90&sort=StatusDate&sortingType=Desc&filters=${filters}`;
+  try { await chrome.tabs.update(tabId, { url }); } catch (_e) { return null; }
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    await sleep(700);
+    try {
+      const [res] = await chrome.scripting.executeScript({
+        target: { tabId },
+        func: (pn) => {
+          const text = (el) => (el.textContent || "").replace(/\s+/g, " ").trim();
+          const rows = [...document.querySelectorAll("tbody tr")].map((tr) => [...tr.children].map(text));
+          const hit = rows.find((cells) => cells.some((cell) => cell.includes(pn)));
+          if (!hit) return null;
+          return { mode: hit[1] || "", date: hit[2] || "", status: hit[6] || "" };
+        },
+        args: [posting],
+      });
+      if (res?.result) return res.result;
+    } catch (_e) { /* 页面还在导航，下一轮再试 */ }
+  }
+  return null;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   console.log(`[SW ${VERSION}] 收到消息:`, msg.action, msg.skus ? `(${msg.skus.length} SKU)` : "");
 
   if (msg.action === "ping") {
     sendResponse({ ok: true, version: VERSION });
     return;
+  }
+
+  // v2.2.9.209 取卖家后台 cookie
+  //   客户端/服务端都读不到 ozon.ru 的 cookie（跨域 + HttpOnly），只有插件能用 chrome.cookies。
+  //   ERP 拿它去服务端调卖家后台接口，补「已取消订单的取消日期」（Seller API 不返回该字段）。
+  if (msg.action === "ozonCookies") {
+    (async () => {
+      try {
+        const jar = new Map();
+        let host = "seller.ozon.ru";
+        for (const domain of ["ozon.ru", "ozon.com", "ozonru.cn"]) {
+          let list = [];
+          try { list = await chrome.cookies.getAll({ domain }); } catch (_e) { list = []; }
+          for (const cookie of list || []) {
+            if (!cookie || !cookie.name || cookie.name.startsWith("__Host-")) continue;
+            jar.set(cookie.name, `${cookie.name}=${cookie.value}`);
+            // 中国站店铺的会话在 ozonru.cn 上，接口域名要跟着换
+            if (domain === "ozonru.cn" && cookie.name === "__Secure-access-token" && !jar.has("__ozon_ru_token")) host = "seller.ozonru.cn";
+          }
+        }
+        const cookie = [...jar.values()].join("; ");
+        const company = jar.has("sc_company_id") ? String(jar.get("sc_company_id")).split("=").slice(1).join("=") : "";
+        console.log(`[SW ${VERSION}] ozonCookies: ${jar.size} 个, host=${host}, company=${company}`);
+        sendResponse({ ok: Boolean(cookie), cookie, count: jar.size, host, company_id: company });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
+    })();
+    return true;
+  }
+
+  // v2.2.9.209 FBS 取消时间：多店铺时逐个标签页试，找到「有该 company 权限」的那个再全量拉。
+  //   接口按 company_id 鉴权，选错标签页会直接 403 PermissionDenied（之前就是这个原因导致 0 命中）。
+  if (msg.action === "ozonCancelDates") {
+    (async () => {
+      try {
+        const postings = (Array.isArray(msg.postings) ? msg.postings : []).map(String).filter(Boolean).slice(0, 5000);
+        if (!postings.length) return sendResponse({ ok: false, error: "没有传订单号" });
+        const companyId = String(msg.companyId || "").replace(/\D/g, "");
+        const from = msg.from || "2025-01-01T00:00:00.000Z";
+        const to = msg.to || new Date(Date.now() + 86400000).toISOString();
+        const wanted = new Set(postings);
+
+        const fetchPage = async (tabId, cursorIn) => {
+          const [res] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: async (company, cursor, fromIn, toIn) => {
+              if (!company) {
+                const matched = document.cookie.match(/(?:^|;\s*)sc_company_id=(\d+)/);
+                if (matched) company = matched[1];
+              }
+              if (!company) return { error: "缺少 company_id", status: 0 };
+              const body = {
+                filter: {
+                  company_id: Number(company), delivery_groups: ["all"], status_alias: ["cancelled"],
+                  processed_at_from: fromIn, processed_at_to: toIn,
+                },
+                limit: 1000, cursor, sort: "last_change_status_date", sort_dir: "desc",
+              };
+              const response = await fetch("/api/posting-service/seller-ui/fbs/posting/list", {
+                method: "POST", credentials: "include",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+              });
+              if (response.status !== 200) return { error: `HTTP ${response.status}`, status: response.status };
+              const text = await response.text();
+              let data = null;
+              try { data = JSON.parse(text); } catch (_e) { return { error: "返回不是 JSON（可能未登录）", status: 200 }; }
+              const result = data?.result || {};
+              const list = Array.isArray(result.postings) ? result.postings : [];
+              const map = {};
+              for (const item of list) {
+                if (item && item.posting_number && item.last_change_status_date) map[item.posting_number] = item.last_change_status_date;
+              }
+              return { rows: map, count: list.length, cursor: String(result.cursor || ""), status: 200 };
+            },
+            args: [companyId, cursorIn, from, to],
+          });
+          return res?.result || {};
+        };
+
+        // 逐个标签页探测：403 说明这个标签页登录的是别的店铺
+        let tabs = await listSellerTabs();
+        if (!tabs.length) { const created = await ensureSellerTab(); tabs = created ? [created] : []; }
+        let tab = null, first = null, lastError = "";
+        for (const candidate of tabs) {
+          const probe = await fetchPage(candidate.id, "");
+          if (probe.status === 200 && !probe.error) { tab = candidate; first = probe; break; }
+          lastError = probe.error || "";
+          if (probe.status === 403) continue;
+        }
+
+        const rows = {}, pages = [];
+        if (!tab) {
+          const hint = lastError.includes("403")
+            ? "当前打开的 seller 标签页都是别的店铺（接口按公司校验，403）。请在浏览器打开该店铺的卖家后台再试"
+            : (lastError || "没有可用的 seller.ozon.ru 标签页，请先登录卖家后台");
+          return sendResponse({ ok: false, error: hint, total: wanted.size, scanned: 0, pages: [] });
+        }
+
+        Object.assign(rows, first.rows || {});
+        pages.push(first.count || 0);
+        await notifyErpProgress({ phase: "fbs", done: 1, scanned: Object.keys(rows).length });
+        let cursor = first.cursor || "";
+        for (let page = 1; cursor && page < 30; page += 1) {
+          const next = await fetchPage(tab.id, cursor);
+          if (next.error) break;
+          Object.assign(rows, next.rows || {});
+          pages.push(next.count || 0);
+          await notifyErpProgress({ phase: "fbs", done: page + 1, scanned: Object.keys(rows).length });
+          cursor = next.cursor || "";
+        }
+
+        const hit = {};
+        for (const posting of wanted) if (rows[posting]) hit[posting] = rows[posting];
+        const missing = [...wanted].filter((posting) => !rows[posting]);
+        console.log(`[SW ${VERSION}] ozonCancelDates: 扫到 ${Object.keys(rows).length} 单，命中 ${Object.keys(hit).length}/${wanted.size}`);
+        sendResponse({ ok: true, rows: hit, missing, total: wanted.size, scanned: Object.keys(rows).length, pages, tabs: tabs.length });
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  // v2.2.9.209 WHD(FBO) 取消日期
+  //   Ozon 的 FBO 订单列表/详情都没有取消时间，只有「退货和取消」页显示状态日期。
+  //   这里在真实标签页里按单号逐个查，用 DOM 取那一行（只到日，够用）。
+  if (msg.action === "whdCancelDates") {
+    (async () => {
+      try {
+        const postings = (Array.isArray(msg.postings) ? msg.postings : []).map(String).filter(Boolean).slice(0, 120);
+        if (!postings.length) return sendResponse({ ok: false, error: "没有传订单号" });
+        const tab = await ensureSellerTab();
+        if (!tab) return sendResponse({ ok: false, error: "没有可用的 seller.ozon.ru 标签页，请先在浏览器登录卖家后台" });
+        const rows = {}, missing = [];
+        await notifyErpProgress({ phase: "whd", done: 0, total: postings.length });
+        for (let i = 0; i < postings.length; i += 1) {
+          const posting = postings[i];
+          const result = await extractCancelRow(tab.id, posting);
+          if (result) rows[posting] = result; else missing.push(posting);
+          await notifyErpProgress({ phase: "whd", done: i + 1, total: postings.length, hit: Object.keys(rows).length });
+          await sleep(80);
+        }
+        console.log(`[SW ${VERSION}] whdCancelDates: 命中 ${Object.keys(rows).length}/${postings.length}`);
+        sendResponse({ ok: true, rows, missing, total: postings.length });
+      } catch (error) {
+        sendResponse({ ok: false, error: error.message });
+      }
+    })();
+    return true;
   }
 
   // v2.2.9.5: 让 ERP 强制 reload plugin (cache 不更新时用)
@@ -5929,7 +6144,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       try {
         const postingNumbers = Array.isArray(msg.postingNumbers) ? msg.postingNumbers.map(String).filter(Boolean) : [];
         if (!postingNumbers.length) return sendResponse({ ok: false, error: "没有传订单号" });
-        // v2.2.9.204 卖家后台可能停在中国站域名（ozonru.cn），或从 .ru 重定向过去：
+        // v2.2.9.209 卖家后台可能停在中国站域名（ozonru.cn），或从 .ru 重定向过去：
         //   只查 seller.ozon.ru 会漏掉已登录的标签页 → 新建标签被重定向 → 注入报
         //   「Cannot access contents of the page, Extension manifest must request permission…」
         let tabs = [];

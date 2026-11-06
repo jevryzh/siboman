@@ -279,7 +279,7 @@ const initApp = () => {
             <el-sub-menu index="statistics">
               <template #title><el-icon><DataAnalysis /></el-icon><span>统计分析</span></template>
               <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')"><span>月度统计</span></el-menu-item>
-              <el-menu-item index="#/settlement-detail" @click="goTo('#/settlement-detail')"><span>结算明细</span></el-menu-item>
+              <el-menu-item index="#/settlement-detail" @click="goTo('#/settlement-detail')"><span>店铺结算原始数据</span></el-menu-item>
             </el-sub-menu>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
