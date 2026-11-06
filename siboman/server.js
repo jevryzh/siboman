@@ -15744,7 +15744,8 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       //   原来前端为了算 tab 个数，把订单列表翻到最多 10 页 × 200 = 2000 条再本地统计，
       //   但库里有 6700+ 条 → 数字全是残缺的（用户看到「待发运 771」，后台实际 667）。
       const statusCountRes = await db.query(
-        `SELECT COALESCE(NULLIF(display_status, ''), status) AS st, count(*)::int AS cnt
+        // Accio Work (2026-11-06)：归并多店铺后同一货件会重复出现，按 posting_number 去重计数
+        `SELECT COALESCE(NULLIF(display_status, ''), status) AS st, count(DISTINCT posting_number)::int AS cnt
            FROM app_order_cache WHERE ${where.join(" AND ")} GROUP BY 1`,
         params,
       );
@@ -15754,7 +15755,7 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       // v2.2.9.163 「已超时」也在服务端算：前端原来要靠 summaryRows 全量行判断，
       //   逼得前端翻 10 页 × 200 条（页面很慢）。这里用 shipment_date 直接数。
       const overdueRes = await db.query(
-        `SELECT count(*)::int AS cnt FROM app_order_cache
+        `SELECT count(DISTINCT posting_number)::int AS cnt FROM app_order_cache
           WHERE ${where.join(" AND ")}
             AND COALESCE(NULLIF(display_status, ''), status) IN ('awaiting_packaging','awaiting_deliver')
             AND shipment_date IS NOT NULL AND shipment_date < now()`,
@@ -15776,15 +15777,24 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         } catch (_e) { /* 诊断失败不影响主流程 */ }
       }
       const countRes = await db.query(
-        `SELECT count(*)::int AS count FROM app_order_cache WHERE ${where.join(" AND ")}`,
+        `SELECT count(DISTINCT posting_number)::int AS count FROM app_order_cache WHERE ${where.join(" AND ")}`,
         params,
       );
+      // Accio Work (2026-11-06)：归并多店铺后，同一货件可能被两个 store 各缓存一条，
+      //   导致「筛 199 条查出 399 条」。用 ROW_NUMBER 按 posting_number 去重（保留 updated_at 最新）。
       const rowsRes = await db.query(
-        `SELECT payload, COALESCE(NULLIF(display_status, ''), status) AS display_status, status AS source_status
-         FROM app_order_cache
-         WHERE ${where.join(" AND ")}
-         ORDER BY in_process_at DESC NULLS LAST, updated_at DESC
-         LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        `SELECT payload, display_status, source_status
+           FROM (
+             SELECT posting_number, payload, in_process_at, updated_at,
+                    COALESCE(NULLIF(display_status, ''), status) AS display_status,
+                    status AS source_status,
+                    ROW_NUMBER() OVER (PARTITION BY posting_number ORDER BY updated_at DESC NULLS LAST) AS rn
+               FROM app_order_cache
+              WHERE ${where.join(" AND ")}
+           ) dedup
+          WHERE dedup.rn = 1
+          ORDER BY dedup.in_process_at DESC NULLS LAST, dedup.updated_at DESC
+          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset],
       );
       const orders = rowsRes.rows.map((row) => normalizeOrderAccountingPayload({
