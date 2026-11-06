@@ -886,6 +886,30 @@ window.OrderListView = {
         notify.error('导出毛线标签失败：' + String(e.message || e).slice(0, 240), 0);
       } finally { yarnLabelsBusy.value = false; }
     };
+    const exportYarnLabelsOfficial = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先选择店铺');
+      const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
+      if (!picked.length) return notify.warning('请先勾选要导出的订单');
+      yarnLabelsBusy.value = true;
+      exportStart(`API 导出毛线标签（${picked.length} 单）`);
+      try {
+        exportStep(10, '正在逐单获取 Ozon 标签…');
+        // Codex: 服务端逐单请求官方接口并按拣货单顺序合并，不依赖浏览器插件。
+        const res = await axios.post('/api/seller/orders/yarn-labels', {
+          store_ids: storeIds, posting_numbers: picked, ordered_single: true,
+        }, { responseType: 'blob', timeout: 600000 });
+        exportStep(95, '正在下载 PDF…');
+        downloadBlob(res.data, `毛线标签_${new Date().toISOString().slice(0, 10)}.pdf`, 'application/pdf');
+        exportFinish();
+        notify.success(`已导出 ${res.headers['x-item-count'] || picked.length} 单毛线标签，顺序与拣货单一致`);
+      } catch (e) {
+        exportFail();
+        let msg = e.message;
+        try { if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg; } catch (_e2) {}
+        notify.error('API 导出毛线标签失败：' + String(msg).slice(0, 240), 0);
+      } finally { yarnLabelsBusy.value = false; }
+    };
     const openPostingDialog = () => {
       postingDialog.text = postingFilter.value.join('\n');
       postingDialog.visible = true;
@@ -1320,7 +1344,7 @@ window.OrderListView = {
       orders, displayedOrders, loading, summaryLoading, kpiLoading, activeTab, statusTabs, statusTabItems, pagination,
       selectedOrders, notes, batchLoading,
       postingFilter, postingDialog, openPostingDialog, applyPostingFilter, clearPostingFilter,
-      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, exportProgress, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
+      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, exportYarnLabelsOfficial, exportProgress, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
       lastBatchResult, hasFetched, orderEmptyText, shops, currentStoreName,
       storeScope, storeScopeOptions, onStoreScopeChange,
       detailDrawer, shipDialog,
@@ -1496,6 +1520,9 @@ window.OrderListView = {
           </el-button>
           <el-button size="large" plain :loading="yarnLabelsBusy" @click="exportYarnLabels">
             <el-icon><Tickets /></el-icon><span>导出毛线标签</span>
+          </el-button>
+          <el-button size="large" plain :disabled="yarnLabelsBusy" @click="exportYarnLabelsOfficial" title="不依赖插件，逐单从 Ozon API 获取并按拣货单顺序合并；可能受接口限流影响">
+            <el-icon><Download /></el-icon><span>API 导出标签</span>
           </el-button>
           <el-button size="large" plain :loading="feesImporting" @click="pickFeesFile">
             <el-icon><Upload /></el-icon><span>导入费用结算</span>

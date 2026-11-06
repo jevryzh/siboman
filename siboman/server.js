@@ -16592,25 +16592,31 @@ app.post("/api/seller/orders/yarn-label-pdf", requireAuth, async (req, res, next
       if (it && it.pn && it.url) urlByPn.set(String(it.pn), String(it.url));
     }
     const seq = order.length ? order.filter((pn) => urlByPn.has(pn)) : [...urlByPn.keys()];
-    const bufs = [];
+    // Codex: 有界并行下载，按 seq 索引合并，避免 CDN 慢响应拖住整批且不改变标签顺序。
+    const bufs = new Array(seq.length);
     const rejectedHosts = new Set();
     let fetchFailed = 0;
-    for (const pn of seq) {
-      const u = urlByPn.get(pn);
-      if (!isLabelPdfUrl(u)) {
-        // 记录被拒的域名，失败时直接告诉用户/日志是哪个 CDN 不在白名单，不用再翻代码
-        try { rejectedHosts.add(new URL(String(u)).hostname); } catch { rejectedHosts.add(String(u).slice(0, 40)); }
-        continue;
+    let nextLabel = 0;
+    const fetchWorker = async () => {
+      while (nextLabel < seq.length) {
+        const index = nextLabel++;
+        const u = urlByPn.get(seq[index]);
+        if (!isLabelPdfUrl(u)) {
+          try { rejectedHosts.add(new URL(String(u)).hostname); } catch { rejectedHosts.add(String(u).slice(0, 40)); }
+          continue;
+        }
+        try {
+          const r = await fetch(u, { redirect: "follow", signal: AbortSignal.timeout(30000) });
+          if (!r.ok) { fetchFailed += 1; continue; }
+          const b = Buffer.from(await r.arrayBuffer());
+          if (b.slice(0, 4).toString() !== "%PDF") { fetchFailed += 1; continue; }
+          bufs[index] = b;
+        } catch (_e) { fetchFailed += 1; }
       }
-      try {
-        const r = await fetch(u, { redirect: "follow" });
-        if (!r.ok) { fetchFailed += 1; continue; }
-        const b = Buffer.from(await r.arrayBuffer());
-        if (b.slice(0, 4).toString() !== "%PDF") { fetchFailed += 1; continue; }
-        bufs.push(b);
-      } catch (_e) { fetchFailed += 1; }
-    }
-    if (!bufs.length) {
+    };
+    await Promise.all(Array.from({ length: Math.min(4, seq.length) }, fetchWorker));
+    const orderedBufs = bufs.filter(Boolean);
+    if (!orderedBufs.length) {
       const bits = [];
       if (rejectedHosts.size) bits.push(`${rejectedHosts.size} 个域名不在白名单：${[...rejectedHosts].slice(0, 3).join("、")}`);
       if (fetchFailed) bits.push(`${fetchFailed} 个下载失败或不是 PDF`);
@@ -16618,7 +16624,7 @@ app.post("/api/seller/orders/yarn-label-pdf", requireAuth, async (req, res, next
       return res.status(400).json({ success: false, error: `下载标签失败：${bits.join("；")}` });
     }
     const outDoc = await PDFDocument.create();
-    for (const b of bufs) {
+    for (const b of orderedBufs) {
       const src = await PDFDocument.load(b, { ignoreEncryption: true });
       const pages = await outDoc.copyPages(src, src.getPageIndices());
       pages.forEach((pg) => outDoc.addPage(pg));
@@ -16626,7 +16632,7 @@ app.post("/api/seller/orders/yarn-label-pdf", requireAuth, async (req, res, next
     const merged = Buffer.from(await outDoc.save());
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="yarn-labels-${Date.now()}.pdf"`);
-    res.setHeader("X-Page-Count", String(bufs.length));
+    res.setHeader("X-Page-Count", String(orderedBufs.length));
     res.send(merged);
   } catch (error) { next(error); }
 });
@@ -16704,7 +16710,9 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     const { client_id: clientId, api_key: apiKey } = creds.rows[0];
     // v2.2.9.181 Ozon 面单接口有「每秒请求数」限流（429），并发 8 会直接触发限流导致整批失败。
     //   降到 3 + 429 指数退避重试，失败时把真实原因带回去（之前一律吞成"未返回任何标签"）。
-    const CHUNK = 20, CONCURRENCY = 3;
+    // Codex: 逐单模式用于不依赖插件的有序导出；整批接口的页序不能保证与拣货单一致。
+    const orderedSingle = req.body?.ordered_single === true;
+    const CHUNK = orderedSingle ? 1 : 20, CONCURRENCY = orderedSingle ? 2 : 3;
     const chunks = [];
     for (let i = 0; i < postings.length; i += CHUNK) chunks.push(postings.slice(i, i + CHUNK));
     const fetchChunk = async (batch) => {
@@ -16716,7 +16724,7 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
         });
         const buf = Buffer.from(await r.arrayBuffer());
         const ct = r.headers.get("content-type") || "";
-        if (r.ok && !ct.includes("json")) return { ok: true, buf };
+        if (r.ok && !ct.includes("json") && buf.slice(0, 4).toString() === "%PDF") return { ok: true, buf };
         const text = buf.toString("utf8").slice(0, 200);
         if (r.status === 429) { await new Promise((x) => setTimeout(x, 1200 * (attempt + 1))); continue; }
         return { ok: false, err: `HTTP ${r.status} ${text}` };
@@ -16737,6 +16745,9 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
       await new Promise((x) => setTimeout(x, 350));
     }
     const pdfs = slots.filter(Boolean);
+    if (orderedSingle && failed) {
+      return res.status(502).json({ success: false, error: `逐单获取标签失败：${failed} 单；首个原因：${firstErr || '未知'}。没有生成不完整的 PDF。` });
+    }
     if (!pdfs.length) {
       return res.status(400).json({ success: false, error: `Ozon 未返回标签（${failed} 批失败，首批原因：${firstErr || '未知'}）` });
     }

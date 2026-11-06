@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.209";
+const VERSION = "2.2.9.210";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -6188,23 +6188,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               let j = null; try { j = JSON.parse(t); } catch (_e) {}
               return { status: r.status, json: j, text: t.slice(0, 200) };
             };
-            const items = [];
-            const failed = [];
-            for (let k = 0; k < postingNumbers.length; k += 1) {
-              const pn = postingNumbers[k];
-              const create = await post("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] });
-              const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
-              if (!taskId) { failed.push({ pn, err: `create ${create.status}` }); continue; }
-              let url = "";
-              for (let i = 0; i < 12 && !url; i += 1) {
-                await sleep(i === 0 ? 600 : 900);
-                const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
-                const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
-                if (m) url = m[0].replace(/\\\//g, "/");
+            // Codex: 两个任务并行轮询；每单仍独立创建 PDF，结果按传入顺序返回。
+            const results = new Array(postingNumbers.length);
+            let next = 0;
+            const worker = async () => {
+              while (next < postingNumbers.length) {
+                const k = next++;
+                const pn = postingNumbers[k];
+                try {
+                  const create = await post("/api/label/task/create", { company_id: companyId, posting_numbers: [pn] });
+                  const taskId = create.json && create.json.tasks && create.json.tasks[0] && create.json.tasks[0].task_id;
+                  if (!taskId) { results[k] = { pn, err: `create ${create.status}` }; continue; }
+                  let url = "";
+                  for (let i = 0; i < 12 && !url; i += 1) {
+                    await sleep(i === 0 ? 600 : 900);
+                    const st = await post("/api/label/task/get", { task_id: String(taskId), company_id: companyId });
+                    const m = JSON.stringify(st.json || {}).match(/https?:\/\/[^"\\]+?\.pdf/);
+                    if (m) url = m[0].replace(/\\\//g, "/");
+                  }
+                  results[k] = url ? { pn, url } : { pn, err: "no_url", taskId };
+                } catch (e) {
+                  results[k] = { pn, err: String((e && e.message) || e).slice(0, 120) };
+                }
               }
-              if (url) items.push({ pn, url });
-              else failed.push({ pn, err: "no_url", taskId });
-            }
+            };
+            await Promise.all(Array.from({ length: Math.min(2, postingNumbers.length) }, worker));
+            const items = results.filter((it) => it && it.url);
+            const failed = results.filter((it) => it && !it.url);
             return { ok: true, items, failed };
           },
           args: [postingNumbers],

@@ -472,6 +472,7 @@ window.StoreManagementView = {
           </div>
           <p>最近更新：</p>
           <ul style="margin-left: 20px; color: #666; line-height: 1.8">
+            <li>Codex 修改 · v2.2.9.210 毛线标签逐单任务改为限量并行，按拣货单顺序返回；另增无需插件的 API 逐单导出备选入口。批量上架和拣货单未调整。</li>
             <li>✅ v2.2.9.127 销售漏斗面板已从本插件移出，改为独立的 Chrome 插件（独立安装、单独使用，不需要本插件和 ERP）。它直接用页面会话调 Ozon 自己的 analytics 接口，所以不需要 Premium、也不需要 Api-Key。本插件因此移除了该内容脚本、erpFunnel 消息处理器。</li>
             <li>✅ v2.2.9.126 销售漏斗面板改为「跟随当前登录的 Ozon 账号」：从页面 localStorage.vuex / cookie sc_company_id 读出 company_id（= 店铺 Client-Id）带给 ERP，反查对应店铺。以前面板固定在 ERP 顶栏选中的店铺，会出现「页面登录 Three Latte、面板却显示 Yulanfang」的错位。</li>
             <li>✅ v2.2.9.125 新增「销售漏斗」面板：在 seller.ozon.ru 后台分析页右下角注入浮层，直接显示 展示 → 详情浏览 → 加购 → 下单 漏斗、转化率、销售额与按 SKU 明细。Ozon 后台的销售漏斗是 Premium 专属（会弹订阅引导、列卡在加载骨架），这里走 Seller API /v1/analytics/data 免订阅取数；插件 token 只能读自己店铺。同时 ERP 侧新增独立页面「销售漏斗」。</li>

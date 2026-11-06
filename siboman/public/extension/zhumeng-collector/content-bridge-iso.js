@@ -15,7 +15,7 @@
   "use strict";
   const PROTO = "__zhumeng_proto";
   const PROTO_VAL = "zhumeng-v1";
-  const VERSION = "2.2.9.209";
+  const VERSION = "2.2.9.210";
 
   console.log(`[逐梦采集器 v${VERSION}][ISO] 启动, 监听 window message`);
 
