@@ -10,24 +10,28 @@ const makePdf = async (width) => {
 const pdfs = { A: await makePdf(101), B: await makePdf(102), C: await makePdf(103) };
 const attempts = {};
 const progress = [];
+const delays = [];
 const fetchImpl = async (_url, options) => {
   const posting = JSON.parse(options.body).posting_number[0];
   attempts[posting] = (attempts[posting] || 0) + 1;
   if (posting === 'A') await new Promise((resolve) => setTimeout(resolve, 10));
-  if (posting === 'B' && attempts[posting] === 1) {
+  if (posting === 'B' && attempts[posting] <= 6) {
     return { status: 429, ok: false, headers: { get: () => 'application/json' }, arrayBuffer: async () => Buffer.from('{"error":"rate limit"}') };
   }
   return { status: 200, ok: true, headers: { get: () => 'application/pdf' }, arrayBuffer: async () => pdfs[posting] };
 };
 const result = await buildOrderedYarnLabels(['A', 'B', 'C'], {
   baseUrl: 'https://example.test', clientId: 'test', apiKey: 'test', fetchImpl,
-  sleep: async () => {}, onProgress: (item) => progress.push(item),
+  sleep: async (ms) => { delays.push(ms); }, onProgress: (item) => progress.push(item),
 });
 const merged = await PDFDocument.load(result);
 assert.deepEqual(merged.getPages().map((page) => page.getWidth()), [101, 102, 103]);
-assert.equal(attempts.B, 2);
+assert.equal(attempts.B, 7);
 assert.equal(progress.at(-1).completed, 3);
-assert.equal(progress.at(-1).rateLimited, 1);
+assert.equal(progress.at(-1).rateLimited, 6);
+assert.ok(delays.includes(2000));
+assert.ok(delays.includes(5000));
+assert.ok(delays.some((ms) => ms >= 15000));
 
 await assert.rejects(buildOrderedYarnLabels(['A', 'bad', 'C'], {
   baseUrl: 'https://example.test', clientId: 'test', apiKey: 'test', sleep: async () => {},
