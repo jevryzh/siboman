@@ -1404,12 +1404,12 @@ window.OrderListView = {
   },
   template: `
     <div class="order-list-v3" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px">
-      <el-teleport to="body">
+      <teleport to="body">
         <div v-if="productHover.visible" :style="{ position: 'fixed', left: productHover.left + 'px', top: productHover.top + 'px', zIndex: 10000, width: 'min(280px, calc(100vw - 16px))', padding: '10px', boxSizing: 'border-box', background: '#fff', border: '1px solid #e2e8f0', borderRadius: '6px', boxShadow: '0 12px 32px rgba(15,23,42,.22)', pointerEvents: 'none' }">
           <img :src="productHover.image" :alt="productHover.name" style="display:block; width:100%; aspect-ratio:1; object-fit:contain" />
           <div style="font-size:12px; color:#334155; line-height:18px; margin-top:6px; max-height:36px; overflow:hidden; overflow-wrap:anywhere">{{ productHover.name }}</div>
         </div>
-      </el-teleport>
+      </teleport>
             <!-- v2.2.9.169 批量单号筛选 -->
         <el-dialog v-model="postingDialog.visible" title="按单号批量查询" width="560px">
           <div style="font-size:13px; color:#64748b; margin-bottom:8px">
