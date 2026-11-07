@@ -15643,7 +15643,124 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
       //   于是 100 < 200 永远成立 → **每次同步只抓最新 100 单就停了**，
       //   更早的货件永远进不了缓存（用户报「卖家后台有待发运、ERP 里查不到」的真因）。
       //   现在：直接用 v4 的 cursor 翻页，单页 100，最多 60 页 = 6000 单。
+      //
+      // Accio Work (2026-11-07) v2.2.9.214 兄弟 posting 补全（方案 2，P1）
+      //   根因：Ozon 的 /v4/posting/fbs/list 的 since/to 过滤是按每条 posting 自身的变更
+      //   时间戳，不是按同一订单整体。同一张订单的多个 posting (e.g. -1 / -3) 变更时间
+      //   不同步时，窗口只能捞到其中一部分 —— 实测 46062808-0059 这单只返回了 -1，-3 被漏掉，
+      //   用户导入 179 单号查出来只有 178 条。
+      //   修复：list 每页返回 batch 后，用 /v3/posting/fbs/get 的 related_postings 字段
+      //   探测每条 posting 的兄弟，未在 batch / 本轮已见集合里的兄弟逐一 get 完整 payload
+      //   后 enrich + upsert。v4/list 不支持 related_postings（已实测），只能在 get 里拿。
+      //   并发 5 路，run 级硬上限 500 条防限流爆炸；兄弟探测失败不影响主同步链路。
       const PAGE = 100;
+      const PROBE_CONCURRENCY = 5;
+      const BACKFILL_HARD_CAP = 500;
+      const seenInRun = new Set();           // 本轮已 upsert 或已探测过的 posting_number
+      let backfilledTotal = 0;
+      let probedTotal = 0;
+
+      // 轻量并发池：对 items 执行 fn，不引入新依赖
+      const runPool = async (items, fn, concurrency) => {
+        const results = new Array(items.length);
+        let idx = 0;
+        const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+          while (true) {
+            const i = idx++;
+            if (i >= items.length) return;
+            try {
+              results[i] = await fn(items[i], i);
+            } catch (err) {
+              results[i] = { __error: err };
+            }
+          }
+        });
+        await Promise.all(workers);
+        return results;
+      };
+
+      // 对一条 posting 调 fbs/get，返回 Ozon 的 result 节点；失败返回 null
+      const fetchPostingFull = async (postingNumber) => {
+        try {
+          const data = await callOzonSellerAPI("/v3/posting/fbs/get", {
+            posting_number: postingNumber,
+            with: {
+              analytics_data: true,
+              financial_data: true,
+              barcodes: true,
+              product_exemplars: true,
+              related_postings: true,
+              translit: true,
+            },
+          }, { storeId, userId: req.user.id });
+          return data?.result || null;
+        } catch (err) {
+          console.warn(`[OrdersCache] sibling-probe fbs/get ${postingNumber} failed:`, err?.message || err);
+          return null;
+        }
+      };
+
+      // 对一个 batch 做兄弟补全：返回新 upsert 的 posting 数（不含 batch 自身）
+      const probeSiblingsForBatch = async (batch) => {
+        if (!batch.length) return 0;
+        // 本页 posting_number 全部先入 seenInRun，避免兄弟列表里把本页的也当缺的去重拉
+        const pagePns = batch.map((p) => p.posting_number).filter(Boolean);
+        for (const pn of pagePns) seenInRun.add(pn);
+        // 剔除本轮已探测过的（跨页兄弟可能重复出现）
+        const toProbe = pagePns.filter((pn) => !seenInRun.has(pn + "::probed"));
+        if (!toProbe.length) return 0;
+
+        // 第一步：并发 get 这些 posting 拿 related_postings
+        const probeResults = await runPool(
+          toProbe,
+          async (pn) => {
+            const full = await fetchPostingFull(pn);
+            seenInRun.add(pn + "::probed");
+            return { pn, full };
+          },
+          PROBE_CONCURRENCY,
+        );
+        probedTotal += toProbe.length;
+
+        // 收集兄弟 posting_number 差集
+        const siblingPns = new Set();
+        for (const r of probeResults) {
+          if (!r || r.__error || !r.full) continue;
+          const siblings = (r.full.related_postings?.related_posting_numbers) || [];
+          for (const sp of siblings) {
+            if (!sp || typeof sp !== "string") continue;
+            if (seenInRun.has(sp)) continue;      // 已在 page 或已拉过
+            siblingPns.add(sp);
+          }
+        }
+        if (!siblingPns.size) return 0;
+
+        // 硬上限保护
+        const remaining = Math.max(0, BACKFILL_HARD_CAP - backfilledTotal);
+        const siblingsToFetch = Array.from(siblingPns).slice(0, remaining);
+        if (!siblingsToFetch.length) return 0;
+
+        // 第二步：并发 get 兄弟拿完整 payload
+        const fetchedResults = await runPool(
+          siblingsToFetch,
+          async (pn) => {
+            const full = await fetchPostingFull(pn);
+            seenInRun.add(pn);
+            seenInRun.add(pn + "::probed");
+            return full;
+          },
+          PROBE_CONCURRENCY,
+        );
+        const fetched = fetchedResults.filter((r) => r && !r.__error && r.posting_number);
+        if (!fetched.length) return 0;
+
+        // 走和主链路一样的 enrich + upsert，保证字段口径一致
+        const enrichedSiblings = await enrichPostings(fetched);
+        await upsertOrderCache(enrichedSiblings.enriched || []);
+        backfilledTotal += fetched.length;
+        return fetched.length;
+      };
+
       let cursor = "";
       let synced = 0;
       for (let page = 0; page < 60; page++) {
@@ -15662,11 +15779,20 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
           const enriched = await enrichPostings(batch);
           await upsertOrderCache(enriched.enriched || []);
           synced += batch.length;
+          // 兄弟补全：失败不中断主同步
+          try {
+            await probeSiblingsForBatch(batch);
+          } catch (err) {
+            console.warn(`[OrdersCache] siblings backfill page=${page} failed:`, err?.message || err);
+          }
+          if (backfilledTotal >= BACKFILL_HARD_CAP) {
+            console.warn(`[OrdersCache] sibling backfill reached cap ${BACKFILL_HARD_CAP}, skipping further probes`);
+          }
         }
         if (!r.has_next || !r.cursor || batch.length < PAGE) break;
         cursor = r.cursor;
       }
-      console.log(`[OrdersCache] store=${storeId} sync_range=${label} synced=${synced}`);
+      console.log(`[OrdersCache] store=${storeId} sync_range=${label} synced=${synced} siblings_probed=${probedTotal} backfilled=${backfilledTotal}`);
     };
 
     const syncCacheWindow = async (days) => {
