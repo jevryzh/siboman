@@ -16533,17 +16533,27 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     if (!picked.length) return res.status(400).json({ success: false, error: "请先勾选要导出的订单" });
     // Accio Work (2026-11-06)：同店铺多账号归并，避免各见一半
     const sharedIds = await resolveSharedStoreIds(db, storeIds);
-    // 先按「订单 × 色号」聚合，再按订单汇总成 12×1/18×1/26×1
+    const scopeIds = sharedIds.length ? sharedIds : storeIds;
+    // Accio Work (2026-11-07) 修 "01×2 / Qty=2" bug：
+    //   同一 posting 被多个 store_id 都同步了一份，旧实现在 items CTE 里
+    //   直接 SUM 会把 1 件算成 N 件（N = 该单在几个 store 里出现过）。
+    //   先按 posting_number 去重，只保留 synced_at 最新的那条 payload，再做颜色聚合。
     const result = await db.query(
-      `WITH items AS (
-          SELECT c.posting_number AS pn,
-                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+      `WITH unique_postings AS (
+          SELECT DISTINCT ON (c.posting_number)
+                 c.posting_number, c.payload, c.synced_at
             FROM app_order_cache c
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
-             AND COALESCE(p->>'name','') ILIKE '%пряж%'
+           ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
+        ),
+        items AS (
+          SELECT u.posting_number AS pn,
+                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+            FROM unique_postings u
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
+           WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
              AND COALESCE(p->>'offer_id','') <> ''
            GROUP BY 1, 2
         )
@@ -16554,7 +16564,7 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
                MIN(color) AS first_color
           FROM items
          GROUP BY pn`,
-      [sharedIds.length ? sharedIds : storeIds, picked],
+      [scopeIds, picked],
     );
     // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
     // v2.2.9.175 Label = 订单号第一个 "-" **前面**那一段的末 4 位
@@ -16705,22 +16715,33 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
     // Accio Work (2026-11-06)：同店铺多账号归并（前端会带 store_ids）
     const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
       : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
-    const sharedIds = storeIds.length ? await resolveSharedStoreIds(db, storeIds) : [];
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const sharedIds = await resolveSharedStoreIds(db, storeIds);
+    const scopeIds = sharedIds.length ? sharedIds : storeIds;
+    // Accio Work (2026-11-07) 和拣货单口径保持一致：同一 posting 只取 synced_at 最新的一行。
+    //   旧实现在 items CTE 里直接 SUM(c.payload...)，同一订单被两个 store 同步时数量翻倍，
+    //   连带把排序里的「按件数升序」整个带偏。
     const rows = await db.query(
-      `WITH items AS (
-          SELECT c.posting_number AS pn,
+      `WITH unique_postings AS (
+          SELECT DISTINCT ON (c.posting_number)
+                 c.posting_number, c.payload, c.synced_at
+            FROM app_order_cache c
+           WHERE c.store_id = ANY($1::uuid[])
+             AND c.posting_number = ANY($2::text[])
+           ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
+        ),
+        items AS (
+          SELECT u.posting_number AS pn,
                  substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
                  SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-            FROM app_order_cache c
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-           WHERE ${sharedIds.length ? "c.store_id = ANY($1::uuid[])" : "c.user_id = $1"}
-             AND c.posting_number = ANY($2::text[])
-             AND COALESCE(p->>'name','') ILIKE '%пряж%'
+            FROM unique_postings u
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
+           WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
              AND COALESCE(p->>'offer_id','') <> ''
            GROUP BY 1, 2
         )
         SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS kinds, MIN(color) AS c1 FROM items GROUP BY pn`,
-      [sharedIds.length ? sharedIds : req.user.id, picked],
+      [scopeIds, picked],
     );
     const sorted = sortYarnOrderRows(rows.rows);
     res.json({ success: true, posting_numbers: sorted.map((r) => String(r.pn)) });
@@ -16771,26 +16792,24 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     // Accio Work (2026-11-06)：同店铺多账号归并，避免各见一半
     const sharedIds = await resolveSharedStoreIds(db, storeIds);
     const scopeIds = sharedIds.length ? sharedIds : storeIds;
-    const rows = await db.query(
-      `SELECT DISTINCT c.posting_number
-         FROM app_order_cache c
-         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
-        WHERE c.store_id = ANY($1::uuid[])
-          AND c.posting_number = ANY($2::text[])
-          AND COALESCE(p->>'name','') ILIKE '%пряж%'`,
-      [scopeIds, picked],
-    );
-    // 用和「导出毛线拣货单」**完全相同**的 SQL + 排序规则，保证两个文件的顺序一一对应
+    // Accio Work (2026-11-07) 和拣货单口径对齐：同一 posting 只取 synced_at 最新的一行，
+    //   再做颜色/件数聚合；避免多 store 同步导致数量翻倍、排序错乱。
     const orderRows = await db.query(
-      `WITH items AS (
-          SELECT c.posting_number AS pn,
-                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+      `WITH unique_postings AS (
+          SELECT DISTINCT ON (c.posting_number)
+                 c.posting_number, c.payload, c.synced_at
             FROM app_order_cache c
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(c.payload->'products','[]'::jsonb)) p
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
-             AND COALESCE(p->>'name','') ILIKE '%пряж%'
+           ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
+        ),
+        items AS (
+          SELECT u.posting_number AS pn,
+                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
+                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+            FROM unique_postings u
+            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
+           WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
              AND COALESCE(p->>'offer_id','') <> ''
            GROUP BY 1, 2
         )
