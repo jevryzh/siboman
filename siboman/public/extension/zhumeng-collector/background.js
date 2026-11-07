@@ -12,7 +12,7 @@
  *   - diagnose action
  */
 
-const VERSION = "2.2.9.213";
+const VERSION = "2.2.9.215";
 const OZON_FRONTEND_ORIGIN = "https://www.ozon.ru";
 const OZON_PRODUCT_URL = (sku) => `https://www.ozon.ru/product/${sku}/`;
 const OPI_BASE_URL = "https://api-seller.ozon.ru";
@@ -6484,6 +6484,82 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch (e) {
         console.error(`[SW ${VERSION}] discoverCategoryPage error:`, e.message);
         sendResponse({ ok: false, error: e.message || String(e), version: VERSION });
+      }
+    })();
+    return true;
+  }
+
+  if (msg.action === "smartPickCrawlStores") {
+    (async () => {
+      try {
+        const taskId = String(msg.taskId || "").trim();
+        const stores = Array.isArray(msg.stores)
+          ? msg.stores.map((s) => String(s || "").trim()).filter(Boolean).slice(0, 20)
+          : [];
+        if (!taskId) return sendResponse({ ok: false, error: "缺少选品任务 ID" });
+        if (!stores.length) return sendResponse({ ok: false, error: "请先添加至少 1 个 Ozon 卖家店铺链接或 ID" });
+
+        const collectedSkus = new Set();
+        let pages = 0;
+        for (const rawStore of stores) {
+          let targetUrl = rawStore;
+          if (!/^https?:\/\//i.test(targetUrl)) {
+            const digits = targetUrl.match(/(\d{3,20})/)?.[1];
+            targetUrl = digits
+              ? `https://www.ozon.ru/seller/${digits}/products/`
+              : `https://www.ozon.ru/seller/${encodeURIComponent(targetUrl)}/products/`;
+          }
+          let tab = null;
+          try {
+            tab = await createTabWithRetry({ url: targetUrl, active: false }, "打开 Ozon 好店页");
+            await sleep(4500);
+            const [inj] = await chrome.scripting.executeScript({
+              target: { tabId: tab.id },
+              func: () => {
+                const skus = new Set();
+                const anchors = Array.from(document.querySelectorAll('a[href*="/product/"]'));
+                for (const a of anchors) {
+                  const href = String(a.getAttribute("href") || "");
+                  const m = href.match(/\/product\/(?:[^/?#]*-)?(\d{5,20})(?:\/|\?|$)/);
+                  if (m) skus.add(m[1]);
+                }
+                const html = document.documentElement?.innerHTML || "";
+                const re = /"sku"\s*:\s*"?(\d{6,20})"?/g;
+                let match;
+                while ((match = re.exec(html)) !== null && skus.size < 80) {
+                  skus.add(match[1]);
+                }
+                return Array.from(skus).slice(0, 80);
+              },
+            });
+            for (const s of inj?.result || []) collectedSkus.add(String(s));
+            pages += 1;
+          } catch (err) {
+            console.warn("[SmartPickCrawl] store tab error:", err?.message || err);
+          } finally {
+            if (tab?.id) chrome.tabs.remove(tab.id).catch(() => {});
+          }
+        }
+
+        const skuList = Array.from(collectedSkus);
+        if (skuList.length) {
+          await erpApi(`/api/smart-pick/tasks/${encodeURIComponent(taskId)}/skus`, {
+            method: "POST",
+            body: JSON.stringify({ skus: skuList, done: true }),
+          }).catch((e) => console.warn("[SmartPickCrawl] report skus failed:", e?.message || e));
+        }
+        sendResponse({
+          ok: true,
+          result: {
+            reported: skuList.length,
+            skus: skuList,
+            pages,
+            stores: stores.length,
+            done: true,
+          },
+        });
+      } catch (e) {
+        sendResponse({ ok: false, error: e?.message || String(e) });
       }
     })();
     return true;

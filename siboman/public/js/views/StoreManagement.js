@@ -57,6 +57,7 @@ window.StoreManagementView = {
     // v2.2.9.208 结算日期：插件逐单/逐页回推进度（之前按批回报，WHD 不足一批时长时间停在 0/N）。
     // v2.2.9.209 结算日期：逐个 seller 标签页探测，避免多店铺时选到别家标签页导致 403、0 命中。
     // v2.2.9.211 毛线标签：插件端 429 退避重试（Accio Work 修改）
+    // v2.2.9.215 AI 智选：按好店找品与双通道协同（Accio Work 修改）
     const PLUGIN_MANIFEST_VERSION = Vue.ref('');
     const PLUGIN_ZIP_VERSION = Vue.ref('');
     const fetchPluginVersions = async () => {

@@ -172,6 +172,7 @@ const initApp = () => {
         'yandex-orders': 'Yandex 订单', 'ozon-patrol': '巡查跟卖', 'sales-funnel': '销售漏斗',
         'statistics-analysis': '月结统计', 'settlement-detail': '应计原始数据',
         'data-screen': '数据大屏', stores: '店铺管理', analytics: '统计分析', 'market-discovery': '选品发现',
+        'smart-pick': 'AI 智选',
       };
       const routeName = Vue.computed(() => {
         const path = currentPath.value.toLowerCase();
@@ -180,6 +181,7 @@ const initApp = () => {
         if (path === '#/ai-image') return 'ai-generator';
         if (path === '#/screen') return 'data-screen';
         if (path === '#/ranking') return 'market-discovery';
+        if (path.includes('smart-pick')) return 'smart-pick';
         if (path.includes('dashboard')) return 'dashboard';
         if (path.includes('sales-funnel') || path.includes('funnel')) return 'sales-funnel';
         if (path.includes('single-sourcing-review')) return 'single-sourcing-review';
@@ -241,6 +243,9 @@ const initApp = () => {
             </el-menu-item>
             <el-menu-item index="#/sourcing" @click="goTo('#/sourcing')">
               <el-icon><TrendCharts /></el-icon><span>选品中心</span>
+            </el-menu-item>
+            <el-menu-item index="#/smart-pick" @click="goTo('#/smart-pick')">
+              <el-icon><MagicStick /></el-icon><span>AI 智选</span>
             </el-menu-item>
             <el-menu-item index="#/collection" @click="goTo('#/collection')">
               <el-icon><Box /></el-icon><span>采集箱</span>
@@ -328,6 +333,7 @@ const initApp = () => {
           <el-main class="erp-main">
             <div v-if="routeName === 'dashboard'" class="erp-route-page"><dashboard-view /></div>
             <div v-else-if="routeName === 'sourcing'" class="erp-route-page"><market-discovery-view /></div>
+            <div v-else-if="routeName === 'smart-pick'" class="erp-route-page" style="padding:0; background:transparent; min-height:100%"><smart-pick-view /></div>
             <div v-else-if="routeName === 'single-sourcing-review'" class="erp-route-page"><single-sourcing-review-view /></div>
             <div v-else-if="routeName === 'single-sourcing'" class="erp-route-page"><sourcing-module-view /></div>
             <div v-else-if="routeName === 'collection'"><collection-box-view /></div>
@@ -389,6 +395,7 @@ const initApp = () => {
   register('settlement-detail-view', window.SettlementDetailView);
   register('data-screen-view', window.DataScreenView);
   register('market-discovery-view', window.MarketDiscoveryView);
+  register('smart-pick-view', window.SmartPickView);
   register('store-management-view', window.StoreManagementView);
   register('ozon-patrol-view', window.OzonPatrolView);
   register('analytics-funnel-view', window.AnalyticsFunnelView);

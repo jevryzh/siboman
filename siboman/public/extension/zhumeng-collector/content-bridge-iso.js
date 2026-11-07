@@ -15,7 +15,7 @@
   "use strict";
   const PROTO = "__zhumeng_proto";
   const PROTO_VAL = "zhumeng-v1";
-  const VERSION = "2.2.9.213";
+  const VERSION = "2.2.9.215";
 
   console.log(`[逐梦采集器 v${VERSION}][ISO] 启动, 监听 window message`);
 
@@ -222,6 +222,21 @@
         replyToMain(reqId, "discoverCategory.response", resp);
       } catch (e) {
         replyToMain(reqId, "discoverCategory.response", { ok: false, error: e.message });
+      }
+      return;
+    }
+
+    // Accio Work (2026-11-07): AI 智选「按好店找品」翻页抓取 Ozon 卖家店铺 SKU
+    if (kind === "smartPickCrawl.request" || kind === "smart-pick-crawl.request") {
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          action: "smartPickCrawlStores",
+          taskId: String(data.taskId || ""),
+          stores: Array.isArray(data.stores) ? data.stores : [],
+        });
+        replyToMain(reqId, kind.replace(/\.request$/, ".response"), resp || { ok: false, error: "插件无返回" });
+      } catch (e) {
+        replyToMain(reqId, kind.replace(/\.request$/, ".response"), { ok: false, error: e.message });
       }
       return;
     }

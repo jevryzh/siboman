@@ -20,6 +20,25 @@ import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js
 import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
+import {
+  BUILTIN_CATEGORY_TREE,
+  ensureSmartPickTables,
+  getOrCreateSmartPickTask,
+  formatSmartPickTaskRow,
+  formatSmartPickItemRow,
+  summarizeSmartPickItems,
+  normalizeSmartPickPolicy,
+  normalizeSmartPickScope,
+  refillSmartPickItems,
+  recalculateTaskItemsForPolicy,
+  ingestSmartPickStoreSkus,
+  runSmartPickDualChannelSourcing,
+  finalizeSmartPickItemPackage,
+  batchFinalizeSmartPickItems,
+  updateSmartPickItemQuote,
+  pushSmartPickToCollectBox,
+  pushSmartPickToFollowSell,
+} from "./lib/smart-pick-engine.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -2599,6 +2618,7 @@ async function initDatabase() {
     `);
 
     await seedInitialUsers();
+    await ensureSmartPickTables(db, path.join(__dirname, "data", "smart-pick-seed.json"));
   } catch (e) {
     console.error("[initDatabase] ERROR:", e);
     // 不退出，尝试继续运行，某些 DDL 报错不影响基本功能
@@ -13579,6 +13599,500 @@ app.post("/api/auto-listing/items/bulk-action", requireAuth, async (req, res, ne
     }
     res.json({ success: true, updated: result.rowCount });
   } catch (error) { next(error); }
+});
+
+// ============================================================================
+// Accio Work (2026-11-07): AI 智选（Smart-Pick Engine）REST API
+// ============================================================================
+
+async function resolveSmartPickStoreId(req) {
+  const raw = String(
+    req.query?.store_id ||
+      req.query?.storeId ||
+      req.body?.store_id ||
+      req.body?.storeId ||
+      req.headers["x-store-id"] ||
+      "",
+  )
+    .split(",")[0]
+    .trim();
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRe.test(raw)) return raw;
+  if (!db) return null;
+  const fallback = await db.query(
+    `SELECT id FROM app_stores WHERE user_id = $1 AND platform = 'ozon' ORDER BY created_at ASC LIMIT 1`,
+    [req.user.id],
+  );
+  return fallback.rows[0]?.id || null;
+}
+
+async function loadSmartPickTaskAndSummary(taskId, userId) {
+  const taskRes = await db.query(
+    `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+    [taskId, userId],
+  );
+  if (!taskRes.rowCount) return null;
+  const taskRow = taskRes.rows[0];
+  const itemsRes = await db.query(
+    `SELECT * FROM app_smart_pick_items
+      WHERE task_id = $1
+      ORDER BY
+        CASE sourcing_stage
+          WHEN 'good' THEN 1
+          WHEN 'listed' THEN 2
+          WHEN 'matched' THEN 3
+          WHEN 'sourcing' THEN 4
+          WHEN 'queued' THEN 5
+          WHEN 'idle' THEN 6
+          WHEN 'over_budget' THEN 7
+          WHEN 'low_margin' THEN 8
+          WHEN 'not_single' THEN 9
+          WHEN 'no_source' THEN 10
+          WHEN 'failed' THEN 11
+          ELSE 12
+        END ASC,
+        COALESCE(actual_margin_pct, est_margin_pct, -999) DESC,
+        sold_count DESC,
+        updated_at DESC`,
+    [taskRow.id],
+  );
+  const formattedItems = itemsRes.rows.map(formatSmartPickItemRow);
+  const summary = summarizeSmartPickItems(formattedItems, taskRow);
+  const formattedTask = formatSmartPickTaskRow(taskRow, summary);
+  return { taskRow, formattedTask, formattedItems, summary };
+}
+
+app.get("/api/smart-pick/categories", requireAuth, async (req, res, next) => {
+  try {
+    res.json({ ok: true, categories: BUILTIN_CATEGORY_TREE });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/smart-pick/quote", requireAuth, async (req, res) => {
+  res.json({
+    ok: true,
+    pointsPerCandidate: 0,
+    maxCandidates: 5,
+    maxPointsPerItem: 0,
+    mode: "dual_channel",
+  });
+});
+
+app.get("/api/smart-pick/tasks", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = await resolveSmartPickStoreId(req);
+    const taskRow = await getOrCreateSmartPickTask(db, { userId: req.user.id, storeId });
+    const bundle = await loadSmartPickTaskAndSummary(taskRow.id, req.user.id);
+    res.json({
+      ok: true,
+      task: bundle.formattedTask,
+      summary: bundle.summary,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = await resolveSmartPickStoreId(req);
+    const taskRow = await getOrCreateSmartPickTask(db, { userId: req.user.id, storeId });
+    const nextPolicy = normalizeSmartPickPolicy({
+      ...(taskRow.policy || {}),
+      ...(req.body?.policy || req.body || {}),
+    });
+    const nextScope = normalizeSmartPickScope(req.body?.scope || taskRow.scope || {});
+    const nextStatus = req.body?.status ? String(req.body.status) : String(taskRow.status || "running");
+
+    const upd = await db.query(
+      `UPDATE app_smart_pick_tasks
+          SET policy = $2::jsonb,
+              scope = $3::jsonb,
+              status = $4,
+              next_run_at = now() + interval '1 minute',
+              updated_at = now()
+        WHERE id = $1
+        RETURNING *`,
+      [taskRow.id, JSON.stringify(nextPolicy), JSON.stringify(nextScope), nextStatus],
+    );
+    const updatedTaskRow = upd.rows[0];
+
+    // 1) 对现有全部商品按新策略立即重算预算、运费、预估/真实利润率与状态流转
+    const recalc = await recalculateTaskItemsForPolicy(db, {
+      taskId: updatedTaskRow.id,
+      policy: nextPolicy,
+    });
+
+    // 2) 若当前商品数不足 targetCount，自动补池
+    const cntRes = await db.query(
+      `SELECT COUNT(*)::int AS cnt FROM app_smart_pick_items WHERE task_id = $1`,
+      [updatedTaskRow.id],
+    );
+    const currentCnt = Number(cntRes.rows[0]?.cnt || 0);
+    if (currentCnt < nextPolicy.targetCount) {
+      await refillSmartPickItems(db, {
+        taskRow: updatedTaskRow,
+        limit: Math.min(60, nextPolicy.targetCount - currentCnt),
+      });
+    }
+
+    const bundle = await loadSmartPickTaskAndSummary(updatedTaskRow.id, req.user.id);
+    res.json({
+      ok: true,
+      task: bundle.formattedTask,
+      summary: bundle.summary,
+      recalculated: recalc,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/smart-pick/tasks/:id/items", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    if (!bundle) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    res.json({
+      ok: true,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+      total: bundle.formattedItems.length,
+      list: bundle.formattedItems,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/refill", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const taskRow = taskRes.rows[0];
+    const limit = Math.min(100, Math.max(5, Number(req.body?.limit || 30)));
+    const refillResult = await refillSmartPickItems(db, { taskRow, limit });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      refill: refillResult,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+      total: bundle.formattedItems.length,
+      list: bundle.formattedItems,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+const handleSmartPickIngestSkus = async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1`,
+      [taskId],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const result = await ingestSmartPickStoreSkus(db, {
+      taskRow: taskRes.rows[0],
+      skus: req.body?.skus || [],
+      done: Boolean(req.body?.done),
+    });
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
+};
+
+app.post("/api/smart-pick/tasks/:id/skus", requireAuth, handleSmartPickIngestSkus);
+app.post("/ozon/selection/smart-pick/tasks/:id/skus", requireAuth, handleSmartPickIngestSkus);
+
+app.post("/api/smart-pick/tasks/:id/source", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const taskRow = taskRes.rows[0];
+    const itemIds = Array.isArray(req.body?.itemIds || req.body?.ids)
+      ? (req.body.itemIds || req.body.ids).map(String).filter(Boolean)
+      : [];
+
+    const result = await runSmartPickDualChannelSourcing(db, {
+      taskRow,
+      itemIds,
+      limit: Math.min(60, Math.max(5, Number(req.body?.limit || 30))),
+    });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      result,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+      total: bundle.formattedItems.length,
+      list: bundle.formattedItems,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/smart-pick/tasks/:id/items/:itemId/ozon-dims", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const itemId = String(req.params.itemId || "").trim();
+    const rowRes = await db.query(
+      `SELECT * FROM app_smart_pick_items WHERE id = $1 AND task_id = $2 AND user_id = $3`,
+      [itemId, taskId, req.user.id],
+    );
+    if (!rowRes.rowCount) return res.status(404).json({ ok: false, error: "商品不存在" });
+    const row = rowRes.rows[0];
+
+    // 优先查 app_products 中是否已有该 SKU 的实测尺寸
+    const prodRes = await db.query(
+      `SELECT weight, depth, width, height FROM app_products WHERE offer_id = $1 OR name ILIKE $2 LIMIT 1`,
+      [String(row.sku), `%${String(row.sku)}%`],
+    );
+    const prod = prodRes.rows[0];
+    const weightG = Number(row.weight_g || prod?.weight || 320);
+    const lengthMm = Number(prod?.depth || 220);
+    const widthMm = Number(prod?.width || 160);
+    const heightMm = Number(prod?.height || 80);
+
+    res.json({
+      ok: true,
+      dims: {
+        grossWeightG: weightG,
+        lengthMm,
+        widthMm,
+        heightMm,
+        lengthCm: Math.round((lengthMm / 10) * 10) / 10,
+        widthCm: Math.round((widthMm / 10) * 10) / 10,
+        heightCm: Math.round((heightMm / 10) * 10) / 10,
+        source: "ozon",
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/items/:itemId/finalize", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const itemId = String(req.params.itemId || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+
+    // 支持前端传 cm 或 mm
+    const grossWeightG = Number(req.body?.grossWeightG ?? req.body?.weightG ?? 320);
+    const lengthMm =
+      req.body?.lengthMm != null
+        ? Number(req.body.lengthMm)
+        : Number(req.body?.lengthCm || 22) * 10;
+    const widthMm =
+      req.body?.widthMm != null
+        ? Number(req.body.widthMm)
+        : Number(req.body?.widthCm || 16) * 10;
+    const heightMm =
+      req.body?.heightMm != null
+        ? Number(req.body.heightMm)
+        : Number(req.body?.heightCm || 8) * 10;
+
+    const item = await finalizeSmartPickItemPackage(db, {
+      taskRow: taskRes.rows[0],
+      itemId,
+      grossWeightG,
+      lengthMm,
+      widthMm,
+      heightMm,
+      source: String(req.body?.source || "manual"),
+    });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      item,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/batch-finalize", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const itemIds = Array.isArray(req.body?.itemIds || req.body?.ids)
+      ? (req.body.itemIds || req.body.ids).map(String).filter(Boolean)
+      : [];
+    const result = await batchFinalizeSmartPickItems(db, {
+      taskRow: taskRes.rows[0],
+      itemIds,
+    });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      result,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+      total: bundle.formattedItems.length,
+      list: bundle.formattedItems,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/items/:itemId/quote", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const itemId = String(req.params.itemId || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const item = await updateSmartPickItemQuote(db, {
+      taskRow: taskRes.rows[0],
+      itemId,
+      actualCostCny: req.body?.actualCostCny ?? req.body?.priceCny,
+      moqText: req.body?.moqText || "",
+      note: req.body?.note || "",
+    });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      item,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/collect-box", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const itemIds = Array.isArray(req.body?.itemIds || req.body?.ids)
+      ? (req.body.itemIds || req.body.ids).map(String).filter(Boolean)
+      : [];
+    const result = await pushSmartPickToCollectBox(db, {
+      taskRow: taskRes.rows[0],
+      userId: req.user.id,
+      itemIds,
+    });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      ...result,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+      list: bundle.formattedItems,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/follow-sell", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const taskRes = await db.query(
+      `SELECT * FROM app_smart_pick_tasks WHERE id = $1 AND user_id = $2`,
+      [taskId, req.user.id],
+    );
+    if (!taskRes.rowCount) return res.status(404).json({ ok: false, error: "选品任务不存在" });
+    const itemIds = Array.isArray(req.body?.itemIds || req.body?.ids)
+      ? (req.body.itemIds || req.body.ids).map(String).filter(Boolean)
+      : [];
+    const storeId = await resolveSmartPickStoreId(req);
+    const result = await pushSmartPickToFollowSell(db, {
+      taskRow: taskRes.rows[0],
+      userId: req.user.id,
+      storeId,
+      itemIds,
+    });
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      ...result,
+      task: bundle.formattedTask,
+      counts: bundle.summary.counts,
+      summary: bundle.summary,
+      list: bundle.formattedItems,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/smart-pick/tasks/:id/items/delete", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const taskId = String(req.params.id || "").trim();
+    const itemIds = Array.isArray(req.body?.itemIds || req.body?.ids)
+      ? (req.body.itemIds || req.body.ids).map(String).filter(Boolean)
+      : [];
+    if (!itemIds.length) return res.status(400).json({ ok: false, error: "请先勾选要移除的商品" });
+    const del = await db.query(
+      `DELETE FROM app_smart_pick_items WHERE task_id = $1 AND user_id = $2 AND id = ANY($3::uuid[])`,
+      [taskId, req.user.id, itemIds],
+    );
+    const bundle = await loadSmartPickTaskAndSummary(taskId, req.user.id);
+    res.json({
+      ok: true,
+      deleted: del.rowCount,
+      task: bundle?.formattedTask || null,
+      counts: bundle?.summary?.counts || {},
+      summary: bundle?.summary || null,
+      list: bundle?.formattedItems || [],
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/sourcing/platform-snapshot/refresh", requireAuth, async (req, res, next) => {
