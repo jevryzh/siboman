@@ -274,10 +274,12 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const base = Math.floor(abs / count), rest = abs - base * count;
       return Array.from({ length: count }, (_, index) => sign * (base + (index < rest ? 1 : 0)));
     };
-    const addLoose = (unit, month, cents, flows, date) => {
+    const addLoose = (unit, month, cents, flows, date, isAd) => {
       const key = `${unit}|${month}`;
-      const item = loose.get(key) || { unit, month, income: 0, fees: 0, flows: 0, last_date: null };
-      if (cents > 0) item.income += cents; else item.fees += -cents;
+      const item = loose.get(key) || { unit, month, income: 0, fees: 0, ad: 0, flows: 0, last_date: null };
+      // 广告（逐单报表拆出来的 54/41）挂不到订单时仍要算「推广」，不能当成代扣
+      if (isAd) item.ad += Math.abs(cents);
+      else if (cents > 0) item.income += cents; else item.fees += -cents;
       item.flows += flows;
       if (date && (!item.last_date || date > item.last_date)) item.last_date = date;
       loose.set(key, item);
@@ -314,10 +316,12 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       const coveredElsewhere = source === 'ozon' && (typeId === 41 || typeId === 54);
       if (!targets.length) {
         // 挂不到任何一个包裹单的流水，按「单号+月份」单独成行，进「主单级费用」一起统计
-        if (cents && month && unit && !coveredElsewhere) addLoose(unit, month, cents, 1, String(entry.date));
+        if (cents && month && unit && !coveredElsewhere) {
+          addLoose(unit, month, cents, 1, String(entry.date), source === 'ad_report' && (typeId === 41 || typeId === 54));
+        }
       } else if (residual > 0 && month && unit && !coveredElsewhere) {
         // 有包裹归属、但仍有 SKU 在主单下匹配不到：残差进主单级费用，不再静默丢弃
-        addLoose(unit, month, residual, 0, String(entry.date));
+        addLoose(unit, month, residual, 0, String(entry.date), false);
       }
       for (const target of targets) {
         const row = slot(target.posting);
@@ -388,7 +392,8 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     // 它们没有结算日期，归月用应计日期，订单类型标成 MONTHLY_FEE_TYPE，供页面筛选。
     for (const item of loose.values()) {
       const income = item.income / 100, fees = -item.fees / 100;
-      const receipt = rounded(income + fees);
+      const looseAd = item.ad ? rounded(item.ad / 100) : null;
+      const receipt = rounded(income + fees - (looseAd || 0));
       const receiptCny = rate ? rounded(receipt * rate) : null;
       list.push({
         posting_number: item.unit,
@@ -397,7 +402,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         settled_date: null, order_settled_date: null, accrual_date: item.last_date,
         order_type: MONTHLY_FEE_TYPE, cancel_reason: '',
         income_rub: income, ozon_fees_rub: fees,
-        advertising_cpo_rub: null, advertising_cpc_rub: null, allocated_ad_rub: null, advertising_rub: null,
+        advertising_cpo_rub: looseAd, advertising_cpc_rub: null, allocated_ad_rub: null, advertising_rub: looseAd,
         receipt_rub: receipt, receipt_cny: receiptCny,
         purchase_cny: null, label_cny: null, profit_cny: null, version: 0,
         margin_pct: null, platform_net_rub: receipt, low_income: false, no_accrual: false,
@@ -726,10 +731,24 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
       }
       await stage('正在回填结算日期', 95);
       await updateSettledFromSales(ctx);
+      // 订单成员变了（新单进表 / 补到历史单），41 点击广告的分母就变了，分摊必须按新成员重算。
+      // 只重算「同步区间内、本来就有分摊」的日子，避免每次同步都全表重扫。
+      let reallocDays = 0;
+      if (changed > 0) {
+        await stage('正在重算点击广告分摊', 97);
+        const days = datesBetween(syncRange.from, syncRange.to < shanghaiDate() ? syncRange.to : shanghaiDate());
+        const existing = (await query(`SELECT DISTINCT ad_date::text AS d FROM app_statistics_click_allocations
+          WHERE user_id=$1 AND store_id=$2 AND ad_date = ANY($3::date[])`, [ctx.userId, ctx.storeId, days]))
+          .rows.map((row) => row.d);
+        if (existing.length) {
+          reallocDays = existing.length;
+          await transaction(ctx, (client) => rebuildClickAllocations(client, ctx, existing));
+        }
+      }
       await query(`UPDATE app_statistics_order_syncs SET status='succeeded',fetched=$2,changed=$3,finished_at=now(),phase='同步完成',progress=100,message=$4 WHERE id=$1`,
-        [id, fetched, changed, `ERP 订单表 ${syncRange.from} ~ ${syncRange.to} · 读取 ${fetched} 单 · 更新 ${changed} 单`]);
+        [id, fetched, changed, `ERP 订单表 ${syncRange.from} ~ ${syncRange.to} · 读取 ${fetched} 单 · 更新 ${changed} 单${reallocDays ? ` · 重算点击分摊 ${reallocDays} 天` : ''}`]);
       clearCache(ctx.storeId);
-      return { fetched, changed, from: syncRange.from, to: syncRange.to, days: syncRange.days, total };
+      return { fetched, changed, from: syncRange.from, to: syncRange.to, days: syncRange.days, total, realloc_days: reallocDays };
     } catch (error) {
       await query(`UPDATE app_statistics_order_syncs SET status='failed',fetched=$2,changed=$3,finished_at=now(),message=$4,phase=$5 WHERE id=$1`,
         [id, fetched, changed, String(error.message || error).slice(0, 500), '同步失败']).catch(() => {});
