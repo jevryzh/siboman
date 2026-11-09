@@ -18,6 +18,7 @@ import https from "node:https";
 import net from "node:net";
 import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
 import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
+import { createBusinessAnalysis } from "./lib/business-analysis.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
 import {
@@ -28291,6 +28292,10 @@ await migrateYandexEnvToStores();
 const statisticsAnalysis = createStatisticsAnalysis({ db, assertStoreAccess: assertActiveStoreAccess, callOzon: callOzonSellerAPI, defaultRate: RUB_CNY_RATE, credentialSecret: AUTH_SECRET, notify: sendAlertMailThrottled });
 await statisticsAnalysis.init();
 statisticsAnalysis.register(app, requireAuth);
+// 经营分析（店铺结算 → 经营分析）：主营总览直接复用月结统计口径，Etsy 走月度录入，资金流水独立成表
+const businessAnalysis = createBusinessAnalysis({ db, statistics: statisticsAnalysis });
+await businessAnalysis.init();
+businessAnalysis.register(app, requireAuth);
 if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
   setTimeout(() => maybeRefreshOzonOpportunityPool("startup"), 12000).unref?.();
   setInterval(() => maybeRefreshOzonOpportunityPool("interval"), OZON_OPPORTUNITY_REFRESH_INTERVAL_MS).unref?.();

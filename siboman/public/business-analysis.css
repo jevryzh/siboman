@@ -1,0 +1,213 @@
+/* 经营分析（经营总览 / 资金流水） */
+.biz-page { max-width: 1760px; margin: 0 auto; }
+.biz-page * { box-sizing: border-box; }
+/* 组件根节点本身也是 .erp-route-page，和外层 wrapper 重复吃了一份 padding
+   （左右各 34px），这里去掉内层那份，把宽度让给表格 */
+.erp-route-page > .biz-page:not(.biz-embedded) { padding: 0; background: transparent; min-height: 0; }
+/* 工具栏末尾的动作按钮：永远排在同一行，且靠右对齐 */
+.biz-toolbar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; margin-left: auto; }
+/* 资金流水页：左右留白收紧、不设上限，把宽度尽量给表格 */
+.erp-route-page:has(> .biz-cashflow:not(.biz-embedded)) { padding: 18px 16px; }
+.biz-cashflow { max-width: none; }
+.biz-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
+.biz-title { margin: 0; font-size: 26px; line-height: 1.2; color: #0f172a; font-weight: 900; }
+.biz-sub { margin: 6px 0 0; color: #64748b; font-size: 13px; line-height: 1.5; }
+.biz-head-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.biz-alert { margin-bottom: 12px; }
+
+.biz-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 12px; }
+.biz-kpis-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.biz-kpi { background: #fff; border: 1px solid #dfe7f1; border-radius: 8px; padding: 10px 12px; min-width: 0; }
+.biz-kpi > span { display: block; color: #64748b; font-size: 11px; font-weight: 800; }
+.biz-kpi > strong { display: block; margin: 5px 0 2px; font-size: 20px; line-height: 1.15; font-weight: 900; color: #0f172a; }
+.biz-kpi > small { color: #94a3b8; font-size: 11px; font-weight: 700; }
+
+.biz-empty { background: #fff; border: 1px dashed #cbd5e1; border-radius: 8px; padding: 28px; color: #64748b; font-size: 14px; line-height: 1.8; }
+
+.biz-chart-card { background: #fff; border: 1px solid #dfe7f1; border-radius: 8px; padding: 10px 12px 4px; margin-bottom: 12px; }
+.biz-chart-head { font-weight: 900; color: #0f172a; font-size: 13px; }
+.biz-chart-head small { color: #94a3b8; font-weight: 700; }
+.biz-chart { height: 190px; width: 100%; }
+
+.biz-entity { background: #fff; border: 1px solid #dfe7f1; border-radius: 8px; padding: 0 0 14px; margin-bottom: 16px; overflow: hidden; }
+.biz-entity-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; background: #f8fafc; border-bottom: 1px solid #e5edf6; flex-wrap: wrap; }
+.biz-entity-name { font-size: 18px; font-weight: 900; color: #0f172a; }
+.biz-entity-totals { display: flex; gap: 18px; flex-wrap: wrap; color: #64748b; font-size: 13px; }
+.biz-entity-totals b { color: #0f172a; font-size: 15px; }
+.biz-entity-empty { padding: 18px; color: #94a3b8; font-size: 13px; }
+
+.biz-platform { padding: 12px 18px 0; }
+.biz-platform-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+.biz-platform-tag { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 900; }
+.biz-tag-etsy { background: #fff7ed; color: #c2410c; border: 1px solid #fed7aa; }
+.biz-tag-ozon { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+
+.biz-store { margin-bottom: 14px; }
+.biz-store-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+.biz-store-head b { font-size: 14px; color: #0f172a; }
+.biz-store-total { margin-top: 6px; color: #64748b; font-size: 12px; }
+.biz-store-total b { color: #0f172a; }
+.biz-table { margin-top: 2px; }
+
+/* 股东权益页 */
+.biz-tabs .el-tabs__header { margin-bottom: 12px; }
+/* 总览：左 3/5（股权结构 + 上月流水） + 右 2/5（股东规则整块） */
+.biz-eq-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; align-items: stretch; }
+.biz-eq-left { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.biz-eq-left > .biz-matrix-card { margin-bottom: 0; }
+.biz-eq-right { min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+.biz-eq-right > .biz-matrix-card { width: 100%; margin-bottom: 0; display: flex; flex-direction: column; }
+.biz-eq-right > .biz-matrix-card:last-child { flex: 1; }
+.biz-eq-right .biz-rules { flex: 1; overflow: auto; }
+/* 出入总览 */
+.biz-flow-table { font-size: 11.5px; min-width: 300px; }
+.biz-flow-table th, .biz-flow-table td { padding: 4px 6px; }
+.biz-flow-table th { background: #f1f5f9; }
+.biz-flow-name { text-align: left; font-weight: 900; color: #0f172a; }
+.biz-flow-in .biz-flow-name { color: #15803d; }
+.biz-flow-out .biz-flow-name { color: #b45309; }
+.biz-flow-profit td { background: #eff6ff; font-weight: 900; }
+.biz-flow-total { background: #fffbeb !important; font-weight: 900; color: #78350f; }
+@media (max-width: 1200px) { .biz-eq-layout { grid-template-columns: minmax(0, 1fr); } }
+.biz-embedded.erp-route-page { padding: 4px 0 0; max-width: none; }
+.biz-ladder-wrap { overflow-x: auto; }
+/* 今年度流出结余：二级分类 × 月份 横向矩阵 */
+.biz-year-matrix { min-width: 900px; }
+.biz-year-matrix th, .biz-year-matrix td { font-size: 10.5px; padding: 3px 4px; }
+.biz-year-matrix .biz-col-month { min-width: 96px; font-size: 10.5px; text-align: left; padding-left: 8px; }
+.biz-year-matrix .biz-sub-name { padding-left: 18px; font-weight: 700; color: #334155; }
+.biz-year-matrix tfoot td { background: #fffbeb; font-weight: 900; color: #78350f; }
+.biz-year-matrix th.biz-group-head { background: #e2e8f0; color: #0f172a; font-weight: 900; font-size: 10.5px; }
+.biz-year-matrix th.biz-sub-head { background: #f1f5f9; color: #334155; font-weight: 800; font-size: 10px; }
+.biz-year-matrix th.biz-total-head { background: #fde68a; color: #78350f; font-weight: 900; }
+.biz-year-matrix .biz-col-total { background: #fffbeb; font-weight: 900; color: #78350f; }
+.biz-year-matrix .biz-col-balance { background: #eff6ff; font-weight: 900; color: #1d4ed8; }
+.biz-year-matrix tbody tr:hover td { background: #f8fafc; }
+.biz-equity-card { background: #fff; border: 1px solid #dfe7f1; border-radius: 8px; padding: 12px 14px; min-height: 260px; }
+.biz-equity-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid #e5edf6; font-weight: 900; color: #0f172a; font-size: 14px; }
+.biz-equity-empty { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; min-height: 190px; text-align: center; color: #94a3b8; font-size: 13px; }
+.biz-equity-empty p { margin: 0; }
+.biz-equity-table th { background: #f1f5f9; }
+.biz-equity-table td { text-align: center; color: #334155; font-weight: 700; }
+.biz-equity-table .biz-eq-name { text-align: left; font-weight: 900; color: #0f172a; }
+.biz-equity-table .biz-eq-top { background: #fff7ed; color: #9a3412; text-align: center; line-height: 1.7; }
+.biz-equity-table .biz-eq-top strong { display: block; font-weight: 900; }
+.biz-equity-table .biz-eq-top span { display: block; font-weight: 900; }
+.biz-eq-hist { display: block; margin-top: 3px; font-style: normal; font-size: 10px; font-weight: 700; color: #94a3b8; line-height: 1.5; }
+.biz-eq-top-inner { display: block; cursor: help; line-height: 1.7; }
+.biz-eq-unpaid { min-width: 110px; }
+/* PB / 团队 TOP 的悬浮记录列表 */
+.biz-tip { font-size: 11px; line-height: 1.75; }
+.biz-tip-title { font-weight: 900; margin-bottom: 2px; }
+
+/* 股东规则文本块 */
+.biz-rules { display: flex; flex-direction: column; gap: 14px; }
+.biz-rule h4 { margin: 0 0 6px; font-size: 13px; font-weight: 900; color: #0f172a; }
+.biz-rule p { margin: 0 0 4px; font-size: 12.5px; line-height: 1.7; color: #334155; }
+.biz-rule p:last-child { margin-bottom: 0; }
+.biz-ladder { margin-top: 8px; }
+.biz-ladder th, .biz-ladder td { font-size: 11px; padding: 3px 5px; }
+.biz-ladder th { background: #f8fafc; }
+.biz-ladder tbody td:first-child { font-weight: 900; background: #f1f5f9; }
+
+/* 经营总览 · 月度矩阵（月份 × 分块，分块头带底色） */
+.biz-matrix-card { background: #fff; border: 1px solid #dfe7f1; border-radius: 8px; padding: 10px 12px 12px; margin-bottom: 12px; }
+.biz-matrix-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; font-weight: 900; color: #0f172a; font-size: 13px; }
+.biz-matrix-title small { color: #94a3b8; font-weight: 700; font-size: 11px; }
+.biz-matrix-wrap { overflow-x: auto; max-width: 100%; }
+.biz-matrix-card { min-width: 0; overflow: hidden; }
+.biz-flow-wrap { overflow-x: auto; max-width: 100%; }
+.biz-matrix { border-collapse: collapse; width: 100%; min-width: 640px; font-size: 11.5px; background: #fff; }
+.biz-matrix th, .biz-matrix td { border: 1px solid #cbd5e1; padding: 3px 6px; white-space: nowrap; }
+.biz-matrix thead th { font-weight: 900; color: #0f172a; text-align: center; vertical-align: middle; font-size: 11.5px; }
+.biz-matrix .biz-col-month { position: sticky; left: 0; z-index: 2; background: #f1f5f9; color: #0f172a; font-weight: 900; text-align: center; min-width: 56px; font-size: 11.5px; }
+.biz-matrix thead .biz-col-month { z-index: 3; }
+
+.biz-grp { font-size: 11.5px; letter-spacing: .2px; }
+.biz-grp em { font-style: normal; font-weight: 700; opacity: .75; }
+.biz-grp-blue { background: #dbeafe; color: #1e3a8a; }
+.biz-grp-green { background: #dcfce7; color: #166534; }
+.biz-grp-amber { background: #fef3c7; color: #92400e; }
+.biz-grp-bao { background: #bbf7d0; color: #14532d; }
+.biz-grp-team { background: #fde68a; color: #78350f; }
+.biz-grp-btn { margin-left: 8px; padding: 1px 8px; border: 1px solid rgba(15,23,42,.25); border-radius: 4px; background: rgba(255,255,255,.7); color: inherit; font-size: 11px; font-weight: 800; cursor: pointer; }
+.biz-grp-btn:hover { background: #fff; }
+.biz-grp-err { margin-left: 6px; color: #dc2626; font-weight: 900; font-size: 11px; }
+.biz-grp-miss { margin-left: 6px; padding: 0 6px; border-radius: 3px; background: rgba(148,163,184,.25); color: #475569; font-size: 10px; font-weight: 800; }
+.biz-range-tag { display: inline-flex; align-items: center; height: 30px; padding: 0 10px; border-radius: 6px; background: #f1f5f9; color: #475569; font-size: 12px; font-weight: 800; }
+
+/* 年度合计行 + 月份列备注 */
+.biz-matrix tbody tr.biz-row-year td { background: #eef2f7 !important; font-weight: 900; color: #0f172a; border-top: 1px solid #94a3b8; }
+.biz-matrix tbody tr.biz-row-year .biz-col-month { background: #e2e8f0 !important; }
+.biz-th-note { display: block; margin-top: 1px; font-style: normal; font-size: 10px; font-weight: 700; color: #94a3b8; }
+.biz-th-warn { color: #d97706; }
+
+.biz-sub { background: #f8fafc; color: #475569; font-weight: 800; font-size: 10.5px; }
+.biz-sub-blue { background: #eff6ff; }
+.biz-sub-green { background: #f0fdf4; }
+.biz-sub-amber { background: #fffbeb; }
+
+.biz-matrix tbody tr:nth-child(even) td { background: #fcfdff; }
+.biz-matrix tbody tr:nth-child(even) .biz-col-month { background: #eef2f7; }
+.biz-matrix tbody tr:hover td { background: #f5f9ff; }
+.biz-matrix tbody tr:hover .biz-col-month { background: #e8eff8; }
+
+.biz-num { text-align: right; font-variant-numeric: tabular-nums; font-weight: 700; color: #334155; }
+.biz-num-profit { color: #0f172a; }
+.biz-num-neg { color: #dc2626 !important; }
+.biz-num-bao { background: #dcfce7 !important; font-weight: 900; color: #14532d; }
+.biz-num-team { background: #fffbeb !important; font-weight: 900; color: #78350f; }
+
+/* 表格右上角：图标图例 */
+.biz-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.biz-legend-item { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; font-weight: 800; color: #475569; }
+.biz-legend-item .biz-ico { margin-left: 0; }
+.biz-legend-hint { color: #94a3b8; font-weight: 700; }
+
+/* 表内标记图标：销冠 / 个人 PB / 团队 PB */
+.biz-grp-note { background: #f1f5f9; color: #334155; min-width: 150px; }
+.biz-matrix td.biz-note { text-align: left; white-space: normal; min-width: 150px; padding: 3px 8px; }
+.biz-ico { margin-left: 4px; font-size: 13px; vertical-align: -2px; }
+.biz-ico-gold { color: #f59e0b; }
+.biz-ico-blue { color: #2563eb; }
+.biz-ico-green { color: #16a34a; }
+.biz-ico-amber { color: #8b5cf6; }
+.biz-matrix tbody tr.biz-row-year td.biz-note { background: #eef2f7; }
+.biz-note-input { width: 100%; border: 1px solid transparent; background: transparent; padding: 2px 4px; font-size: 11.5px; color: #334155; border-radius: 4px; outline: none; }
+.biz-note-input::placeholder { color: #cbd5e1; }
+.biz-note-input:hover { border-color: #e2e8f0; background: #fff; }
+.biz-note-input:focus { border-color: #93c5fd; background: #fff; box-shadow: 0 0 0 2px rgba(59,130,246,.12); }
+.biz-note-stat { display: block; font-size: 11px; font-weight: 800; color: #0f172a; line-height: 1.6; }
+
+/* 表体按人上色：超=浅蓝、宝=浅绿，一眼分得开 */
+.biz-matrix tbody td.biz-tint-blue { background: #f6faff; }
+.biz-matrix tbody td.biz-tint-green { background: #f4fdf7; }
+.biz-matrix tbody tr:hover td.biz-tint-blue { background: #eaf4ff; }
+.biz-matrix tbody tr:hover td.biz-tint-green { background: #e8fbef; }
+
+.biz-matrix tfoot td { background: #f8fafc; font-weight: 900; color: #0f172a; border-top: 2px solid #94a3b8; }
+.biz-matrix tfoot .biz-col-month { background: #e8eef6; }
+
+.biz-card { background: #fff; border: 1px solid #dfe7f1; border-radius: 8px; padding: 0 0 4px; }
+.biz-card-head { padding: 12px 14px; border-bottom: 1px solid #e5edf6; font-weight: 900; color: #0f172a; font-size: 14px; }
+.biz-card-head small { color: #94a3b8; font-weight: 700; margin-left: 6px; }
+
+.biz-toolbar { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.biz-bulk { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; font-size: 13px; color: #1e3a8a; }
+
+.biz-muted { color: #94a3b8; font-size: 12px; font-weight: 700; }
+.biz-zero { color: #cbd5e1; }
+.biz-pos { color: #15803d; }
+.biz-neg { color: #dc2626; }
+.biz-row-pending td { background: #fffbeb !important; }
+
+.biz-profile h3 { margin: 0 0 10px; font-size: 15px; color: #0f172a; }
+.biz-profile-row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+
+@media (max-width: 1200px) {
+  .biz-kpis, .biz-kpis-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* 导入预览：自动归类汇总条 */
+.biz-import-summary { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.biz-chip { display: inline-flex; align-items: center; gap: 4px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 3px 8px; font-size: 12px; color: #334155; font-weight: 700; }

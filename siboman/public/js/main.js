@@ -171,6 +171,7 @@ const initApp = () => {
         'yandex-products': 'Yandex 商品', 'yandex-autolist': 'Yandex 自动上架', 'yandex-inventory': 'Yandex 库存',
         'yandex-orders': 'Yandex 订单', 'ozon-patrol': '巡查跟卖', 'sales-funnel': '销售漏斗',
         'statistics-analysis': '月结统计', 'settlement-detail': '应计原始数据',
+        'business-overview': '经营总览', cashflow: '资金流水', 'shareholder-equity': '股东权益',
         'data-screen': '数据大屏', stores: '店铺管理', analytics: '统计分析', 'market-discovery': '选品发现',
         'smart-pick': 'AI 智选',
       };
@@ -182,6 +183,9 @@ const initApp = () => {
         if (path === '#/screen') return 'data-screen';
         if (path === '#/ranking') return 'market-discovery';
         if (path.includes('smart-pick')) return 'smart-pick';
+        if (path.includes('business-overview')) return 'business-overview';
+        if (path.includes('shareholder-equity')) return 'shareholder-equity';
+        if (path.includes('cashflow')) return 'cashflow';
         if (path.includes('dashboard')) return 'dashboard';
         if (path.includes('sales-funnel') || path.includes('funnel')) return 'sales-funnel';
         if (path.includes('single-sourcing-review')) return 'single-sourcing-review';
@@ -213,6 +217,8 @@ const initApp = () => {
         const r = routeName.value;
         if (r === 'yandex-products' || r === 'yandex-orders' || r === 'yandex-inventory' || r === 'yandex-autolist') return 'yandex';
         if (r === 'stores') return 'all';
+        // 经营分析跨多个店铺/平台，不该因为切页面把顶栏店铺改掉
+        if (r === 'business-overview' || r === 'cashflow' || r === 'shareholder-equity') return 'all';
         return 'ozon';
       });
       Vue.watch(headerPlatform, (platform) => {
@@ -237,7 +243,7 @@ const initApp = () => {
             <img src="/extension/zhumeng-collector/icons/icon48.png" style="width:28px; height:28px; border-radius:6px" />
             逐梦 ERP
           </div>
-          <el-menu :default-active="currentPath" background-color="#001529" text-color="#fff">
+          <el-menu :default-active="currentPath" :default-openeds="['statistics','biz-analysis']" background-color="#001529" text-color="#fff">
             <el-menu-item index="#/dashboard" @click="goTo('#/dashboard')">
               <el-icon><Odometer /></el-icon><span>仪表盘</span>
             </el-menu-item>
@@ -297,6 +303,11 @@ const initApp = () => {
               <el-menu-item index="#/statistics-analysis" @click="goTo('#/statistics-analysis')"><span>月结统计</span></el-menu-item>
               <el-menu-item index="#/settlement-detail" @click="goTo('#/settlement-detail')"><span>应计原始数据</span></el-menu-item>
             </el-sub-menu>
+            <el-sub-menu index="biz-analysis">
+              <template #title><el-icon><TrendCharts /></el-icon><span>经营分析</span></template>
+              <el-menu-item index="#/business-overview" @click="goTo('#/business-overview')"><span>经营总览</span></el-menu-item>
+              <el-menu-item index="#/shareholder-equity" @click="goTo('#/shareholder-equity')"><span>股东权益</span></el-menu-item>
+            </el-sub-menu>
             <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
               <el-icon><Monitor /></el-icon><span>数据大屏</span>
             </el-menu-item>
@@ -350,6 +361,9 @@ const initApp = () => {
             <div v-else-if="routeName === 'analytics'" class="erp-route-page"><analytics-center-view /></div>
             <div v-else-if="routeName === 'statistics-analysis'" class="erp-route-page"><statistics-analysis-view /></div>
             <div v-else-if="routeName === 'settlement-detail'" class="erp-route-page"><settlement-detail-view /></div>
+            <div v-else-if="routeName === 'business-overview'" class="erp-route-page"><business-overview-view /></div>
+            <div v-else-if="routeName === 'shareholder-equity'" class="erp-route-page"><shareholder-equity-view /></div>
+            <div v-else-if="routeName === 'cashflow'" class="erp-route-page"><cash-flow-view /></div>
             <div v-else-if="routeName === 'data-screen'"><data-screen-view /></div>
             <div v-else-if="routeName === 'market-discovery'" class="erp-route-page"><market-discovery-view /></div>
             <div v-else-if="routeName === 'stores'"><store-management-view /></div>
@@ -393,6 +407,9 @@ const initApp = () => {
   register('analytics-center-view', window.AnalyticsCenterView);
   register('statistics-analysis-view', window.StatisticsAnalysisView);
   register('settlement-detail-view', window.SettlementDetailView);
+  register('business-overview-view', window.BusinessOverviewView);
+  register('shareholder-equity-view', window.ShareholderEquityView);
+  register('cash-flow-view', window.CashFlowView);
   register('data-screen-view', window.DataScreenView);
   register('market-discovery-view', window.MarketDiscoveryView);
   register('smart-pick-view', window.SmartPickView);
