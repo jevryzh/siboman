@@ -19,7 +19,18 @@ window.StatisticsAnalysisView = {
     // 主筛选栏常驻的两个日期区间：下单日期 / 结算日期
     const orderDateRange = ref([]), settleDateRange = ref([]);
     const batchNumbers = ref([]), batchVisible = ref(false), batchText = ref(''), batchError = ref('');
-    const missingOnly = ref(false), unsettledOnly = ref(false), sort = ref('ordered_at'), direction = ref('asc');
+    // 默认按下单日期倒序（用户口径，2026-11-09）
+    const missingOnly = ref(false), unsettledOnly = ref(false), sort = ref('ordered_at'), direction = ref('desc');
+    // 结算明细表格高度：按窗口实测算，避免页面级滚动条
+    const detailTableHeight = ref(480);
+    const sizeDetailTable = async () => {
+      await Vue.nextTick();
+      const el = table.value && table.value.$el;
+      if (!el) return;
+      const top = el.getBoundingClientRect().top;
+      const reserve = 74; // 分页 footer + 页面底部留白
+      detailTableHeight.value = Math.max(260, Math.floor(window.innerHeight - top - reserve));
+    };
     const selected = ref([]), table = ref(null), costVisible = ref(false), drafts = ref([]), fillAmount = ref(null), labelFillAmount = ref(null);
     const costError = ref(''), costScope = ref(null), uploadInput = ref(null), monthVisible = ref(false), costSource = ref('manual');
     const costPage = ref(1);
@@ -172,6 +183,7 @@ window.StatisticsAnalysisView = {
         const response = await requestOrders('/api/statistics/report');
         if (token !== generation || !sameScope(scope)) return;
         rows.value = response.data.rows; total.value = response.data.total; run.value = response.data.run;
+        if (tab.value === 'orders') sizeDetailTable();
         // 表格月份与顶部月份不一致时（切换了月份但还没重载表格），不要用表格结果覆盖顶部卡片
         if (scope.month === month.value) summary.value = response.data.summary;
         fieldCatalog.value = response.data.filter_catalog || []; advertising.value = response.data.advertising || {};
@@ -884,16 +896,21 @@ window.StatisticsAnalysisView = {
     }
     watch(month, () => { ledgerVisible.value = false; if (!month.value) return; loadSummary(); });
     // 月份选择器只改顶部统计；切回订单明细时，若月份变过才跟着重载
-    watch(tab, (value) => { if (value === 'orders' && tableMonth.value !== month.value) applyFilter(); });
+    watch(tab, (value) => {
+      if (value !== 'orders') return;
+      sizeDetailTable();
+      if (tableMonth.value !== month.value) applyFilter();
+    });
     watch(monthRange, () => { if (monthRange.value?.length === 2) load(); });
     onMounted(() => {
+      window.addEventListener('resize', () => { if (tab.value === 'orders') sizeDetailTable(); });
       // 不做定时轮询，进页面、切月份、同步完成后各拉一次
       window.addEventListener('shop-changed', shopChanged);
       window.addEventListener('message', onSettleProgress);
       load();
     });
     onBeforeUnmount(() => { stopped = true; generation++; clearInterval(poll); stopOrderSyncPoll(); window.removeEventListener('shop-changed', shopChanged); window.removeEventListener('message', onSettleProgress); });
-    return { tab, month, monthRange, loading, saving, syncing, orderSyncing, orderSyncRange, orderSyncProgress, orderLogLoading, orderLogs, orderLogLast, syncOrdersNow, loadOrderLogs, recordsVisible, recordsTab, openRecords, recordsTabChanged, exporting, error, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
+    return { tab, month, monthRange, loading, saving, syncing, orderSyncing, orderSyncRange, orderSyncProgress, orderLogLoading, orderLogs, orderLogLast, syncOrdersNow, loadOrderLogs, recordsVisible, recordsTab, openRecords, recordsTabChanged, exporting, error, detailTableHeight, rows, monthly, summary, run, total, page, pageSize, search, status, orderType, missingOnly, unsettledOnly,
       settledSyncing, settledStage, settleRun, settleResult, settlePercent, settleProgressText, copyFailed, onSettleProgress, cookieVisible, cookieSaving, cookieInput, webSession, syncSettledDates, cookieFromBrowser, saveCookie, loadWebSession,
       orderDateRange, settleDateRange,
       selected, table, costVisible, drafts, fillAmount, labelFillAmount, costError, uploadInput, monthVisible, monthDraft, settingsError, changes, changesLoading,
@@ -988,7 +1005,7 @@ window.StatisticsAnalysisView = {
           <div class="statistics-actions"><el-button :icon="'Plus'" :disabled="rules.length>=30" @click="addRule">条件</el-button><el-button :icon="'Search'" type="primary" @click="queryRules">应用筛选</el-button><el-tooltip content="清空全部筛选"><el-button :icon="'RefreshLeft'" circle aria-label="清空筛选" @click="resetFilters"/></el-tooltip><span class="statistics-meta">同时满足全部条件</span></div>
         </div>
         <div class="statistics-data-note" v-if="summary.coverage && !summary.coverage.complete">应计数据未完整同步：本月 {{summary.coverage.checked_days}} / {{summary.coverage.expected_days}} 天。毛利暂不结算。</div>
-        <el-table ref="table" :data="rows" v-loading="loading" row-key="posting_number" border stripe max-height="calc(100vh - 400px)" @selection-change="selected=$event" @sort-change="sortChanged" empty-text="所选月份暂无应计订单" class="statistics-orders">
+        <el-table ref="table" :data="rows" v-loading="loading" row-key="posting_number" border stripe :max-height="detailTableHeight" style="min-height:260px" :default-sort="{ prop: 'ordered_at', order: 'descending' }" @selection-change="selected=$event" @sort-change="sortChanged" empty-text="所选月份暂无应计订单" class="statistics-orders">
           <el-table-column type="selection" width="40" :reserve-selection="true" :selectable="canMaintainCosts"/>
           <el-table-column prop="posting_number" label="订单号" width="190" fixed="left" sortable="custom">
             <template #default="{row}"><div class="statistics-posting">

@@ -383,7 +383,10 @@ export function filterReportRows(rows, params = {}) {
     && (params.missing_cost !== '1' || (row.purchase_cny == null && !row.loose_month))
     && (params.unsettled !== '1' || (row.order_settled_date == null && !row.loose_month))
     && tests.every((test) => test(row)));
-  const key = catalog.has(params.sort) ? params.sort : 'ordered_at', direction = params.direction === 'desc' ? -1 : 1;
+  // 不传排序时默认按下单日期倒序（口径：列表最新的单在上面）
+  const explicitSort = catalog.has(params.sort);
+  const key = explicitSort ? params.sort : 'ordered_at';
+  const direction = params.direction === 'desc' ? -1 : params.direction === 'asc' ? 1 : (explicitSort ? 1 : -1);
   return filtered.sort((a, b) => a[key] == null ? (b[key] == null ? 0 : 1) : b[key] == null ? -1
     : direction * (typeof a[key] === 'number' ? a[key] - b[key] : String(a[key]).localeCompare(String(b[key]))));
 }
