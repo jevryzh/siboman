@@ -243,60 +243,30 @@ const initApp = () => {
             <img src="/extension/zhumeng-collector/icons/icon48.png" style="width:28px; height:28px; border-radius:6px" />
             逐梦 ERP
           </div>
-          <el-menu :default-active="currentPath" :default-openeds="['statistics','biz-analysis']" background-color="#001529" text-color="#fff">
+          <el-menu :default-active="currentPath" :default-openeds="['selection-mgmt','product-mgmt','statistics','biz-analysis','yandex-mgmt','ai-tools']" background-color="#001529" text-color="#fff">
             <el-menu-item index="#/dashboard" @click="goTo('#/dashboard')">
               <el-icon><Odometer /></el-icon><span>仪表盘</span>
             </el-menu-item>
-            <el-menu-item index="#/sourcing" @click="goTo('#/sourcing')">
-              <el-icon><TrendCharts /></el-icon><span>选品中心</span>
-            </el-menu-item>
-            <el-menu-item index="#/smart-pick" @click="goTo('#/smart-pick')">
-              <el-icon><MagicStick /></el-icon><span>AI 智选</span>
-            </el-menu-item>
-            <el-menu-item index="#/collection" @click="goTo('#/collection')">
-              <el-icon><Box /></el-icon><span>采集箱</span>
-            </el-menu-item>
-            <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')">
-              <el-icon><Search /></el-icon><span>单品找货</span>
-            </el-menu-item>
-            <el-menu-item index="#/products" @click="goTo('#/products')">
-              <el-icon><Goods /></el-icon><span>商品管理</span>
-            </el-menu-item>
-            <el-menu-item index="#/yandex-products" @click="goTo('#/yandex-products')">
-              <el-icon><GoodsFilled /></el-icon><span>Yandex 商品</span>
-            </el-menu-item>
-            <el-menu-item index="#/yandex-autolist" @click="goTo('#/yandex-autolist')">
-              <el-icon><UploadFilled /></el-icon><span>Yandex 自动上架</span>
-            </el-menu-item>
-            <el-menu-item index="#/yandex-inventory" @click="goTo('#/yandex-inventory')">
-              <el-icon><House /></el-icon><span>Yandex 库存</span>
-            </el-menu-item>
+            <!-- [Accio Work 修改] v2.2.9.219 左侧菜单重组：二级菜单分组版 -->
+            <el-sub-menu index="selection-mgmt">
+              <template #title><el-icon><TrendCharts /></el-icon><span>选品管理</span></template>
+              <el-menu-item index="#/sourcing" @click="goTo('#/sourcing')"><span>选品中心</span></el-menu-item>
+              <el-menu-item index="#/smart-pick" @click="goTo('#/smart-pick')"><span>AI 智选</span></el-menu-item>
+              <el-menu-item index="#/collection" @click="goTo('#/collection')"><span>采集箱</span></el-menu-item>
+              <el-menu-item index="#/single-sourcing" @click="goTo('#/single-sourcing')"><span>单品找货</span></el-menu-item>
+            </el-sub-menu>
+            <el-sub-menu index="product-mgmt">
+              <template #title><el-icon><Goods /></el-icon><span>商品管理</span></template>
+              <el-menu-item index="#/products" @click="goTo('#/products')"><span>商品列表</span></el-menu-item>
+              <el-menu-item index="#/upload" @click="goTo('#/upload')"><span>批量上架</span></el-menu-item>
+              <el-menu-item index="#/listing-history" @click="goTo('#/listing-history')"><span>上架记录</span></el-menu-item>
+              <el-menu-item index="#/ozon-patrol" @click="goTo('#/ozon-patrol')"><span>巡查跟卖</span></el-menu-item>
+            </el-sub-menu>
             <el-menu-item index="#/inventory" @click="goTo('#/inventory')">
               <el-icon><House /></el-icon><span>库存管理</span>
             </el-menu-item>
-            <el-menu-item index="#/ozon-patrol" @click="goTo('#/ozon-patrol')">
-              <el-icon><View /></el-icon><span>巡查跟卖</span>
-            </el-menu-item>
             <el-menu-item index="#/orders" @click="goTo('#/orders')">
               <el-icon><ShoppingCart /></el-icon><span>订单管理</span>
-            </el-menu-item>
-            <el-menu-item index="#/yandex-orders" @click="goTo('#/yandex-orders')">
-              <el-icon><Tickets /></el-icon><span>Yandex 订单</span>
-            </el-menu-item>
-            <el-menu-item index="#/upload" @click="goTo('#/upload')">
-              <el-icon><UploadFilled /></el-icon><span>批量上架</span>
-            </el-menu-item>
-            <el-menu-item index="#/listing-history" @click="goTo('#/listing-history')">
-              <el-icon><Document /></el-icon><span>上架记录</span>
-            </el-menu-item>
-            <el-menu-item index="#/ai-generator" @click="goTo('#/ai-generator')">
-              <el-icon><MagicStick /></el-icon><span>AI 图片生成</span>
-            </el-menu-item>
-            <el-menu-item index="#/image-set-console" @click="openImageSetConsole">
-              <el-icon><PictureFilled /></el-icon><span>AI 套图控制台</span>
-            </el-menu-item>
-            <el-menu-item index="#/sales-funnel" @click="goTo('#/sales-funnel')">
-              <el-icon><TrendCharts /></el-icon><span>销售漏斗</span>
             </el-menu-item>
             <el-sub-menu index="statistics">
               <template #title><el-icon><DataAnalysis /></el-icon><span>店铺结算</span></template>
@@ -308,12 +278,23 @@ const initApp = () => {
               <el-menu-item index="#/business-overview" @click="goTo('#/business-overview')"><span>经营总览</span></el-menu-item>
               <el-menu-item index="#/shareholder-equity" @click="goTo('#/shareholder-equity')"><span>股东权益</span></el-menu-item>
             </el-sub-menu>
-            <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')">
-              <el-icon><Monitor /></el-icon><span>数据大屏</span>
-            </el-menu-item>
             <el-menu-item index="#/stores" @click="goTo('#/stores')">
               <el-icon><Setting /></el-icon><span>店铺管理</span>
             </el-menu-item>
+            <el-sub-menu index="yandex-mgmt">
+              <template #title><el-icon><GoodsFilled /></el-icon><span>Yandex 管理</span></template>
+              <el-menu-item index="#/yandex-products" @click="goTo('#/yandex-products')"><span>商品管理</span></el-menu-item>
+              <el-menu-item index="#/yandex-autolist" @click="goTo('#/yandex-autolist')"><span>自动上架</span></el-menu-item>
+              <el-menu-item index="#/yandex-inventory" @click="goTo('#/yandex-inventory')"><span>库存管理</span></el-menu-item>
+              <el-menu-item index="#/yandex-orders" @click="goTo('#/yandex-orders')"><span>订单管理</span></el-menu-item>
+            </el-sub-menu>
+            <el-sub-menu index="ai-tools">
+              <template #title><el-icon><MagicStick /></el-icon><span>AI 工具</span></template>
+              <el-menu-item index="#/ai-generator" @click="goTo('#/ai-generator')"><span>AI 图片生成</span></el-menu-item>
+              <el-menu-item index="#/image-set-console" @click="openImageSetConsole"><span>AI 套图控制台</span></el-menu-item>
+              <el-menu-item index="#/data-screen" @click="goTo('#/data-screen')"><span>数据大屏</span></el-menu-item>
+              <el-menu-item index="#/sales-funnel" @click="goTo('#/sales-funnel')"><span>销售漏斗</span></el-menu-item>
+            </el-sub-menu>
           </el-menu>
         </el-aside>
         <el-container>
