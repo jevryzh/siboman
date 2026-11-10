@@ -171,6 +171,37 @@ window.BusinessOverviewView = {
       return cells;
     };
 
+    // ── 月度是否结算完成 ──
+    // 规则（用户 2026-11-10 确认）：Ozon 应计数据齐全 + 其他平台数据也都录进来了，才算这个月结算完成
+    //   ① Ozon 块：用后端给的 settled（该月每天是否都同步过应计流水 + 月份已过完）
+    //   ② 手工录入的平台块（Etsy 等）：这块只要在某个月录过数据，说明在运营，
+    //      那么从那时起每个月都得录，没录就算「缺数据 → 未结算完」
+    const blockManualMeta = computed(() => {
+      const map = new Map();
+      for (const block of blocks.value) {
+        const months = (block.months || []).filter((m) => m.manual).map((m) => m.month).sort();
+        map.set(block.key, { hasManual: months.length > 0, firstMonth: months[0] || null });
+      }
+      return map;
+    });
+    const monthSettled = (month) => {
+      let judged = false, ok = true;
+      for (const block of blocks.value) {
+        const bucket = blockMonthIndex.value.get(block.key)?.get(month);
+        if (bucket && bucket.settled != null) {   // Ozon：应计齐不齐
+          judged = true;
+          if (!bucket.settled) ok = false;
+          continue;
+        }
+        const meta = blockManualMeta.value.get(block.key);
+        if (meta?.hasManual && month >= meta.firstMonth) {   // 手工平台：该月有没有录
+          judged = true;
+          if (!bucket?.manual) ok = false;
+        }
+      }
+      return judged ? ok : month <= completeCutoff.value;
+    };
+
     // ── 矩阵：月份行 + 每年合计行 + 区间合计 ──
     // 合计口径跟用户的表一致：国宝合计 = 宝的毛利合计（Ozon 毛利1 + Etsy 毛利2）；
     // 团队合计营收 = 超毛利 + 国宝合计（即所有块的毛利之和）
@@ -203,7 +234,7 @@ window.BusinessOverviewView = {
           month, label: `${month.slice(2, 4)}-${month.slice(5, 7)}`, cells,
           chao: r2(chao), bao: r2(bao), team: r2(team), isYear: false,
           note: notes.value[month] || '',
-          incomplete: month > completeCutoff.value,
+          incomplete: !monthSettled(month),
         });
         totals.bao = r2(totals.bao + bao);
         totals.team = r2(totals.team + team);

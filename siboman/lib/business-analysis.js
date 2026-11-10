@@ -422,6 +422,37 @@ export function createBusinessAnalysis({ db, statistics = null }) {
     return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
   };
 
+  // 判断某个月是否「结算完成」，口径与经营总览页面一致：
+  //   Ozon 平台：后端在 overview 里按应计日同步情况算好的 settled
+  //   手工录入平台（Etsy 等）：该块有录入后，每个月都得录
+  // 返回 null 表示两类数据都没有、无法判断（调用方回退到老的截止月规则）
+  function monthCompletion(ov) {
+    const groups = [];
+    for (const entity of ov.entities || []) for (const platform of entity.platforms || []) groups.push(platform);
+    const manualStart = new Map();
+    for (const g of groups) {
+      const first = (g.months || []).filter((m) => m.manual).map((m) => m.month).sort()[0];
+      if (first) manualStart.set(g, first);
+    }
+    return (month) => {
+      let judged = false;
+      for (const g of groups) {
+        const bucket = (g.months || []).find((m) => m.month === month);
+        if (bucket && bucket.settled != null) {
+          judged = true;
+          if (!bucket.settled) return false;
+          continue;
+        }
+        const first = manualStart.get(g);
+        if (first && month >= first) {
+          judged = true;
+          if (!bucket?.manual) return false;
+        }
+      }
+      return judged ? true : null;
+    };
+  }
+
   // ───────────────────────── 记录历史（团队 TOP / 个人 PB） ─────────────────────────
   // 从经营总览的月度毛利里滚出「每次刷新纪录」的月份列表：团队合计 / 超 / 宝
   async function recordHistory(userId, year) {
@@ -441,10 +472,14 @@ export function createBusinessAnalysis({ db, statistics = null }) {
         }
       }
     }
-    const cutoff = completeMonthCutoff(2);
+    // 参与记录的月份口径 = 「经营总览」里的「结算完成」：Ozon 应计日齐全 + 手工平台该月已录。
+    // 以前写死「当月-2」导致上月已经结完的月份也进不了 PB，用户反馈后才改。
+    const isComplete = monthCompletion(ov);
+    const fallback = completeMonthCutoff(2);
     const list = [...months.values()]
-      .filter((rec) => rec.month <= cutoff) // 不完整的月份不参与记录
+      .filter((rec) => { const done = isComplete(rec.month); return done == null ? rec.month <= fallback : done; })
       .sort((a, b) => a.month.localeCompare(b.month));
+    const cutoff = list.length ? list[list.length - 1].month : fallback;
     const build = (key) => {
       let max = 0;
       const history = [];
@@ -604,6 +639,28 @@ export function createBusinessAnalysis({ db, statistics = null }) {
       bucket.refund_cny = 0;
       bucket.orders += Number(row.orders || 0);
     }
+    // 月度结算完成度：该月每天是否都同步过应计流水（判断依据是 app_statistics_days，不是「最近两个月」这种拍脑袋规则）。
+    // 整月没有任何同步记录时不做判断（留给前端按老规则兜底），避免把同步起始前的月份标成未结算。
+    const checkedDays = new Set((data.days || []).map((d) => String(d.accrued_date).slice(0, 10)));
+    const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+    for (const bucket of months) {
+      const month = String(bucket.month || '').slice(0, 7);
+      if (!/^\d{4}-\d{2}$/.test(month)) continue;
+      const [y, mo] = month.split('-').map(Number);
+      const lastDay = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+      const monthEnd = `${month}-${String(lastDay).padStart(2, '0')}`;
+      const cutoff = monthEnd < today ? monthEnd : today;
+      const days = [];
+      for (let d = 1; d <= Number(cutoff.slice(8, 10)); d += 1) days.push(`${month}-${String(d).padStart(2, '0')}`);
+      if (!days.some((d) => checkedDays.has(d))) continue;
+      const missing = days.filter((d) => !checkedDays.has(d));
+      bucket.expected_days = days.length;
+      bucket.checked_days = days.length - missing.length;
+      bucket.missing_days = missing.length;
+      bucket.coverage_complete = missing.length === 0;
+      // 已过完的月份 + 应计日齐全 = 结算完成；当月必然未完成
+      bucket.settled = monthEnd < today && missing.length === 0;
+    }
     return { months, rate: effectiveRate };
   }
 
@@ -659,6 +716,8 @@ export function createBusinessAnalysis({ db, statistics = null }) {
           bucket.refund_cny = moneyOr0(bucket.refund_cny + m.refund_cny);
           bucket.profit_cny = moneyOr0(bucket.profit_cny + m.profit_cny);
           bucket.orders += Number(m.orders || 0);
+          // 结算完成标记：多店合并时，该月所有店都齐了才算完成
+          if (m.settled != null) bucket.settled = (bucket.settled ?? true) && m.settled;
         }
       }
 
