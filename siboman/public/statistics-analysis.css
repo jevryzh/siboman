@@ -179,3 +179,107 @@ body:has(.statistics-workbench) .erp-route-page { padding:14px 20px; }
 .statistics-ad-detail .ad-total { display:flex; align-items:baseline; justify-content:space-between; gap:28px; margin-top:7px; padding-top:9px; border-top:1px solid #dce2e5; font-size:13px; color:#26343c; }
 .statistics-ad-detail .ad-total b { font-size:15px; font-weight:500; font-variant-numeric:tabular-nums; }
 .statistics-ad-detail .ad-note { margin-top:7px; padding-top:7px; border-top:1px dashed #e5e9eb; font-size:11px; line-height:1.6; color:#9aa4a9; }
+
+/* ==========================================================================
+   订单管理页（.order-workbench）：
+   版式完全对齐「店铺结算 - 应计原始数据」，目的是把垂直空间全留给表格。
+   注意：这里不复用 .statistics-workbench 类名，避免带上它的移动端导航/侧栏规则。
+   ========================================================================== */
+/* 订单页的父容器（main.js 里 routeName==='orders' 那个 div）没有 erp-route-page 类，
+   所以内边距直接加在 .order-workbench 上：与月结统计（14/20）同一档，这里再松一点。 */
+.order-workbench { min-width:0; color:#26343c; font-size:14px; padding:18px 24px 22px; box-sizing:border-box; min-height:100%; }
+.order-workbench h2 { margin:0 0 3px; font-size:18px; font-weight:700; letter-spacing:0; }
+.order-workbench .statistics-heading { margin-bottom:10px; align-items:flex-start; gap:10px 12px; }
+.order-workbench .statistics-heading > div:first-child { min-width:0; flex:1 1 auto; }
+.order-workbench .statistics-heading .statistics-meta { white-space:normal; overflow:visible; text-overflow:clip; line-height:1.6; }
+.order-workbench .statistics-heading .statistics-actions { flex:0 0 auto; flex-wrap:wrap; justify-content:flex-end; }
+.order-workbench .el-button + .el-button { margin-left:0; }
+
+/* 表格：与应计原始数据同一密度（12px / 表头不折行 / 内边距 5px） */
+.order-workbench .el-table { border-radius:0; box-shadow:none; font-size:12px; }
+.order-workbench .el-table th.el-table__cell { padding:5px 0; }
+.order-workbench .el-table th.el-table__cell .cell { white-space:nowrap; font-size:12px; font-weight:600; padding:0 6px; line-height:1.5; }
+.order-workbench .el-table td.el-table__cell { padding:5px 0; }
+.order-workbench .el-table td.el-table__cell .cell { padding:0 6px; line-height:1.45; }
+.order-workbench .el-table .cell { font-variant-numeric:tabular-nums; }
+.order-workbench .el-table colgroup col[name="gutter"] { width:0!important; }
+.order-workbench .el-table__cell .el-button.is-link { height:auto; padding:0; font-size:11px; vertical-align:baseline; }
+.order-workbench .el-table__cell .el-tag { font-size:11px; padding:0 5px; height:19px; line-height:17px; }
+
+/* 状态页签：一行紧凑胶囊，整行铺满（原来是 max-content，右边留一大片空） */
+.order-workbench .order-status-tabs { display:flex; align-items:center; gap:3px; width:100%; padding:3px; margin-bottom:10px; background:#fff; border:1px solid #dce2e5; border-radius:6px; box-sizing:border-box; }
+.order-workbench .order-status-tab { flex:1 1 0; min-width:0; border:0; background:transparent; border-radius:4px; padding:4px 6px; font-size:13px; font-weight:600; color:#647177; cursor:pointer; white-space:nowrap; text-align:center; overflow:hidden; text-overflow:ellipsis; }
+.order-workbench .order-status-tab:hover { color:#185FA5; }
+.order-workbench .order-status-tab.is-active { background:#1f2937; color:#fff; }
+.order-workbench .order-status-tab .order-status-count { margin-left:5px; padding:0 5px; border-radius:9px; font-size:11px; font-weight:500; background:#eef2f7; color:#647177; }
+.order-workbench .order-status-tab.is-active .order-status-count { background:rgba(255,255,255,.2); color:#fff; }
+
+/* 标题栏抓取区：标签 + 时间窗 + 两个按钮，一行不换行 */
+.order-workbench .statistics-heading .statistics-actions.order-head-actions { display:flex; align-items:center; gap:8px; flex-wrap:nowrap; }
+.order-workbench .order-sync-label { font-size:12px; color:#6b767d; white-space:nowrap; }
+
+/* 工具栏 */
+.order-workbench .statistics-toolbar { padding:0 0 8px; align-items:flex-start; }
+.order-workbench .statistics-filters { row-gap:8px; }
+
+/* 订单页查询条件：压在一行里，不折行。
+   复选框默认带 30px 右边距、相邻按钮默认带 12px 左间距，这里都去掉，改用容器 gap 统一控制。 */
+.order-workbench .order-query-row { flex-wrap:nowrap; gap:6px; }
+.order-workbench .order-query-row .order-flag { margin-right:0; }
+.order-workbench .order-query-row .order-flag .el-checkbox__label { padding-left:5px; font-size:12px; }
+.order-workbench .order-query-row .el-button+.el-button { margin-left:0; }
+.order-workbench .order-query-row .el-date-editor,
+.order-workbench .order-query-row .el-input { flex:0 1 auto; min-width:0; }
+.order-workbench .order-query-row .el-input__wrapper { padding-left:7px; padding-right:7px; }
+.order-workbench .order-tool-row { justify-content:space-between; gap:10px 14px; }
+.order-workbench .order-autosync { display:flex; align-items:center; gap:8px; font-size:12px; color:#6b767d; white-space:nowrap; }
+.order-workbench .order-dot { width:7px; height:7px; border-radius:50%; display:inline-block; background:#cbd5e1; }
+.order-workbench .order-dot.is-on { background:#10b981; }
+
+/* 导出/打印进度：浅蓝底条，和统计页的同步进度条同款 */
+.order-workbench .order-progress { position:sticky; top:0; z-index:30; margin-bottom:10px; padding:9px 14px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; }
+.order-workbench .order-progress-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:6px; font-size:13px; font-weight:600; color:#0b5aa5; }
+.order-workbench .order-progress-detail { margin-top:5px; font-size:11px; color:#4b7ba8; }
+
+/* 已选订单条 */
+.order-workbench .order-selection-bar { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; padding:7px 12px; margin-bottom:8px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:6px; font-size:12px; color:#1e3a8a; }
+
+/* 单元格内容密度 */
+.order-workbench .order-cell-main { font-size:12px; font-weight:600; color:#26343c; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.order-workbench .order-cell-sub { font-size:11px; font-weight:400; color:#8a9499; line-height:1.45; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.order-workbench .order-cell-num { font-size:13px; font-weight:600; }
+.order-workbench .order-thumb { width:38px; height:38px; border-radius:5px; flex:none; background:#f3f5f7; }
+.order-workbench .order-thumb-empty { width:38px; height:38px; border-radius:5px; background:#f3f5f7; display:flex; align-items:center; justify-content:center; }
+.order-workbench .order-store-chip { display:inline-block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:2px 6px; border-radius:4px; background:#f2f6f7; font-size:11px; color:#647177; }
+.order-workbench .order-deadline { display:inline-flex; flex-direction:column; align-items:center; justify-content:center; min-width:50px; padding:2px 6px; border:1px solid; border-radius:5px; line-height:1.25; font-weight:600; }
+.order-workbench .order-deadline b { font-size:13px; }
+.order-workbench .order-deadline small { font-size:10px; font-weight:400; }
+
+/* 分页条：贴底一行，不额外占高 */
+.order-workbench .order-footer { display:flex; align-items:center; justify-content:flex-end; gap:10px; padding:8px 0 0; font-size:12px; color:#6b767d; }
+
+/* 定时任务看板弹窗 */
+.order-cron-dialog .el-dialog__body { padding-top:8px; max-height:76vh; overflow-y:auto; }
+.cron-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px; }
+.cron-meta { font-size:12px; color:#6b767d; line-height:1.6; }
+.cron-job { border:1px solid #e2e7e9; border-radius:8px; padding:12px 14px; margin-bottom:10px; background:#fff; }
+.cron-job.is-frontend { background:#fafbfc; }
+.cron-job-head { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
+.cron-job-head b { font-size:14px; color:#1f2937; }
+.cron-job-schedule { font-size:12px; color:#0b5aa5; background:#eff6ff; border-radius:4px; padding:2px 7px; }
+.cron-row { display:flex; gap:10px; padding:3px 0; }
+.cron-label { flex:0 0 40px; font-size:12px; color:#8a9499; }
+.cron-text { flex:1; min-width:0; font-size:12px; color:#4a565c; line-height:1.65; }
+.cron-chip { display:inline-block; margin:0 6px 4px 0; padding:1px 7px; border-radius:10px; background:#f2f6f7; color:#5b6a72; font-size:11px; }
+.cron-runs { margin-top:8px; padding-top:8px; border-top:1px dashed #e5e9eb; }
+.cron-run { display:flex; align-items:center; gap:8px; padding:3px 0; font-size:12px; color:#4a565c; }
+.cron-run-when { flex:0 0 42px; color:#8a9499; }
+.cron-run-time { flex:0 0 118px; font-variant-numeric:tabular-nums; color:#26343c; }
+.cron-run-dur { flex:0 0 46px; color:#8a9499; font-variant-numeric:tabular-nums; }
+.cron-run-summary { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.cron-run-empty { padding:6px 0; font-size:12px; color:#9aa4a9; }
+@media(max-width:900px) {
+  .order-workbench .statistics-heading .statistics-actions.order-head-actions { flex-wrap:wrap; justify-content:flex-start; }
+  .order-workbench .statistics-heading .statistics-actions { flex-wrap:wrap; justify-content:flex-start; }
+  .order-workbench .order-tool-row { flex-direction:column; align-items:stretch; }
+}

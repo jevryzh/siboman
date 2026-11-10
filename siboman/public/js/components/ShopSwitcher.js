@@ -3,10 +3,19 @@ window.ShopSwitcher = {
   props: {
     // ozon | yandex | all —— 决定下拉里展示哪个平台的店铺
     platform: { type: String, default: 'ozon' },
+    // 2026-11-10 订单页需要「全部店铺」这个聚合口径；只在该页开启，
+    //   选中后用独立标记 ordersAllStores 记录，不污染全局 currentStoreId，
+    //   这样切到其它页面时顶栏仍显示原来那家店铺，不会被带上 "__all__" 查空。
+    allowAll: { type: Boolean, default: false },
   },
   setup(props, { emit }) {
+    const ALL_VALUE = '__all__';
+    const ALL_FLAG_KEY = 'ordersAllStores';
+    const allStores = () => localStorage.getItem(ALL_FLAG_KEY) === '1';
     const shops = Vue.ref([]);
-    const currentStoreId = Vue.ref(localStorage.getItem('currentStoreId') || '');
+    const currentStoreId = Vue.ref(
+      props.allowAll && allStores() ? ALL_VALUE : (localStorage.getItem('currentStoreId') || ''),
+    );
     const loading = Vue.ref(false);
 
     const fetchShops = async () => {
@@ -25,6 +34,8 @@ window.ShopSwitcher = {
 
     // 当前选中的店铺若不属于本平台，自动切到本平台第一家
     const alignSelection = () => {
+      // 订单页选了「全部店铺」时不动它，否则会被这段逻辑改成第一家店
+      if (props.allowAll && currentStoreId.value === ALL_VALUE) return;
       const sid = localStorage.getItem('currentStoreId') || '';
       const valid = shops.value.some((s) => s.id === sid);
       if (!valid && shops.value.length) {
@@ -38,7 +49,16 @@ window.ShopSwitcher = {
     };
 
     const handleStoreChange = (val) => {
+      if (val === ALL_VALUE) {
+        localStorage.setItem(ALL_FLAG_KEY, '1');
+        currentStoreId.value = ALL_VALUE;
+        emit('change', ALL_VALUE);
+        window.dispatchEvent(new CustomEvent('shop-changed', { detail: ALL_VALUE }));
+        return;
+      }
+      localStorage.removeItem(ALL_FLAG_KEY);
       localStorage.setItem('currentStoreId', val);
+      currentStoreId.value = val;
       emit('change', val);
       window.dispatchEvent(new CustomEvent('shop-changed', { detail: val }));
     };
@@ -59,7 +79,7 @@ window.ShopSwitcher = {
     Vue.onMounted(fetchShops);
     Vue.watch(() => props.platform, fetchShops);
 
-    return { shops, currentStoreId, loading, handleStoreChange, displayClientId, platformLabel };
+    return { shops, currentStoreId, loading, handleStoreChange, displayClientId, platformLabel, ALL_VALUE };
   },
   template: `
     <div class="shop-switcher">
@@ -70,6 +90,12 @@ window.ShopSwitcher = {
         v-loading="loading"
         @change="handleStoreChange"
       >
+        <el-option v-if="allowAll" :value="ALL_VALUE" label="全部店铺（聚合）">
+          <div style="display: flex; align-items: center; gap: 8px">
+            <span>全部店铺（聚合）</span>
+            <el-tag size="small" type="warning">聚合</el-tag>
+          </div>
+        </el-option>
         <el-option
           v-for="shop in shops"
           :key="shop.id"

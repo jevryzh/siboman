@@ -19,6 +19,8 @@ import net from "node:net";
 import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
 import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
 import { createBusinessAnalysis } from "./lib/business-analysis.js";
+import { ensureCronTable, startCronRun, finishCronRun, listCronJobs, CRON_JOBS as CRON_JOBS_META } from "./lib/cron-registry.js";
+import { createOrderSync } from "./lib/order-sync.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
 import {
@@ -2206,6 +2208,34 @@ async function initDatabase() {
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS error TEXT NOT NULL DEFAULT '';
       ALTER TABLE app_order_costs ADD COLUMN IF NOT EXISTS source_url_1688 TEXT NOT NULL DEFAULT '';
       ALTER TABLE app_order_costs ADD COLUMN IF NOT EXISTS outbound_cost_cny NUMERIC(12,2) NOT NULL DEFAULT 0;
+      -- 2026-11-10 采购物流号（国内采购发往仓库的快递单号），订单页展示 + 后续备货对账用
+      ALTER TABLE app_order_costs ADD COLUMN IF NOT EXISTS purchase_tracking_no TEXT NOT NULL DEFAULT '';
+      -- 2026-11-10 订单页「导入采购」历史（每次导入一条，含源文件路径）
+      CREATE TABLE IF NOT EXISTS app_order_cost_imports (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL DEFAULT '',
+        file_path TEXT NOT NULL DEFAULT '',
+        rows INT NOT NULL DEFAULT 0,
+        applied INT NOT NULL DEFAULT 0,
+        failed INT NOT NULL DEFAULT 0,
+        message TEXT NOT NULL DEFAULT '',
+        details JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_order_cost_imports_user ON app_order_cost_imports(user_id, created_at DESC);
+      -- 2026-11-10 采购批次号（订单页「批次」功能）：一单一条，批次号在同一用户下跨订单只能是同一个批次
+      CREATE TABLE IF NOT EXISTS app_order_batches (
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL,
+        posting_number TEXT NOT NULL,
+        batch_no TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, store_id, posting_number)
+      );
+      CREATE INDEX IF NOT EXISTS idx_order_batches_no ON app_order_batches(user_id, batch_no);
+      CREATE INDEX IF NOT EXISTS idx_order_batches_posting ON app_order_batches(user_id, posting_number);
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS ozon_response JSONB NOT NULL DEFAULT '{}'::jsonb;
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
       ALTER TABLE app_order_ship_events ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
@@ -2790,6 +2820,20 @@ app.get("/api/version", async (_req, res) => {
     pluginVersion,
     pluginZipVersion: pluginVersion,
   });
+});
+
+/* ============================================================
+   定时任务看板：后台在跑哪些定时器、抓什么、条件是什么、最近几次跑出什么结果
+   ============================================================ */
+app.get("/api/system/cron-jobs", requireAuth, async (_req, res, next) => {
+  try {
+    if (!db) return res.json({ success: true, jobs: CRON_JOBS_META.map((job) => ({ ...job, runs: [] })) });
+    const jobs = await listCronJobs((text, params) => db.query(text, params), { runsPerJob: 3 });
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, serverTime: new Date().toISOString(), jobs });
+  } catch (error) {
+    next(error);
+  }
 });
 
 /* ============================================================
@@ -15875,6 +15919,114 @@ const resolveSharedStoreIds = async (db, storeIds) => {
   return r.rows.map((x) => x.id);
 };
 
+// 2026-11-10 订单查询条件统一入口（列表 / 导出 / 批次三处共用）。
+//   起因：列表和导出各写一套条件，结果「页面看到的」和「导出的」不是同一批数据。
+//   调用方先把店铺范围塞进 where（约定是 where[0]），这里只追加业务条件并推进 params。
+//   opts.alias      外层表别名：列表用 app_order_cache，导出用 c
+//   opts.storeScope 子查询里的店铺判断片段：列表 ANY($1::uuid[])，导出 <alias>.store_id
+//   ⚠️ 子查询里一律写限定名（app_order_cache.posting_number），裸列名会被解析成子查询自己的列 → 条件恒真
+//   ⚠️ 新增查询条件只改这一处，别在接口里另起一套。
+const appendOrderQueryConditions = (where, params, body = {}, opts = {}) => {
+  const alias = opts.alias || "app_order_cache";
+  const storeScope = opts.storeScope || "ANY($1::uuid[])";
+  const status = String(body.status || "").trim().toLowerCase();
+  const pushLike = (value) => { params.push(`%${value}%`); return params.length; };
+
+  if (body.since) { params.push(body.since); where.push(`${alias}.in_process_at >= $${params.length}`); }
+  if (body.to) { params.push(body.to); where.push(`${alias}.in_process_at <= $${params.length}`); }
+
+  if (status && status !== "all") {
+    params.push(status === "disputed" ? "dispute" : status);
+    where.push(`COALESCE(NULLIF(${alias}.display_status, ''), ${alias}.status) = $${params.length}`);
+  }
+
+  // 批量单号：货件号 / 订单号 / 订单号前缀三种形式兜底
+  const postingFilter = Array.isArray(body.posting_numbers)
+    ? body.posting_numbers.map((x) => String(x).trim()).filter(Boolean).slice(0, 1000)
+    : [];
+  if (postingFilter.length) {
+    params.push(postingFilter);
+    const exactIdx = params.length;
+    let sqlCond = `${alias}.posting_number = ANY($${exactIdx}::text[]) OR ${alias}.payload->>'order_number' = ANY($${exactIdx}::text[])`;
+    const prefixes = postingFilter.filter((x) => /^\d+-\d+$/.test(x));
+    if (prefixes.length) {
+      params.push(prefixes);
+      sqlCond += ` OR ${alias}.posting_number LIKE ANY(SELECT unnest($${params.length}::text[]) || '-%')`;
+    }
+    where.push(`(${sqlCond})`);
+  }
+
+  // 订单号框：同时支持订单号 / 货件号 / 采购批次号
+  const orderNoKeyword = String(body.order_no || "").trim();
+  if (orderNoKeyword) {
+    const idx = pushLike(orderNoKeyword);
+    where.push(`(${alias}.posting_number ILIKE $${idx}
+      OR COALESCE(${alias}.payload->>'order_number','') ILIKE $${idx}
+      OR EXISTS (SELECT 1 FROM app_order_batches b
+                  WHERE b.posting_number = ${alias}.posting_number
+                    AND b.store_id = ${storeScope}
+                    AND b.batch_no ILIKE $${idx}))`);
+  }
+
+  // 货品：名称 / 货号 / SKU
+  const productKeyword = String(body.product_q || "").trim();
+  if (productKeyword) {
+    const idx = pushLike(productKeyword);
+    where.push(`EXISTS (
+      SELECT 1 FROM jsonb_array_elements(COALESCE(${alias}.payload->'products','[]'::jsonb)) AS prod
+       WHERE COALESCE(prod->>'name','') ILIKE $${idx}
+          OR COALESCE(prod->>'offer_id','') ILIKE $${idx}
+          OR COALESCE(prod->>'sku','') ILIKE $${idx}
+    )`);
+  }
+
+  // 结算日期区间
+  const settledSince = String(body.settled_since || "").trim();
+  const settledTo = String(body.settled_to || "").trim();
+  if (settledSince || settledTo) {
+    params.push(settledSince || null, settledTo || null);
+    const sIdx = params.length - 1;
+    const tIdx = params.length;
+    where.push(`EXISTS (
+      SELECT 1 FROM app_statistics_orders so
+       WHERE so.posting_number = ${alias}.posting_number
+         AND so.store_id = ${storeScope}
+         AND so.settled_date IS NOT NULL
+         AND ($${sIdx}::date IS NULL OR so.settled_date >= $${sIdx}::date)
+         AND ($${tIdx}::date IS NULL OR so.settled_date <= $${tIdx}::date)
+    )`);
+  }
+
+  // 缺采购：只要「空」，等于 0 视为已填
+  if (body.missing_purchase === true || body.missing_purchase === "1") {
+    where.push(`NOT EXISTS (
+      SELECT 1 FROM app_statistics_costs sc
+       WHERE sc.posting_number = ${alias}.posting_number
+         AND sc.store_id = ${storeScope}
+         AND sc.purchase_cny IS NOT NULL
+    )`);
+  }
+
+  // 未结算：没有结算日期
+  if (body.unsettled === true || body.unsettled === "1") {
+    where.push(`NOT EXISTS (
+      SELECT 1 FROM app_statistics_orders so2
+       WHERE so2.posting_number = ${alias}.posting_number
+         AND so2.store_id = ${storeScope}
+         AND so2.settled_date IS NOT NULL
+    )`);
+  }
+
+  // 旧参数 q（导出还在用）：原始 payload 文本模糊匹配
+  const legacyQ = String(body.q || "").trim();
+  if (legacyQ) {
+    params.push(`%${legacyQ}%`);
+    where.push(`(${alias}.posting_number ILIKE $${params.length} OR ${alias}.payload::text ILIKE $${params.length})`);
+  }
+
+  return postingFilter;
+};
+
 /**
  * v0.3.3 订单列表 - 平铺金额 + 物理 JOIN 商品表拉图
  * 输入: {store_id, status, limit, offset, since, to}
@@ -16327,60 +16479,18 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
     };
 
     if (db && syncMode !== "live") {
-      const cacheCountRes = await db.query(
-        `SELECT count(*)::int AS count
-         FROM app_order_cache
-         WHERE user_id = $1 AND store_id = $2`,
-        [req.user.id, storeId],
-      );
-      const cacheCount = Number(cacheCountRes.rows[0]?.count || 0);
-      if (syncMode === "latest") {
-        const syncSince = req.body?.sync_since ? new Date(req.body.sync_since) : null;
-        const syncTo = req.body?.sync_to ? new Date(req.body.sync_to) : null;
-        if (syncSince && syncTo && Number.isFinite(syncSince.getTime()) && Number.isFinite(syncTo.getTime()) && syncSince <= syncTo) {
-          await syncCacheRange({ since: syncSince, to: syncTo, label: "manual" });
-        } else {
-          await syncCacheWindow(1);
-        }
-      }
-      else if (syncMode === "in_progress") await syncCacheWindow(defaultCacheHistoryDays);
-      else if (!hasExplicitRange && cacheCount < 550) await syncCacheWindow(defaultCacheHistoryDays);
+      // 2026-11-10 列表接口改为纯读缓存。
+      //   同步全部交给 lib/order-sync.js 的定时任务（新单/待处理/取消/运输中/签收/兜底/跟踪池/月度），
+      //   以及页面上的「立即同步」按钮（POST /api/seller/orders/sync）。
+      //   原来这里会按 sync_mode 顺手抓 Ozon，导致"点查询顺便全量重拉"，是配额浪费和慢的主因。
       await pruneCacheWindow(defaultCacheHistoryDays);
 
       // Accio Work (2026-11-06)：按同一 client_id 的所有 store 归并（同店铺多账号各见一半）
       const sharedStoreIds = db ? await resolveSharedStoreIds(db, storeId) : [storeId];
       const where = ["store_id = ANY($1::uuid[])"];
       const params = [sharedStoreIds.length ? sharedStoreIds : [storeId]];
-      if (req.body?.since) {
-        params.push(req.body.since);
-        where.push(`in_process_at >= $${params.length}`);
-      }
-      if (req.body?.to) {
-        params.push(req.body.to);
-        where.push(`in_process_at <= $${params.length}`);
-      }
-      if (status && status !== "all") {
-        params.push(status === "disputed" ? "dispute" : status);
-        where.push(`COALESCE(NULLIF(display_status, ''), status) = $${params.length}`);
-      }
-      // v2.2.9.169 按一批指定货件号查询（用户批量粘贴单号找订单）
-      const postingFilter = Array.isArray(req.body?.posting_numbers)
-        ? req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean).slice(0, 1000)
-        : [];
-      if (postingFilter.length) {
-        // v2.2.9.180 宽容匹配：用户可能粘贴「货件号」(8765-0022-3)、
-        //   「订单号」(8765-0022)、或带空格的，做三种形式兜底。
-        const exact = postingFilter;
-        const prefixes = postingFilter.filter((x) => /^\d+-\d+$/.test(x));   // 订单号形式 → 匹配 posting_number LIKE 'xxx-%'
-        params.push(exact);
-        const exactIdx = params.length;
-        let sqlCond = `posting_number = ANY($${exactIdx}::text[]) OR payload->>'order_number' = ANY($${exactIdx}::text[])`;
-        if (prefixes.length) {
-          params.push(prefixes);
-          sqlCond += ` OR posting_number LIKE ANY(SELECT unnest($${params.length}::text[]) || '-%')`;
-        }
-        where.push(`(${sqlCond})`);
-      }
+      // 查询条件统一走 appendOrderQueryConditions（与导出、批次接口同一套 SQL 条件）
+      const postingFilter = appendOrderQueryConditions(where, params, req.body, { alias: "app_order_cache" });
       // v2.2.9.162 状态计数交回服务端。
       //   原来前端为了算 tab 个数，把订单列表翻到最多 10 页 × 200 = 2000 条再本地统计，
       //   但库里有 6700+ 条 → 数字全是残缺的（用户看到「待发运 771」，后台实际 667）。
@@ -16443,6 +16553,76 @@ app.post("/api/seller/orders", requireAuth, async (req, res, next) => {
         source_status: row.source_status,
         status: row.display_status || row.payload?.status || row.source_status,
       }));
+
+      // 2026-11-10 订单列表补充「月结层面」的字段（都不写进订单表，按订单号实时关联）：
+      //   采购金额 = app_statistics_costs.purchase_cny
+      //   贴单费   = app_statistics_costs.label_cny
+      //   结算日期 = app_statistics_orders.settled_date
+      //   采购物流号 = app_order_costs.purchase_tracking_no
+      //   采购批次号 = app_order_batches.batch_no
+      if (orders.length) {
+        const scopeStores = sharedStoreIds.length ? sharedStoreIds : [storeId];
+        const numbers = [...new Set(orders.map((o) => String(o.posting_number || "")).filter(Boolean))];
+        if (numbers.length) {
+          const [costRes, settledRes, trackRes, batchRes] = await Promise.all([
+            db.query(
+              `SELECT posting_number, purchase_cny, label_cny
+                 FROM app_statistics_costs
+                WHERE user_id = $1 AND store_id = ANY($2::uuid[]) AND posting_number = ANY($3::text[])`,
+              [req.user.id, scopeStores, numbers],
+            ).catch(() => ({ rows: [] })),
+            db.query(
+              `SELECT posting_number, settled_date
+                 FROM app_statistics_orders
+                WHERE user_id = $1 AND store_id = ANY($2::uuid[]) AND posting_number = ANY($3::text[])`,
+              [req.user.id, scopeStores, numbers],
+            ).catch(() => ({ rows: [] })),
+            db.query(
+              `SELECT posting_number, purchase_tracking_no
+                 FROM app_order_costs
+                WHERE store_id = ANY($1::uuid[]) AND posting_number = ANY($2::text[])`,
+              [scopeStores, numbers],
+            ).catch(() => ({ rows: [] })),
+            db.query(
+              `SELECT posting_number, batch_no
+                 FROM app_order_batches
+                WHERE user_id = $1 AND store_id = ANY($2::uuid[]) AND posting_number = ANY($3::text[])`,
+              [req.user.id, scopeStores, numbers],
+            ).catch(() => ({ rows: [] })),
+          ]);
+          const costMap = new Map();
+          for (const r of costRes.rows) {
+            const prev = costMap.get(r.posting_number) || {};
+            costMap.set(r.posting_number, {
+              purchase_cny: r.purchase_cny == null ? prev.purchase_cny : Number(r.purchase_cny),
+              label_cny: r.label_cny == null ? prev.label_cny : Number(r.label_cny),
+            });
+          }
+          const settledMap = new Map();
+          for (const r of settledRes.rows) {
+            if (r.settled_date) settledMap.set(r.posting_number, r.settled_date);
+          }
+          const trackMap = new Map();
+          for (const r of trackRes.rows) {
+            const v = String(r.purchase_tracking_no || "").trim();
+            if (v) trackMap.set(r.posting_number, v);
+          }
+          const batchMap = new Map();
+          for (const r of batchRes.rows) {
+            const v = String(r.batch_no || "").trim();
+            if (v) batchMap.set(r.posting_number, v);
+          }
+          for (const order of orders) {
+            const pn = String(order.posting_number || "");
+            const cost = costMap.get(pn) || {};
+            order.purchase_cny = cost.purchase_cny ?? null;
+            order.label_cny = cost.label_cny ?? null;
+            order.settled_date = settledMap.get(pn) || null;
+            order.purchase_tracking_no = trackMap.get(pn) || "";
+            order.batch_no = batchMap.get(pn) || "";
+          }
+        }
+      }
       console.log(`[OrdersCache] store=${storeId} mode=${syncMode || "cache"} status=${status || "all"} limit=${limit} offset=${offset} total=${countRes.rows[0]?.count || 0}`);
       return res.json({
         success: true,
@@ -16500,6 +16680,10 @@ app.post("/api/seller/orders/detail", requireAuth, async (req, res) => {
     }, { storeId, userId: req.user.id });
 
     const p = ozonData?.result || {};
+    // 2026-11-10 修复：详情接口下面查商品图时用到 sharedStoreIds，但这里从没定义过，
+    //   导致点「查看详情」必报 `sharedStoreIds is not defined`（接口 502）。
+    //   与列表接口同一口径：按同一 client_id 的所有店铺取商品图。
+    const sharedStoreIds = db ? await resolveSharedStoreIds(db, storeId) : [storeId];
     // 附加商品图
     if (db && Array.isArray(p.products) && p.products.length) {
       const offerIds = p.products.map(x => x.offer_id).filter(Boolean);
@@ -20748,6 +20932,9 @@ app.post("/api/seller/orders/:postingNumber/source", requireAuth, async (req, re
     const offerId = String(req.body?.offer_id || "").trim();
     const outboundCostCny = Number(req.body?.outbound_cost_cny ?? req.body?.purchase_price_cny);
     const sourceUrl = String(req.body?.source_url_1688 || "").trim();
+    // 2026-11-10 采购物流号：只有前端显式传了才覆盖，避免其它调用方把这个字段清空
+    const hasTrackingNo = Object.prototype.hasOwnProperty.call(req.body || {}, "purchase_tracking_no");
+    const purchaseTrackingNo = hasTrackingNo ? String(req.body?.purchase_tracking_no || "").trim().slice(0, 120) : "";
     if (!postingNumber) return res.status(400).json({ success: false, error: "缺少 posting_number" });
     if (!storeId || !offerId) return res.status(400).json({ success: false, error: "店铺和货号必填" });
     if (!Number.isFinite(outboundCostCny) || outboundCostCny < 0 || outboundCostCny > 1000000) {
@@ -20787,8 +20974,8 @@ app.post("/api/seller/orders/:postingNumber/source", requireAuth, async (req, re
     );
     await client.query(
       `INSERT INTO app_order_costs
-        (user_id, store_id, posting_number, offer_id, source_url_1688, outbound_cost_cny, note, changed_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$1)
+        (user_id, store_id, posting_number, offer_id, source_url_1688, outbound_cost_cny, note, changed_by, purchase_tracking_no)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$1,$8)
        ON CONFLICT (store_id, posting_number) DO UPDATE SET
          user_id = EXCLUDED.user_id,
          offer_id = EXCLUDED.offer_id,
@@ -20796,8 +20983,9 @@ app.post("/api/seller/orders/:postingNumber/source", requireAuth, async (req, re
          outbound_cost_cny = EXCLUDED.outbound_cost_cny,
          note = EXCLUDED.note,
          changed_by = EXCLUDED.changed_by,
+         purchase_tracking_no = CASE WHEN $9 THEN EXCLUDED.purchase_tracking_no ELSE app_order_costs.purchase_tracking_no END,
          updated_at = now()`,
-      [req.user.id, storeId, postingNumber, offerId, sourceUrl, outboundCostCny, `订单 ${postingNumber} 编辑出单总成本`],
+      [req.user.id, storeId, postingNumber, offerId, sourceUrl, outboundCostCny, `订单 ${postingNumber} 编辑出单总成本`, purchaseTrackingNo, hasTrackingNo],
     );
 
     const cacheRes = await client.query(
@@ -20879,6 +21067,7 @@ app.post("/api/seller/orders/:postingNumber/source", requireAuth, async (req, re
         purchase_price_cny: Number(product.purchase_price_cny || 0),
         outbound_cost_cny: Math.round(outboundCostCny * 100) / 100,
         source_url_1688: product.source_url_1688 || "",
+        purchase_tracking_no: purchaseTrackingNo,
       },
       order: updatedOrder,
     });
@@ -20886,6 +21075,311 @@ app.post("/api/seller/orders/:postingNumber/source", requireAuth, async (req, re
     await client.query("ROLLBACK").catch(() => {});
     next(error);
   } finally { client.release(); }
+});
+
+/* ============================================================================
+   2026-11-10 订单同步：手动触发 + 状态查询
+   - 手动「立即同步」= 新单 + 待处理 + 取消 + 兜底（约 18 页/店，3~8 秒）
+   - 前端按店铺逐个调用，避免多店一次请求超时
+   ========================================================================== */
+app.post("/api/seller/orders/sync", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const raw = Array.isArray(req.body?.store_ids) ? req.body.store_ids : [req.body?.store_id].filter(Boolean);
+    const ids = raw.map((x) => String(x || "").trim()).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ success: false, error: "未选择店铺" });
+    const owned = await db.query(
+      `SELECT id FROM app_stores WHERE user_id = $1 AND id = ANY($2::uuid[]) AND platform='ozon'`,
+      [req.user.id, ids],
+    );
+    if (!owned.rows.length) return res.status(403).json({ success: false, error: "店铺不存在或不属于当前账号" });
+    const startedAt = Date.now();
+    const result = await orderSync.runQuick(owned.rows.map((r) => r.id));
+    res.json({ success: true, ...result, stores_done: owned.rows.length, duration_ms: Date.now() - startedAt });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/seller/orders/sync/state", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.query?.store_id || "").trim();
+    if (!storeId) return res.json({ success: true, state: null, watch_pool: 0 });
+    const owned = await db.query(`SELECT id FROM app_stores WHERE id=$1 AND user_id=$2`, [storeId, req.user.id]);
+    if (!owned.rows.length) return res.status(403).json({ success: false, error: "店铺不存在" });
+    const state = await orderSync.getState(storeId);
+    const pool = await db.query(
+      `SELECT count(*)::int AS total,
+              count(*) FILTER (WHERE note = '疑似丢件')::int AS suspect
+         FROM app_order_watch_pool WHERE store_id = $1`,
+      [storeId],
+    ).catch(() => ({ rows: [{ total: 0, suspect: 0 }] }));
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ success: true, state, watch_pool: Number(pool.rows[0]?.total || 0), watch_suspect: Number(pool.rows[0]?.suspect || 0) });
+  } catch (error) { next(error); }
+});
+
+/* ============================================================================
+   2026-11-10 订单页「导入采购」：按订单号批量写入 采购金额/贴单费/采购物流号
+   - 采购金额、贴单费 → app_statistics_costs（与月结统计同一张表、同一口径）
+   - 采购物流号     → app_order_costs.purchase_tracking_no
+   - 每次导入留一条历史，并把源文件存到 data/order-cost-imports，可回看/下载
+   ========================================================================== */
+const ORDER_COST_IMPORT_DIR = path.join(DATA_DIR, "order-cost-imports");
+
+app.post("/api/seller/orders/costs/import", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const rawRows = Array.isArray(req.body?.rows) ? req.body.rows : [];
+    if (!rawRows.length) return res.status(400).json({ success: false, error: "没有可导入的行" });
+    if (rawRows.length > 20000) return res.status(400).json({ success: false, error: "一次最多导入 20000 单" });
+
+    // 归一化 + 校验
+    const rows = [];
+    const errors = [];
+    for (const [index, item] of rawRows.entries()) {
+      const postingNumber = String(item?.posting_number || "").trim();
+      if (!postingNumber) { errors.push(`第 ${index + 1} 行缺少订单号`); continue; }
+      const num = (value, label) => {
+        if (value === null || value === undefined || String(value).trim() === "") return null;
+        const n = Number(String(value).replace(/[,，¥￥\s]/g, ""));
+        if (!Number.isFinite(n) || n < 0 || n > 1000000) throw new Error(`${postingNumber} 的${label}无效：${value}`);
+        return Math.round(n * 100) / 100;
+      };
+      let purchase = null, label = null;
+      try {
+        purchase = num(item.purchase_cny, "采购金额");
+        label = num(item.label_cny, "贴单费");
+      } catch (e) {
+        errors.push(String(e.message).slice(0, 120));
+        continue;
+      }
+      const tracking = String(item.purchase_tracking_no || "").trim().slice(0, 120);
+      if (purchase === null && label === null && !tracking) continue;   // 三个都空 → 跳过
+      rows.push({ posting_number: postingNumber, purchase_cny: purchase, label_cny: label, purchase_tracking_no: tracking });
+    }
+    if (!rows.length) {
+      return res.status(400).json({ success: false, error: errors.length ? errors.slice(0, 5).join("；") : "没有填写任何金额或物流号" });
+    }
+
+    // 订单号 → 店铺（同一 client 多店时优先取本用户名下单店）
+    const numbers = [...new Set(rows.map((r) => r.posting_number))];
+    const storeRes = await db.query(
+      `SELECT DISTINCT ON (posting_number) posting_number, store_id
+         FROM app_order_cache
+        WHERE user_id = $1 AND posting_number = ANY($2::text[])
+        ORDER BY posting_number, updated_at DESC NULLS LAST`,
+      [req.user.id, numbers],
+    );
+    const storeMap = new Map(storeRes.rows.map((r) => [String(r.posting_number), String(r.store_id)]));
+
+    let applied = 0, failed = 0, trackingOnly = 0;
+    const client = await db.connect();
+    try {
+      await client.query("BEGIN");
+      for (const row of rows) {
+        const storeId = storeMap.get(row.posting_number);
+        if (!storeId) { failed += 1; errors.push(`订单不在缓存里：${row.posting_number}`); continue; }
+        if (row.purchase_cny !== null || row.label_cny !== null) {
+          await client.query(
+            `INSERT INTO app_statistics_costs (user_id, store_id, posting_number, purchase_cny, label_cny, version)
+             VALUES ($1,$2,$3,$4,$5,1)
+             ON CONFLICT (user_id, store_id, posting_number) DO UPDATE SET
+               purchase_cny = COALESCE(EXCLUDED.purchase_cny, app_statistics_costs.purchase_cny),
+               label_cny    = COALESCE(EXCLUDED.label_cny, app_statistics_costs.label_cny),
+               version      = app_statistics_costs.version + 1,
+               updated_at   = now()`,
+            [req.user.id, storeId, row.posting_number, row.purchase_cny, row.label_cny],
+          );
+          applied += 1;
+        }
+        if (row.purchase_tracking_no) {
+          await client.query(
+            `INSERT INTO app_order_costs (user_id, store_id, posting_number, offer_id, purchase_tracking_no, note, changed_by)
+             VALUES ($1,$2,$3,'',$4,'导入采购物流号',$1)
+             ON CONFLICT (store_id, posting_number) DO UPDATE SET
+               purchase_tracking_no = EXCLUDED.purchase_tracking_no,
+               changed_by = EXCLUDED.changed_by,
+               updated_at = now()`,
+            [req.user.id, storeId, row.posting_number, row.purchase_tracking_no],
+          );
+          if (row.purchase_cny === null && row.label_cny === null) trackingOnly += 1;
+        }
+      }
+      // 源文件存档（失败不影响导入结果）
+      const importId = crypto.randomUUID();
+      let savedPath = "";
+      const fileName = String(req.body?.filename || "采购录入.xlsx").slice(0, 120);
+      try {
+        const base64 = String(req.body?.file_base64 || "").split(",").pop();
+        if (base64) {
+          const buffer = Buffer.from(base64, "base64");
+          if (buffer.length && buffer.length <= 10 * 1024 * 1024) {
+            await fs.mkdir(ORDER_COST_IMPORT_DIR, { recursive: true });
+            const safeName = fileName.replace(/[^\w.\-\u4e00-\u9fa5]/g, "_").slice(-60);
+            savedPath = path.join(ORDER_COST_IMPORT_DIR, `${importId}-${safeName}`);
+            await fs.writeFile(savedPath, buffer);
+          }
+        }
+      } catch (e) { console.warn("[OrderCostImport] 源文件存档失败:", String(e.message || e).slice(0, 160)); }
+
+      await client.query(
+        `INSERT INTO app_order_cost_imports (id, user_id, file_name, file_path, rows, applied, failed, message, details)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)`,
+        [importId, req.user.id, fileName, savedPath, rows.length, applied, failed,
+          errors.length ? errors.slice(0, 5).join("；").slice(0, 400) : "全部成功",
+          JSON.stringify({ tracking_only: trackingOnly, errors: errors.slice(0, 50) })],
+      );
+      await client.query("COMMIT");
+      res.json({ success: true, import_id: importId, rows: rows.length, applied, failed, tracking_only: trackingOnly, errors: errors.slice(0, 10) });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally { client.release(); }
+  } catch (error) { next(error); }
+});
+
+app.get("/api/seller/orders/costs/imports", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const limit = Math.min(100, Math.max(1, Number(req.query?.limit || 30)));
+    const result = await db.query(
+      `SELECT id, file_name, rows, applied, failed, message, details, created_at,
+              (file_path <> '') AS has_file
+         FROM app_order_cost_imports
+        WHERE user_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [req.user.id, limit],
+    );
+    res.json({ success: true, imports: result.rows });
+  } catch (error) { next(error); }
+});
+
+app.get("/api/seller/orders/costs/imports/:id/file", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const result = await db.query(
+      `SELECT file_name, file_path FROM app_order_cost_imports WHERE id = $1 AND user_id = $2`,
+      [req.params.id, req.user.id],
+    );
+    const row = result.rows[0];
+    if (!row || !row.file_path) return res.status(404).json({ success: false, error: "找不到导入源文件" });
+    try { await fs.access(row.file_path); } catch { return res.status(404).json({ success: false, error: "源文件已被清理" }); }
+    res.download(row.file_path, row.file_name || path.basename(row.file_path));
+  } catch (error) { next(error); }
+});
+
+// 2026-11-10 采购批次号：按「当前查询条件命中的全部订单」写入 / 按「勾选的订单」删除
+//   规则：批次号在系统内不可重复；命中订单里只要有一单已有批次号就整体拒绝，必须先手动删除
+const BATCH_NO_MAX_LEN = 40;
+
+app.post("/api/seller/orders/batches", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const batchNo = String(req.body?.batch_no || "").trim();
+    if (!batchNo) return res.status(400).json({ success: false, error: "请先填写批次号" });
+    if (batchNo.length > BATCH_NO_MAX_LEN) {
+      return res.status(400).json({ success: false, error: `批次号最多 ${BATCH_NO_MAX_LEN} 个字符` });
+    }
+
+    const rawIds = Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : [];
+    const ids = rawIds.map(String).filter(Boolean);
+    if (!ids.length) return res.status(400).json({ success: false, error: "请先选择店铺" });
+    const shared = await resolveSharedStoreIds(db, ids);
+    const scopeIds = [...new Set([...(shared.length ? shared : []), ...ids])];
+
+    // 与列表页同一套查询条件 → 「页面上过滤出来的」就是这里命中的
+    const where = ["store_id = ANY($1::uuid[])"];
+    const params = [scopeIds];
+    appendOrderQueryConditions(where, params, req.body, { alias: "app_order_cache" });
+
+    const targetRes = await db.query(
+      `SELECT DISTINCT ON (posting_number) posting_number, store_id
+         FROM app_order_cache
+        WHERE ${where.join(" AND ")}
+        ORDER BY posting_number, updated_at DESC NULLS LAST
+        LIMIT 20000`,
+      params,
+    );
+    const targets = targetRes.rows;
+    if (!targets.length) return res.status(400).json({ success: false, error: "当前查询条件下没有订单" });
+
+    const pns = targets.map((r) => String(r.posting_number));
+
+    // 已有批次号 → 整体拒绝（必须手动删掉才能重新录入）
+    const existing = await db.query(
+      `SELECT posting_number, batch_no FROM app_order_batches
+        WHERE user_id = $1 AND store_id = ANY($2::uuid[]) AND posting_number = ANY($3::text[])`,
+      [req.user.id, scopeIds, pns],
+    );
+    if (existing.rows.length) {
+      const sample = existing.rows.slice(0, 3).map((r) => `${r.posting_number}（${r.batch_no}）`).join("、");
+      return res.status(409).json({
+        success: false,
+        blocked: existing.rows.length,
+        error: `当前筛选结果中有 ${existing.rows.length} 单已有采购批次号：${sample}${existing.rows.length > 3 ? " 等" : ""}。`
+          + "请先勾选这些订单执行「删除批次」，再录入新批次。",
+      });
+    }
+
+    // 批次号不可重复：同一个号不允许落给两批订单
+    const dup = await db.query(
+      `SELECT posting_number FROM app_order_batches WHERE user_id = $1 AND batch_no = $2 LIMIT 1`,
+      [req.user.id, batchNo],
+    );
+    if (dup.rows.length) {
+      return res.status(409).json({
+        success: false,
+        error: `批次号「${batchNo}」已存在（订单 ${dup.rows[0].posting_number} 在用），请换一个批次号`,
+      });
+    }
+
+    const client = await db.connect();
+    let assigned = 0;
+    try {
+      await client.query("BEGIN");
+      for (const row of targets) {
+        await client.query(
+          `INSERT INTO app_order_batches (user_id, store_id, posting_number, batch_no)
+           VALUES ($1,$2,$3,$4)
+           ON CONFLICT (user_id, store_id, posting_number)
+           DO UPDATE SET batch_no = EXCLUDED.batch_no, updated_at = now()`,
+          [req.user.id, row.store_id, row.posting_number, batchNo],
+        );
+        assigned += 1;
+      }
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally { client.release(); }
+
+    res.json({ success: true, batch_no: batchNo, assigned });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/orders/batches/remove", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const pns = (Array.isArray(req.body?.posting_numbers) ? req.body.posting_numbers : [])
+      .map((x) => String(x).trim()).filter(Boolean).slice(0, 2000);
+    if (!pns.length) return res.status(400).json({ success: false, error: "请先勾选要删除批次的订单" });
+    const rawIds = Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : [];
+    const ids = rawIds.map(String).filter(Boolean);
+    const result = ids.length
+      ? await db.query(
+        `DELETE FROM app_order_batches
+          WHERE user_id = $1 AND posting_number = ANY($2::text[]) AND store_id = ANY($3::uuid[])`,
+        [req.user.id, pns, ids],
+      )
+      : await db.query(
+        `DELETE FROM app_order_batches WHERE user_id = $1 AND posting_number = ANY($2::text[])`,
+        [req.user.id, pns],
+      );
+    res.json({ success: true, removed: result.rowCount });
+  } catch (error) { next(error); }
 });
 
 app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
@@ -20907,23 +21401,12 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
     if (req.body?.source === "cache" || req.body?.from_cache) {
       const where = ["c.user_id = $1", "c.store_id = $2"];
       const params = [req.user.id, storeId];
-      if (filter.since && req.body?.since) { params.push(req.body.since); where.push(`c.in_process_at >= $${params.length}`); }
-      if (filter.to && req.body?.to) { params.push(req.body.to); where.push(`c.in_process_at <= $${params.length}`); }
-      if (status && status.toLowerCase() !== "all") {
-        params.push(status);
-        where.push(`COALESCE(NULLIF(c.display_status,''), c.status) = $${params.length}`);
-      }
-      const pns = Array.isArray(req.body?.posting_numbers) ? req.body.posting_numbers.map(String).filter(Boolean) : [];
-      if (pns.length) { params.push(pns); where.push(`c.posting_number = ANY($${params.length}::text[])`); }
-      const q = String(req.body?.q || "").trim();
-      if (q) {
-        params.push(`%${q}%`);
-        where.push(`(c.posting_number ILIKE $${params.length} OR c.payload::text ILIKE $${params.length})`);
-      }
+      // 查询条件与列表页共用同一实现（别名 c；店铺按行关联，导出只支持单店）
+      appendOrderQueryConditions(where, params, req.body, { alias: "c", storeScope: "c.store_id" });
       const sql = `SELECT c.payload, c.posting_number FROM app_order_cache c WHERE ${where.join(" AND ")} ORDER BY c.in_process_at DESC`;
       const r = await db.query(sql, params);
       postings = r.rows.map((x) => x.payload).filter(Boolean);
-      console.log(`[OrdersExport] cache 导出 store=${storeId} status=${status || "all"} q=${q || "-"} 单号=${pns.length} → ${postings.length} 条`);
+      console.log(`[OrdersExport] cache 导出 store=${storeId} status=${status || "all"} order_no=${String(req.body?.order_no || "-")} 单号=${(req.body?.posting_numbers || []).length} → ${postings.length} 条`);
     } else {
       // v2.2.9.141 改用 v4（v3 已废弃，返回假 429）
       const data = await ozonFbsListCompat({
@@ -20958,8 +21441,25 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       for (const row of metaRows.rows) productMeta.set(row.offer_id, row);
     }
 
+    // 采购批次号（2026-11-10）：来自 app_order_batches，按货件号关联
+    const batchMap = new Map();
+    if (postings.length) {
+      const batchNumbers = [...new Set(postings.map((p) => String(p.posting_number || "")).filter(Boolean))];
+      if (batchNumbers.length) {
+        const bRows = await db.query(
+          `SELECT posting_number, batch_no FROM app_order_batches
+            WHERE user_id = $1 AND store_id = $2 AND posting_number = ANY($3::text[])`,
+          [req.user.id, storeId, batchNumbers],
+        ).catch(() => ({ rows: [] }));
+        for (const r of bRows.rows) {
+          const v = String(r.batch_no || "").trim();
+          if (v) batchMap.set(r.posting_number, v);
+        }
+      }
+    }
+
     // 订单级履约 CSV，保留 Ozon 原始金额与本地采购信息，便于财务复核。
-    const header = ["货件号", "订单号", "状态", "创建时间", "发货截止", "实际发货时间", "配送方式", "仓库", "买家城市", "收货地址", "商品", "货号", "SKU", "数量", "结算币种", "商品金额", "平台佣金", "平台到手", "采购成本(CNY)", "1688货源", "本地备注"];
+    const header = ["货件号", "订单号", "状态", "创建时间", "发货截止", "实际发货时间", "配送方式", "仓库", "买家城市", "收货地址", "商品", "货号", "SKU", "数量", "结算币种", "商品金额", "平台佣金", "平台到手", "采购成本(CNY)", "采购批次号", "1688货源", "本地备注"];
     const rows = [header];
     for (const p of postings) {
       const prods = p.products || [];
@@ -20969,9 +21469,15 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
       const qty = prods.reduce((a, x) => a + (x.quantity || 0), 0);
       const dm = p.delivery_method || {};
       const financialProducts = p.financial_data?.products || [];
-      const nativeAmount = prods.reduce((sum, product) => sum + Number(product.price || 0) * Number(product.quantity || 1), 0);
-      const commission = financialProducts.reduce((sum, product) => sum + Number(product.commission_amount || 0) * Number(product.quantity || 1), 0);
-      const payout = financialProducts.reduce((sum, product) => sum + Number(product.payout || 0) * Number(product.quantity || 1), 0);
+      // Ozon 的 price 有时是对象 {amount, currency}，直接 Number() 会得到 NaN（导出里出现过一列 NaN）
+      const moneyOf = (value) => {
+        if (value == null) return 0;
+        if (typeof value === "object") return Number(value.amount ?? value.value ?? 0) || 0;
+        return Number(value) || 0;
+      };
+      const nativeAmount = prods.reduce((sum, product) => sum + moneyOf(product.price) * Number(product.quantity || 1), 0);
+      const commission = financialProducts.reduce((sum, product) => sum + moneyOf(product.commission_amount) * Number(product.quantity || 1), 0);
+      const payout = financialProducts.reduce((sum, product) => sum + moneyOf(product.payout) * Number(product.quantity || 1), 0);
       const purchaseCost = prods.reduce((sum, product) => sum + Number(productMeta.get(product.offer_id)?.purchase_price_cny || 0) * Number(product.quantity || 1), 0);
       const address = p.customer?.address || p.addressee || p.address || {};
       rows.push([
@@ -20994,6 +21500,7 @@ app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
         commission,
         payout,
         purchaseCost,
+        batchMap.get(p.posting_number) || "",
         offers.map((offerId) => productMeta.get(offerId)?.source_url_1688 || "").filter(Boolean).join(" | "),
         notesMap[p.posting_number] || "",
       ]);
@@ -28289,6 +28796,28 @@ try {
 }
 await initDatabase();
 await migrateYandexEnvToStores();
+// 定时任务运行记录表（订单页「定时任务」弹窗读它）
+if (db) { try { await ensureCronTable((text, params) => db.query(text, params)); } catch (e) { console.warn('[cron] 建表失败:', String(e.message || e).slice(0, 200)); } }
+// 2026-11-10 订单同步引擎：新单/待处理/取消/运输中/签收/兜底/跟踪池/月度全量
+//   老的 refreshRecentOrderStatuses（按下单时间窗全量重拉）已停用 —— 它看不到 30 天前下单、
+//   近期才变更状态的单，而且成本是全量重拉。详见 输出/订单管理-同步改造方案.md
+const orderSync = createOrderSync({
+  db,
+  listPage: ozonFbsListV4Page,
+  getPosting: async (postingNumber, storeId, userId) => {
+    const data = await callOzonSellerAPI("/v3/posting/fbs/get", {
+      posting_number: postingNumber,
+      with: { financial_data: true, analytics_data: true },
+    }, { storeId, userId });
+    return data?.result || null;
+  },
+  logger: console,
+});
+if (db) {
+  await orderSync.init();
+  orderSync.start();
+}
+
 const statisticsAnalysis = createStatisticsAnalysis({ db, assertStoreAccess: assertActiveStoreAccess, callOzon: callOzonSellerAPI, defaultRate: RUB_CNY_RATE, credentialSecret: AUTH_SECRET, notify: sendAlertMailThrottled });
 await statisticsAnalysis.init();
 statisticsAnalysis.register(app, requireAuth);
@@ -28299,77 +28828,9 @@ businessAnalysis.register(app, requireAuth);
 if (db && OZON_OPPORTUNITY_REFRESH_INTERVAL_MS > 0) {
   setTimeout(() => maybeRefreshOzonOpportunityPool("startup"), 12000).unref?.();
   setInterval(() => maybeRefreshOzonOpportunityPool("interval"), OZON_OPPORTUNITY_REFRESH_INTERVAL_MS).unref?.();
-
-  // v2.2.9.176 定时刷新「近期订单状态」。
-  //   ⚠️ 原来的增量同步只拉「最近 24h 内**新建**」的订单，导致 10/31 下单、11/01 变更状态的单
-  //   永远不会被刷新（用户实测 7 条一直挂在「待备货」，实际已经是「待发运」）。
-  //   这里每 20 分钟把最近 3 天的订单重新拉一遍，覆盖这种状态变更。
-  const ORDER_STATUS_REFRESH_MS = 15 * 60 * 1000;
-  // v2.2.9.177 分两档：
-  //   快档 15 分钟一次、覆盖近 8 天（活跃订单状态变更基本都在这范围）
-  //   慢档 2 小时一次、覆盖近 30 天（兜住更老才变更的单，实测 14 天就够）
-  //   这样「待备货 / 待发运 / 运输中 / 已送达 / 已取消」**所有状态**都会自动跟上，
-  //   不需要用户逐个反馈。
-  const ORDER_REFRESH_FAST_DAYS = 8;
-  const ORDER_REFRESH_SLOW_DAYS = 30;
-  let orderStatusRefreshing = false;
-  let lastSlowRefreshAt = 0;
-  const refreshRecentOrderStatuses = async () => {
-    if (orderStatusRefreshing) return;
-    orderStatusRefreshing = true;
-    try {
-      const stores = await db.query(`SELECT id, user_id FROM app_stores WHERE platform='ozon' AND active=TRUE`);
-      const to = new Date();
-      const needSlow = Date.now() - lastSlowRefreshAt > 2 * 60 * 60 * 1000;
-      const days = needSlow ? ORDER_REFRESH_SLOW_DAYS : ORDER_REFRESH_FAST_DAYS;
-      if (needSlow) lastSlowRefreshAt = Date.now();
-      const since = new Date(to.getTime() - days * 86400e3);
-      for (const st of stores.rows) {
-        // v2.2.9.198 单店隔离：某个店铺 API Key 失效（403 Api-key is deactivated）时，
-        //   不能把整个刷新循环 abort 掉，否则排在后面的店铺（如 HappyFriday）永远刷不到，
-        //   状态停在旧值 → 前端「待备货」数字虚高（实测 25 vs 后台 3）。
-        try {
-          let cursor = "";
-          let touched = 0;
-          // v2.2.9.198 Ozon /v4/posting/fbs/list 的游标固定是 in_process_at 升序（不认 dir:DESC），
-          //   只翻 40 页×100=4000 条时，30 天窗口下 7457 条订单只能刷到最旧的 4000 条，
-          //   最新的待备货订单在第 60+ 页永远刷不到 → 前端「待备货」虚高（25 vs 后台 3）。
-          //   提到 120 页（12000 条）覆盖全部窗口订单。
-          for (let page = 0; page < 120; page += 1) {
-            const r = await ozonFbsListV4Page({
-              since: since.toISOString(), to: to.toISOString(), status: "all",
-              limit: 100, cursor, with: { financial_data: true, analytics_data: true },
-              storeId: st.id, userId: st.user_id,
-            });
-            const batch = r.postings || [];
-            for (const p of batch) {
-              await db.query(
-                `UPDATE app_order_cache
-                    SET status = $3, display_status = $3, substatus = $4,
-                        payload = COALESCE(payload, '{}'::jsonb) || $5::jsonb,
-                        synced_at = now(), updated_at = now()
-                  WHERE store_id = $1 AND posting_number = $2`,
-                [st.id, String(p.posting_number), String(p.status || ""), String(p.substatus || ""), JSON.stringify(p)],
-              );
-              touched += 1;
-            }
-            if (!r.has_next || !r.cursor || batch.length < 100) break;
-            cursor = r.cursor;
-          }
-          if (touched) console.log(`[OrderStatusRefresh] store=${st.id} window=${days}d refreshed=${touched}`);
-        } catch (e) {
-          console.error(`[OrderStatusRefresh] store=${st.id} 失败，跳过该店继续刷新其他店:`, String(e.message || e).slice(0, 200));
-        }
-      }
-    } catch (e) {
-      console.error("[OrderStatusRefresh] 失败:", String(e.message || e).slice(0, 200));
-    } finally {
-      orderStatusRefreshing = false;
-    }
-  };
-  setTimeout(() => refreshRecentOrderStatuses().catch(() => {}), 60 * 1000);
-  setInterval(() => refreshRecentOrderStatuses().catch(() => {}), ORDER_STATUS_REFRESH_MS).unref?.();
 }
+
+
 
 // SPA catch-all
 app.get("*", (req, res, next) => {

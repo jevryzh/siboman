@@ -33,20 +33,28 @@ window.OrderListView = {
       quantity: 1,
       source_url_1688: '',
       outbound_cost_cny: 0,
+      purchase_tracking_no: '',
       row: null,
     });
     const lastBatchResult = Vue.ref(null);
     const shops = Vue.ref([]);
     const ALL_STORES = '__all__';
     const CURRENT_STORE = '__current__';
-    const storeScope = Vue.ref([CURRENT_STORE]);
-    let previousStoreScope = [CURRENT_STORE];
-    const searchKeyword = Vue.ref('');
-    const filterField = Vue.ref('all');
-    const autoSync = Vue.ref(true);
+    // 2026-11-10 店铺改由顶栏全局控制（含「全部店铺」聚合）；这里只跟随，不再自己提供选择器。
+    //   顶栏选「全部店铺」时 ShopSwitcher 会写 localStorage.ordersAllStores=1。
+    const ordersAllStores = () => localStorage.getItem('ordersAllStores') === '1';
+    const storeScope = Vue.ref([ordersAllStores() ? ALL_STORES : CURRENT_STORE]);
+    let previousStoreScope = storeScope.value.slice();
+    // 2026-11-10 查询条件重构：订单号 / 货品 / 下单日期 / 结算日期 / 缺采购 / 未结算（状态仍用上方页签）
+    const orderNoKeyword = Vue.ref('');
+    const productKeyword = Vue.ref('');
+    const settledRange = Vue.ref([]);
+    const onlyMissingPurchase = Vue.ref(false);
+    const onlyUnsettled = Vue.ref(false);
     const kpiAnchorAt = Vue.ref(null);
-    const syncWindowDialog = Vue.reactive({ visible: false, since: '', to: '' });
-    let autoSyncTimer = null;
+    // 2026-11-10 同步改成「后台定时 + 页面立即同步」：页面上不再有抓取时间窗 / 自动同步开关
+    const syncBusy = Vue.ref(false);
+    const lastSync = Vue.reactive({ at: '', inserted: 0, changed: 0, pool: 0, suspect: 0 });
     const ORDER_SUMMARY_PAGE_SIZE = 200;
     const ORDER_SUMMARY_MAX_PAGES_PER_STORE = 1;   // v2.2.9.163 计数已交给服务端统计，这里只留一页给超时/兜底逻辑
 
@@ -141,21 +149,11 @@ window.OrderListView = {
       const week = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][d.getDay()];
       return `${d.toISOString().slice(0, 10)} ${week}`;
     });
+    // 2026-11-10 抓取窗口已在标题栏可见，这里只说明「列表正在看哪段时间」
     const syncRangeText = Vue.computed(() => {
       const [sinceD, toD] = dateRange.value || [];
-      if (!sinceD || !toD) {
-        const custom = syncWindowBounds();
-        const anchor = custom?.sync_to ? new Date(custom.sync_to) : (kpiAnchorAt.value ? new Date(kpiAnchorAt.value) : new Date());
-        const since = custom?.sync_since ? new Date(custom.sync_since) : new Date(anchor.getTime() - 24 * 3600 * 1000);
-        const format = (date) => {
-          const pad = (n) => String(n).padStart(2, '0');
-          return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-        };
-        return `同步范围：${format(since)} 至 ${format(anchor)}（从上次同步前 1 天开始，避免漏单）`;
-      }
-      const sinceText = `${sinceD} 00:00`;
-      const toText = `${toD} 23:59`;
-      return `同步范围：${sinceText} 至 ${toText}（从上次同步前 1 天开始，避免漏单）`;
+      if (!sinceD || !toD) return '列表时间：全部（缓存 84 天）';
+      return `列表时间：${sinceD} ~ ${toD}`;
     });
     const dateRangeBounds = () => {
       const [sinceD, toD] = dateRange.value || [];
@@ -164,123 +162,26 @@ window.OrderListView = {
         to: toD ? new Date(`${toD}T23:59:59+08:00`).toISOString() : undefined,
       };
     };
-    const toDateTimeLocal = (date) => {
-      const pad = (n) => String(n).padStart(2, '0');
-      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    // 结算日期范围（DATE 列，直接按 YYYY-MM-DD 比较）
+    const settledRangeBounds = () => {
+      const [sinceD, toD] = settledRange.value || [];
+      return { settled_since: sinceD || undefined, settled_to: toD || undefined };
     };
-    const syncWindowBounds = () => {
-      if (!syncWindowDialog.since || !syncWindowDialog.to) return null;
-      return {
-        sync_since: new Date(`${syncWindowDialog.since}:00+08:00`).toISOString(),
-        sync_to: new Date(`${syncWindowDialog.to}:59+08:00`).toISOString(),
-      };
-    };
-    const ensureSyncWindowDefaults = () => {
-      if (syncWindowDialog.since && syncWindowDialog.to) return;
-      const to = kpiAnchorAt.value ? new Date(kpiAnchorAt.value) : new Date();
-      const since = new Date(to.getTime() - 24 * 3600 * 1000);
-      syncWindowDialog.since = toDateTimeLocal(since);
-      syncWindowDialog.to = toDateTimeLocal(to);
-    };
-    const openSyncWindowDialog = () => {
-      ensureSyncWindowDefaults();
-      syncWindowDialog.visible = true;
-    };
-    const saveSyncWindow = () => {
-      const bounds = syncWindowBounds();
-      if (!bounds || new Date(bounds.sync_since).getTime() > new Date(bounds.sync_to).getTime()) {
-        notify.warning('请设置有效的同步时间范围');
-        return;
-      }
-      syncWindowDialog.visible = false;
-      notify.success('同步时间已设置');
-    };
-    const resetSyncWindow = () => {
-      syncWindowDialog.since = '';
-      syncWindowDialog.to = '';
-      syncWindowDialog.visible = false;
-      notify.success('已恢复默认同步时间');
-    };
-    const filterOptions = [
-      { label: '全部字段', value: 'all' },
-      { label: '货件编号', value: 'posting' },
-      { label: 'SKU', value: 'sku' },
-      { label: '货号', value: 'offer' },
-      { label: '商品名', value: 'name' },
-    ];
+    // 2026-11-10 组合查询：所有条件同时生效（后端 AND 拼接，状态由上方页签给 status）
+    const advancedFilterParams = () => ({
+      order_no: orderNoKeyword.value.trim() || undefined,
+      product_q: productKeyword.value.trim() || undefined,
+      ...settledRangeBounds(),
+      ...(onlyMissingPurchase.value ? { missing_purchase: true } : {}),
+      ...(onlyUnsettled.value ? { unsettled: true } : {}),
+    });
+    const hasAdvancedFilters = () => Boolean(
+      orderNoKeyword.value.trim() || productKeyword.value.trim()
+      || settledRange.value?.length || onlyMissingPurchase.value || onlyUnsettled.value
+      || dateRange.value?.length,
+    );
     const roundMoney = (value) => Math.round(Number(value || 0) * 100) / 100;
     const moneyText = (value) => `¥${Number(value || 0).toFixed(2)}`;
-    // v2.2.9.143 利润相关（对齐 Yandex 订单详情）
-    // v2.2.9.146 WHD 退货（Ozon /v1/returns/list，实测全部是 schema=Whd）
-    const returnsDrawer = Vue.reactive({ visible: false, loading: false, rows: [], error: '', scanned: 0, failed: [] });
-    const openReturns = async () => {
-      returnsDrawer.visible = true;
-      returnsDrawer.loading = true;
-      returnsDrawer.error = '';
-      returnsDrawer.rows = [];
-      returnsDrawer.failed = [];
-      try {
-        // ⚠️ 不能用 selectedStoreIds()：订单页默认带的是 CURRENT_STORE，
-        //   localStorage 里可能存着一个**已失效的旧店铺 id**，结果只查那一个、
-        //   而且它的 API Key 还是错的 → 一条都出不来。
-        //   WHD 退货直接查**全部 Ozon 店铺**（表格里有「店铺」列可区分）。
-        let ids = activeStoreIds();
-        if (!ids.length) { await fetchShops(); ids = activeStoreIds(); }
-        if (!ids.length) { returnsDrawer.error = '没有可用的 Ozon 店铺'; returnsDrawer.loading = false; return; }
-        const all = [];
-        const failed = [];
-        for (const sid of ids) {
-          try {
-            const res = await axios.post('/api/seller/returns', { store_id: sid, limit: 200 });
-            const storeName = (shops.value.find((x) => String(x.id) === String(sid)) || {}).name || '';
-            (res.data?.returns || []).forEach((r) => all.push({ ...r, store_id: sid, store_name: storeName }));
-          } catch (e) {
-            // 个别店铺 API Key 失效/无权限时，不要让整个列表挂掉
-            const name = (shops.value.find((x) => String(x.id) === String(sid)) || {}).name || sid;
-            failed.push(`${name}（${e.response?.data?.error || e.message}）`);
-          }
-        }
-        returnsDrawer.failed = failed;
-        all.sort((a, b) => new Date(b.return_date || b.final_moment || 0) - new Date(a.return_date || a.final_moment || 0));
-        returnsDrawer.rows = all;
-        returnsDrawer.scanned = ids.length;
-      } catch (e) {
-        returnsDrawer.error = e.response?.data?.error || e.message || '读取失败';
-      } finally {
-        returnsDrawer.loading = false;
-      }
-    };
-    const returnsTypeText = (t) => ({ ClientReturn: '客户退货', Cancellation: '订单取消' }[t] || t || '-');
-    const returnsTypeTag = (t) => (t === 'ClientReturn' ? 'warning' : 'info');
-
-    // v2.2.9.143 导入 Ozon 应收费用结算 xlsx
-    const feesFileInput = Vue.ref(null);
-    const feesImporting = Vue.ref(false);
-    const pickFeesFile = () => { if (feesFileInput.value) feesFileInput.value.click(); };
-    const onFeesFile = async (ev) => {
-      const file = ev && ev.target && ev.target.files ? ev.target.files[0] : null;
-      if (!file) return;
-      feesImporting.value = true;
-      try {
-        const b64 = await new Promise((resolve, reject) => {
-          const r = new FileReader();
-          r.onload = () => resolve(String(r.result || "").split(",")[1] || "");
-          r.onerror = reject;
-          r.readAsDataURL(file);
-        });
-        const res = await axios.post('/api/seller/order-fees/import', { file_base64: b64, filename: file.name });
-        const d = res.data || {};
-        notify.success(`已导入 ${d.imported} 个订单的费用（表「${d.sheet}」）｜累计 ${d.stored} 单，` +
-          `合计 ₽${Number(d.sum_total || 0).toFixed(2)} / ¥${Number(d.sum_total_cny || 0).toFixed(2)}` +
-          (d.period ? `｜结算期 ${d.period}` : ''));
-        await fetchOrders();
-      } catch (e) {
-        notify.error('导入失败：' + (e.response && e.response.data && e.response.data.error || e.message));
-      } finally {
-        feesImporting.value = false;
-        if (ev && ev.target) ev.target.value = '';
-      }
-    };
     const profitOf = (o) => (o && o.profit) || null;
     const profitColor = (o) => {
       const p = profitOf(o);
@@ -324,19 +225,19 @@ window.OrderListView = {
         notify.warning('复制失败，请手动复制');
       }
     };
-    const rowTextForSearch = (row) => {
-      const productText = (row.products || []).map((p) => [p.sku, p.offer_id, p.name].join(' ')).join(' ');
-      return [row.posting_number, row.status, row.store_name, productText].join(' ').toLowerCase();
+    const copyText = async (text) => {
+      const value = String(text || '').trim();
+      if (!value) return;
+      try {
+        await navigator.clipboard?.writeText(value);
+        notify.success('已复制');
+      } catch {
+        notify.warning('复制失败，请手动复制');
+      }
     };
-    const rowMatchesSearch = (row) => {
-      const q = searchKeyword.value.trim().toLowerCase();
-      if (!q) return true;
-      if (filterField.value === 'posting') return String(row.posting_number || '').toLowerCase().includes(q);
-      if (filterField.value === 'sku') return (row.products || []).some((p) => String(p.sku || '').toLowerCase().includes(q));
-      if (filterField.value === 'offer') return (row.products || []).some((p) => String(p.offer_id || '').toLowerCase().includes(q));
-      if (filterField.value === 'name') return (row.products || []).some((p) => String(p.name || '').toLowerCase().includes(q));
-      return rowTextForSearch(row).includes(q);
-    };
+    // 2026-11-10 「下单日期」独立成列：日期与时间分两行
+    const orderDateText = (row) => (toBeijingTime(row.in_process_at || row.created_at) || '').slice(0, 10) || '-';
+    const orderTimeText = (row) => (toBeijingTime(row.in_process_at || row.created_at) || '').slice(11, 16);
     const deadlineHours = (row) => {
       const raw = row.shipment_date || row.delivering_date || '';
       if (!raw) return null;
@@ -398,9 +299,10 @@ window.OrderListView = {
       return Math.round((c - p) / Math.abs(p) * 1000) / 10;
     };
     const displayedOrders = Vue.computed(() => {
+      // 2026-11-10 查询条件（订单号/货品/下单日期/结算日期/缺采购/未结算）全部由服务端过滤，
+      //   前端只保留「已超时」这种需要按当前时间算的页签过滤。
       const filtered = orders.value
-        .filter((row) => activeTab.value === 'overdue' ? isOverdue(row) : true)
-        .filter(rowMatchesSearch);
+        .filter((row) => activeTab.value === 'overdue' ? isOverdue(row) : true);
       // 多店铺/全部店铺时数据是一次性拉回前端的，这里做前端分页；
       // 单店铺走服务端分页（offset 已按页切好），不再二次切片。
       const aggregate = isAllStoresScope() || selectedStoreIds().length > 1;
@@ -444,8 +346,25 @@ window.OrderListView = {
       pagination.currentPage = 1;
       fetchOrders();
     };
+    // 2026-11-10 查询/重置：所有条件（含状态页签）组合生效，条件变化一律回到第 1 页
+    const runQuery = () => {
+      pagination.currentPage = 1;
+      refreshOrderDashboard();
+    };
+    const resetQueryConditions = () => {
+      orderNoKeyword.value = '';
+      productKeyword.value = '';
+      settledRange.value = [];
+      onlyMissingPurchase.value = false;
+      onlyUnsettled.value = false;
+      dateRange.value = [];
+      postingFilter.value = [];
+      activeTab.value = 'all';
+      pagination.currentPage = 1;
+      refreshOrderDashboard();
+    };
 
-    const fetchOrders = async (syncMode = 'cache') => {
+    const fetchOrders = async () => {
       const storeIds = selectedStoreIds();
       if (!storeIds.length) {
         hasFetched.value = true;
@@ -465,8 +384,8 @@ window.OrderListView = {
           store_id: sid,
           status: apiStatusForActiveTab(),
           since, to,
-          sync_mode: syncMode,
-          ...(syncMode === 'latest' ? (syncWindowBounds() || {}) : {}),
+          ...advancedFilterParams(),
+          // 2026-11-10 列表接口只读缓存，不再传 sync_mode（同步由定时任务 / 「立即同步」负责）
           ...(postingFilter.value.length ? { posting_numbers: postingFilter.value } : {}),
           limit,
           offset,
@@ -553,6 +472,7 @@ window.OrderListView = {
               status: 'all',
               since,
               to,
+              ...advancedFilterParams(),
               sync_mode: 'cache',
               limit: ORDER_SUMMARY_PAGE_SIZE,
               offset: page * ORDER_SUMMARY_PAGE_SIZE,
@@ -665,17 +585,292 @@ window.OrderListView = {
       }
     };
 
-    const refreshOrderDashboard = async (syncMode = 'cache') => {
+    // 2026-11-10 顶部「本周 GMV / 利润 / 利润率 / 待处理」四张卡片已按需求移除，
+    //   fetchOrderKpis（每店再拉 200 单算 GMV）不再参与刷新，省掉一次全店订单扫描。
+    //   列表接口现在只读缓存，不再顺手抓 Ozon。
+    const refreshOrderDashboard = async () => {
       kpiAnchorAt.value = new Date().toISOString();
-      if (syncMode === 'cache') {
-        await Promise.all([fetchOrders('cache'), fetchOrderSummary(), fetchOrderKpis()]);
-        return;
-      }
-      await fetchOrders(syncMode);
-      await Promise.all([fetchOrderSummary(), fetchOrderKpis()]);
+      await Promise.all([fetchOrders(), fetchOrderSummary()]);
     };
-    const pullLatestOrders = () => refreshOrderDashboard('latest');
-    const refreshInProgressOrders = () => refreshOrderDashboard('in_progress');
+
+    // ===== 立即同步（手动跑一次：新单 + 待处理 + 取消 + 兜底） =====
+    const lastSyncText = Vue.computed(() => {
+      if (!lastSync.at) return '尚未同步';
+      const parts = [`上次同步 ${toBeijingTime(lastSync.at)}`];
+      if (lastSync.inserted) parts.push(`新增 ${lastSync.inserted}`);
+      if (lastSync.changed) parts.push(`状态变更 ${lastSync.changed}`);
+      return parts.join(' · ');
+    });
+    const fetchSyncState = async () => {
+      const storeId = getStoreId();
+      if (!storeId) return;
+      try {
+        const res = await axios.get('/api/seller/orders/sync/state', { params: { store_id: storeId } });
+        const st = res.data?.state || {};
+        lastSync.at = st.last_ok_at || st.last_run_at || '';
+        lastSync.inserted = Number(st.stats?.inserted || 0);
+        lastSync.changed = Number(st.stats?.changed || 0);
+        lastSync.pool = Number(res.data?.watch_pool || 0);
+        lastSync.suspect = Number(res.data?.watch_suspect || 0);
+      } catch { /* 状态读取失败不影响列表 */ }
+    };
+    const runManualSync = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先在顶栏选择店铺');
+      syncBusy.value = true;
+      const sum = { inserted: 0, changed: 0, closing: 0, failed: 0 };
+      try {
+        // 逐店调用，避免多店一次请求超时
+        for (const sid of storeIds) {
+          const res = await axios.post('/api/seller/orders/sync', { store_id: sid }, { timeout: 300000 });
+          sum.inserted += Number(res.data?.inserted || 0);
+          sum.changed += Number(res.data?.changed || 0);
+          sum.closing += Number(res.data?.closing_fixed || 0);
+          sum.failed += Number(res.data?.failed || 0);
+        }
+        notify.success(`立即同步完成：新增 ${sum.inserted} · 状态变更 ${sum.changed}${sum.closing ? ` · 兜底纠正 ${sum.closing}` : ''}${sum.failed ? ` · ${sum.failed} 店失败` : ''}`);
+      } catch (e) {
+        notify.error('同步失败：' + (e.response?.data?.error || e.message));
+      } finally {
+        syncBusy.value = false;
+        await fetchSyncState();
+        await refreshOrderDashboard();
+      }
+    };
+
+    // ===== 定时任务看板：后台在跑哪些定时器、抓什么、什么条件、最近几次结果 =====
+    const cronDialog = Vue.reactive({ visible: false, loading: false, jobs: [], error: '', serverTime: '', refreshedAt: '' });
+    let cronTimer = null;
+    const fetchCronJobs = async () => {
+      cronDialog.loading = true;
+      cronDialog.error = '';
+      try {
+        const res = await axios.get('/api/system/cron-jobs');
+        cronDialog.jobs = res.data?.jobs || [];
+        cronDialog.serverTime = res.data?.serverTime || '';
+        cronDialog.refreshedAt = new Date().toISOString();
+      } catch (e) {
+        cronDialog.error = e.response?.data?.error || e.message || '读取失败';
+      } finally {
+        cronDialog.loading = false;
+      }
+    };
+    const openCronDialog = () => {
+      cronDialog.visible = true;
+      fetchCronJobs();
+      if (cronTimer) clearInterval(cronTimer);
+      cronTimer = setInterval(() => { if (cronDialog.visible) fetchCronJobs(); }, 15000);
+    };
+    Vue.onBeforeUnmount(() => { if (cronTimer) clearInterval(cronTimer); });
+    const cronStatusMeta = (status) => ({
+      running: { text: '运行中', type: 'warning' },
+      succeeded: { text: '成功', type: 'success' },
+      partial: { text: '部分失败', type: 'warning' },
+      failed: { text: '失败', type: 'danger' },
+      skipped: { text: '跳过', type: 'info' },
+    }[status] || { text: status || '-', type: 'info' });
+    const cronDuration = (run) => {
+      if (!run?.started_at) return '';
+      const start = new Date(run.started_at).getTime();
+      const end = run.finished_at ? new Date(run.finished_at).getTime() : Date.now();
+      if (!Number.isFinite(start) || !Number.isFinite(end)) return '';
+      const sec = Math.max(0, Math.round((end - start) / 1000));
+      if (sec < 60) return `${sec}s`;
+      return `${Math.floor(sec / 60)}m${String(sec % 60).padStart(2, '0')}s`;
+    };
+    const cronRunLabel = (index) => ['上一次', '上上次'][index] || '更早';
+    const cronIsRunning = (job) => (job?.runs || []).some((run) => run.status === 'running');
+
+    // ===== 导入采购：模板生成 / 导入 / 导入历史（2026-11-10）=====
+    //   采购金额 + 贴单费 → app_statistics_costs（与月结统计同表同口径）
+    //   采购物流号        → app_order_costs.purchase_tracking_no
+    const COST_HEAD = ['订单号', '下单日期', '货品', '数量', '采购价格', '贴单费', '采购物流单号'];
+    const costFileInput = Vue.ref(null);
+    const costImporting = Vue.ref(false);
+    const costTemplateBusy = Vue.ref(false);
+    const costHistory = Vue.reactive({ visible: false, loading: false, rows: [], error: '' });
+
+    // 把「当前查询条件」命中的订单全部拉回来（不受分页限制），供模板生成使用
+    const fetchAllFilteredForCost = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) throw new Error('请先在顶栏选择店铺');
+      const { since, to } = dateRangeBounds();
+      const merged = new Map();
+      for (const sid of storeIds) {
+        for (let page = 0; page < 20; page += 1) {
+          const res = await axios.post('/api/seller/orders', {
+            store_id: sid,
+            status: apiStatusForActiveTab(),
+            since, to,
+            sync_mode: 'cache',
+            limit: 500,
+            offset: page * 500,
+            ...advancedFilterParams(),
+            ...(postingFilter.value.length ? { posting_numbers: postingFilter.value } : {}),
+          });
+          const batch = res.data.orders || [];
+          for (const row of batch) {
+            merged.set(row.posting_number, { ...row, store_id: sid, store_name: storeNameById(sid) });
+          }
+          if (!res.data.has_next || batch.length < 500) break;
+          if (merged.size >= 8000) break;
+        }
+        if (merged.size >= 8000) break;
+      }
+      return [...merged.values()];
+    };
+
+    const generateCostTemplate = async () => {
+      if (!window.XLSX) return notify.error('Excel 组件还没加载完，请稍后再试');
+      costTemplateBusy.value = true;
+      try {
+        const rows = await fetchAllFilteredForCost();
+        if (!rows.length) return notify.warning('当前查询条件下没有订单，先调整筛选再生成模板');
+        const sorted = rows.slice().sort((a, b) => String(a.in_process_at || '').localeCompare(String(b.in_process_at || '')));
+        const body = sorted.map((row) => {
+          const product = primaryProduct(row);
+          return [
+            row.posting_number,
+            orderDateText(row),
+            product.name || '',
+            Number(row.product_count || product.quantity || 1),
+            row.purchase_cny == null ? '' : Number(row.purchase_cny),
+            row.label_cny == null ? '' : Number(row.label_cny),
+            row.purchase_tracking_no || '',
+          ];
+        });
+        const sheet = XLSX.utils.aoa_to_sheet([COST_HEAD, ...body]);
+        sheet['!cols'] = [{ wch: 20 }, { wch: 12 }, { wch: 42 }, { wch: 6 }, { wch: 11 }, { wch: 11 }, { wch: 20 }];
+        sheet['!freeze'] = { xSplit: '0', ySplit: '1' };
+        const help = XLSX.utils.aoa_to_sheet([
+          ['采购录入说明'],
+          [''],
+          ['1. 模板按「订单页当前的查询条件」生成，包含当前筛选命中的全部订单（最多 8000 单）。'],
+          ['2. 只需要填「采购价格」「贴单费」「采购物流单号」三列，其余列仅供核对，填了也不会导入。'],
+          ['3. 以「订单号」为准；留空的单元格表示不修改原值（不会清零）。'],
+          ['4. 采购价格单位人民币，最多两位小数；贴单费按单收取。'],
+          ['5. 采购物流单号非必填，填了就会写到该订单的采购物流号上。'],
+          ['6. 填好后回到订单页 → 导入采购 → 导入 Excel，按订单号批量写入。'],
+          ['7. 单次最多 20000 行；支持 .xlsx / .xls / .csv。'],
+        ]);
+        help['!cols'] = [{ wch: 92 }];
+        const book = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(book, sheet, '采购录入');
+        XLSX.utils.book_append_sheet(book, help, '填写说明');
+        const stamp = new Date().toISOString().slice(0, 10);
+        XLSX.writeFile(book, `采购录入模板_${currentStoreName.value}_${stamp}.xlsx`);
+        notify.success(`模板已生成：${rows.length} 单`);
+      } catch (e) {
+        notify.error('生成模板失败：' + (e.response?.data?.error || e.message));
+      } finally {
+        costTemplateBusy.value = false;
+      }
+    };
+
+    const costAmount = (value, label, rowNo) => {
+      if (value === null || value === undefined || String(value).trim() === '') return null;
+      const text = String(value).trim().replace(/[,，¥￥\s]/g, '');
+      if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error(`第 ${rowNo} 行${label}无效：${String(value).trim().slice(0, 20)}`);
+      return Number(text);
+    };
+
+    const onCostFile = async (event) => {
+      const file = event?.target?.files?.[0];
+      if (event?.target) event.target.value = '';
+      if (!file) return;
+      if (file.size > 10 * 1024 * 1024) return notify.error('文件不能超过 10MB');
+      if (!window.XLSX) return notify.error('Excel 组件还没加载完，请稍后再试');
+      costImporting.value = true;
+      try {
+        const workbook = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+        let matrix = null, headerIndex = -1, sheetName = '';
+        for (const name of workbook.SheetNames) {
+          const m = XLSX.utils.sheet_to_json(workbook.Sheets[name], { header: 1, defval: null });
+          const hit = m.findIndex((r) => r.some((c) => String(c ?? '').trim() === '订单号'));
+          if (hit >= 0) { matrix = m; headerIndex = hit; sheetName = name; break; }
+        }
+        if (!matrix) throw new Error('没找到含「订单号」表头的工作表，请用「生成采购模板」生成的文件');
+        const header = matrix[headerIndex].map((c) => String(c ?? '').trim());
+        const idIndex = header.indexOf('订单号');
+        const purchaseIndex = header.findIndex((c) => c.startsWith('采购') && !c.includes('物流'));
+        const labelIndex = header.findIndex((c) => c.startsWith('贴单'));
+        const trackingIndex = header.findIndex((c) => c.includes('物流'));
+        if (purchaseIndex < 0 && labelIndex < 0 && trackingIndex < 0) {
+          throw new Error('至少要有一列：采购价格 / 贴单费 / 采购物流单号');
+        }
+        const rows = [];
+        const seen = new Set();
+        for (const [i, row] of matrix.slice(headerIndex + 1).entries()) {
+          const rowNo = headerIndex + i + 2;
+          const purchase = purchaseIndex < 0 ? null : costAmount(row[purchaseIndex], '采购价格', rowNo);
+          const label = labelIndex < 0 ? null : costAmount(row[labelIndex], '贴单费', rowNo);
+          const tracking = trackingIndex < 0 ? '' : String(row[trackingIndex] ?? '').trim();
+          if (purchase === null && label === null && !tracking) continue;
+          const postingNumber = String(row[idIndex] ?? '').trim();
+          if (!postingNumber) throw new Error(`第 ${rowNo} 行订单号为空`);
+          if (seen.has(postingNumber)) throw new Error(`订单号重复：${postingNumber}`);
+          seen.add(postingNumber);
+          rows.push({ posting_number: postingNumber, purchase_cny: purchase, label_cny: label, purchase_tracking_no: tracking });
+        }
+        if (!rows.length) throw new Error('没有读到可导入的数据（三列都是空的）');
+        if (rows.length > 20000) throw new Error(`一次最多导入 20000 单，本次 ${rows.length} 单`);
+        const purchaseCount = rows.filter((r) => r.purchase_cny != null).length;
+        const labelCount = rows.filter((r) => r.label_cny != null).length;
+        const trackingCount = rows.filter((r) => r.purchase_tracking_no).length;
+        await window.ElementPlus.ElMessageBox.confirm(
+          `将从「${sheetName}」导入 ${rows.length} 单：采购金额 ${purchaseCount} 单、贴单费 ${labelCount} 单、采购物流号 ${trackingCount} 单。留空的字段不会覆盖原值。`,
+          '确认导入采购数据',
+          { type: 'warning', confirmButtonText: '确认导入', cancelButtonText: '取消' },
+        );
+        const fileBase64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || '').split(',').pop() || '');
+          reader.onerror = reject;
+          reader.readAsDataURL(file);
+        });
+        const res = await axios.post('/api/seller/orders/costs/import', {
+          filename: file.name,
+          file_base64: fileBase64,
+          rows,
+        }, { timeout: 180000 });
+        const d = res.data || {};
+        notify.success(`导入完成：成功 ${d.applied || 0} 单${d.tracking_only ? `（其中 ${d.tracking_only} 单只写了物流号）` : ''}${d.failed ? `，失败 ${d.failed} 单` : ''}`);
+        if (d.errors && d.errors.length) notify.warning('部分行未导入：' + d.errors.slice(0, 3).join('；'), 12000);
+        await refreshOrderDashboard('cache');
+      } catch (e) {
+        if (e === 'cancel' || e?.message === 'cancel') return;
+        notify.error('导入采购失败：' + (e.response?.data?.error || e.message));
+      } finally {
+        costImporting.value = false;
+      }
+    };
+
+    const fetchCostImports = async () => {
+      costHistory.loading = true;
+      costHistory.error = '';
+      try {
+        const res = await axios.get('/api/seller/orders/costs/imports', { params: { limit: 50 } });
+        costHistory.rows = res.data?.imports || [];
+      } catch (e) {
+        costHistory.error = e.response?.data?.error || e.message;
+      } finally {
+        costHistory.loading = false;
+      }
+    };
+    const openCostImports = () => { costHistory.visible = true; fetchCostImports(); };
+    const downloadCostImport = async (row) => {
+      try {
+        const res = await axios.get(`/api/seller/orders/costs/imports/${row.id}/file`, { responseType: 'blob' });
+        downloadBlob(res.data, row.file_name || '采购导入源文件.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      } catch (e) {
+        notify.error('下载源文件失败：' + (e.response?.data?.error || e.message));
+      }
+    };
+    const handleCostCommand = (command) => {
+      if (command === 'template') generateCostTemplate();
+      else if (command === 'import') { if (costFileInput.value) costFileInput.value.click(); }
+      else if (command === 'history') openCostImports();
+    };
 
     // v0.3.3 订单详情
     const openDetail = async (row) => {
@@ -1130,23 +1325,7 @@ window.OrderListView = {
       } catch (e) { notify.error('备注保存失败: ' + (e.response?.data?.error || e.message)); }
       finally { noteDialog.saving = false; }
     };
-    const procurementPreview = Vue.computed(() => {
-      const row = procurementDialog.row || {};
-      const outboundCost = roundMoney(Number(procurementDialog.outbound_cost_cny || 0));
-      const commission = orderCommission(row);
-      const lastMile = orderLastMile(row);
-      const sales = roundMoney(Number(row.total_cny || 0));
-      return {
-        sales,
-        commission,
-        lastMile,
-        ozonCost: roundMoney(commission + lastMile),
-        outboundCost,
-        totalCost: roundMoney(commission + lastMile + outboundCost),
-        profit: roundMoney(sales - commission - lastMile - outboundCost),
-        calculable: orderDelivered(row),
-      };
-    });
+    // 2026-11-10 订单页不再做利润计算（利润只在月结统计里算），这里只维护货源链接 / 采购物流号
     const openProcurementSource = (row) => {
       const product = primaryProduct(row);
       if (!product.offer_id) return notify.warning('当前订单没有可编辑的商品货号');
@@ -1158,12 +1337,14 @@ window.OrderListView = {
       procurementDialog.quantity = Number(product.quantity || row.product_count || 1);
       procurementDialog.source_url_1688 = product.source_url_1688 || '';
       procurementDialog.outbound_cost_cny = Number(row.outbound_cost_cny || 0);
+      procurementDialog.purchase_tracking_no = row.purchase_tracking_no || '';
       procurementDialog.row = row;
       procurementDialog.visible = true;
     };
     const saveProcurementSource = async () => {
-      const cost = Number(procurementDialog.outbound_cost_cny);
-      if (!Number.isFinite(cost) || cost < 0) return notify.warning('请输入有效的出单总成本');
+      // 订单页不再维护出单成本（利润在月结统计里算），这里只把原值原样带回去，不覆盖用户历史数据
+      const cost = Number(procurementDialog.outbound_cost_cny || 0);
+      if (!Number.isFinite(cost) || cost < 0) return notify.warning('出单总成本异常');
       procurementDialog.saving = true;
       try {
         const res = await axios.post(`/api/seller/orders/${encodeURIComponent(procurementDialog.posting_number)}/source`, {
@@ -1171,6 +1352,7 @@ window.OrderListView = {
           offer_id: procurementDialog.offer_id,
           outbound_cost_cny: cost,
           source_url_1688: procurementDialog.source_url_1688,
+          purchase_tracking_no: String(procurementDialog.purchase_tracking_no || '').trim(),
         });
         const updatedOrder = res.data.order;
         const updatedProduct = res.data.product;
@@ -1180,10 +1362,11 @@ window.OrderListView = {
           const product = (target.products || []).find((item) => String(item.offer_id) === String(updatedProduct.offer_id));
           if (product) Object.assign(product, updatedProduct);
         }
+        // 采购物流号不在订单缓存 payload 里，单独回填到行上
+        if (target) target.purchase_tracking_no = String(procurementDialog.purchase_tracking_no || '').trim();
         procurementDialog.visible = false;
-        notify.success(orderDelivered(target || procurementDialog.row) ? '货源和出单总成本已保存，利润已重算' : '货源和出单总成本已保存，订单已送达后会计算利润');
+        notify.success('货源链接、采购物流号已保存');
         fetchOrderSummary();
-        fetchOrderKpis();
       } catch (e) {
         notify.error('保存货源失败: ' + (e.response?.data?.error || e.message));
       } finally {
@@ -1259,7 +1442,7 @@ window.OrderListView = {
           status: activeTab.value === 'all' ? '' : activeTab.value,
           since,
           to,
-          q: searchKeyword.value || '',
+          ...advancedFilterParams(),
           posting_numbers: postingFilter.value.length ? postingFilter.value : undefined,
           source: 'cache',
         }, { responseType: 'blob', timeout: 120000 });
@@ -1270,6 +1453,85 @@ window.OrderListView = {
         a.click();
         URL.revokeObjectURL(url);
       } catch (e) { notify.error('导出失败: ' + (e.response?.data?.error || e.message)); }
+    };
+
+    // ===== 2026-11-10 采购批次号 =====
+    //   增加：作用于「当前查询条件命中的全部订单」（后端按同一套条件取单号，不受分页限制）
+    //   删除：只作用于「已勾选的订单」
+    //   规则：命中订单里只要有一单已有批次号，后端整体拒绝 → 必须先删
+    const batchDialog = Vue.reactive({ visible: false, value: '', busy: false });
+    const batchBusy = Vue.ref(false);
+    const queryScopeParams = () => ({
+      store_ids: selectedStoreIds(),
+      status: apiStatusForActiveTab(),
+      ...dateRangeBounds(),
+      ...advancedFilterParams(),
+      ...(postingFilter.value.length ? { posting_numbers: postingFilter.value } : {}),
+    });
+    const openBatchDialog = () => {
+      if (!selectedStoreIds().length) return notify.warning('请先选择店铺');
+      batchDialog.value = '';
+      batchDialog.visible = true;
+    };
+    const submitBatch = async () => {
+      const batchNo = String(batchDialog.value || '').trim();
+      if (!batchNo) return notify.warning('请先填写批次号');
+      if (batchNo.length > 40) return notify.warning('批次号最多 40 个字符');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `将给「当前查询条件命中的全部订单」写入批次号「${batchNo}」。已有批次号的订单不会被覆盖——只要命中一单，本次会整体拒绝。`,
+          '确认增加批次',
+          { type: 'warning', confirmButtonText: '确定录入', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      batchDialog.busy = true;
+      batchBusy.value = true;
+      try {
+        const res = await axios.post('/api/seller/orders/batches', { ...queryScopeParams(), batch_no: batchNo }, { timeout: 180000 });
+        const d = res.data || {};
+        batchDialog.visible = false;
+        notify.success(`批次号「${d.batch_no}」已写入 ${d.assigned} 单`);
+        await refreshOrderDashboard();
+      } catch (e) {
+        notify.error('增加批次失败：' + (e.response?.data?.error || e.message), 20000);
+      } finally {
+        batchDialog.busy = false;
+        batchBusy.value = false;
+      }
+    };
+    const removeBatch = async () => {
+      const rows = selectedOrders.value || [];
+      const picked = [...new Set(rows.map((r) => String(r.posting_number || '')).filter(Boolean))];
+      if (!picked.length) return notify.warning('请先勾选要删除批次的订单');
+      const names = [...new Set(rows.map((r) => String(r.batch_no || '').trim()).filter(Boolean))];
+      if (!names.length) return notify.warning('所选订单里没有采购批次号，无需删除');
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `将删除所选 ${picked.length} 单的采购批次号（${names.slice(0, 3).join('、')}${names.length > 3 ? ' 等' : ''}）。删除后可以重新录入。`,
+          '确认删除批次',
+          { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' },
+        );
+      } catch { return; }
+      batchBusy.value = true;
+      try {
+        const storeIds = [...new Set(rows.map((r) => effectiveStoreIdForOrder(r)).filter(Boolean))];
+        const res = await axios.post('/api/seller/orders/batches/remove', { store_ids: storeIds, posting_numbers: picked });
+        notify.success(`已删除 ${Number(res.data?.removed || 0)} 单的采购批次号`);
+        selectedOrders.value = [];
+        await refreshOrderDashboard();
+      } catch (e) {
+        notify.error('删除批次失败：' + (e.response?.data?.error || e.message), 15000);
+      } finally { batchBusy.value = false; }
+    };
+    const handleBatchCommand = (command) => {
+      if (command === 'add') openBatchDialog();
+      else if (command === 'remove') removeBatch();
+    };
+    // 2026-11-10 三个导出按钮收进「打印」下拉，功能不变
+    const handlePrintCommand = (command) => {
+      if (command === 'picklist') exportYarnPicklist();
+      else if (command === 'labels') exportYarnLabels();
+      else if (command === 'labels-api') exportYarnLabelsOfficial();
     };
 
     const batchShip = async () => {
@@ -1318,17 +1580,27 @@ window.OrderListView = {
       return { text: `${hours}小时${minutes}分`, urgent: ms <= 2 * 3600000 };
     };
 
-    const onShopChanged = () => {
-      if (storeScopeValues().includes(CURRENT_STORE)) {
-        selectedOrders.value = [];
+    // 顶栏店铺切换（含「全部店铺」聚合）→ 同步本页作用域并重拉
+    const onShopChanged = (event) => {
+      const val = String(event?.detail || '');
+      if (val === ALL_STORES) {
+        storeScope.value = [ALL_STORES];
+      } else if (!storeScopeValues().includes(ALL_STORES)) {
+        // 顶栏切了某家店（或从聚合切回单店）：跟随当前店铺，不再锁定旧 id
+        storeScope.value = [CURRENT_STORE];
       }
+      previousStoreScope = storeScope.value.slice();
       pagination.currentPage = 1;
       orders.value = [];
+      summaryRows.value = [];
+      kpiRows.value = [];
+      previousKpiRows.value = [];
       selectedOrders.value = [];
       pagination.total = 0;
       refreshOrderDashboard();
     };
-    const onStoreScopeChange = (value = storeScope.value) => {
+    // 保留给「全部店铺/多选」的历史逻辑（当前无选择器入口，仍被 applyStoreScope 复用）
+    const applyStoreScope = (value = storeScope.value) => {
       const incoming = (Array.isArray(value) ? value : [value]).map((item) => String(item || '').trim()).filter(Boolean);
       const hadAll = previousStoreScope.includes(ALL_STORES);
       const hasAll = incoming.includes(ALL_STORES);
@@ -1364,53 +1636,53 @@ window.OrderListView = {
         console.warn('订单页拉取店铺列表失败', e.message);
       }
     };
-    const setupAutoSync = () => {
-      if (autoSyncTimer) clearInterval(autoSyncTimer);
-      autoSyncTimer = null;
-      if (!autoSync.value) return;
-      autoSyncTimer = setInterval(() => refreshOrderDashboard('latest'), 5 * 60 * 1000);
-    };
-    Vue.watch(autoSync, setupAutoSync);
+    // 2026-11-10 前端自动同步已移除：同步全部交给后台定时任务，页面上的「立即同步」只做手动补一次
     window.addEventListener('shop-changed', onShopChanged);
     Vue.onBeforeUnmount(() => {
       window.removeEventListener('shop-changed', onShopChanged);
-      if (autoSyncTimer) clearInterval(autoSyncTimer);
     });
 
     Vue.onMounted(() => {
-      fetchShops().finally(() => refreshOrderDashboard());
-      setupAutoSync();
+      fetchShops().finally(() => { refreshOrderDashboard(); fetchSyncState(); });
     });
 
     return {
       orders, displayedOrders, loading, summaryLoading, kpiLoading, activeTab, statusTabs, statusTabItems, pagination,
       selectedOrders, notes, batchLoading,
       postingFilter, postingDialog, openPostingDialog, applyPostingFilter, clearPostingFilter,
-      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, exportYarnLabelsOfficial, exportProgress, noteDialog, procurementDialog, procurementPreview, syncWindowDialog,
+      yarnPicklistBusy, yarnLabelsBusy, exportYarnPicklist, exportYarnLabels, exportYarnLabelsOfficial, exportProgress, noteDialog, procurementDialog, syncBusy, runManualSync, lastSync, lastSyncText, fetchSyncState,
       lastBatchResult, hasFetched, orderEmptyText, shops, currentStoreName,
-      storeScope, storeScopeOptions, onStoreScopeChange,
+      storeScope, storeScopeOptions, isAllStoresScope,
       detailDrawer, shipDialog,
-      fetchOrders, fetchOrderSummary, fetchOrderKpis, refreshOrderDashboard, pullLatestOrders, refreshInProgressOrders,
+      fetchOrders, fetchOrderSummary, fetchOrderKpis, refreshOrderDashboard,
       onPageChange, onPageSizeChange, toBeijingTime,
-      openSyncWindowDialog, saveSyncWindow, resetSyncWindow, openDetail, openShipDialog, confirmShip, statusTagType, statusText,
+      openDetail, openShipDialog, confirmShip, statusTagType, statusText,
       onSelectionChange, orderNote, openNoteDialog, saveNote, exportOrders, batchShip, deadlineInfo,
       openProcurementSource, saveProcurementSource, findSourceForOrder, handleRowAction, cancelOrder,
-      selectStatusTab, searchKeyword, filterField, filterOptions, autoSync,
+      selectStatusTab,
+      // 2026-11-10 采购批次号
+      batchDialog, batchBusy, handleBatchCommand, openBatchDialog, submitBatch, removeBatch,
+      handlePrintCommand,
       todayLabel, syncRangeText, summaryStats, moneyText, trendText, trendColor, primaryProduct, rowCreatedTime,
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
-      feesFileInput, feesImporting, pickFeesFile, onFeesFile,
       labelsPrinting, printLabels,   // v2.2.9.156 打印面单
       yarnExporting, exportPendingSkus,   // v2.2.9.165 导出待备货毛线数量
       pickListBusy, printPickList,   // v2.2.9.157 生成拣货单
-      returnsDrawer, openReturns, returnsTypeText, returnsTypeTag,   // v2.2.9.146 WHD 退货
-      rowStatusSubtext, copyPostingNumber, deadlineBadgeStyle, warehouseText, deliveryText,
+      rowStatusSubtext, copyPostingNumber, copyText, orderDateText, orderTimeText, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
-      // v0.3.5 时窗
+      // v0.3.5 时窗 + 2026-11-10 组合查询条件
       dateRange, rangeShortcuts,
+      orderNoKeyword, productKeyword, settledRange, onlyMissingPurchase, onlyUnsettled,
+      runQuery, resetQueryConditions, hasAdvancedFilters,
+      // 定时任务看板
+      cronDialog, openCronDialog, fetchCronJobs, cronStatusMeta, cronDuration, cronRunLabel, cronIsRunning,
+      // 导入采购
+      costFileInput, costImporting, costTemplateBusy, costHistory, handleCostCommand, onCostFile,
+      generateCostTemplate, fetchCostImports, openCostImports, downloadCostImport,
     };
   },
   template: `
-    <div class="order-list-v3" style="background:#f8fafc; min-height:100%; padding:22px 30px 28px">
+    <div class="order-workbench">
             <!-- v2.2.9.169 批量单号筛选 -->
         <el-dialog v-model="postingDialog.visible" title="按单号批量查询" width="560px">
           <div style="font-size:13px; color:#64748b; margin-bottom:8px">
@@ -1423,167 +1695,136 @@ window.OrderListView = {
             <el-button type="primary" @click="applyPostingFilter">查询</el-button>
           </template>
         </el-dialog>
-      <div style="max-width:1500px; margin:0 auto">
-        <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin-bottom:18px">
+      <div style="min-width:0">
+        <!-- 标题区：与「店铺结算 - 应计原始数据」同版式（h2 18px + 一行灰色说明 + 右侧操作） -->
+        <header class="statistics-heading">
           <div>
-            <div style="font-size:28px; line-height:1; font-weight:800; color:#111827; letter-spacing:0">订单</div>
-            <div style="margin-top:14px; font-size:14px; color:#64748b">{{ todayLabel }} · {{ currentStoreName }} · {{ autoSync ? '自动同步中' : '手动同步' }}</div>
+            <h2>订单管理</h2>
+            <div class="statistics-meta">
+              {{ todayLabel }} · {{ currentStoreName }} · {{ lastSyncText }}
+              <span v-if="lastSync.pool" style="color:#b45309"> · 跟踪池 {{ lastSync.pool }} 单<span v-if="lastSync.suspect">（疑似丢件 {{ lastSync.suspect }}）</span></span>
+              · 后台自动：新单 15 分钟、待处理 1 小时、取消 2 小时、运输中/签收 12 小时
+            </div>
           </div>
-          <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; justify-content:flex-end">
-            <el-tooltip content="重新读取本地缓存，不请求 Ozon" placement="top">
-              <el-button size="large" @click="refreshOrderDashboard('cache')">
-                <el-icon><Refresh /></el-icon><span>刷新</span>
-              </el-button>
+          <div class="statistics-actions order-head-actions">
+            <el-tooltip content="立即手动跑一次：新单 + 待处理 + 取消 + 兜底核对（约 3~8 秒）" placement="bottom">
+              <el-button type="primary" :icon="'Refresh'" :loading="syncBusy" @click="runManualSync">立即同步</el-button>
             </el-tooltip>
-            <el-button size="large" type="primary" style="background:#111827; border-color:#111827" @click="pullLatestOrders">
-              <el-icon><Download /></el-icon><span>拉取最新订单</span>
-            </el-button>
-            <el-button size="large" @click="openSyncWindowDialog">
-              <el-icon><Calendar /></el-icon><span>设置时间</span>
-            </el-button>
-            <el-button size="large" @click="refreshInProgressOrders">
-              <el-icon><RefreshRight /></el-icon><span>刷新进行中订单</span>
-            </el-button>
+            <el-tooltip content="查看后台定时任务：每个步骤的频率、上次执行时间与结果" placement="bottom">
+              <el-button :icon="'Timer'" circle aria-label="定时任务" @click="openCronDialog" />
+            </el-tooltip>
           </div>
-        </div>
+        </header>
 
         <!-- v2.2.9.200 导出/打印常驻进度条（替代一闪而过的 toast） -->
         <transition name="el-fade-in">
-          <div v-if="exportProgress.visible" style="position:sticky; top:0; z-index:30; margin-bottom:14px; background:#111827; color:#fff; border-radius:8px; padding:12px 16px; box-shadow:0 6px 20px rgba(17,24,39,.25)">
-            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:8px">
-              <span style="font-size:14px; font-weight:700">{{ exportProgress.label }}</span>
-              <span style="font-size:13px; opacity:.85">{{ exportProgress.percent }}%</span>
+          <div v-if="exportProgress.visible" class="order-progress">
+            <div class="order-progress-head">
+              <span>{{ exportProgress.label }}</span>
+              <span>{{ exportProgress.percent }}%</span>
             </div>
-            <el-progress :percentage="exportProgress.percent" :stroke-width="10" :show-text="false" :status="exportProgress.percent >= 100 ? 'success' : ''" />
-            <div v-if="exportProgress.detail" style="margin-top:6px; font-size:12px; opacity:.85">{{ exportProgress.detail }}</div>
+            <el-progress :percentage="exportProgress.percent" :stroke-width="6" :show-text="false" :status="exportProgress.percent >= 100 ? 'success' : ''" />
+            <div v-if="exportProgress.detail" class="order-progress-detail">{{ exportProgress.detail }}</div>
           </div>
         </transition>
 
-        <div style="border:1px solid #dfe7f1; border-radius:8px; background:#fff; padding:14px 16px; color:#475569; font-weight:600; margin-bottom:18px">
-          {{ syncRangeText }}
-        </div>
-
-        <div v-loading="kpiLoading || summaryLoading" element-loading-text="正在统计本周经营指标..." style="display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border:1px solid #dfe7f1; border-radius:8px; overflow:hidden; background:#fff; margin-bottom:22px">
-          <div style="padding:22px 28px; border-right:1px solid #e5edf6">
-            <div style="font-size:13px; font-weight:700; color:#7c8798">本周 GMV</div>
-            <div style="margin-top:12px; font-size:32px; font-weight:800; color:#111827">{{ moneyText(summaryStats.gmv) }}</div>
-            <div :style="{ marginTop:'8px', color:trendColor(summaryStats.gmvTrend), fontSize:'13px', fontWeight:700 }">
-              {{ trendText(summaryStats.gmvTrend) }} <span style="color:#64748b; font-weight:500">vs 上 7 天</span>
-            </div>
-          </div>
-          <div style="padding:22px 28px; border-right:1px solid #e5edf6">
-            <div style="font-size:13px; font-weight:700; color:#7c8798">本周利润</div>
-            <div style="margin-top:12px; font-size:32px; font-weight:800; color:#111827">{{ moneyText(summaryStats.profit) }}</div>
-            <div :style="{ marginTop:'8px', color:trendColor(summaryStats.profitTrend), fontSize:'13px', fontWeight:700 }">
-              {{ trendText(summaryStats.profitTrend) }} <span style="color:#64748b; font-weight:500">vs 上 7 天</span>
-            </div>
-          </div>
-          <div style="padding:22px 28px; border-right:1px solid #e5edf6">
-            <div style="font-size:13px; font-weight:700; color:#7c8798">本周利润率</div>
-            <div style="margin-top:12px; font-size:32px; font-weight:800; color:#111827">{{ summaryStats.profitRate }}<span style="font-size:18px">%</span></div>
-            <div :style="{ marginTop:'8px', color:trendColor(summaryStats.profitRateTrend), fontSize:'13px', fontWeight:700 }">
-              {{ trendText(summaryStats.profitRateTrend, 'pp') }} <span style="color:#64748b; font-weight:500">vs 上 7 天</span>
-            </div>
-          </div>
-          <div style="padding:22px 28px">
-            <div style="font-size:13px; font-weight:700; color:#7c8798">待处理</div>
-            <div style="margin-top:12px; font-size:32px; font-weight:800; color:#111827">{{ summaryStats.pending }}</div>
-            <div style="margin-top:8px; color:#64748b; font-size:13px">{{ summaryStats.awaitingPackaging }} 待备货 · {{ summaryStats.awaitingDeliver }} 待发运</div>
-          </div>
-        </div>
-
-        <div style="display:flex; align-items:center; gap:10px; border:1px solid #dfe7f1; border-radius:8px; background:#fff; padding:5px; width:max-content; max-width:100%; margin-bottom:14px; overflow-x:auto">
+        <div class="order-status-tabs">
           <button
             v-for="tab in statusTabItems"
             :key="tab.value"
-            @click="selectStatusTab(tab.value)"
-            :style="{
-              border:'none',
-              borderRadius:'6px',
-              padding:'8px 14px',
-              cursor:'pointer',
-              fontWeight:800,
-              whiteSpace:'nowrap',
-              background: activeTab === tab.value ? '#111827' : 'transparent',
-              color: activeTab === tab.value ? '#fff' : '#64748b'
-            }">
+            class="order-status-tab"
+            :class="{ 'is-active': activeTab === tab.value }"
+            @click="selectStatusTab(tab.value)">
             {{ tab.label }}
-            <span :style="{ marginLeft:'6px', padding:'1px 8px', borderRadius:'999px', background: activeTab === tab.value ? 'rgba(255,255,255,.18)' : '#eef2f7', color: activeTab === tab.value ? '#fff' : '#64748b' }">{{ tab.count }}</span>
+            <span class="order-status-count">{{ tab.count }}</span>
           </button>
         </div>
 
-        <div style="display:grid; grid-template-columns:240px 130px minmax(240px,1fr) 250px 70px 70px; gap:10px; align-items:center; margin-bottom:12px">
-          <el-select
-            v-model="storeScope"
-            size="large"
-            multiple
-            collapse-tags
-            collapse-tags-tooltip
-            :max-collapse-tags="1"
-            filterable
-            placeholder="选择店铺"
-            style="width:100%"
-            @change="onStoreScopeChange">
-            <template #prefix><el-icon><Shop /></el-icon></template>
-            <el-option v-for="item in storeScopeOptions" :key="'filter-' + item.value" :label="item.label" :value="item.value" />
-          </el-select>
-          <el-select v-model="filterField" size="large" style="width:100%">
-            <el-option v-for="item in filterOptions" :key="item.value" :label="item.label" :value="item.value" />
-          </el-select>
-          <el-button size="large" @click="openPostingDialog">
-            <el-icon><Tickets /></el-icon><span style="margin-left:4px">批量单号</span>
-          </el-button>
-          <el-tag v-if="postingFilter.length" closable type="success" size="large" @close="clearPostingFilter">
-            已按 {{ postingFilter.length }} 个单号筛选
-          </el-tag>
-          <el-input v-model="searchKeyword" size="large" clearable placeholder="搜索货件号 / SKU / 货号 / 商品名..." style="width:100%">
-            <template #prefix><el-icon><Search /></el-icon></template>
-          </el-input>
-          <el-date-picker
-            v-model="dateRange"
-            type="daterange"
-            value-format="YYYY-MM-DD"
-            start-placeholder="下单时间"
-            end-placeholder="结束时间"
-            :shortcuts="rangeShortcuts"
-            size="large"
-            style="width:100%"
-            @change="() => { pagination.currentPage=1; refreshOrderDashboard(); }" />
-          <el-button size="large" style="width:100%" @click="refreshOrderDashboard">筛选</el-button>
-          <el-button size="large" style="width:100%" @click="() => { searchKeyword=''; filterField='all'; activeTab='all'; pagination.currentPage=1; refreshOrderDashboard(); }">重置</el-button>
-        </div>
-
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px">
-          <el-button size="large" type="warning" plain @click="exportOrders">
-            <el-icon><Download /></el-icon><span>订单导出</span>
-          </el-button>
-          <el-button size="large" plain :loading="yarnPicklistBusy" @click="exportYarnPicklist">
-            <el-icon><Tickets /></el-icon><span>导出毛线拣货单</span>
-          </el-button>
-          <el-button size="large" plain :loading="yarnLabelsBusy" @click="exportYarnLabels">
-            <el-icon><Tickets /></el-icon><span>导出毛线标签</span>
-          </el-button>
-          <el-button size="large" plain :disabled="yarnLabelsBusy" @click="exportYarnLabelsOfficial" title="不依赖插件，逐单从 Ozon API 获取并按拣货单顺序合并；可能受接口限流影响">
-            <el-icon><Download /></el-icon><span>API 导出标签</span>
-          </el-button>
-          <el-button size="large" plain :loading="feesImporting" @click="pickFeesFile">
-            <el-icon><Upload /></el-icon><span>导入费用结算</span>
-          </el-button>
-          <el-button size="large" plain @click="openReturns">
-            <el-icon><Box /></el-icon><span>WHD 退货</span>
-          </el-button>
-          <input ref="feesFileInput" type="file" accept=".xlsx" style="display:none" @change="onFeesFile" />
-          <div style="display:flex; align-items:center; gap:10px; color:#64748b; font-weight:700">
-            <span :style="{ width:'8px', height:'8px', borderRadius:'50%', background:autoSync ? '#10b981' : '#cbd5e1', display:'inline-block' }"></span>
-            <span>自动同步</span>
-            <el-switch v-model="autoSync" />
+        <div class="statistics-toolbar">
+          <div class="statistics-filters order-query-row">
+            <el-date-picker v-model="dateRange" type="daterange" value-format="YYYY-MM-DD" format="MM-DD" unlink-panels clearable
+              start-placeholder="下单起" end-placeholder="下单止" @change="runQuery" style="width:200px" />
+            <el-date-picker v-model="settledRange" type="daterange" value-format="YYYY-MM-DD" format="MM-DD" unlink-panels clearable
+              start-placeholder="结算起" end-placeholder="结算止" @change="runQuery" style="width:200px" />
+            <el-input v-model="orderNoKeyword" placeholder="订单号/批次号" clearable title="支持订单号、货件号，以及采购批次号" @keyup.enter="runQuery" @clear="runQuery" style="width:145px">
+              <template #prefix><el-icon><Search /></el-icon></template>
+            </el-input>
+            <el-input v-model="productKeyword" placeholder="货品名称/货号/SKU" clearable @keyup.enter="runQuery" @clear="runQuery" style="width:165px" />
+            <el-button plain :icon="'Tickets'" @click="openPostingDialog">批量单号<span v-if="postingFilter.length"> ({{ postingFilter.length }})</span></el-button>
+            <el-checkbox v-model="onlyMissingPurchase" class="order-flag" @change="runQuery">缺采购</el-checkbox>
+            <el-checkbox v-model="onlyUnsettled" class="order-flag" @change="runQuery">未结算</el-checkbox>
+            <el-button :icon="'Search'" @click="runQuery">查询</el-button>
+            <el-button :icon="'RefreshLeft'" circle aria-label="重置查询条件" title="重置全部查询条件" @click="resetQueryConditions" />
           </div>
         </div>
 
-        <div v-if="selectedOrders.length" style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; margin-bottom:12px; background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px">
-          <span style="font-size:13px; font-weight:700; color:#1e3a8a">已选择 {{ selectedOrders.length }} 个订单</span>
+        <div class="statistics-toolbar order-tool-row">
+          <div class="statistics-filters">
+            <el-button type="warning" plain :icon="'Download'" @click="exportOrders">订单导出</el-button>
+            <el-dropdown trigger="click" @command="handleCostCommand">
+              <el-button plain :icon="'Upload'" :loading="costImporting || costTemplateBusy">
+                导入采购<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="template">
+                    <el-icon><Document /></el-icon><span>生成采购模板（按当前查询）</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="import">
+                    <el-icon><Upload /></el-icon><span>导入 Excel（按订单号写入）</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="history" divided>
+                    <el-icon><Clock /></el-icon><span>导入历史</span>
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+            <input ref="costFileInput" type="file" accept=".xlsx,.xls,.csv" style="display:none" @change="onCostFile" />
+            <el-dropdown trigger="click" @command="handleBatchCommand">
+              <el-button plain :icon="'Files'" :loading="batchBusy">
+                批次<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="add">
+                    <el-icon><Plus /></el-icon><span>增加批次（当前筛选的全部订单）</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="remove" divided>
+                    <el-icon><Delete /></el-icon><span>删除批次（只处理已勾选订单）</span>
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+            <el-dropdown trigger="click" @command="handlePrintCommand">
+              <el-button plain :icon="'Printer'" :loading="yarnPicklistBusy || yarnLabelsBusy">
+                打印<el-icon class="el-icon--right"><ArrowDown /></el-icon>
+              </el-button>
+              <template #dropdown>
+                <el-dropdown-menu>
+                  <el-dropdown-item command="picklist">
+                    <el-icon><Tickets /></el-icon><span>导出毛线拣货单</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="labels">
+                    <el-icon><Tickets /></el-icon><span>导出毛线标签（插件）</span>
+                  </el-dropdown-item>
+                  <el-dropdown-item command="labels-api" :disabled="yarnLabelsBusy" divided>
+                    <el-icon><Download /></el-icon><span>API 导出标签</span>
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </div>
+        </div>
 
-      <div style="display:flex; gap:8px"><el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button><el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button><el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button><el-button size="small" @click="exportOrders">导出当前筛选</el-button><el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button></div>
+        <div v-if="selectedOrders.length" class="order-selection-bar">
+          <span style="font-weight:600">已选择 {{ selectedOrders.length }} 个订单</span>
+          <div style="display:flex; gap:6px; flex-wrap:wrap">
+            <el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button>
+            <el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button>
+            <el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button>
+            <el-button size="small" @click="exportOrders">导出当前筛选</el-button>
+            <el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button>
+          </div>
         </div>
 
         <el-alert
@@ -1600,98 +1841,114 @@ window.OrderListView = {
           <div v-if="lastBatchResult.errors.length > 10" style="font-size:12px; color:#909399; margin-top:4px">其余 {{ lastBatchResult.errors.length - 10 }} 条请缩小筛选范围后重试。</div>
         </div>
 
-        <el-table :data="displayedOrders" v-loading="loading" element-loading-text="正在读取订单..." border size="large" :empty-text="orderEmptyText" :row-key="orderRowKey" style="border-radius:8px; overflow:hidden; box-shadow:0 8px 24px rgba(15,23,42,.04)" @selection-change="onSelectionChange">
-          <el-table-column type="selection" width="52" :selectable="(row) => true" />
-          <el-table-column label="倒计时" width="110">
+        <el-table :data="displayedOrders" v-loading="loading" element-loading-text="正在读取订单..." border size="small" :empty-text="orderEmptyText" :row-key="orderRowKey" height="calc(100vh - 348px)" style="width:100%" @selection-change="onSelectionChange">
+          <el-table-column type="selection" width="42" :selectable="(row) => true" />
+          <!-- 2026-11-10 倒计时列已按要求隐藏（deadlineHourText / deadlineBadgeStyle 保留，随时可以恢复） -->
+          <el-table-column label="订单号" width="128">
             <template #default="{ row }">
-              <div :style="{ width:'64px', minHeight:'48px', border:'1px solid', borderRadius:'10px', display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', fontWeight:800, ...deadlineBadgeStyle(row) }">
-                <span style="font-size:18px; line-height:1">{{ deadlineHourText(row).main }}</span>
-                <span v-if="deadlineHourText(row).unit" style="font-size:11px; margin-top:2px">{{ deadlineHourText(row).unit }}</span>
+              <div style="display:flex; align-items:center; gap:2px; min-width:0">
+                <span class="order-cell-main" style="font-family:ui-monospace,monospace">{{ row.posting_number }}</span>
+                <el-button link type="primary" @click="copyPostingNumber(row)"><el-icon size="12"><CopyDocument /></el-icon></el-button>
               </div>
+              <div class="order-cell-sub" style="margin-top:2px">{{ row.order_number || row.order_id || '' }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="货件 / 状态" width="250">
+          <el-table-column label="状态" width="96">
             <template #default="{ row }">
-              <div style="display:flex; flex-direction:column; gap:8px">
-                <div style="display:flex; align-items:center; gap:6px">
-                  <span style="font-size:15px; font-weight:800; color:#1f2937">{{ row.posting_number }}</span>
-                  <el-button link type="primary" size="small" @click="copyPostingNumber(row)"><el-icon><CopyDocument /></el-icon></el-button>
-                </div>
-                <div style="display:flex; align-items:center; gap:8px">
-                  <el-tag size="small" :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
-                  <span style="font-size:13px; color:#94a3b8">{{ rowCreatedTime(row) }}</span>
-                </div>
-                <div style="font-size:12px; color:#94a3b8">{{ rowStatusSubtext(row) }}</div>
-              </div>
+              <el-tag size="small" :type="statusTagType(row.status)">{{ statusText(row.status) }}</el-tag>
             </template>
           </el-table-column>
-          <el-table-column label="店铺" width="135">
+          <el-table-column label="下单日期" width="92">
             <template #default="{ row }">
-              <div style="display:inline-flex; align-items:center; gap:8px; background:#f1f5f9; border-radius:7px; padding:8px 10px; color:#475569; font-weight:800">
-                <span style="width:5px; height:5px; border-radius:50%; background:#6366f1"></span>
-                <span>{{ row.store_name || currentStoreName }}</span>
-              </div>
+              <div class="order-cell-main">{{ orderDateText(row) }}</div>
+              <div class="order-cell-sub" style="margin-top:2px">{{ orderTimeText(row) }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="商品" min-width="390">
+          <el-table-column v-if="isAllStoresScope()" label="店铺" width="100">
             <template #default="{ row }">
-              <div style="display:flex; gap:12px; align-items:center; min-width:0">
-                <el-image :src="primaryProduct(row).image" style="width:58px; height:58px; border-radius:8px; flex-shrink:0; background:#f1f5f9" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="primaryProduct(row).image ? [primaryProduct(row).image] : []">
+              <span class="order-store-chip">{{ row.store_name || currentStoreName }}</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="商品" min-width="250">
+            <template #default="{ row }">
+              <div style="display:flex; gap:8px; align-items:center; min-width:0">
+                <el-image :src="primaryProduct(row).image" class="order-thumb" fit="cover" preview-teleported hide-on-click-modal :preview-src-list="primaryProduct(row).image ? [primaryProduct(row).image] : []">
                   <template #error>
-                    <div style="width:58px; height:58px; background:#f1f5f9; display:flex; align-items:center; justify-content:center">
-                      <el-icon color="#cbd5e1"><Picture /></el-icon>
-                    </div>
+                    <div class="order-thumb-empty"><el-icon color="#cbd5e1"><Picture /></el-icon></div>
                   </template>
                 </el-image>
                 <div style="min-width:0; flex:1">
-                  <div style="font-size:15px; color:#1f2937; font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ primaryProduct(row).name || '-' }}</div>
-                  <div style="margin-top:6px; font-size:12px; color:#94a3b8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">
+                  <div class="order-cell-main">{{ primaryProduct(row).name || '-' }}</div>
+                  <div class="order-cell-sub" style="margin-top:3px">
                     SKU {{ primaryProduct(row).sku || '-' }}　货号 {{ primaryProduct(row).offer_id || '-' }}　×{{ row.product_count || primaryProduct(row).quantity || 1 }}
-                  </div>
-                  <div style="margin-top:6px; display:flex; gap:10px; align-items:center; flex-wrap:wrap">
-                    <a v-if="primaryProduct(row).source_url_1688" :href="primaryProduct(row).source_url_1688" target="_blank" rel="noopener noreferrer" style="font-size:12px; color:#2563eb">1688 采购</a>
+                    <a v-if="primaryProduct(row).source_url_1688" :href="primaryProduct(row).source_url_1688" target="_blank" rel="noopener noreferrer" style="color:#2563eb">1688</a>
                   </div>
                 </div>
               </div>
             </template>
           </el-table-column>
-          <el-table-column label="仓库 / 配送" width="180">
+          <el-table-column label="仓库 / 配送" width="106">
             <template #default="{ row }">
-              <div style="font-weight:800; color:#1f2937">{{ warehouseText(row) }}</div>
-              <div style="margin-top:5px; color:#64748b; font-size:13px">{{ deliveryText(row) }}</div>
-              <div v-if="row.tracking_number" style="margin-top:5px; color:#4f46e5; font-size:12px">{{ row.tracking_number }}</div>
+              <div class="order-cell-main">{{ warehouseText(row) }}</div>
+              <div class="order-cell-sub" style="margin-top:2px">{{ deliveryText(row) }}</div>
+              <div class="order-cell-sub" style="margin-top:2px; color:#4f46e5" v-if="row.tracking_number">{{ row.tracking_number }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="订单金额" width="130" align="right">
+          <el-table-column label="订单金额" width="94" align="right">
             <template #default="{ row }">
-              <div style="font-size:16px; font-weight:800; color:#1f2937">{{ moneyText(row.total_cny) }}</div>
-              <div v-if="Number(row.total_rub || 0)" style="margin-top:4px; font-size:12px; color:#94a3b8">₽ {{ Number(row.total_rub || 0).toFixed(2) }}</div>
+              <div class="order-cell-num">{{ moneyText(row.total_cny) }}</div>
+              <div v-if="Number(row.total_rub || 0)" class="order-cell-sub" style="margin-top:2px">₽ {{ Number(row.total_rub || 0).toFixed(2) }}</div>
             </template>
           </el-table-column>
-          <el-table-column label="利润" width="130" align="right">
+          <!-- 采购金额 / 贴单费：按订单号关联月结成本表（app_statistics_costs），订单表不加字段 -->
+          <el-table-column label="采购金额" width="86" align="right">
             <template #default="{ row }">
-              <template v-if="hasOrderProfit(row)">
-                <div :style="{ fontSize:'16px', fontWeight:800, color: orderProfit(row) >= 0 ? '#059669' : '#dc2626' }">{{ moneyText(orderProfit(row)) }}</div>
-                <div :style="{ marginTop:'4px', fontSize:'12px', color: orderProfit(row) >= 0 ? '#059669' : '#dc2626' }">{{ orderProfitRate(row) }}%</div>
-                <div style="margin-top:4px; font-size:11px; color:#94a3b8">成本 {{ moneyText(orderTotalCost(row)) }}</div>
-              </template>
-              <el-button v-else-if="orderDelivered(row)" link type="warning" size="small" @click="openProcurementSource(row)">补出单成本</el-button>
-              <span v-else style="color:#94a3b8; font-weight:700">已送达后计算</span>
+              <div v-if="row.purchase_cny != null" class="order-cell-num">{{ moneyText(row.purchase_cny) }}</div>
+              <span v-else class="order-cell-sub" style="color:#b45309">待录入</span>
             </template>
           </el-table-column>
-          <el-table-column label="备注" width="170" show-overflow-tooltip>
+          <el-table-column label="贴单费" width="74" align="right">
             <template #default="{ row }">
-              <el-button v-if="orderNote(row)" link type="warning" size="small" style="max-width:150px; padding:0; justify-content:flex-start" @click="openNoteDialog(row)">
-                <span style="display:block; max-width:150px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ orderNote(row) }}</span>
+              <div v-if="row.label_cny != null" class="order-cell-num">{{ moneyText(row.label_cny) }}</div>
+              <span v-else class="order-cell-sub">-</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="采购物流号" width="116">
+            <template #default="{ row }">
+              <div v-if="row.purchase_tracking_no" style="display:flex; align-items:center; gap:2px; min-width:0">
+                <span class="order-cell-main" style="font-family:ui-monospace,monospace">{{ row.purchase_tracking_no }}</span>
+                <el-button link type="primary" @click="copyText(row.purchase_tracking_no)"><el-icon size="12"><CopyDocument /></el-icon></el-button>
+              </div>
+              <el-button v-else link type="primary" style="font-size:11px" @click="openProcurementSource(row)">+ 填写</el-button>
+            </template>
+          </el-table-column>
+          <!-- 采购批次号：来自 app_order_batches.batch_no，一单一条 -->
+          <el-table-column label="采购批次号" width="112" show-overflow-tooltip>
+            <template #default="{ row }">
+              <span v-if="row.batch_no" class="order-cell-main" style="font-family:ui-monospace,monospace">{{ row.batch_no }}</span>
+              <span v-else class="order-cell-sub">-</span>
+            </template>
+          </el-table-column>
+          <!-- 结算日期：来自 app_statistics_orders.settled_date，同样不加字段 -->
+          <el-table-column label="结算日期" width="92">
+            <template #default="{ row }">
+              <div v-if="row.settled_date" class="order-cell-main">{{ String(row.settled_date).slice(0, 10) }}</div>
+              <span v-else class="order-cell-sub">未结算</span>
+            </template>
+          </el-table-column>
+          <el-table-column label="备注" width="96" show-overflow-tooltip>
+            <template #default="{ row }">
+              <el-button v-if="orderNote(row)" link type="warning" style="max-width:100px; justify-content:flex-start" @click="openNoteDialog(row)">
+                <span style="display:block; max-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap">{{ orderNote(row) }}</span>
               </el-button>
-              <span v-else style="color:#94a3b8">-</span>
+              <span v-else class="order-cell-sub">-</span>
             </template>
           </el-table-column>
-          <el-table-column label="操作" width="72" fixed="right" align="center">
+          <el-table-column label="操作" width="48" fixed="right" align="center">
             <template #default="{ row }">
               <el-dropdown trigger="click" placement="bottom-end" @command="handleRowAction">
-                <el-button link style="width:28px; height:28px; padding:0; color:#64748b">
-                  <el-icon size="18"><MoreFilled /></el-icon>
+                <el-button link style="width:24px; height:24px; padding:0; color:#64748b">
+                  <el-icon size="15"><MoreFilled /></el-icon>
                 </el-button>
                 <template #dropdown>
                   <el-dropdown-menu>
@@ -1717,7 +1974,7 @@ window.OrderListView = {
           </el-table-column>
         </el-table>
 
-        <div style="position:sticky; bottom:0; left:0; right:0; margin-top:0; padding:12px 0; background:#f8fafc; z-index:10; display:flex; justify-content:flex-end">
+        <div class="order-footer">
           <el-pagination
             v-model:current-page="pagination.currentPage"
             v-model:page-size="pagination.pageSize"
@@ -1735,7 +1992,7 @@ window.OrderListView = {
         <template #footer><el-button @click="noteDialog.visible=false">取消</el-button><el-button type="primary" :loading="noteDialog.saving" @click="saveNote">保存备注</el-button></template>
       </el-dialog>
 
-      <el-dialog v-model="procurementDialog.visible" title="编辑货源 / 出单成本" width="560px" style="max-width:calc(100vw - 40px)" destroy-on-close>
+      <el-dialog v-model="procurementDialog.visible" title="编辑货源 / 采购" width="520px" style="max-width:calc(100vw - 40px)" destroy-on-close>
         <div style="display:grid; gap:14px; min-width:0">
           <div style="display:flex; gap:12px; align-items:flex-start; padding:12px; background:#f8fafc; border:1px solid #e5edf6; border-radius:8px; max-width:100%; box-sizing:border-box">
             <div style="min-width:0; flex:1; max-width:100%">
@@ -1747,126 +2004,110 @@ window.OrderListView = {
             <el-form-item label="1688 货源链接">
               <el-input v-model="procurementDialog.source_url_1688" clearable placeholder="https://detail.1688.com/offer/..." />
             </el-form-item>
-            <el-form-item label="出单总成本 (CNY)">
-              <el-tooltip placement="top" content="决定利润计算 = 订单金额 - 出单总成本 - Ozon 佣金/尾程扣费。出单总成本包含采购、运费、包装、损耗等全部出单环节成本。">
-                <el-icon style="margin-left:4px; color:#94a3b8"><QuestionFilled /></el-icon>
-              </el-tooltip>
-              <div style="width:100%; margin-top:8px">
-                <el-input-number v-model="procurementDialog.outbound_cost_cny" :min="0" :precision="2" :step="1" controls-position="right" style="width:220px; max-width:100%" />
-              </div>
+            <el-form-item label="采购物流号">
+              <el-input v-model="procurementDialog.purchase_tracking_no" clearable maxlength="120" placeholder="国内采购发往仓库的快递单号（留空表示暂不填）" />
             </el-form-item>
           </el-form>
-          <div style="display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); border:1px solid #e5edf6; border-radius:8px; overflow:hidden; max-width:100%">
-            <div style="padding:12px; border-right:1px solid #e5edf6; border-bottom:1px solid #e5edf6">
-              <div style="font-size:12px; color:#64748b; font-weight:700">销售额</div>
-              <div style="margin-top:6px; font-size:18px; font-weight:800; color:#111827">{{ moneyText(procurementPreview.sales) }}</div>
-            </div>
-            <div style="padding:12px; border-bottom:1px solid #e5edf6">
-              <div style="font-size:12px; color:#64748b; font-weight:700">Ozon 佣金</div>
-              <div style="margin-top:6px; font-size:18px; font-weight:800; color:#111827">{{ moneyText(procurementPreview.commission) }}</div>
-            </div>
-            <div style="padding:12px; border-right:1px solid #e5edf6; border-bottom:1px solid #e5edf6">
-              <div style="font-size:12px; color:#64748b; font-weight:700">尾程/物流</div>
-              <div style="margin-top:6px; font-size:18px; font-weight:800; color:#111827">{{ moneyText(procurementPreview.lastMile) }}</div>
-            </div>
-            <div style="padding:12px; border-bottom:1px solid #e5edf6">
-              <div style="font-size:12px; color:#64748b; font-weight:700">出单总成本</div>
-              <div style="margin-top:6px; font-size:18px; font-weight:800; color:#111827">{{ moneyText(procurementPreview.outboundCost) }}</div>
-            </div>
-            <div style="padding:12px; border-right:1px solid #e5edf6">
-              <div style="font-size:12px; color:#64748b; font-weight:700">合计成本</div>
-              <div style="margin-top:6px; font-size:18px; font-weight:800; color:#111827">{{ moneyText(procurementPreview.totalCost) }}</div>
-            </div>
-            <div style="padding:12px">
-              <div style="font-size:12px; color:#64748b; font-weight:700">决定利润</div>
-              <div v-if="procurementPreview.calculable" :style="{ marginTop:'6px', fontSize:'18px', fontWeight:800, color: procurementPreview.profit >= 0 ? '#059669' : '#dc2626' }">{{ moneyText(procurementPreview.profit) }}</div>
-              <div v-else style="margin-top:6px; font-size:13px; font-weight:800; color:#94a3b8">已送达后计算</div>
-            </div>
+          <div style="font-size:12px; color:#8a9499; line-height:1.6">
+            采购金额、贴单费请在「导入采购」里按订单号批量录入（与月结统计同一口径），这里只维护货源链接和采购物流号。
           </div>
-          <div style="font-size:12px; color:#64748b; line-height:1.6">利润口径：订单金额 - 出单总成本 - Ozon 佣金 - 尾程/物流。尾程/物流来自 Ozon 财务明细里的履约、配送、转运等服务项；只有已送达订单才计算利润。</div>
         </div>
         <template #footer>
           <el-button @click="procurementDialog.visible=false">取消</el-button>
-          <el-button type="primary" :loading="procurementDialog.saving" @click="saveProcurementSource">保存并重算利润</el-button>
+          <el-button type="primary" :loading="procurementDialog.saving" @click="saveProcurementSource">保存</el-button>
         </template>
       </el-dialog>
 
-      <el-dialog v-model="syncWindowDialog.visible" title="设置同步时间" width="520px">
-        <div style="display:grid; gap:12px">
-          <el-alert type="info" :closable="false" show-icon title="拉取最新订单会按这里设置的时间窗口同步；不设置时默认同步最近 1 天。" />
-          <el-form label-position="top">
-            <el-form-item label="开始时间">
-              <el-input v-model="syncWindowDialog.since" type="datetime-local" />
-            </el-form-item>
-            <el-form-item label="结束时间">
-              <el-input v-model="syncWindowDialog.to" type="datetime-local" />
-            </el-form-item>
-          </el-form>
+      <!-- 采购导入历史 -->
+      <el-dialog v-model="costHistory.visible" title="采购导入历史" width="840px" top="7vh" append-to-body>
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:8px">
+          <span style="font-size:12px; color:#6b767d">每次导入留一条记录，源文件可下载；最多显示最近 50 次</span>
+          <el-button size="small" :icon="'Refresh'" :loading="costHistory.loading" @click="fetchCostImports">刷新</el-button>
         </div>
+        <el-alert v-if="costHistory.error" type="error" :closable="false" show-icon :title="costHistory.error" style="margin-bottom:8px" />
+        <el-table :data="costHistory.rows" size="small" border height="420" empty-text="还没有导入记录">
+          <el-table-column label="导入时间" width="140">
+            <template #default="{ row }">{{ toBeijingTime(row.created_at) }}</template>
+          </el-table-column>
+          <el-table-column prop="file_name" label="源文件" min-width="200" show-overflow-tooltip />
+          <el-table-column label="行数" width="62" align="right">
+            <template #default="{ row }">{{ row.rows }}</template>
+          </el-table-column>
+          <el-table-column label="成功" width="62" align="right">
+            <template #default="{ row }"><b style="color:#15803d">{{ row.applied }}</b></template>
+          </el-table-column>
+          <el-table-column label="失败" width="62" align="right">
+            <template #default="{ row }"><span :style="{ color: row.failed ? '#dc2626' : '#94a3b8' }">{{ row.failed }}</span></template>
+          </el-table-column>
+          <el-table-column prop="message" label="结果" min-width="170" show-overflow-tooltip />
+          <el-table-column label="源文件" width="74" align="center">
+            <template #default="{ row }">
+              <el-button v-if="row.has_file" link type="primary" @click="downloadCostImport(row)">下载</el-button>
+              <span v-else style="color:#cbd5e1">-</span>
+            </template>
+          </el-table-column>
+        </el-table>
+        <template #footer><el-button @click="costHistory.visible = false">关闭</el-button></template>
+      </el-dialog>
+
+      <!-- 定时任务看板 -->
+      <el-dialog v-model="cronDialog.visible" title="后台定时任务" width="900px" top="6vh" append-to-body class="order-cron-dialog">
+        <div class="cron-head">
+          <span class="cron-meta">
+            这里只列与本页 / 结算相关的定时器；每次执行结果保留 7 天。
+            <span v-if="cronDialog.refreshedAt">数据时间 {{ toBeijingTime(cronDialog.refreshedAt) }}，每 15 秒自动刷新</span>
+          </span>
+          <el-button size="small" :icon="'Refresh'" :loading="cronDialog.loading" @click="fetchCronJobs">刷新</el-button>
+        </div>
+        <el-alert v-if="cronDialog.error" type="error" :closable="false" show-icon :title="'读取定时任务失败：' + cronDialog.error" style="margin-bottom:10px" />
+        <div v-loading="cronDialog.loading && !cronDialog.jobs.length" element-loading-text="正在读取定时任务...">
+          <div v-for="job in cronDialog.jobs" :key="job.key" class="cron-job" :class="{ 'is-frontend': job.type === 'frontend' }">
+            <div class="cron-job-head">
+              <b>{{ job.title }}</b>
+              <el-tag size="small" :type="job.type === 'frontend' ? 'info' : 'primary'" effect="plain">{{ job.type === 'frontend' ? '前端' : '后台' }}</el-tag>
+              <el-tag v-if="cronIsRunning(job)" size="small" type="warning" effect="dark">运行中</el-tag>
+              <span class="cron-job-schedule">{{ job.schedule }}</span>
+            </div>
+            <div class="cron-row"><span class="cron-label">抓什么</span><div class="cron-text">{{ job.scope }}</div></div>
+            <div class="cron-row"><span class="cron-label">条件</span><div class="cron-text">{{ job.condition }}</div></div>
+            <div v-if="job.covers && job.covers.length" class="cron-row">
+              <span class="cron-label">覆盖</span>
+              <div class="cron-text"><span v-for="c in job.covers" :key="c" class="cron-chip">{{ c }}</span></div>
+            </div>
+            <div class="cron-runs">
+              <template v-if="job.runs && job.runs.length">
+                <div v-for="(run, index) in job.runs" :key="run.id" class="cron-run">
+                  <span class="cron-run-when">{{ cronRunLabel(index) }}</span>
+                  <span class="cron-run-time">{{ toBeijingTime(run.started_at) || '-' }}</span>
+                  <el-tag size="small" :type="cronStatusMeta(run.status).type" effect="plain">{{ cronStatusMeta(run.status).text }}</el-tag>
+                  <span class="cron-run-dur">{{ cronDuration(run) }}</span>
+                  <span class="cron-run-summary">{{ run.summary || '—' }}</span>
+                </div>
+              </template>
+              <div v-else class="cron-run-empty">{{ job.type === 'frontend' ? '前端任务，不在服务端记录执行结果' : '暂无执行记录（服务刚重启或还没到执行时点）' }}</div>
+            </div>
+          </div>
+          <div v-if="!cronDialog.jobs.length && !cronDialog.loading" class="cron-run-empty">没有读取到定时任务</div>
+        </div>
+        <template #footer><el-button @click="cronDialog.visible = false">关闭</el-button></template>
+      </el-dialog>
+
+      <!-- 2026-11-10 增加采购批次号：作用于「当前查询条件命中的全部订单」 -->
+      <el-dialog v-model="batchDialog.visible" title="增加采购批次号" width="460px" append-to-body>
+        <div style="font-size:13px; color:#64748b; line-height:1.7; margin-bottom:10px">
+          将给「当前查询条件命中的<b>全部订单</b>」写入同一个批次号（不受分页限制）。
+          只要命中订单里有一单已有批次号，本次会整体拒绝——请先勾选这些订单执行「删除批次」。
+        </div>
+        <el-input v-model="batchDialog.value" maxlength="40" show-word-limit clearable
+          placeholder="例如：PO-20261110-01" @keyup.enter="submitBatch" />
+        <div style="font-size:12px; color:#94a3b8; margin-top:8px">批次号在系统内不可重复，录入后可用订单号框按批次号反查。</div>
         <template #footer>
-          <el-button @click="resetSyncWindow">恢复默认</el-button>
-          <el-button @click="syncWindowDialog.visible=false">取消</el-button>
-          <el-button type="primary" @click="saveSyncWindow">保存</el-button>
+          <el-button @click="batchDialog.visible = false">取消</el-button>
+          <el-button type="primary" :loading="batchDialog.busy" @click="submitBatch">确定录入</el-button>
         </template>
       </el-dialog>
 
       <!-- v0.3.3 订单详情抽屉 -->
-      <!-- v2.2.9.146 WHD 退货抽屉 -->
-      <el-drawer v-model="returnsDrawer.visible" title="WHD 退货" size="980px" append-to-body destroy-on-close>
-        <div v-loading="returnsDrawer.loading" element-loading-text="正在读取 WHD 退货...">
-          <el-alert v-if="returnsDrawer.error" type="error" :closable="false" show-icon
-            :title="'读取失败：' + returnsDrawer.error" style="margin-bottom:10px" />
-          <el-alert v-if="returnsDrawer.failed.length" type="warning" :closable="false" show-icon style="margin-bottom:10px"
-            :title="'有 ' + returnsDrawer.failed.length + ' 个店铺读取失败（已跳过，其余店铺正常显示）：' + returnsDrawer.failed.join('；')" />
-          <div style="display:flex; align-items:center; gap:10px; margin-bottom:10px">
-            <el-tag type="success" effect="plain">共 {{ returnsDrawer.rows.length }} 条</el-tag>
-            <span style="font-size:12px; color:#94a3b8">
-              来源 Ozon 官方接口 /v1/returns/list（schema=Whd，仓库「Склад WHD」）
-            </span>
-            <el-button size="small" @click="openReturns">刷新</el-button>
-          </div>
-          <el-table :data="returnsDrawer.rows" size="small" border max-height="72vh" empty-text="没有 WHD 退货记录">
-            <el-table-column label="店铺" width="120" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.store_name || '-' }}</template>
-            </el-table-column>
-            <el-table-column label="退货单号" width="150">
-              <template #default="{ row }"><span style="font-family:monospace">{{ row.posting_number || '-' }}</span></template>
-            </el-table-column>
-            <el-table-column label="订单号" width="130">
-              <template #default="{ row }"><span style="font-family:monospace">{{ row.order_number || '-' }}</span></template>
-            </el-table-column>
-            <el-table-column label="类型" width="96">
-              <template #default="{ row }">
-                <el-tag size="small" :type="returnsTypeTag(row.type)" effect="plain">{{ returnsTypeText(row.type) }}</el-tag>
-              </template>
-            </el-table-column>
-            <el-table-column label="退货原因" min-width="170" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.reason || '-' }}</template>
-            </el-table-column>
-            <el-table-column label="商品" min-width="230">
-              <template #default="{ row }">
-                <div style="font-size:12px">{{ row.product_name || '-' }}</div>
-                <div style="font-size:11px; color:#94a3b8">货号 {{ row.offer_id || '-' }} · SKU {{ row.sku || '-' }}</div>
-              </template>
-            </el-table-column>
-            <el-table-column label="数量" width="60" align="center">
-              <template #default="{ row }">×{{ row.quantity || 1 }}</template>
-            </el-table-column>
-            <el-table-column label="金额" width="100" align="right">
-              <template #default="{ row }">
-                {{ row.currency === 'CNY' ? '¥' : '' }}{{ Number(row.price || 0).toFixed(2) }}{{ row.currency && row.currency !== 'CNY' ? ' ' + row.currency : '' }}
-              </template>
-            </el-table-column>
-            <el-table-column label="退货时间" width="150">
-              <template #default="{ row }">{{ toBeijingTime(row.return_date || row.final_moment) || '-' }}</template>
-            </el-table-column>
-            <el-table-column label="仓库" min-width="110" show-overflow-tooltip>
-              <template #default="{ row }">{{ row.place || '-' }}</template>
-            </el-table-column>
-          </el-table>
-        </div>
-      </el-drawer>
-
       <el-drawer v-model="detailDrawer.visible" title="订单详情" size="720px" destroy-on-close>
         <div v-loading="detailDrawer.loading">
           <template v-if="detailDrawer.order">
@@ -1886,65 +2127,15 @@ window.OrderListView = {
               <!-- v2.2.9.143 应收费用结算（来自导入的 Ozon 结算 xlsx），只要这两个合计 -->
               <el-descriptions-item label="合计费用">
                 <span style="font-weight:700; color:#b45309">
-                  {{ detailDrawer.order.fees ? '₽ ' + Number(detailDrawer.order.fees.total_fee || 0).toFixed(2) : '-' }}
+                  {{ detailDrawer.order.fees ? '₽ ' + Number(detailDrawer.order.fees.total_fee || 0).toFixed(2) : '' }}
                 </span>
-                <span v-if="!detailDrawer.order.fees" style="margin-left:8px; font-size:12px; color:#94a3b8">未导入费用结算</span>
+                <span v-if="!detailDrawer.order.fees" style="margin-left:8px; font-size:12px; color:#94a3b8">暂无费用数据</span>
               </el-descriptions-item>
               <el-descriptions-item label="合计费用（人民币）">
                 <span style="font-weight:700; color:#b45309">
                   {{ detailDrawer.order.fees ? '¥ ' + Number(detailDrawer.order.fees.total_fee_cny || 0).toFixed(2) : '-' }}
                 </span>
                 <span v-if="detailDrawer.order.fees && detailDrawer.order.fees.settle_period" style="margin-left:8px; font-size:12px; color:#94a3b8">结算期 {{ detailDrawer.order.fees.settle_period }}</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="利润(估算)">
-                <span :style="{ color: profitColor(detailDrawer.order), fontWeight: 800 }">{{ profitText(detailDrawer.order) }}</span>
-                <span v-if="detailDrawer.order.profit?.cost_missing" style="margin-left:8px; font-size:12px; color:#94a3b8">缺 1688 采购价</span>
-                <span v-else-if="detailDrawer.order.profit?.commission_pending" style="margin-left:8px; font-size:12px; color:#94a3b8">佣金待 Ozon 结算回填</span>
-              </el-descriptions-item>
-            </el-descriptions>
-
-            <!-- v2.2.9.143 利润明细（估算）：版式与 Yandex 订单详情一致 -->
-            <el-divider content-position="left">利润明细（估算）</el-divider>
-            <el-descriptions :column="1" border size="small">
-              <el-descriptions-item label="卖家货值">{{ moneyText(detailDrawer.order.profit?.seller_goods_cny) }}</el-descriptions-item>
-              <el-descriptions-item label="买家实付">
-                {{ moneyText(detailDrawer.order.profit?.buyer_paid_cny) }}
-                <span style="margin-left:8px; font-size:12px; color:#94a3b8">已按汇率折算，含 Ozon 促销</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="加价/补贴差">
-                <span :style="{ color: (detailDrawer.order.profit?.buyer_diff_cny || 0) >= 0 ? '#b45309' : '#16a34a' }">
-                  {{ moneyText(detailDrawer.order.profit?.buyer_diff_cny) }}
-                </span>
-                <span style="margin-left:8px; font-size:12px; color:#94a3b8">
-                  买家实付 − 卖家货值；正数=Ozon 加价（不进我口袋），负数=Ozon 出钱补贴买家
-                </span>
-              </el-descriptions-item>
-              <el-descriptions-item label="收入合计">
-                {{ moneyText(detailDrawer.order.profit?.revenue_cny) }}
-                <span style="margin-left:8px; font-size:12px; color:#94a3b8">= 卖家货值（不含 Ozon 加价）</span>
-              </el-descriptions-item>
-              <!-- v2.2.9.147 回款金额：结算后是 Ozon 真实 payout；结算前按「卖家货值 − 平台佣金」估算 -->
-              <el-descriptions-item label="回款金额">
-                <b style="color:#0f766e">{{ moneyText(detailDrawer.order.payout?.payout_cny) }}</b>
-                <span v-if="detailDrawer.order.payout?.estimated" style="margin-left:8px; font-size:12px; color:#b45309">
-                  估算（Ozon 还没结算，按 卖家货值 − 平台佣金 计算）
-                </span>
-                <span v-else style="margin-left:8px; font-size:12px; color:#16a34a">Ozon 结算实值</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="1688 采购成本">
-                <span v-if="detailDrawer.order.profit?.purchase_cny === null" style="color:#b45309">待核算（缺成本）</span>
-                <span v-else>{{ moneyText(detailDrawer.order.profit?.purchase_cny) }}</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="平台佣金">
-                <span v-if="detailDrawer.order.profit?.commission_cny === null" style="color:#94a3b8">待 Ozon 结算后回填</span>
-                <span v-else>{{ moneyText(detailDrawer.order.profit?.commission_cny) }}</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="CEL 头程">
-                <span style="color:#94a3b8">—（Ozon 订单接口不返回，需财务配置）</span>
-              </el-descriptions-item>
-              <el-descriptions-item label="国内运费+代贴单">{{ moneyText(detailDrawer.order.profit?.fixed_cny) }}</el-descriptions-item>
-              <el-descriptions-item label="利润">
-                <span :style="{ color: profitColor(detailDrawer.order), fontWeight: 800 }">{{ profitText(detailDrawer.order) }}</span>
               </el-descriptions-item>
             </el-descriptions>
 

@@ -142,6 +142,13 @@ const initApp = () => {
       // 独立出图服务（image-set）的控制台：同域，未登录会跳 ERP 登录页
       const openImageSetConsole = () => window.open('/image-set-console.html', '_blank', 'noopener');
       const handleStoreChange = (val) => {
+        // 「全部店铺（聚合）」只属于订单页：不能写进全局 currentStoreId，
+        //   否则切到商品/库存等页面会拿 '__all__' 当店铺 id 去查 → 全空。
+        if (val === '__all__') {
+          currentStoreId.value = localStorage.getItem('currentStoreId') || '';
+          window.dispatchEvent(new CustomEvent('shop-changed', { detail: val }));
+          return;
+        }
         // 双写: localStorage (拦截器读) + 全局事件 (视图刷新)
         currentStoreId.value = val;
         localStorage.setItem('currentStoreId', val);
@@ -305,7 +312,8 @@ const initApp = () => {
               <el-breadcrumb-item>{{ routeLabel }}</el-breadcrumb-item>
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
-              <shop-switcher v-if="routeName !== 'orders' && routeName !== 'yandex-orders'" :platform="headerPlatform" @change="handleStoreChange" />
+              <!-- 2026-11-10 订单页也把店铺放到顶栏（全局控制）：订单页额外提供「全部店铺（聚合）」 -->
+              <shop-switcher v-if="routeName !== 'yandex-orders'" :platform="headerPlatform" :allow-all="routeName === 'orders'" @change="handleStoreChange" />
               <el-tooltip content="下载最新版 Chrome 采集插件 zip（解压后在扩展程序页加载已解压的文件夹）" placement="bottom">
                 <a :href="pluginDownloadUrl" target="_blank" rel="noreferrer" style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; color:#475569; font-size:12px; text-decoration:none; white-space:nowrap">
                   📦 插件下载
@@ -357,6 +365,15 @@ const initApp = () => {
   };
 
   const app = Vue.createApp(App);
+  // 2026-11-10 兜底：某个页面组件渲染报错时（例如模板引用了 setup 没 return 的方法），
+  //   Vue 默认会把错误往上抛，整棵树渲染失败 → 整站白屏，用户只看到「系统全量重构中」。
+  //   装上 errorHandler 后只让出错的那个组件区域不显示，其余页面照常可用，并给出可见提示。
+  app.config.errorHandler = (err, _instance, info) => {
+    console.error('[vue-error]', info, err);
+    try {
+      window.ElementPlus?.ElMessage?.error?.({ message: `页面渲染出错：${String(err?.message || err).slice(0, 120)}`, duration: 10000, showClose: true });
+    } catch (_e) { /* 提示失败不影响主流程 */ }
+  };
   app.use(ElementPlus);
   for (const [key, component] of Object.entries(ElementPlusIconsVue)) { app.component(key, component); }
 

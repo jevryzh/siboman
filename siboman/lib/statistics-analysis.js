@@ -8,6 +8,7 @@ import {
   moneyCents, monthBounds, normalizeOrder, parentOf, rounded, shanghaiDate, STATUS_NAMES, validateAccrual,
 } from './ozon-settlement.js';
 import { businessDate, DEFAULT_AD_TIMEZONE, filterReportRows, matchOrderAdRows, monthlyAccrualReport, orderTimestamp, REPORT_FIELDS, settlementExceptions } from './statistics-daily-report.js';
+import { startCronRun, finishCronRun } from './cron-registry.js';
 import { createPerformanceClient, openCredential, sealCredential } from './ozon-performance.js';
 
 const ACTIVE = "('queued','running')";
@@ -166,6 +167,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
   const reportCache = new Map();
   const revisions = new Map();
   let timer = null, scheduling = false, orderTimer = null;
+  let settleSkipLoggedAt = 0;   // settlement_daily 的 skipped 记录节流（30 分钟一条）
   const clearCache = (store) => { reportCache.delete(store); revisions.set(store, (revisions.get(store) || 0) + 1); };
   const query = (sql, values = []) => {
     if (!db) throw fail('统计分析需要数据库支持', 503);
@@ -1006,15 +1008,31 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
   async function orderSyncTick() {
     if (!db || orderSyncing) return;
     orderSyncing = true;
+    const runId = await startCronRun((text, params) => query(text, params), 'stats_order_sync', 'schedule');
+    const stat = { stores: 0, ran: 0, skipped: 0, failed: 0 };
     try {
       const stores = (await query(`SELECT id,user_id FROM app_stores WHERE active=TRUE AND platform='ozon'`)).rows;
+      stat.stores = stores.length;
       for (const store of stores) {
         const last = (await query(`SELECT max(started_at) AS at FROM app_statistics_order_syncs WHERE user_id=$1 AND store_id=$2`,
           [store.user_id, store.id])).rows[0]?.at;
-        if (last && Date.now() - new Date(last).getTime() < ORDER_SYNC_MS) continue;
-        await syncOrdersNow({ userId: store.user_id, storeId: store.id }, 'auto').catch((error) => logger.warn('[order-sync]', store.id, error.message));
+        if (last && Date.now() - new Date(last).getTime() < ORDER_SYNC_MS) { stat.skipped += 1; continue; }
+        const ok = await syncOrdersNow({ userId: store.user_id, storeId: store.id }, 'auto')
+          .then(() => true)
+          .catch((error) => { logger.warn('[order-sync]', store.id, error.message); return false; });
+        if (ok) stat.ran += 1; else stat.failed += 1;
       }
-    } catch (error) { logger.warn('[order-sync]', error.message); }
+      await finishCronRun((text, params) => query(text, params), runId, {
+        status: stat.failed ? 'partial' : (stat.ran ? 'succeeded' : 'skipped'),
+        summary: stat.ran
+          ? `${stat.ran} 店执行 / ${stat.skipped} 店未到 30 分钟跳过${stat.failed ? ` / ${stat.failed} 店失败` : ''}`
+          : `${stat.stores} 店均未到 30 分钟，本次跳过`,
+        stats: stat,
+      });
+    } catch (error) {
+      logger.warn('[order-sync]', error.message);
+      await finishCronRun((text, params) => query(text, params), runId, { status: 'failed', summary: String(error.message || error).slice(0, 300), stats: stat });
+    }
     finally { orderSyncing = false; }
   }
   async function fetchDay(ctx, date, id) {
@@ -1228,6 +1246,7 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
     const dueSlots = SCHEDULE_SLOTS.filter(([h, m]) => localMin >= h * 60 + m).length;
     if (!dueSlots) return;
     scheduling = true;
+    const started = [];
     try {
       const stores = await query(`SELECT s.id,s.user_id,MIN(m.month) AS month,
         (SELECT count(*) FROM app_statistics_runs r WHERE r.store_id=s.id AND r.status='succeeded'
@@ -1243,9 +1262,31 @@ export function createStatisticsAnalysis({ db, assertStoreAccess, callOzon, defa
         if (Number(store.done_today || 0) >= dueSlots) continue;
         if (running.size >= 2) break;
         await startSync({ userId: store.user_id, storeId: store.id }, store.month, 'daily', { from: yesterdayStr, to: todayStr });
+        started.push(store.id);
       }
     } catch (error) { logger.error('[statistics-schedule]', error.message); }
-    finally { scheduling = false; }
+    finally {
+      scheduling = false;
+      // 记录策略：真起了同步 → 记一条 succeeded；
+      //   没起（今日时点已完成）→ 最多每 30 分钟记一条 skipped，避免每分钟一条噪音。
+      if (started.length) {
+        settleSkipLoggedAt = Date.now();
+        const runId = await startCronRun(query, 'settlement_daily', 'schedule');
+        await finishCronRun(query, runId, {
+          status: 'succeeded',
+          summary: `时点满足，启动 ${started.length} 个店铺的增量同步（昨天 → 今天）`,
+          stats: { due_slots: dueSlots, started: started.length },
+        });
+      } else if (Date.now() - settleSkipLoggedAt > 30 * 60000) {
+        settleSkipLoggedAt = Date.now();
+        const runId = await startCronRun(query, 'settlement_daily', 'schedule');
+        await finishCronRun(query, runId, {
+          status: 'skipped',
+          summary: `今日 ${dueSlots} 个时点均已完成，无需补跑`,
+          stats: { due_slots: dueSlots, started: 0 },
+        });
+      }
+    }
   }
   function start() {
     if (!db || timer) return;
