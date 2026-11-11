@@ -3326,9 +3326,26 @@ async function buildYandexNettingMap(context) {
     if (info?.result?.status === "DONE" || info?.result?.file) { fileUrl = info.result.file || ""; break; }
   }
   if (!fileUrl) throw new Error("付款报告生成超时");
-  const resp = await fetch(fileUrl, { signal: AbortSignal.timeout(60000) });
-  if (!resp.ok) throw new Error(`下载付款报告失败 HTTP ${resp.status}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
+  // [Accio Work 修改] v2.2.9.221 报告文件下载强制走 IPv4：
+  //   服务器无 IPv6 出口，而 mds.yandex.net 的 DNS 先回 AAAA → fetch 直接
+  //   ENETUNREACH（journal 里反复 [yandex-netting] fetch failed 的根因），
+  //   空报告会被 fail-TTL 缓存，订单详情全部显示「暂未覆盖」。
+  //   dns.setDefaultResultOrder 只影响本进程的解析顺序，零依赖。
+  try { require("dns").setDefaultResultOrder?.("ipv4first"); } catch (_e) { /* 老版本 Node 忽略 */ }
+  let buf = null;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3 && !buf; attempt += 1) {
+    try {
+      const resp = await fetch(fileUrl, { signal: AbortSignal.timeout(60000) });
+      if (!resp.ok) throw new Error(`下载付款报告失败 HTTP ${resp.status}`);
+      buf = Buffer.from(await resp.arrayBuffer());
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[yandex-netting] 报告下载失败(第${attempt + 1}次): ${String(e?.message || e).slice(0, 120)}`);
+      if (attempt < 2) await new Promise((r) => setTimeout(r, 3000));
+    }
+  }
+  if (!buf) throw lastErr || new Error("下载付款报告失败");
   const parsed = parseXlsxBuffer(buf);
   const sheet = parsed.sheets.find((x) => /платеж/i.test(x.name)) || parsed.sheets[0];
   if (!sheet?.path) throw new Error("付款报告里没有可读的工作表");
@@ -6522,9 +6539,17 @@ app.get("/api/yandex/orders/:id/settlement", requireAuth, async (req, res, next)
     if (!orderId) return res.status(400).json({ success: false, error: "缺少订单号" });
     const context = await getYandexMarketContext({ storeId: req.query.store_id || null, userId: req.user.id });
     // netting 缓存有就直接用；没有就等一次（详情弹窗是用户主动打开，可承受一次生成等待）
-    const netting = await getYandexNettingMap(context);
-    const entry = netting.get(orderId);
-    const settlement = buildYandexOrderSettlement(orderId, entry);
+    // [Accio Work 修改] v2.2.9.221 缓存命中但整个报告为空（历史下载失败遗落的空头缓存）
+    //   也强刷一次——用户点开详情就是要看数据，不能拿 fail-TTL 空缓存糊弄。
+    const mapKey = String(context.businessId || "");
+    const cachedHit = yandexNettingCache.get(mapKey);
+    const cachedEmpty = cachedHit && cachedHit.map && cachedHit.map.size === 0 && Date.now() - cachedHit.at < YANDEX_NETTING_TTL_MS;
+    const settlement = await (async () => {
+      if (cachedEmpty) yandexNettingCache.delete(mapKey);
+      const netting = await getYandexNettingMap(context);
+      const entry = netting.get(orderId);
+      return buildYandexOrderSettlement(orderId, entry);
+    })();
     // 手填采购费（有则返回）
     let manualPurchase = null;
     if (db) {
