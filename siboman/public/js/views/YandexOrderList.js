@@ -7,7 +7,7 @@ window.YandexOrderListView = {
     const search = Vue.ref('');
     const pagination = Vue.reactive({ currentPage: 1, pageSize: 20, total: 0 });
     const apiReady = Vue.ref(true);
-    const detailDrawer = Vue.reactive({ visible: false, row: null });
+    const detailDrawer = Vue.reactive({ visible: false, row: null, settlement: null, settlementLoading: false, purchaseInput: null, purchaseSaving: false });
     const shipping = Vue.reactive({}); // orderId -> bool（发货中）
 
     const notify = {
@@ -179,9 +179,59 @@ window.YandexOrderListView = {
       }
     };
 
-    const openDetail = (row) => {
+    const openDetail = async (row) => {
       detailDrawer.row = row;
       detailDrawer.visible = true;
+      // [Accio Work 修改] v2.2.9.220 打开详情即拉「付款报告实测结算拆解 + 手填采购费」
+      detailDrawer.settlement = null;
+      detailDrawer.settlementLoading = true;
+      detailDrawer.purchaseInput = null;
+      detailDrawer.purchaseSaving = false;
+      try {
+        const res = await axios.get(`/api/yandex/orders/${row.order_id}/settlement`, {
+          params: { store_id: currentStoreId.value || undefined },
+        });
+        if (res.data?.success) {
+          detailDrawer.settlement = res.data;
+          if (res.data.manual_purchase) detailDrawer.purchaseInput = res.data.manual_purchase.purchase_cny;
+        }
+      } catch (_e) { /* 结算数据拉不到时弹窗仍显示原有估算明细 */ }
+      finally { detailDrawer.settlementLoading = false; }
+    };
+
+    // [Accio Work 修改] v2.2.9.220 保存手填采购费 → 实时回算净利润
+    const savePurchase = async () => {
+      if (!detailDrawer.row) return;
+      const orderId = detailDrawer.row.order_id;
+      detailDrawer.purchaseSaving = true;
+      try {
+        const val = detailDrawer.purchaseInput;
+        const body = { store_id: currentStoreId.value || undefined };
+        if (val === null || val === '' || val === undefined) body.purchase_cny = null;
+        else {
+          const n = Number(val);
+          if (!Number.isFinite(n) || n < 0) return notify.warning('采购费请填 ≥0 的数字，或清空');
+          body.purchase_cny = Math.round(n * 100) / 100;
+        }
+        const res = await axios.post(`/api/yandex/orders/${orderId}/purchase`, body);
+        if (res.data?.success) {
+          if (res.data.cleared) {
+            detailDrawer.purchaseInput = null;
+            if (detailDrawer.settlement) detailDrawer.settlement.net_income_cny = null;
+            notify.success(`订单 ${orderId} 采购费已清空`);
+          } else {
+            detailDrawer.purchaseInput = res.data.purchase_cny;
+            if (detailDrawer.settlement) detailDrawer.settlement.net_income_cny = res.data.net_income_cny;
+            notify.success(`采购费已保存，净利润 ${res.data.net_income_cny === null ? '待付款报告数据' : '¥' + res.data.net_income_cny}`);
+          }
+        } else {
+          notify.error(res.data?.error || '保存失败');
+        }
+      } catch (error) {
+        notify.error(error.response?.data?.error || error.message || '保存失败');
+      } finally {
+        detailDrawer.purchaseSaving = false;
+      }
     };
 
     const shipOrder = async (row) => {
@@ -225,6 +275,10 @@ window.YandexOrderListView = {
       statusText, statusTagType, primaryProduct, productImages, moneyText, profitText, profitColor, toBeijing, fetchOrders, resetFilters,
       yandexStores, currentStoreId, storeContext, changeYandexStore,
       detailDrawer, openDetail, shipOrder, shipping,
+      savePurchase, fmtCny: (v) => (v === null || v === undefined || Number.isNaN(Number(v))) ? '—' : '¥' + Number(v).toFixed(2),
+      settlementItems: (s) => (s?.settlement?.items || []),
+      payoutItems: (s) => (s?.settlement?.items || []).filter((x) => x.channel === 'payout'),
+      balanceItems: (s) => (s?.settlement?.items || []).filter((x) => x.channel === 'balance'),
     };
   },
   template: `
@@ -384,6 +438,100 @@ window.YandexOrderListView = {
               <span style="margin-left:8px; font-size:12px; color:#94a3b8">佣金24%+费率估算，未含类目差异</span>
             </el-descriptions-item>
           </el-descriptions>
+
+          <!-- ═══ [Accio Work 修改] v2.2.9.220 实测结算（付款报告）═══ -->
+          <el-divider content-position="left">这单我能拿到多少？（付款报告实测）</el-divider>
+          <div v-loading="detailDrawer.settlementLoading">
+            <template v-if="detailDrawer.settlement?.settlement">
+              <!-- 三口径金额卡 -->
+              <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px; margin-bottom:14px">
+                <div style="background:#eff6ff; border:1px solid #bfdbfe; border-radius:8px; padding:12px">
+                  <div style="font-size:12px; color:#0369a1; font-weight:700">银行回款</div>
+                  <div style="font-size:22px; font-weight:900; color:#0369a1; margin-top:6px">{{ fmtCny(detailDrawer.settlement.settlement.bank_payout_cny) }}</div>
+                  <div style="font-size:11px; color:#64748b; margin-top:4px">实际打到收款账户的钱</div>
+                </div>
+                <div style="background:#f0fdfa; border:1px solid #99f6e4; border-radius:8px; padding:12px">
+                  <div style="font-size:12px; color:#0f766e; font-weight:700">订单总经济所得</div>
+                  <div style="font-size:22px; font-weight:900; color:#0f766e; margin-top:6px">{{ fmtCny(detailDrawer.settlement.settlement.total_income_cny) }}</div>
+                  <div style="font-size:11px; color:#64748b; margin-top:4px">银行回款 + 余额变动</div>
+                </div>
+                <div style="background:#fefce8; border:1px solid #fde047; border-radius:8px; padding:12px">
+                  <div style="font-size:12px; color:#a16207; font-weight:700">净利润（我的成本自己填）</div>
+                  <div style="font-size:22px; font-weight:900; color:#a16207; margin-top:6px">
+                    <span v-if="detailDrawer.settlement.net_income_cny !== null && detailDrawer.settlement.net_income_cny !== undefined">{{ fmtCny(detailDrawer.settlement.net_income_cny) }}</span>
+                    <span v-else style="font-size:13px">填采购费后算出</span>
+                  </div>
+                  <div style="font-size:11px; color:#64748b; margin-top:4px">总经济所得 − 采购费</div>
+                </div>
+              </div>
+
+              <!-- 采购费自填 -->
+              <div style="display:flex; align-items:center; gap:10px; margin-bottom:14px; padding:10px 12px; background:#fffbeb; border:1px solid #fde68a; border-radius:8px">
+                <span style="font-size:13px; font-weight:700; color:#92400e; white-space:nowrap">我的采购费（¥）</span>
+                <el-input-number v-model="detailDrawer.purchaseInput" :min="0" :max="100000" :precision="2" :step="1" size="small" style="width:170px" placeholder="如 40" />
+                <el-button type="primary" size="small" :loading="detailDrawer.purchaseSaving" @click="savePurchase">保存并算净利润</el-button>
+                <el-button size="small" @click="detailDrawer.purchaseInput = null; savePurchase()">清空</el-button>
+                <span style="font-size:11px; color:#92400e">只填这一单的采购成本，保存后净利润实时更新</span>
+              </div>
+
+              <!-- 银行回款通道 -->
+              <div style="font-size:13px; font-weight:800; color:#0369a1; margin:10px 0 6px">① 银行回款通道（打款流水）</div>
+              <el-table :data="payoutItems(detailDrawer.settlement)" size="small" border>
+                <el-table-column label="项目" min-width="160">
+                  <template #default="{ row }">
+                    <div>{{ row.name }}</div>
+                    <div v-if="row.raw_name && row.raw_name !== row.name" style="font-size:11px; color:#94a3b8">{{ row.raw_name }}</div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="金额" width="110" align="right">
+                  <template #default="{ row }">
+                    <b :style="{ color: row.amount >= 0 ? '#059669' : '#dc2626' }">{{ row.amount >= 0 ? '+' : '' }}{{ fmtCny(row.amount) }}</b>
+                  </template>
+                </el-table-column>
+                <el-table-column label="笔数" width="60" align="center">
+                  <template #default="{ row }">×{{ row.n }}</template>
+                </el-table-column>
+                <el-table-column label="状态" min-width="130" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span style="font-size:12px; color:#94a3b8">{{ row.status }}</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <div style="text-align:right; font-size:13px; font-weight:800; color:#0369a1; padding:6px 2px">银行回款合计 = {{ fmtCny(detailDrawer.settlement.settlement.bank_payout_cny) }}</div>
+
+              <!-- 余额通道 -->
+              <div style="font-size:13px; font-weight:800; color:#0f766e; margin:12px 0 6px">② 余额通道（预充余额增减）</div>
+              <el-table :data="balanceItems(detailDrawer.settlement)" size="small" border>
+                <el-table-column label="项目" min-width="160">
+                  <template #default="{ row }">
+                    <div>{{ row.name }}</div>
+                    <div v-if="row.raw_name && row.raw_name !== row.name" style="font-size:11px; color:#94a3b8">{{ row.raw_name }}</div>
+                  </template>
+                </el-table-column>
+                <el-table-column label="金额" width="110" align="right">
+                  <template #default="{ row }">
+                    <b :style="{ color: row.amount >= 0 ? '#059669' : '#dc2626' }">{{ row.amount >= 0 ? '+' : '' }}{{ fmtCny(row.amount) }}</b>
+                  </template>
+                </el-table-column>
+                <el-table-column label="笔数" width="60" align="center">
+                  <template #default="{ row }">×{{ row.n }}</template>
+                </el-table-column>
+                <el-table-column label="状态" min-width="130" show-overflow-tooltip>
+                  <template #default="{ row }">
+                    <span style="font-size:12px; color:#94a3b8">{{ row.status }}</span>
+                  </template>
+                </el-table-column>
+              </el-table>
+              <div style="text-align:right; font-size:13px; font-weight:800; color:#0f766e; padding:6px 2px">余额变动合计 = {{ fmtCny(detailDrawer.settlement.settlement.balance_net_cny) }}</div>
+
+              <!-- 利润公式 -->
+              <el-alert type="success" :closable="false" style="margin-top:12px"
+                :title="'总经济所得 ' + fmtCny(detailDrawer.settlement.settlement.total_income_cny) + ' − 采购费 ' + (detailDrawer.settlement.net_income_cny !== null && detailDrawer.settlement.net_income_cny !== undefined ? fmtCny(detailDrawer.purchaseInput) : '（待填）') + ' = 净利润 ' + (detailDrawer.settlement.net_income_cny !== null && detailDrawer.settlement.net_income_cny !== undefined ? fmtCny(detailDrawer.settlement.net_income_cny) : '—')" />
+            </template>
+            <el-alert v-else-if="!detailDrawer.settlementLoading" type="info" :closable="false" show-icon
+              title="付款报告暂未覆盖该单"
+              description="可能原因：订单刚送达还没结算、或报告窗口（近 35 天）未包含它。下方估算明细仍可参考。" />
+          </div>
 
           <el-divider content-position="left">利润明细（估算）</el-divider>
           <el-descriptions :column="1" border size="small">

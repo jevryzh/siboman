@@ -2224,6 +2224,20 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       CREATE INDEX IF NOT EXISTS idx_order_cost_imports_user ON app_order_cost_imports(user_id, created_at DESC);
+      -- [Accio Work 修改] v2.2.9.220 Yandex 订单手填采购费：订单详情弹窗自由填写，
+      --   与 enrichYandexOrderProfit 的候选表自动成本并行（手填优先展示）。
+      CREATE TABLE IF NOT EXISTS app_yandex_order_costs (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        store_id UUID NOT NULL REFERENCES app_stores(id) ON DELETE CASCADE,
+        order_number TEXT NOT NULL,
+        purchase_cny NUMERIC(12,2) NOT NULL DEFAULT 0,
+        note TEXT NOT NULL DEFAULT '',
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE(store_id, order_number)
+      );
+      CREATE INDEX IF NOT EXISTS idx_yandex_order_costs_store_order ON app_yandex_order_costs(store_id, order_number);
       -- 2026-11-10 采购批次号（订单页「批次」功能）：一单一条，批次号在同一用户下跨订单只能是同一个批次
       CREATE TABLE IF NOT EXISTS app_order_batches (
         user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
@@ -3331,6 +3345,12 @@ async function buildYandexNettingMap(context) {
   const colAmount = findCol("Сумма транзакции, "); // 交易金额（¥）
   const colStatus = findCol("Статус");
   const colBank = findCol("Номер платежного поручения");
+  // [Accio Work 修改] v2.2.9.220 订单结算拆解：额外抓 日期/服务名/类型/来源/买家货币 四列，
+  //   每笔交易保留原始行，订单详情弹窗按「银行回款 / 余额流水」两通道分类展示。
+  const colDate = findCol("Дата транзакции");
+  const colName = findCol("Название товара");
+  const colType = findCol("Тип транзакции");
+  const colSource = findCol("Источник транзакции");
   if (colOrder < 0 || colAmount < 0 || colStatus < 0) throw new Error("付款报告缺少 订单号/金额/状态 列");
   const { planned, actual } = yandexNettingBucket();
   const map = new Map();
@@ -3355,7 +3375,16 @@ async function buildYandexNettingMap(context) {
     if (!orderId) continue;
     const amount = num(r[colAmount]);
     const status = String(r[colStatus] || "").trim();
-    const cur = map.get(orderId) || { planned: 0, actual: 0, bankOrders: [], planned_n: 0, actual_n: 0 };
+    const cur = map.get(orderId) || { planned: 0, actual: 0, bankOrders: [], planned_n: 0, actual_n: 0, lines: [] };
+    // [Accio Work 修改] v2.2.9.220 保留每笔交易原始行（日期/服务名/类型/来源/金额/状态）
+    cur.lines.push({
+      date: colDate >= 0 ? String(r[colDate] || "").trim() : "",
+      name: colName >= 0 ? String(r[colName] || "").trim() : "",
+      type: colType >= 0 ? String(r[colType] || "").trim() : "",
+      source: colSource >= 0 ? String(r[colSource] || "").trim() : "",
+      amount,
+      status,
+    });
     if (planned.includes(status)) { cur.planned += amount; cur.planned_n += 1; }
     else if (actual.includes(status)) { cur.actual += amount; cur.actual_n += 1; }
     const bank = normId(r[colBank]);
@@ -3370,6 +3399,98 @@ async function buildYandexNettingMap(context) {
 function peekYandexNettingMap(context) {
   const hit = yandexNettingCache.get(String(context.businessId || ""));
   return hit ? hit.map : null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// [Accio Work 修改] v2.2.9.220 Yandex 单笔订单结算拆解（付款报告实测口径）
+//   把 netting 报告里该订单的逐笔交易分成两个通道：
+//     ① 银行回款通道：真正打给卖家的钱（买家付款入账 + 打款通道内代扣费用）
+//        → 状态「Будет переведён…/Отправлен…」+ 挂在打款单下的代扣行
+//     ② 余额通道：平台预充余额的增减（补贴返还 + 联合促销分摊的佣金/广告）
+//        → 状态带「Справочно:…баланса」「Будет удержан…」的服务费行
+//   实测样本（订单 62799798274，2026-11-10 报告）：
+//     +455.14 买家付款(Будет переведён)  / -0.1 收款手续费 / -35.6 配送
+//     -8.95 支付转账 / -1 Boost代扣 / -1 陈列代扣  → 银行回款 408.49
+//     +41.87 补贴返还 / -88.46 陈列联促分摊 / -63.91 Boost联促分摊（都在余额）
+//   ⚠️ 判定规则按「状态 + 来源」组而不是只看单一字段：
+//     银行回款 = 状态是打款类(переведён/Отправлен) 或 金额>0 的应计行
+//     余额通道 = 状态含「баланса」(списан/пополнен) 或 「Будет удержан」
+// ═══════════════════════════════════════════════════════════════════════
+// [Accio Work 修改] v2.2.9.220 通道分类（以实测样本迭代出的规则）：
+//   ①银行回款通道：买家付款(переведён/Отправлен→打款计划) + 代扣行(Будет удержан из платежей покупателей→打款时从买家的钱里直接扣)
+//   ②余额通道：Справочно-带 «баланс» 的余额增减（списан с баланса 联促分摊 / пополнен баланс 补贴返还）
+// ⚠️ 俄语大小写不稳定（«баланс»小写б 也出现），一律 /i 不区分大小写。
+function classifyYandexNettingLine(line) {
+  const status = String(line.status || "");
+  const isPayoutFlow = /переведён|Отправлен/i.test(status)
+    || /удержан из платежей покупателей/i.test(status);
+  const isBalance = /баланс[ае]?/i.test(status) || /баланса/i.test(status);
+  return { channel: isPayoutFlow ? "payout" : isBalance ? "balance" : (line.amount >= 0 ? "payout" : "balance") };
+}
+
+// 俄语服务名 → 中文（只翻报告里出现过的服务，未匹配的原样保留）
+function translateYandexNettingName(name) {
+  const map = [
+    [/Платёж покупателя|Платёж покуп/i, "买家付款入账"],
+    [/Приём платежа/i, "收款手续费"],
+    [/Начисления за доставку/i, "配送费"],
+    [/Перевод платежа/i, "支付转账费"],
+    [/Буст продаж/i, "Boost 广告费"],
+    [/Размещение товарных предложений/i, "佣金·商品陈列"],
+    [/Баллы за скидку Маркета|Баллы за скидку/i, "平台补贴返还"],
+  ];
+  for (const [re, zh] of map) if (re.test(name)) return zh;
+  return String(name || "").trim();
+}
+
+// 单笔订单结算拆解：netting 命中行 → { payout, balance, three_amounts }
+function buildYandexOrderSettlement(orderId, nettingEntry) {
+  if (!nettingEntry || !Array.isArray(nettingEntry.lines) || !nettingEntry.lines.length) return null;
+  const payoutLines = [];
+  const balanceLines = [];
+  const grouped = new Map(); // key: channel|name|status-group
+  for (const line of nettingEntry.lines) {
+    const { channel } = classifyYandexNettingLine(line);
+    const zhName = translateYandexNettingName(line.name);
+    const gk = `${channel}|${zhName}|${/Справочно/.test(line.status) ? "ref" : "main"}`;
+    const g = grouped.get(gk) || { channel, name: zhName, raw_name: line.name, amounts: [], statuses: new Set(), dates: new Set() };
+    g.amounts.push(line.amount);
+    g.statuses.add(line.status);
+    if (line.date) g.dates.add(line.date);
+    grouped.set(gk, g);
+    if (channel === "payout") payoutLines.push(line);
+    else balanceLines.push(line);
+  }
+  const items = [...grouped.values()].map((g) => ({
+    channel: g.channel,
+    name: g.name,
+    raw_name: g.raw_name,
+    amount: Math.round(g.amounts.reduce((s, x) => s + x, 0) * 100) / 100,
+    n: g.amounts.length,
+    status: [...g.statuses][0] || "",
+    date: [...g.dates][0] || "",
+  }));
+  const sum = (arr) => Math.round(arr.reduce((s, x) => s + Number(x.amount || 0), 0) * 100) / 100;
+  const bankPayoutCny = sum(payoutLines);
+  const balanceNetCny = sum(balanceLines);
+  return {
+    order_id: String(orderId),
+    items,
+    bank_payout_cny: bankPayoutCny,       // 银行回款（打款通道净额）
+    balance_net_cny: balanceNetCny,       // 余额通道净变动
+    total_income_cny: Math.round((bankPayoutCny + balanceNetCny) * 100) / 100, // 总经济所得
+    line_count: nettingEntry.lines.length,
+  };
+}
+
+// 采购费（用户手填）→ 净利润 = 总经济所得 − 采购费
+function computeYandexOrderNetIncome(settlement, purchaseCny) {
+  if (!settlement) return null;
+  const purchase = Number(purchaseCny);
+  const netIncome = Number.isFinite(purchase)
+    ? Math.round((settlement.total_income_cny - purchase) * 100) / 100
+    : null;
+  return netIncome;
 }
 
 // 带缓存 + 单飞（同一业务只跑一份报告），失败也缓存一会儿避免反复撞 2 分钟限流
@@ -6390,6 +6511,81 @@ app.get("/api/yandex/orders", requireAuth, async (req, res, next) => {
 });
 
 // Yandex 订单发货：更新订单状态为 DELIVERY（卖家备货完成后交给物流）
+// ═══════════════════════════════════════════════════════════════════════
+// [Accio Work 修改] v2.2.9.220 单笔订单结算拆解 + 手填采购费
+//   GET  /api/yandex/orders/:id/settlement → 付款报告实测：收入/费用逐项、银行回款、总经济所得、净利润
+//   POST /api/yandex/orders/:id/purchase   → 保存/清空手填采购费（采购费自填，净利润实时算）
+// ═══════════════════════════════════════════════════════════════════════
+app.get("/api/yandex/orders/:id/settlement", requireAuth, async (req, res, next) => {
+  try {
+    const orderId = String(req.params.id || "").trim();
+    if (!orderId) return res.status(400).json({ success: false, error: "缺少订单号" });
+    const context = await getYandexMarketContext({ storeId: req.query.store_id || null, userId: req.user.id });
+    // netting 缓存有就直接用；没有就等一次（详情弹窗是用户主动打开，可承受一次生成等待）
+    const netting = await getYandexNettingMap(context);
+    const entry = netting.get(orderId);
+    const settlement = buildYandexOrderSettlement(orderId, entry);
+    // 手填采购费（有则返回）
+    let manualPurchase = null;
+    if (db) {
+      try {
+        const r = await db.query(
+          "SELECT purchase_cny, note, updated_at FROM app_yandex_order_costs WHERE store_id = $1 AND order_number = $2",
+          [context.storeId || "", orderId],
+        );
+        if (r.rowCount) manualPurchase = { purchase_cny: Number(r.rows[0].purchase_cny), note: r.rows[0].note || "", updated_at: r.rows[0].updated_at };
+      } catch (_e) { /* 表还没建好时静默 */ }
+    }
+    res.json({
+      success: true,
+      order_id: orderId,
+      settlement,                              // null = 付款报告未覆盖该单
+      manual_purchase: manualPurchase,
+      net_income_cny: settlement ? computeYandexOrderNetIncome(settlement, manualPurchase?.purchase_cny) : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/yandex/orders/:id/purchase", requireAuth, async (req, res, next) => {
+  try {
+    const orderId = String(req.params.id || "").trim();
+    const purchaseCny = req.body?.purchase_cny;
+    const note = String(req.body?.note || "").slice(0, 500);
+    if (!orderId) return res.status(400).json({ success: false, error: "缺少订单号" });
+    if (!db) return res.status(500).json({ success: false, error: "数据库未连接" });
+    const context = await getYandexMarketContext({ storeId: req.body.store_id || null, userId: req.user.id });
+    const storeId = context.storeId || "";
+    if (!storeId) return res.status(400).json({ success: false, error: "该店铺无 store_id（环境变量模式），无法保存采购费" });
+    const valid = Number(purchaseCny);
+    if (purchaseCny !== null && (!Number.isFinite(valid) || valid < 0)) {
+      return res.status(400).json({ success: false, error: "采购费必须是 ≥0 的数字（或传 null 清空）" });
+    }
+    if (purchaseCny === null) {
+      await db.query("DELETE FROM app_yandex_order_costs WHERE store_id = $1 AND order_number = $2", [storeId, orderId]);
+      return res.json({ success: true, order_id: orderId, cleared: true });
+    }
+    await db.query(
+      `INSERT INTO app_yandex_order_costs (user_id, store_id, order_number, purchase_cny, note)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (store_id, order_number)
+       DO UPDATE SET purchase_cny = EXCLUDED.purchase_cny, note = EXCLUDED.note, updated_at = now()`,
+      [req.user.id, storeId, orderId, valid, note],
+    );
+    // 回传最新净利润
+    const netting = peekYandexNettingMap(context);
+    let netIncome = null;
+    if (netting) {
+      const settlement = buildYandexOrderSettlement(orderId, netting.get(orderId));
+      netIncome = computeYandexOrderNetIncome(settlement, valid);
+    }
+    res.json({ success: true, order_id: orderId, purchase_cny: valid, net_income_cny: netIncome });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/yandex/orders/ship", requireAuth, async (req, res, next) => {
   try {
     const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
