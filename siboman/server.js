@@ -15,6 +15,7 @@ import { Pool } from "pg";
 import dnsDefault from "node:dns";
 import dns from "node:dns/promises";
 import https from "node:https";
+import http from "node:http";
 import net from "node:net";
 import { alphaShopMcpCall, getCreds as alphaCreds } from "./lib/alphashop-mcp.js";
 import { createStatisticsAnalysis } from "./lib/statistics-analysis.js";
@@ -3299,6 +3300,35 @@ function yandexNettingBucket() {
   };
 }
 
+// [Accio Work 修改] v2.2.9.221 下载 Yandex 报告文件（显式 IPv4）
+//   实测（2026-11-11 test.renwz.cn）：market-mbi-prod.s3-private.mds.yandex.net
+//   的 DNS 只回 AAAA，服务器无 IPv6 出口 → fetch 无论 ipv4first 还是默认都是
+//   ETIMEDOUT/ENETUNREACH；curl -4 与 https.get+family:4 均正常（79KB/2s）。
+//   undici 的 fetch 没有暴露 family 参数，所以这里必须用原生 http(s) 模块。
+function downloadUrlIPv4Buffer(url, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    // server.js 是 ESM，https/http 已在模块顶部 import
+    let mod;
+    try { mod = url.startsWith("http:") ? http : https; }
+    catch (_e) { mod = https; }
+    const agent = new mod.Agent({ family: 4 });
+    const req = mod.get(url, { agent }, (r) => {
+      const status = r.statusCode || 0;
+      if (status < 200 || status >= 300) {
+        r.resume();
+        reject(new Error(`下载报告失败 HTTP ${status}`));
+        return;
+      }
+      const chunks = [];
+      r.on("data", (c) => chunks.push(c));
+      r.on("end", () => resolve(Buffer.concat(chunks)));
+      r.on("error", reject);
+    });
+    req.setTimeout(timeoutMs, () => req.destroy(new Error(`下载报告超时（${Math.round(timeoutMs / 1000)}s）`)));
+    req.on("error", reject);
+  });
+}
+
 async function buildYandexNettingMap(context) {
   const now = new Date();
   const from = new Date(now.getTime() - 35 * 86400e3);
@@ -3326,19 +3356,12 @@ async function buildYandexNettingMap(context) {
     if (info?.result?.status === "DONE" || info?.result?.file) { fileUrl = info.result.file || ""; break; }
   }
   if (!fileUrl) throw new Error("付款报告生成超时");
-  // [Accio Work 修改] v2.2.9.221 报告文件下载强制走 IPv4：
-  //   服务器无 IPv6 出口，而 mds.yandex.net 的 DNS 先回 AAAA → fetch 直接
-  //   ENETUNREACH（journal 里反复 [yandex-netting] fetch failed 的根因），
-  //   空报告会被 fail-TTL 缓存，订单详情全部显示「暂未覆盖」。
-  //   dns.setDefaultResultOrder 只影响本进程的解析顺序，零依赖。
-  try { require("dns").setDefaultResultOrder?.("ipv4first"); } catch (_e) { /* 老版本 Node 忽略 */ }
+  // [Accio Work 修改] v2.2.9.221 显式 IPv4 下载（fetch 的 AAAA-only DNS 必超时，见函数头注释）
   let buf = null;
   let lastErr = null;
   for (let attempt = 0; attempt < 3 && !buf; attempt += 1) {
     try {
-      const resp = await fetch(fileUrl, { signal: AbortSignal.timeout(60000) });
-      if (!resp.ok) throw new Error(`下载付款报告失败 HTTP ${resp.status}`);
-      buf = Buffer.from(await resp.arrayBuffer());
+      buf = await downloadUrlIPv4Buffer(fileUrl, 60000);
     } catch (e) {
       lastErr = e;
       console.warn(`[yandex-netting] 报告下载失败(第${attempt + 1}次): ${String(e?.message || e).slice(0, 120)}`);
@@ -3487,6 +3510,11 @@ function buildYandexOrderSettlement(orderId, nettingEntry) {
     status: [...g.statuses][0] || "",
     date: [...g.dates][0] || "",
   }));
+  // [Accio Work 修改] 收入行（打款/补贴）的 name 列是俄文商品名，按状态补语义标签
+  for (const it of items) {
+    if (/переведён|Отправлен/i.test(it.status) && it.amount > 0) it.name = "买家付款入账";
+    else if (/пополнен баланс/i.test(it.status) && it.amount > 0) it.name = "平台补贴返还";
+  }
   const sum = (arr) => Math.round(arr.reduce((s, x) => s + Number(x.amount || 0), 0) * 100) / 100;
   const bankPayoutCny = sum(payoutLines);
   const balanceNetCny = sum(balanceLines);
