@@ -176,7 +176,7 @@ const initApp = () => {
         'single-sourcing-review': '单品审核', 'listing-history': '上架记录', 'ai-generator': 'AI 图片生成',
         products: '商品管理', inventory: '库存管理', orders: '订单管理', upload: '批量上架',
         'yandex-products': 'Yandex 商品', 'yandex-autolist': 'Yandex 自动上架', 'yandex-inventory': 'Yandex 库存',
-        'yandex-orders': 'Yandex 订单', 'ozon-patrol': '巡查跟卖', 'sales-funnel': '销售漏斗',
+        'yandex-orders': 'Yandex 订单', 'yandex-payout': '回款总览', 'ozon-patrol': '巡查跟卖', 'sales-funnel': '销售漏斗',
         'statistics-analysis': '月结统计', 'settlement-detail': '应计原始数据',
         'business-overview': '经营总览', cashflow: '资金流水', 'shareholder-equity': '股东权益',
         'data-screen': '数据大屏', stores: '店铺管理', analytics: '统计分析', 'market-discovery': '选品发现',
@@ -202,6 +202,7 @@ const initApp = () => {
         if (path.includes('yandex-autolist')) return 'yandex-autolist';
         if (path.includes('yandex-products')) return 'yandex-products';
         if (path.includes('yandex-inventory')) return 'yandex-inventory';
+        if (path.includes('yandex-payout')) return 'yandex-payout';
         if (path.includes('yandex-orders')) return 'yandex-orders';
         if (path.includes('product')) return 'products';
         if (path.includes('inventory')) return 'inventory';
@@ -222,7 +223,7 @@ const initApp = () => {
       // Yandex 多店铺：按当前路由决定顶栏切换器展示的平台，并自动对齐当前店铺
       const headerPlatform = Vue.computed(() => {
         const r = routeName.value;
-        if (r === 'yandex-products' || r === 'yandex-orders' || r === 'yandex-inventory' || r === 'yandex-autolist') return 'yandex';
+        if (r === 'yandex-products' || r === 'yandex-orders' || r === 'yandex-inventory' || r === 'yandex-autolist' || r === 'yandex-payout') return 'yandex';
         if (r === 'stores') return 'all';
         // 经营分析跨多个店铺/平台，不该因为切页面把顶栏店铺改掉
         if (r === 'business-overview' || r === 'cashflow' || r === 'shareholder-equity') return 'all';
@@ -294,6 +295,7 @@ const initApp = () => {
               <el-menu-item index="#/yandex-autolist" @click="goTo('#/yandex-autolist')"><span>自动上架</span></el-menu-item>
               <el-menu-item index="#/yandex-inventory" @click="goTo('#/yandex-inventory')"><span>库存管理</span></el-menu-item>
               <el-menu-item index="#/yandex-orders" @click="goTo('#/yandex-orders')"><span>订单管理</span></el-menu-item>
+              <el-menu-item index="#/yandex-payout" @click="goTo('#/yandex-payout')"><span>回款总览</span></el-menu-item>
             </el-sub-menu>
             <el-sub-menu index="ai-tools">
               <template #title><el-icon><MagicStick /></el-icon><span>AI 工具</span></template>
@@ -313,7 +315,8 @@ const initApp = () => {
             </el-breadcrumb>
             <div class="header-right" v-if="currentUser" style="display: flex; align-items: center; gap: 15px;">
               <!-- 2026-11-10 订单页也把店铺放到顶栏（全局控制）：订单页额外提供「全部店铺（聚合）」 -->
-              <shop-switcher v-if="routeName !== 'yandex-orders'" :platform="headerPlatform" :allow-all="routeName === 'orders'" @change="handleStoreChange" />
+              <!-- 订单页/回款页有自己的页内店铺选择器，顶栏切换器隐藏避免双开关 -->
+              <shop-switcher v-if="routeName !== 'yandex-orders' && routeName !== 'yandex-payout'" :platform="headerPlatform" :allow-all="routeName === 'orders'" @change="handleStoreChange" />
               <el-tooltip content="下载最新版 Chrome 采集插件 zip（解压后在扩展程序页加载已解压的文件夹）" placement="bottom">
                 <a :href="pluginDownloadUrl" target="_blank" rel="noreferrer" style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border:1px solid #cbd5e1; border-radius:6px; background:#f8fafc; color:#475569; font-size:12px; text-decoration:none; white-space:nowrap">
                   📦 插件下载
@@ -344,6 +347,7 @@ const initApp = () => {
             <div v-else-if="routeName === 'inventory'"><inventory-management-view /></div>
             <div v-else-if="routeName === 'orders'"><order-list-view /></div>
             <div v-else-if="routeName === 'yandex-orders'" class="erp-route-page"><yandex-order-list-view /></div>
+            <div v-else-if="routeName === 'yandex-payout'" class="erp-route-page"><yandex-payout-overview-view /></div>
             <div v-else-if="routeName === 'upload'" class="erp-route-page"><batch-upload-view /></div>
             <div v-else-if="routeName === 'listing-history'" class="erp-route-page"><listing-history-view /></div>
             <div v-else-if="routeName === 'ai-generator'" class="erp-route-page"><ai-image-generator-view /></div>
@@ -399,6 +403,7 @@ const initApp = () => {
   register('yandex-inventory-view', window.YandexInventoryManagementView);
   register('order-list-view', window.OrderListView);
   register('yandex-order-list-view', window.YandexOrderListView);
+  register('yandex-payout-overview-view', window.YandexPayoutOverview);
   register('batch-upload-view', window.BatchUploadView);
   register('listing-history-view', window.ListingHistoryView);
   register('ai-image-generator-view', window.AIImageGeneratorView);

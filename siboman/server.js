@@ -6639,6 +6639,83 @@ app.post("/api/yandex/orders/:id/purchase", requireAuth, async (req, res, next) 
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+// [Accio Work 修改] v2.2.9.222 Yandex 回款总览（店铺级三桶聚合）
+//   GET /api/yandex/payout-overview?store_id=
+//   与订单详情结算共用同一份 netting 报告 + 同一套通道分类（classifyYandexNettingLine），
+//   口径：已入账(Отправлен…/Удержан из платежей…) + 待打款(Будет…/Не будет…) + 余额变动(Справочно…баланса)
+//        → 三者合计 = 全店总经济所得。
+//   ⚠️ 已入账/待打款的分界用状态时态逐行判定（与 v2.2.9.220 实测脚本一致），
+//   而不用 nettingMap 里预聚合的 planned/actual —— 那两个字段不区分通道，会把余额流水算进打款桶。
+// ═══════════════════════════════════════════════════════════════════════
+app.get("/api/yandex/payout-overview", requireAuth, async (req, res, next) => {
+  try {
+    const context = await getYandexMarketContext({ storeId: req.query.store_id || null, userId: req.user.id });
+    // 命中 fail-空缓存就强刷（同结算端点策略：用户主动打开页面就是要看真数据）
+    const mapKey = String(context.businessId || "");
+    const cachedHit = yandexNettingCache.get(mapKey);
+    if (cachedHit && cachedHit.map && cachedHit.map.size === 0 && Date.now() - cachedHit.at < YANDEX_NETTING_TTL_MS) {
+      yandexNettingCache.delete(mapKey);
+    }
+    const netting = await getYandexNettingMap(context);
+    const r2 = (x) => Math.round(x * 100) / 100;
+    const orders = [];
+    for (const [orderId, entry] of netting) {
+      if (!entry || !Array.isArray(entry.lines) || !entry.lines.length) continue;
+      let paid = 0, pending = 0, balanceAcc = 0, lastKey = "";
+      for (const line of entry.lines) {
+        const amount = Number(line.amount || 0);
+        const { channel } = classifyYandexNettingLine(line);
+        const status = String(line.status || "");
+        if (channel === "balance") balanceAcc += amount;
+        else if (/^Не будет|Будет /i.test(status) && !/Отправлен/i.test(status)) pending += amount;
+        else paid += amount;
+        // 流水日期 DD.MM.YYYY HH:MM（莫斯科时间）→ 可比较键 YYYYMMDDHHMM，取最近一笔
+        const d = String(line.date || "");
+        const dm = d.match(/^(\d{2})\.(\d{2})\.(\d{4})(?:[ T](\d{2}):(\d{2}))?/);
+        if (dm) {
+          const key = `${dm[3]}${dm[2]}${dm[1]}${dm[4] || "00"}${dm[5] || "00"}`;
+          if (key > lastKey) lastKey = key;
+        }
+      }
+      const bankPayout = r2(paid + pending);
+      const row = {
+        order_id: String(orderId),
+        paid_cny: r2(paid),          // 已入账（已打款 + 已代扣）
+        pending_cny: r2(pending),    // 待打款（Будет… 排队中）
+        balance_cny: r2(balanceAcc), // 余额通道净变动
+        bank_payout_cny: bankPayout, // 银行回款合计 = 已入账 + 待打款
+        total_income_cny: r2(bankPayout + balanceAcc),
+        line_count: entry.lines.length,
+      };
+      if (lastKey) row.last_transfer_at = `${lastKey.slice(0, 4)}-${lastKey.slice(4, 6)}-${lastKey.slice(6, 8)} ${lastKey.slice(8, 10)}:${lastKey.slice(10)}`;
+      orders.push(row);
+    }
+    // 银行回款合计降序（与订单详情口径一致：先看钱多的单）
+    orders.sort((a, b) => (b.bank_payout_cny - a.bank_payout_cny) || (b.total_income_cny - a.total_income_cny));
+    const totals = {
+      orders: orders.length,
+      paid_cny: r2(orders.reduce((s, x) => s + x.paid_cny, 0)),
+      pending_cny: r2(orders.reduce((s, x) => s + x.pending_cny, 0)),
+      balance_cny: r2(orders.reduce((s, x) => s + x.balance_cny, 0)),
+      total_income_cny: r2(orders.reduce((s, x) => s + x.total_income_cny, 0)),
+    };
+    const after = yandexNettingCache.get(mapKey);
+    const degraded = Boolean(after && after.map && after.map.size === 0 && after.ttl === YANDEX_NETTING_FAIL_TTL_MS);
+    res.json({
+      success: true,
+      store: { id: context.storeId || "", name: context.campaignName || "" },
+      window_days: 35,
+      totals,
+      orders,
+      degraded,      // true = 报告生成失败且被短缓存（多数是 Yandex 1次/2分钟 限流），稍后刷新即可
+      cached_at: after ? new Date(after.at).toISOString() : null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/yandex/orders/ship", requireAuth, async (req, res, next) => {
   try {
     const storeId = String(req.body?.store_id || req.query?.store_id || "").trim() || null;
