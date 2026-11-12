@@ -1,6 +1,6 @@
 // [Accio Work 修改] v2.2.9.222 Yandex 回款总览（店铺级三桶聚合页面）
 //   菜单：Yandex 管理 → 回款总览（#/yandex-payout）
-//   数据：GET /api/yandex/payout-overview（近 35 天 netting 付款报告全量聚合）
+//   数据：GET /api/yandex/payout-overview（近 120 天 netting 付款报告全量聚合）
 //   口径与订单详情「付款报告实测」完全一致（同一份报告、同一套通道分类）。
 window.YandexPayoutOverview = {
   setup() {
@@ -141,8 +141,9 @@ window.YandexPayoutOverview = {
         description="Yandex 报告生成限频 1 次/2 分钟；而且报告生成本来就慢（约 1 分钟）。等 2 分钟后点「刷新」即可，无需其他操作。" />
 
       <el-alert type="info" :closable="false" style="margin-bottom:14px"
-        title="三个口径怎么读"
-        description="待打款 = 已算清、Yandex 将按付款周期转到你银行卡（Будет переведён）；余额变动 = 平台补贴/联促分摊，直接进店铺余额、不经银行卡（Справочно: баланс）；已入账 = 已实际打款或已代扣（Отправлен / Удержан）。全店总所得 = 三项合计。展开订单行可看逐笔流水。" />
+        title=" 三个口径怎么读 · 窗口说明：数据来自近 120 天付款报告"
+        description="待打款 = 已算清、Yandex 将按付款周期转到你银行卡（Будет переведён）；余额变动 = 平台补贴/联促分摊，直接进店铺余额、不经银行卡（Справочно: баланс）；已入账 = 已实际打款或已代扣（Отправлен / Удержан）。全店总所得 = 三项合计。买家付款行在「下单当天」就入报告，所以窗口比订单页查询范围宽；仅 120 天前更老的订单才会显示「暂未覆盖」。" />
+
 
       <!-- 4 张 KPI 卡 -->
       <div v-loading="loading" style="display:grid; grid-template-columns:repeat(4, 1fr); gap:14px; margin-bottom:16px">
@@ -164,7 +165,7 @@ window.YandexPayoutOverview = {
         <div style="background:#f0fdf4; border:1px solid #bbf7d0; border-radius:10px; padding:14px 16px">
           <div style="font-size:12px; color:#15803d; font-weight:700">全店总经济所得</div>
           <div style="font-size:26px; font-weight:800; color:#15803d; margin-top:4px">¥ {{ totals ? fmtAbs(totals.total_income_cny) : '—' }}</div>
-          <div style="font-size:11px; color:#64748b; margin-top:2px">三桶合计 · 近 35 天 · {{ totals ? totals.orders : 0 }} 单</div>
+          <div style="font-size:11px; color:#64748b; margin-top:2px">三桶合计 · 近 120 天 · {{ totals ? totals.orders : 0 }} 单</div>
         </div>
       </div>
 
@@ -265,7 +266,7 @@ window.YandexPayoutOverview = {
           </template>
           <el-alert v-else-if="!drawer.loading" type="warning" :closable="false" show-icon
             title="付款报告暂未覆盖该单"
-            description="可能原因：订单刚送达还没结算、或报告窗口（近 35 天）未包含它。" />
+            description="可能原因：订单早于报告窗口（近 120 天）或交易尚未入账。" />
         </div>
       </el-drawer>
     </div>

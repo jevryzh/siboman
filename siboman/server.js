@@ -3331,7 +3331,12 @@ function downloadUrlIPv4Buffer(url, timeoutMs = 60000) {
 
 async function buildYandexNettingMap(context) {
   const now = new Date();
-  const from = new Date(now.getTime() - 35 * 86400e3);
+  // [Accio Work 修改] v2.2.9.223 窗口 35 → 120 天：
+  //   实测订单 62072220291 的收入行（+40.98 买家付款 / +24.98 补贴，交易日期 21.09.2026）
+  //   在 35 天窗口的报告里被整笔排除，只余 10 月末的代扣费用 → 详情显示「只有费用没有收入」。
+  //   Yandex 按交易日期过滤每行，首笔收款早在下单时（甚至下单后 15min）就发生，
+  //   所以窗口必须覆盖「最早订单的下单日」。120 天 > 订单页最大 90 天查询带宽，留足余量。
+  const from = new Date(now.getTime() - 120 * 86400e3);
   const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   const gen = await callYandexMarketAPI("/v2/reports/united-netting/generate", {
     method: "POST",
@@ -6705,7 +6710,7 @@ app.get("/api/yandex/payout-overview", requireAuth, async (req, res, next) => {
     res.json({
       success: true,
       store: { id: context.storeId || "", name: context.campaignName || "" },
-      window_days: 35,
+      window_days: 120,
       totals,
       orders,
       degraded,      // true = 报告生成失败且被短缓存（多数是 Yandex 1次/2分钟 限流），稍后刷新即可
