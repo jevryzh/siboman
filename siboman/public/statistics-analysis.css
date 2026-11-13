@@ -231,6 +231,13 @@ body:has(.statistics-workbench) .erp-route-page { padding:14px 20px; }
 .order-workbench .order-query-row .el-date-editor,
 .order-workbench .order-query-row .el-input { flex:0 1 auto; min-width:0; }
 .order-workbench .order-query-row .el-input__wrapper { padding-left:7px; padding-right:7px; }
+
+/* 行内录入：可点的单元格给一点提示，编辑时输入框贴住单元格高度 */
+.order-workbench .order-cell-edit { cursor:pointer; border-bottom:1px dashed transparent; }
+.order-workbench .order-cell-edit:hover { border-bottom-color:#cbd5e1; }
+.order-workbench .order-cell-input { height:24px; }
+.order-workbench .order-cell-input .el-input__wrapper { padding:0 6px; box-shadow:none; background:transparent; }
+.order-workbench .order-cell-input .el-input__inner { height:24px; font-size:12px; text-align:right; }
 .order-workbench .order-tool-row { justify-content:space-between; gap:10px 14px; }
 .order-workbench .order-autosync { display:flex; align-items:center; gap:8px; font-size:12px; color:#6b767d; white-space:nowrap; }
 .order-workbench .order-dot { width:7px; height:7px; border-radius:50%; display:inline-block; background:#cbd5e1; }

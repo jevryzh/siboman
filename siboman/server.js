@@ -21713,6 +21713,93 @@ app.post("/api/seller/orders/batches/remove", requireAuth, async (req, res, next
   } catch (error) { next(error); }
 });
 
+// 2026-11-12 订单页行内录入：采购金额 / 贴单费 / 采购物流号（单字段即时保存，替代每次 Excel 导入）
+//   body: { store_id, posting_number, purchase_cny?, label_cny?, purchase_tracking_no? }
+//   只处理请求里出现的字段；金额传 null 表示清空（回到「待录入」），物流号传 '' 表示清空
+app.post("/api/seller/orders/costs/quick", requireAuth, async (req, res, next) => {
+  if (!requireDb(res)) return;
+  try {
+    const storeId = String(req.body?.store_id || "").trim();
+    const postingNumber = String(req.body?.posting_number || "").trim();
+    if (!storeId || !postingNumber) return res.status(400).json({ success: false, error: "缺少店铺或订单号" });
+
+    const owned = await db.query("SELECT 1 FROM app_stores WHERE id = $1 AND user_id = $2 LIMIT 1", [storeId, req.user.id]);
+    if (!owned.rows.length) return res.status(403).json({ success: false, error: "没有该店铺的权限" });
+
+    const has = (key) => Object.prototype.hasOwnProperty.call(req.body || {}, key);
+    const parseAmount = (value, label) => {
+      if (value === null || value === undefined || String(value).trim() === "") return null;
+      const n = Number(String(value).replace(/[,，¥￥\s]/g, ""));
+      if (!Number.isFinite(n) || n < 0 || n > 1000000) {
+        const err = new Error(`${label}不合法：${String(value).slice(0, 20)}`);
+        err.statusCode = 400;
+        throw err;
+      }
+      return Math.round(n * 100) / 100;
+    };
+
+    const purchaseProvided = has("purchase_cny");
+    const labelProvided = has("label_cny");
+    const trackingProvided = has("purchase_tracking_no");
+    if (!purchaseProvided && !labelProvided && !trackingProvided) {
+      return res.status(400).json({ success: false, error: "没有要保存的字段" });
+    }
+    const purchaseValue = purchaseProvided ? parseAmount(req.body.purchase_cny, "采购金额") : null;
+    const labelValue = labelProvided ? parseAmount(req.body.label_cny, "贴单费") : null;
+    const trackingValue = trackingProvided ? String(req.body.purchase_tracking_no ?? "").trim().slice(0, 120) : "";
+
+    if (purchaseProvided || labelProvided) {
+      // 未提供的那个字段用原值（CASE 控制），避免只改贴单费时把采购金额冲成 NULL
+      await db.query(
+        `INSERT INTO app_statistics_costs (user_id, store_id, posting_number, purchase_cny, label_cny, version)
+         VALUES ($1,$2,$3,$4,$5,1)
+         ON CONFLICT (user_id, store_id, posting_number) DO UPDATE SET
+           purchase_cny = CASE WHEN $6 THEN EXCLUDED.purchase_cny ELSE app_statistics_costs.purchase_cny END,
+           label_cny    = CASE WHEN $7 THEN EXCLUDED.label_cny    ELSE app_statistics_costs.label_cny END,
+           version = app_statistics_costs.version + 1,
+           updated_at = now()`,
+        [req.user.id, storeId, postingNumber,
+          purchaseProvided ? purchaseValue : null,
+          labelProvided ? labelValue : null,
+          purchaseProvided, labelProvided],
+      );
+    }
+
+    if (trackingProvided) {
+      await db.query(
+        `INSERT INTO app_order_costs (user_id, store_id, posting_number, purchase_tracking_no, changed_by)
+         VALUES ($1,$2,$3,$4,$1)
+         ON CONFLICT (store_id, posting_number) DO UPDATE SET
+           purchase_tracking_no = EXCLUDED.purchase_tracking_no,
+           changed_by = EXCLUDED.changed_by,
+           updated_at = now()`,
+        [req.user.id, storeId, postingNumber, trackingValue],
+      );
+    }
+
+    // 回写三个字段的当前值，前端直接更新行、不用再拉列表
+    const state = await db.query(
+      `SELECT sc.purchase_cny, sc.label_cny, oc.purchase_tracking_no
+         FROM (SELECT $1::uuid AS user_id, $2::uuid AS store_id, $3::text AS posting_number) k
+         LEFT JOIN app_statistics_costs sc
+                ON sc.user_id = k.user_id AND sc.store_id = k.store_id AND sc.posting_number = k.posting_number
+         LEFT JOIN app_order_costs oc
+                ON oc.store_id = k.store_id AND oc.posting_number = k.posting_number`,
+      [req.user.id, storeId, postingNumber],
+    );
+    const stateRow = state.rows[0] || {};
+    res.json({
+      success: true,
+      purchase_cny: stateRow.purchase_cny == null ? null : Number(stateRow.purchase_cny),
+      label_cny: stateRow.label_cny == null ? null : Number(stateRow.label_cny),
+      purchase_tracking_no: String(stateRow.purchase_tracking_no || ""),
+    });
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ success: false, error: error.message });
+    next(error);
+  }
+});
+
 app.post("/api/seller/orders/export", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   try {

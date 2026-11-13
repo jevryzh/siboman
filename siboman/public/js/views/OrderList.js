@@ -1326,6 +1326,80 @@ window.OrderListView = {
       finally { noteDialog.saving = false; }
     };
     // 2026-11-10 订单页不再做利润计算（利润只在月结统计里算），这里只维护货源链接 / 采购物流号
+    // ===== 2026-11-12 行内录入：采购金额 / 贴单费 / 采购物流号 =====
+    //   点单元格 → 变输入框 → Enter/失焦保存该字段（Esc 取消），省掉每次走 Excel 导入
+    //   空白 = 清空（金额回到"待录入"），只提交被编辑的那一个字段
+    const editingCell = Vue.reactive({ key: '', field: '', value: '', saving: false });
+    let cellInputEl = null;
+    const setCellInput = (el) => { cellInputEl = el; };
+    const cellKeyOf = (row, field) => `${effectiveStoreIdForOrder(row)}:${row.posting_number}:${field}`;
+    const isEditingCell = (row, field) => editingCell.key === cellKeyOf(row, field);
+    const focusCellInput = () => Vue.nextTick(() => {
+      const input = cellInputEl && cellInputEl.$el ? cellInputEl.$el.querySelector('input') : null;
+      if (input) { input.focus(); input.select(); }
+    });
+    const startEditCell = (row, field) => {
+      if (editingCell.saving) return;
+      editingCell.key = cellKeyOf(row, field);
+      editingCell.field = field;
+      const raw = row[field];
+      editingCell.value = raw === null || raw === undefined ? '' : String(raw);
+      focusCellInput();
+    };
+    const cancelCell = () => {
+      if (editingCell.saving) return;
+      editingCell.key = '';
+      editingCell.field = '';
+      editingCell.value = '';
+    };
+    const commitCell = async (row) => {
+      if (!editingCell.key || editingCell.saving) return;
+      const savedKey = editingCell.key;
+      const field = editingCell.field;
+      const text = String(editingCell.value == null ? '' : editingCell.value).trim();
+      const currentValue = row[field] === null || row[field] === undefined ? '' : String(row[field]);
+      if (text === currentValue) { cancelCell(); return; }
+
+      let payloadValue;
+      if (field === 'purchase_tracking_no') {
+        if (text.length > 120) return notify.warning('物流单号最多 120 个字符');
+        payloadValue = text;
+      } else {
+        if (text) {
+          if (!/^\d+(\.\d{1,2})?$/.test(text)) return notify.warning('请输入数字，最多两位小数');
+          if (Number(text) > 1000000) return notify.warning('金额超出可录入范围');
+          payloadValue = Number(text);
+        } else {
+          payloadValue = null;   // 清空 → 回到「待录入」
+        }
+      }
+
+      editingCell.saving = true;
+      try {
+        const res = await axios.post('/api/seller/orders/costs/quick', {
+          store_id: effectiveStoreIdForOrder(row),
+          posting_number: row.posting_number,
+          [field]: payloadValue,
+        });
+        const d = res.data || {};
+        const target = orders.value.find((r) => orderRowKey(r) === orderRowKey(row)) || row;
+        if (d.purchase_cny !== undefined) target.purchase_cny = d.purchase_cny;
+        if (d.label_cny !== undefined) target.label_cny = d.label_cny;
+        if (d.purchase_tracking_no !== undefined) target.purchase_tracking_no = d.purchase_tracking_no;
+        notify.success('已保存', 1200);
+      } catch (e) {
+        notify.error('保存失败：' + (e.response?.data?.error || e.message));
+      } finally {
+        editingCell.saving = false;
+        // 只清理自己这一格：保存途中用户点到别的格子时，不要把它一起关掉
+        if (editingCell.key === savedKey) {
+          editingCell.key = '';
+          editingCell.field = '';
+          editingCell.value = '';
+        }
+      }
+    };
+
     const openProcurementSource = (row) => {
       const product = primaryProduct(row);
       if (!product.offer_id) return notify.warning('当前订单没有可编辑的商品货号');
@@ -1663,6 +1737,8 @@ window.OrderListView = {
       // 2026-11-10 采购批次号
       batchDialog, batchBusy, handleBatchCommand, openBatchDialog, submitBatch, removeBatch,
       handlePrintCommand,
+      // 2026-11-12 行内录入（采购金额 / 贴单费 / 采购物流号）
+      editingCell, setCellInput, isEditingCell, startEditCell, cancelCell, commitCell,
       todayLabel, syncRangeText, summaryStats, moneyText, trendText, trendColor, primaryProduct, rowCreatedTime,
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
       labelsPrinting, printLabels,   // v2.2.9.156 打印面单
@@ -1901,25 +1977,42 @@ window.OrderListView = {
             </template>
           </el-table-column>
           <!-- 采购金额 / 贴单费：按订单号关联月结成本表（app_statistics_costs），订单表不加字段 -->
+          <!-- 2026-11-12 三列支持点击直接录入（单字段即时保存），不用再走 Excel 导入 -->
           <el-table-column label="采购金额" width="86" align="right">
             <template #default="{ row }">
-              <div v-if="row.purchase_cny != null" class="order-cell-num">{{ moneyText(row.purchase_cny) }}</div>
-              <span v-else class="order-cell-sub" style="color:#b45309">待录入</span>
+              <el-input v-if="isEditingCell(row, 'purchase_cny')" :ref="setCellInput" v-model="editingCell.value"
+                size="small" class="order-cell-input" placeholder="金额"
+                @keyup.enter="commitCell(row)" @keyup.esc="cancelCell" @blur="commitCell(row)" />
+              <div v-else class="order-cell-edit" @click="startEditCell(row, 'purchase_cny')">
+                <div v-if="row.purchase_cny != null" class="order-cell-num">{{ moneyText(row.purchase_cny) }}</div>
+                <span v-else class="order-cell-sub" style="color:#b45309">待录入</span>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="贴单费" width="74" align="right">
             <template #default="{ row }">
-              <div v-if="row.label_cny != null" class="order-cell-num">{{ moneyText(row.label_cny) }}</div>
-              <span v-else class="order-cell-sub">-</span>
+              <el-input v-if="isEditingCell(row, 'label_cny')" :ref="setCellInput" v-model="editingCell.value"
+                size="small" class="order-cell-input" placeholder="金额"
+                @keyup.enter="commitCell(row)" @keyup.esc="cancelCell" @blur="commitCell(row)" />
+              <div v-else class="order-cell-edit" @click="startEditCell(row, 'label_cny')">
+                <div v-if="row.label_cny != null" class="order-cell-num">{{ moneyText(row.label_cny) }}</div>
+                <span v-else class="order-cell-sub">-</span>
+              </div>
             </template>
           </el-table-column>
           <el-table-column label="采购物流号" width="116">
             <template #default="{ row }">
-              <div v-if="row.purchase_tracking_no" style="display:flex; align-items:center; gap:2px; min-width:0">
-                <span class="order-cell-main" style="font-family:ui-monospace,monospace">{{ row.purchase_tracking_no }}</span>
-                <el-button link type="primary" @click="copyText(row.purchase_tracking_no)"><el-icon size="12"><CopyDocument /></el-icon></el-button>
+              <el-input v-if="isEditingCell(row, 'purchase_tracking_no')" :ref="setCellInput" v-model="editingCell.value"
+                size="small" class="order-cell-input" placeholder="物流单号"
+                @keyup.enter="commitCell(row)" @keyup.esc="cancelCell" @blur="commitCell(row)" />
+              <div v-else style="display:flex; align-items:center; gap:2px; min-width:0">
+                <template v-if="row.purchase_tracking_no">
+                  <span class="order-cell-main order-cell-edit" style="font-family:ui-monospace,monospace"
+                    @click="startEditCell(row, 'purchase_tracking_no')">{{ row.purchase_tracking_no }}</span>
+                  <el-button link type="primary" @click="copyText(row.purchase_tracking_no)"><el-icon size="12"><CopyDocument /></el-icon></el-button>
+                </template>
+                <el-button v-else link type="primary" style="font-size:11px" @click="startEditCell(row, 'purchase_tracking_no')">+ 填写</el-button>
               </div>
-              <el-button v-else link type="primary" style="font-size:11px" @click="openProcurementSource(row)">+ 填写</el-button>
             </template>
           </el-table-column>
           <!-- 采购批次号：来自 app_order_batches.batch_no，一单一条 -->
