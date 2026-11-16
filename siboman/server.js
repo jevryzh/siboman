@@ -24,6 +24,7 @@ import { ensureCronTable, startCronRun, finishCronRun, listCronJobs, CRON_JOBS a
 import { createOrderSync } from "./lib/order-sync.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
+import { buildYarnRangeXlsx } from "./lib/yarn-range-export.js";
 import {
   BUILTIN_CATEGORY_TREE,
   ensureSmartPickTables,
@@ -18135,6 +18136,96 @@ app.post("/api/seller/orders/pending-sku-export", requireAuth, async (req, res, 
     res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
     res.setHeader("X-Sku-Count", String(result.rows.length));
     res.setHeader("X-Total-Qty", String(totalQty));
+    res.send(buf);
+  } catch (error) { next(error); }
+});
+
+// Accio Work (2026-11-16) v2.2.9.225 「导出毛线订单区间统计」—— 定制需求：
+//   输入起止两个订单号（含首尾），按 in_process_at 时间区间取全部未取消订单，
+//   统计毛线色号数量（马海毛 #NN 总个数=数量×4 单价 3.3、羊驼毛 #W 总个数=数量×2 单价 4.5），
+//   生成双 Sheet xlsx。数据源优先本地 app_order_cache；起/止订单号在缓存中缺失时
+//   回退 Ozon /v3/posting/fbs/get 做边界补查，以确定区间两端 in_process_at。
+//   去重：DISTINCT ON (posting_number) + synced_at DESC，防跨 store_id 重复缓存翻倍。
+app.post("/api/seller/orders/yarn-range-export", requireAuth, async (req, res, next) => {
+  try {
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const startPosting = String(req.body?.start_posting || "").trim();
+    const endPosting = String(req.body?.end_posting || "").trim();
+    if (!startPosting || !endPosting) return res.status(400).json({ success: false, error: "请输入起始订单号和结束订单号" });
+
+    // 1) 本地缓存里取两个订单号的 in_process_at
+    const bound = await db.query(
+      `SELECT DISTINCT ON (posting_number) posting_number, in_process_at
+         FROM app_order_cache
+        WHERE user_id = $1
+          AND store_id = ANY($2::uuid[])
+          AND posting_number = ANY($3::text[])
+        ORDER BY posting_number, synced_at DESC NULLS LAST`,
+      [req.user.id, storeIds, [startPosting, endPosting]],
+    );
+    const boundMap = new Map(bound.rows.map((r) => [r.posting_number, r.in_process_at]));
+
+    // 2) 边界 fallback：缓存里缺的订单号，调 Ozon API 取 in_process_at
+    for (const pn of [startPosting, endPosting]) {
+      if (boundMap.get(pn)) continue;
+      try {
+        for (const storeId of storeIds) {
+          const data = await callOzonSellerAPI("/v3/posting/fbs/get", {
+            posting_number: pn,
+            with: { analytics_data: false, financial_data: false, barcodes: false, product_exemplars: false, translit: false },
+          }, { storeId, userId: req.user.id });
+          const inProcessAt = data?.result?.in_process_at || null;
+          if (inProcessAt) { boundMap.set(pn, inProcessAt); break; }
+        }
+      } catch (_) { /* 某个 store 认证失败就下一个 */ }
+    }
+    const startAt = boundMap.get(startPosting);
+    const endAt = boundMap.get(endPosting);
+    if (!startAt) return res.status(404).json({ success: false, error: `起始订单号 ${startPosting} 未找到（本地缓存和 Ozon 都查不到）` });
+    if (!endAt)   return res.status(404).json({ success: false, error: `结束订单号 ${endPosting} 未找到（本地缓存和 Ozon 都查不到）` });
+    const [t0, t1] = new Date(startAt) <= new Date(endAt) ? [startAt, endAt] : [endAt, startAt];
+
+    // 3) 取区间内全部未取消订单（含首尾时间点）
+    //    DISTINCT ON posting_number + synced_at DESC 保留最新缓存快照，避免跨 store_id 翻倍
+    const rangeRows = await db.query(
+      `SELECT DISTINCT ON (posting_number)
+              posting_number, in_process_at, status, display_status,
+              COALESCE(payload->'products', '[]'::jsonb) AS products
+         FROM app_order_cache
+        WHERE user_id = $1
+          AND store_id = ANY($2::uuid[])
+          AND in_process_at >= $3::timestamptz
+          AND in_process_at <= $4::timestamptz
+        ORDER BY posting_number, synced_at DESC NULLS LAST`,
+      [req.user.id, storeIds, t0, t1],
+    );
+    const orders = rangeRows.rows.map((r) => {
+      const status = String(r.display_status || r.status || "");
+      return {
+        posting_number: r.posting_number,
+        in_process_at: r.in_process_at,
+        status,
+        products: Array.isArray(r.products) ? r.products : [],
+      };
+    });
+    // 分桶：取消 vs 未取消。lib 聚合只使用未取消的。
+    const cancelledCount = orders.filter((o) => /^cancell?ed/i.test(o.status)).length;
+    const validOrders = orders.filter((o) => !/^cancell?ed/i.test(o.status));
+    const validCount = validOrders.length;
+
+    // 4) 构 xlsx（真正的聚合、分组、排序、样式全在 lib 里）
+    const { buf, summary } = await buildYarnRangeXlsx({
+      orders: validOrders,
+      meta: { startPosting, endPosting, startAt: t0, endAt: t1, validCount, cancelledCount },
+    });
+    const fname = `待备货毛线订单区间统计_${new Date().toISOString().slice(0, 10)}.xlsx`;
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
+    res.setHeader("X-Total-Orders",     String(validCount));
+    res.setHeader("X-Cancelled-Orders", String(cancelledCount));
+    res.setHeader("X-Yarn-Orders",      String(summary.yarnOrderCount));
     res.send(buf);
   } catch (error) { next(error); }
 });

@@ -1199,6 +1199,51 @@ window.OrderListView = {
         yarnExporting.value = false;
       }
     };
+    // Accio Work (2026-11-16) v2.2.9.225 导出毛线订单区间统计
+    //   弹窗输入 起始订单号 / 结束订单号；后端按 in_process_at 区间（含首尾）拉所有
+    //   未取消订单，聚合毛线色号数量，生成双 Sheet xlsx。
+    const yarnRangeDialog = Vue.reactive({ visible: false, start: '', end: '', loading: false });
+    const openYarnRangeDialog = () => {
+      yarnRangeDialog.visible = true;
+      yarnRangeDialog.start = '';
+      yarnRangeDialog.end = '';
+    };
+    const exportYarnRange = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先选择店铺');
+      const start = String(yarnRangeDialog.start || '').trim();
+      const end = String(yarnRangeDialog.end || '').trim();
+      if (!start || !end) return notify.warning('请输入起始订单号和结束订单号');
+      yarnRangeDialog.loading = true;
+      try {
+        const res = await axios.post('/api/seller/orders/yarn-range-export',
+          { store_ids: storeIds, start_posting: start, end_posting: end },
+          { responseType: 'blob' });
+        const blob = new Blob([res.data], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `待备货毛线订单区间统计_${new Date().toISOString().slice(0, 10)}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        const total = res.headers['x-total-orders'] || '?';
+        const cancelled = res.headers['x-cancelled-orders'] || '?';
+        const yarn = res.headers['x-yarn-orders'] || '?';
+        notify.success(`已导出：共 ${total} 个有效订单（取消 ${cancelled} 个），毛线 ${yarn} 单`);
+        yarnRangeDialog.visible = false;
+      } catch (e) {
+        let msg = e.message;
+        try {
+          if (e.response?.data instanceof Blob) msg = JSON.parse(await e.response.data.text())?.error || msg;
+          else if (e.response?.data?.error) msg = e.response.data.error;
+        } catch (_e2) { /* 保持原错误 */ }
+        notify.error('导出毛线订单区间统计失败：' + String(msg).slice(0, 200));
+      } finally {
+        yarnRangeDialog.loading = false;
+      }
+    };
     // v2.2.9.157 生成拣货单：调卖家后台异步报告（assembly/list → report/status → report/download），
     //   接口会话绑定 IP，只能由插件在 seller.ozon.ru 里带着登录态调用。
     const pickListBusy = Vue.ref(false);
@@ -1743,6 +1788,7 @@ window.OrderListView = {
       profitColor, profitText, profitOf,   // v2.2.9.143 详情里的利润明细
       labelsPrinting, printLabels,   // v2.2.9.156 打印面单
       yarnExporting, exportPendingSkus,   // v2.2.9.165 导出待备货毛线数量
+      yarnRangeDialog, openYarnRangeDialog, exportYarnRange,   // v2.2.9.225 导出毛线订单区间统计
       pickListBusy, printPickList,   // v2.2.9.157 生成拣货单
       rowStatusSubtext, copyPostingNumber, copyText, orderDateText, orderTimeText, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
@@ -1899,7 +1945,7 @@ window.OrderListView = {
             <el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button>
             <el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button>
             <el-button size="small" @click="exportOrders">导出当前筛选</el-button>
-            <el-button size="small" :loading="yarnExporting" @click="exportPendingSkus">导出待备货毛线</el-button>
+            <el-button size="small" @click="openYarnRangeDialog">导出毛线订单区间统计</el-button>
           </div>
         </div>
 
@@ -2197,6 +2243,26 @@ window.OrderListView = {
         <template #footer>
           <el-button @click="batchDialog.visible = false">取消</el-button>
           <el-button type="primary" :loading="batchDialog.busy" @click="submitBatch">确定录入</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- Accio Work (2026-11-16) v2.2.9.225 导出毛线订单区间统计 -->
+      <el-dialog v-model="yarnRangeDialog.visible" title="导出毛线订单区间统计" width="480px" append-to-body>
+        <div style="font-size:13px; color:#64748b; margin-bottom:12px; line-height:1.7">
+          输入两个订单号，系统按「已接收时间」截取区间（含首尾两单），
+          剔除已取消订单后统计其中的毛线色号与数量。
+        </div>
+        <el-form label-width="90px">
+          <el-form-item label="起始订单号">
+            <el-input v-model="yarnRangeDialog.start" placeholder="例如：23159980-0169-1" clearable />
+          </el-form-item>
+          <el-form-item label="结束订单号">
+            <el-input v-model="yarnRangeDialog.end" placeholder="例如：72351451-0166-1" clearable @keyup.enter="exportYarnRange" />
+          </el-form-item>
+        </el-form>
+        <template #footer>
+          <el-button @click="yarnRangeDialog.visible = false">取消</el-button>
+          <el-button type="primary" :loading="yarnRangeDialog.loading" @click="exportYarnRange">导出</el-button>
         </template>
       </el-dialog>
 

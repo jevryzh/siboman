@@ -4,7 +4,10 @@ import vm from 'node:vm';
 
 const source = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
 const start = source.indexOf('app.post("/api/seller/orders/pending-sku-export"');
-const end = source.indexOf('app.post("/api/seller/orders/labels"', start);
+// Accio Work (2026-11-16): pending-sku-export 之后现在还有 yarn-range-export、labels 等接口；
+//   只截到紧随的下一个 `app.post(` 之前，避免 vm 把下一个接口也执行一遍。
+const nextPost = source.indexOf('\napp.post(', start + 20);
+const end = nextPost > 0 ? nextPost : source.length;
 assert.ok(start >= 0 && end > start, 'pending yarn export route exists');
 
 let handler;
