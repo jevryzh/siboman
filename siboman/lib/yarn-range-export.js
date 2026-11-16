@@ -360,7 +360,7 @@ export async function buildYarnRangeXlsx({ orders, meta }) {
     ],
   });
 
-  // 金额（马海毛）
+  // 金额（马海毛）—— A 列留标签、B:C 合并为金额（D 列 SKU 位置留空）
   const moharAmtRow = sheet1Rows.length + 1;
   sheet1Rows.push({
     cells: [
@@ -370,7 +370,10 @@ export async function buildYarnRangeXlsx({ orders, meta }) {
       { v: "", s: 8 },
     ],
   });
-  merges1.push({ r1: moharAmtRow, c1: 1, r2: moharAmtRow, c2: 3 });
+  merges1.push({ r1: moharAmtRow, c1: 1, r2: moharAmtRow, c2: 2 });
+
+  // ---- 两表之间空一行 ----
+  sheet1Rows.push({ cells: [{ v: "" }, { v: "" }, { v: "" }, { v: "" }] });
 
   // ---- 羊驼毛表 ----
   // 表头
@@ -405,7 +408,7 @@ export async function buildYarnRangeXlsx({ orders, meta }) {
     ],
   });
 
-  // 金额（羊驼毛）
+  // 金额（羊驼毛）—— A 列留标签、B:C 合并为金额
   const alpacaAmtRow = sheet1Rows.length + 1;
   sheet1Rows.push({
     cells: [
@@ -415,9 +418,9 @@ export async function buildYarnRangeXlsx({ orders, meta }) {
       { v: "", s: 5 },
     ],
   });
-  merges1.push({ r1: alpacaAmtRow, c1: 1, r2: alpacaAmtRow, c2: 3 });
+  merges1.push({ r1: alpacaAmtRow, c1: 1, r2: alpacaAmtRow, c2: 2 });
 
-  // 总金额合计
+  // 总金额合计 —— A 列留标签、B:C 合并为金额
   const totalAmtRow = sheet1Rows.length + 1;
   sheet1Rows.push({
     cells: [
@@ -427,7 +430,7 @@ export async function buildYarnRangeXlsx({ orders, meta }) {
       { v: "", s: 6 },
     ],
   });
-  merges1.push({ r1: totalAmtRow, c1: 1, r2: totalAmtRow, c2: 3 });
+  merges1.push({ r1: totalAmtRow, c1: 1, r2: totalAmtRow, c2: 2 });
 
   const sheet1Xml = compileSheet(sheet1Rows, {
     colWidths: [22, 12, 12, 34],
