@@ -17617,6 +17617,18 @@ function buildXlsx(sheetName, rows, opts = {}) {
   const cols = (opts.colWidths || []).map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("");
   const printLayout = opts.printLayout === "a4-portrait";
   const pageBreaks = (opts.pageBreakRows || []).map((row) => `<brk id="${row}" max="16383" man="1"/>`).join("");
+  // Accio Work (2026-11-17) v2.2.9.227 合并单元格支持（用于拣货单组标题行跨列显示完整文字）
+  //   opts.merges: Array<{ r1, c1, r2, c2 }>（0-based 行列，闭区间）
+  const mergesXml = (() => {
+    const list = Array.isArray(opts.merges) ? opts.merges : [];
+    if (!list.length) return "";
+    const cells = list.map((m) => {
+      const a = `${colName(m.c1)}${m.r1 + 1}`;
+      const b = `${colName(m.c2)}${m.r2 + 1}`;
+      return `<mergeCell ref="${a}:${b}"/>`;
+    }).join("");
+    return `<mergeCells count="${list.length}">${cells}</mergeCells>`;
+  })();
   const STYLE_XFS = [
     `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>`,
     // header: 白字加粗 + 蓝底 + 边框 + 居中
@@ -17657,6 +17669,7 @@ function buildXlsx(sheetName, rows, opts = {}) {
     + (printLayout ? `<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><dimension ref="A1:K${rows.length}"/>` : "")
     + (cols ? `<cols>${cols}</cols>` : "")
     + `<sheetData>${body}</sheetData>`
+    + mergesXml
     + (printLayout ? `<printOptions horizontalCentered="1"/><pageMargins left="0.18" right="0.18" top="0.2" bottom="0.2" header="0" footer="0"/><pageSetup paperSize="9" orientation="portrait" fitToWidth="1" fitToHeight="0"/>` : "")
     + (pageBreaks ? `<rowBreaks count="${opts.pageBreakRows.length}" manualBreakCount="${opts.pageBreakRows.length}">${pageBreaks}</rowBreaks>` : "")
     + `</worksheet>`;
@@ -17820,6 +17833,7 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     const rows = [];
     const rowHeights = {};
     const pageBreakRows = [];
+    const merges = [];  // v2.2.9.227 组标题 A:K 整行合并
     let totalItems = 0;
     let pageCount = 0;
     let isFirstGroup = true;
@@ -17832,10 +17846,11 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
         rows.push(BLANK11());
       }
       isFirstGroup = false;
-      // 组标题行：横跨两列整宽度
+      // 组标题行：横跨 A:K 11 列整行合并，保证"马海毛拣货单"完整显示
       rowHeights[rows.length] = 26;
       const titleRow = BLANK11();
       titleRow[0] = T(groupTitle[code] || code);
+      merges.push({ r1: rows.length, c1: 0, r2: rows.length, c2: 10 });
       rows.push(titleRow);
       // 按 PER_PAGE 分页渲染表头 + 数据
       for (let page = 0; page * PER_PAGE < items.length; page += 1) {
@@ -17872,6 +17887,7 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       rowHeights,
       printLayout: "a4-portrait",
       pageBreakRows,
+      merges,
     });
     const fname = `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
