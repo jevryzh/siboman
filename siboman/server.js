@@ -25,6 +25,7 @@ import { createOrderSync } from "./lib/order-sync.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
 import { buildYarnRangeXlsx } from "./lib/yarn-range-export.js";
+import { YARN_KINDS, extractColor as extractYarnColor, classifyColor as classifyYarnColor } from "./lib/yarn-kinds.js";
 import {
   BUILTIN_CATEGORY_TREE,
   ensureSmartPickTables,
@@ -17695,7 +17696,11 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     //   同一 posting 被多个 store_id 都同步了一份，旧实现在 items CTE 里
     //   直接 SUM 会把 1 件算成 N 件（N = 该单在几个 store 里出现过）。
     //   先按 posting_number 去重，只保留 synced_at 最新的那条 payload，再做颜色聚合。
-    const result = await db.query(
+    // Accio Work (2026-11-17) v2.2.9.226：
+    //   SQL 不再抽色号（旧 SQL 的 `[^-]+$` 对 "ALPACA-YARN-W023-2PCS" 会取到 "2PCS" → 错）。
+    //   改成返回 offer_id + qty，色号识别/分类放到 JS 侧 `lib/yarn-kinds.js` 做，
+    //   和拣货单/标签/区间统计三处共用同一套规则，未来加毛线种类只改 YARN_KINDS 配置。
+    const skuRes = await db.query(
       `WITH unique_postings AS (
           SELECT DISTINCT ON (c.posting_number)
                  c.posting_number, c.payload, c.synced_at
@@ -17703,26 +17708,77 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
            ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
-        ),
-        items AS (
-          SELECT u.posting_number AS pn,
-                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-            FROM unique_postings u
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
-           WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
-             AND COALESCE(p->>'offer_id','') <> ''
-           GROUP BY 1, 2
         )
-        SELECT pn,
-               string_agg(color || '×' || qty, '/' ORDER BY color) AS color_qty,
-               SUM(qty)::int AS total_qty,
-               COUNT(*)::int AS color_kinds,
-               MIN(color) AS first_color
-          FROM items
-         GROUP BY pn`,
+        SELECT u.posting_number AS pn,
+               COALESCE(p->>'offer_id','') AS offer_id,
+               SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+          FROM unique_postings u
+          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
+         WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
+           AND COALESCE(p->>'offer_id','') <> ''
+         GROUP BY 1, 2`,
       [scopeIds, picked],
     );
+
+    // JS 侧：抽色号 + 按 kind 分组，每单生成一组行（可能多个 kind → 归入 "mixed"）
+    // 结构：ordersByKind = Map<kindCode, Array<{ pn, colorQty, totalQty, colorKinds, firstColor }>>
+    //   kindCode = "mohar" / "alpaca" / "mixed"
+    const perOrder = new Map(); // pn -> { byKind: Map<kindCode, Map<color, qty>>, unknownQty }
+    for (const row of skuRes.rows) {
+      const pn = String(row.pn);
+      const { kind, color } = classifyYarnColor(extractYarnColor(row.offer_id));
+      const slot = perOrder.get(pn) || { byKind: new Map(), unknownQty: 0 };
+      if (!kind) {
+        slot.unknownQty += Number(row.qty) || 0;
+      } else {
+        const colorMap = slot.byKind.get(kind.code) || new Map();
+        colorMap.set(color, (colorMap.get(color) || 0) + (Number(row.qty) || 0));
+        slot.byKind.set(kind.code, colorMap);
+      }
+      perOrder.set(pn, slot);
+    }
+
+    // 把每单拍扁成一行。多种 kind → 单条 "mixed" 行；单种 → 对应 kind 行。
+    const aggregated = []; // { pn, kind, colorQty, total_qty, color_kinds, first_color }
+    for (const [pn, slot] of perOrder.entries()) {
+      const kindCodes = [...slot.byKind.keys()];
+      if (!kindCodes.length) continue; // 全 unknown 不进拣货单
+      const isMixed = kindCodes.length > 1;
+      const rowKind = isMixed ? "mixed" : kindCodes[0];
+      // 聚所有色号到一行；混种订单也显示两种毛线的 color×qty
+      const colorEntries = [];
+      let total = 0;
+      let colorCount = 0;
+      const colors = [];
+      for (const code of kindCodes) {
+        const colorMap = slot.byKind.get(code);
+        for (const [color, qty] of colorMap.entries()) {
+          colorEntries.push({ color, qty, code });
+          colors.push(color);
+          total += qty;
+          colorCount += 1;
+        }
+      }
+      // 排序 color×qty 的展示顺序：按 kind → 色号
+      colorEntries.sort((a, b) => {
+        if (a.code !== b.code) {
+          const kindIdx = (c) => YARN_KINDS.findIndex((k) => k.code === c);
+          return kindIdx(a.code) - kindIdx(b.code);
+        }
+        return a.color < b.color ? -1 : a.color > b.color ? 1 : 0;
+      });
+      aggregated.push({
+        pn,
+        kind: rowKind,
+        colorQty: colorEntries.map((e) => `${e.color}×${e.qty}`).join("/"),
+        total_qty: total,
+        color_kinds: colorCount,
+        first_color: colors.sort()[0] || "",
+      });
+    }
+
+    // 用现有排序器：kind 分段 → 单/混色 → 件数 → 色号 → pn
+    const sorted = sortYarnOrderRows(aggregated);
     // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
     // v2.2.9.175 Label = 订单号第一个 "-" **前面**那一段的末 4 位
     //   例：0152861040-0435-1 → 前段 0152861040 → 末 4 位 1040
@@ -17731,45 +17787,85 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       const head = String(posting || "").split("-")[0];
       return head.slice(-4).padStart(4, "0");
     };
-    const sorted = sortYarnOrderRows(result.rows);
-    const items = sorted.map((r) => ({
-      shipment: r.pn,
-      colorQty: r.color_qty,
-      qty: Number(r.total_qty || 0),
-      label: labelOf(r.pn),
-    }));
+    // Accio Work (2026-11-17) v2.2.9.226：按毛线种类分组，每组独立出一张表、独立分页。
+    //   表顺序：mohar → alpaca → ...（按 YARN_KINDS 配置顺序）→ mixed
+    //   每种独立分页，不跨种类挤同一页；种类之间用一行空行视觉分隔。
+    const groupTitle = {
+      mohar: "马海毛拣货单",
+      alpaca: "羊驼毛拣货单",
+      mixed: "混种订单拣货单",
+    };
+    for (const k of YARN_KINDS) {
+      if (!(k.code in groupTitle)) groupTitle[k.code] = `${k.label}拣货单`;
+    }
+    const groupOrder = [...YARN_KINDS.map((k) => k.code), "mixed"];
+    const grouped = new Map(); // kindCode -> items[]
+    for (const r of sorted) {
+      const code = r.kind || "mixed";
+      const arr = grouped.get(code) || [];
+      arr.push({
+        shipment: r.pn,
+        colorQty: r.colorQty,
+        qty: Number(r.total_qty || 0),
+        label: labelOf(r.pn),
+      });
+      grouped.set(code, arr);
+    }
     // Codex: keep the A4 print height while avoiding a nearly empty overflow page at 49-52 orders.
     const PER_PAGE = 52;
     const PER_COL = 26;
     const H = (t) => ({ v: t, s: "header" });
+    const T = (t) => ({ v: t, s: "header" });  // 组标题复用 header 蓝底白字样式
+    const BLANK11 = () => Array.from({ length: 11 }, () => ({ v: "", s: "blank" }));
     const rows = [];
     const rowHeights = {};
     const pageBreakRows = [];
-    for (let page = 0; page * PER_PAGE < items.length; page += 1) {
-      if (page) pageBreakRows.push(rows.length);
-      const slice = items.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
-      rowHeights[rows.length] = 25;
-      rows.push([H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label"), H(""), H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label")]);
-      // Codex: balance the last sheet across two columns without padding it with empty print rows.
-      const leftCount = Math.min(PER_COL, Math.ceil(slice.length / 2));
-      for (let i = 0; i < leftCount; i += 1) {
-        const left = slice[i];
-        const right = slice[i + leftCount];
-        rowHeights[rows.length] = 28;
-        rows.push([
-          left ? { v: page * PER_PAGE + i + 1, s: "no" } : { v: "", s: "blank" },
-          left ? { v: left.shipment, s: "shipment" } : { v: "", s: "blank" },
-          left ? { v: left.colorQty, s: left.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
-          left ? { v: left.qty, s: "qty" } : { v: "", s: "blank" },
-          left ? { v: left.label, s: "label" } : { v: "", s: "blank" },
-          { v: "", s: "blank" },
-          right ? { v: page * PER_PAGE + leftCount + i + 1, s: "no" } : { v: "", s: "blank" },
-          right ? { v: right.shipment, s: "shipment" } : { v: "", s: "blank" },
-          right ? { v: right.colorQty, s: right.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
-          right ? { v: right.qty, s: "qty" } : { v: "", s: "blank" },
-          right ? { v: right.label, s: "label" } : { v: "", s: "blank" },
-        ]);
+    let totalItems = 0;
+    let pageCount = 0;
+    let isFirstGroup = true;
+    for (const code of groupOrder) {
+      const items = grouped.get(code);
+      if (!items || !items.length) continue;
+      // 种类之间：第 2+ 个组前加空行 + 分页（独立分页避免挤同一页）
+      if (!isFirstGroup) {
+        pageBreakRows.push(rows.length);
+        rows.push(BLANK11());
       }
+      isFirstGroup = false;
+      // 组标题行：横跨两列整宽度
+      rowHeights[rows.length] = 26;
+      const titleRow = BLANK11();
+      titleRow[0] = T(groupTitle[code] || code);
+      rows.push(titleRow);
+      // 按 PER_PAGE 分页渲染表头 + 数据
+      for (let page = 0; page * PER_PAGE < items.length; page += 1) {
+        if (page) pageBreakRows.push(rows.length);
+        const slice = items.slice(page * PER_PAGE, (page + 1) * PER_PAGE);
+        rowHeights[rows.length] = 25;
+        rows.push([H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label"), H(""), H("No."), H("Shipment"), H("Color×Qty"), H("Qty"), H("Label")]);
+        // Codex: balance the last sheet across two columns without padding it with empty print rows.
+        const leftCount = Math.min(PER_COL, Math.ceil(slice.length / 2));
+        for (let i = 0; i < leftCount; i += 1) {
+          const left = slice[i];
+          const right = slice[i + leftCount];
+          rowHeights[rows.length] = 28;
+          rows.push([
+            left ? { v: page * PER_PAGE + i + 1, s: "no" } : { v: "", s: "blank" },
+            left ? { v: left.shipment, s: "shipment" } : { v: "", s: "blank" },
+            left ? { v: left.colorQty, s: left.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
+            left ? { v: left.qty, s: "qty" } : { v: "", s: "blank" },
+            left ? { v: left.label, s: "label" } : { v: "", s: "blank" },
+            { v: "", s: "blank" },
+            right ? { v: page * PER_PAGE + leftCount + i + 1, s: "no" } : { v: "", s: "blank" },
+            right ? { v: right.shipment, s: "shipment" } : { v: "", s: "blank" },
+            right ? { v: right.colorQty, s: right.colorQty.includes("/") ? "colorqtyMixed" : "colorqty" } : { v: "", s: "blank" },
+            right ? { v: right.qty, s: "qty" } : { v: "", s: "blank" },
+            right ? { v: right.label, s: "label" } : { v: "", s: "blank" },
+          ]);
+        }
+        pageCount += 1;
+      }
+      totalItems += items.length;
     }
     const buf = buildXlsx("A4双列表", rows, {
       colWidths: [3.8, 12.8, 11.4, 4.0, 7.0, 1.4, 3.8, 12.8, 11.4, 4.0, 7.0],
@@ -17780,8 +17876,8 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     const fname = `毛线拣货单_${new Date().toISOString().slice(0, 10)}.xlsx`;
     res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(fname)}`);
-    res.setHeader("X-Item-Count", String(items.length));
-    res.setHeader("X-Page-Count", String(Math.ceil(items.length / PER_PAGE) || 1));
+    res.setHeader("X-Item-Count", String(totalItems));
+    res.setHeader("X-Page-Count", String(pageCount || 1));
     res.send(buf);
   } catch (error) { next(error); }
 });
@@ -17878,7 +17974,9 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
     // Accio Work (2026-11-07) 和拣货单口径保持一致：同一 posting 只取 synced_at 最新的一行。
     //   旧实现在 items CTE 里直接 SUM(c.payload...)，同一订单被两个 store 同步时数量翻倍，
     //   连带把排序里的「按件数升序」整个带偏。
-    const rows = await db.query(
+    // Accio Work (2026-11-17) v2.2.9.226：SQL 不抽色号，JS 侧用 yarn-kinds 分类，
+    //   让排序器能按 kind（mohar/alpaca/mixed）分段。
+    const skuRows = await db.query(
       `WITH unique_postings AS (
           SELECT DISTINCT ON (c.posting_number)
                  c.posting_number, c.payload, c.synced_at
@@ -17886,21 +17984,44 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
            ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
-        ),
-        items AS (
-          SELECT u.posting_number AS pn,
-                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-            FROM unique_postings u
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
-           WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
-             AND COALESCE(p->>'offer_id','') <> ''
-           GROUP BY 1, 2
         )
-        SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS kinds, MIN(color) AS c1 FROM items GROUP BY pn`,
+        SELECT u.posting_number AS pn,
+               COALESCE(p->>'offer_id','') AS offer_id,
+               SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+          FROM unique_postings u
+          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
+         WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
+           AND COALESCE(p->>'offer_id','') <> ''
+         GROUP BY 1, 2`,
       [scopeIds, picked],
     );
-    const sorted = sortYarnOrderRows(rows.rows);
+    // 聚合成排序器要的 { pn, kind, total_qty, color_kinds, first_color }
+    const perOrder = new Map();
+    for (const row of skuRows.rows) {
+      const pn = String(row.pn);
+      const { kind, color } = classifyYarnColor(extractYarnColor(row.offer_id));
+      const slot = perOrder.get(pn) || { kindSet: new Set(), colors: [], totalQty: 0, colorCount: 0 };
+      if (kind) {
+        slot.kindSet.add(kind.code);
+        slot.colors.push(color);
+        slot.totalQty += Number(row.qty) || 0;
+        slot.colorCount += 1;
+      }
+      perOrder.set(pn, slot);
+    }
+    const aggregated = [];
+    for (const [pn, slot] of perOrder.entries()) {
+      if (!slot.kindSet.size) continue;
+      const kinds = [...slot.kindSet];
+      aggregated.push({
+        pn,
+        kind: kinds.length > 1 ? "mixed" : kinds[0],
+        total_qty: slot.totalQty,
+        color_kinds: slot.colorCount,
+        first_color: slot.colors.sort()[0] || "",
+      });
+    }
+    const sorted = sortYarnOrderRows(aggregated);
     res.json({ success: true, posting_numbers: sorted.map((r) => String(r.pn)) });
   } catch (error) { next(error); }
 });
@@ -17951,7 +18072,9 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     const scopeIds = sharedIds.length ? sharedIds : storeIds;
     // Accio Work (2026-11-07) 和拣货单口径对齐：同一 posting 只取 synced_at 最新的一行，
     //   再做颜色/件数聚合；避免多 store 同步导致数量翻倍、排序错乱。
-    const orderRows = await db.query(
+    // Accio Work (2026-11-17) v2.2.9.226：SQL 不抽色号，JS 侧用 yarn-kinds 分类，
+    //   让排序器能按 kind（mohar/alpaca/mixed）分段 → 标签 PDF 也按分段顺序合并。
+    const skuRows = await db.query(
       `WITH unique_postings AS (
           SELECT DISTINCT ON (c.posting_number)
                  c.posting_number, c.payload, c.synced_at
@@ -17959,22 +18082,43 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
            ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
-        ),
-        items AS (
-          SELECT u.posting_number AS pn,
-                 substring(COALESCE(p->>'offer_id','') from '[^-]+$') AS color,
-                 SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
-            FROM unique_postings u
-            CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
-           WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
-             AND COALESCE(p->>'offer_id','') <> ''
-           GROUP BY 1, 2
         )
-        SELECT pn, SUM(qty)::int AS total_qty, COUNT(*)::int AS color_kinds, MIN(color) AS first_color
-          FROM items GROUP BY pn`,
+        SELECT u.posting_number AS pn,
+               COALESCE(p->>'offer_id','') AS offer_id,
+               SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
+          FROM unique_postings u
+          CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
+         WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
+           AND COALESCE(p->>'offer_id','') <> ''
+         GROUP BY 1, 2`,
       [scopeIds, picked],
     );
-    const sortedRows = sortYarnOrderRows(orderRows.rows);
+    const perOrder = new Map();
+    for (const row of skuRows.rows) {
+      const pn = String(row.pn);
+      const { kind, color } = classifyYarnColor(extractYarnColor(row.offer_id));
+      const slot = perOrder.get(pn) || { kindSet: new Set(), colors: [], totalQty: 0, colorCount: 0 };
+      if (kind) {
+        slot.kindSet.add(kind.code);
+        slot.colors.push(color);
+        slot.totalQty += Number(row.qty) || 0;
+        slot.colorCount += 1;
+      }
+      perOrder.set(pn, slot);
+    }
+    const aggregated = [];
+    for (const [pn, slot] of perOrder.entries()) {
+      if (!slot.kindSet.size) continue;
+      const kinds = [...slot.kindSet];
+      aggregated.push({
+        pn,
+        kind: kinds.length > 1 ? "mixed" : kinds[0],
+        total_qty: slot.totalQty,
+        color_kinds: slot.colorCount,
+        first_color: slot.colors.sort()[0] || "",
+      });
+    }
+    const sortedRows = sortYarnOrderRows(aggregated);
     const postings = sortedRows.map((r) => String(r.pn));
     if (!postings.length) return res.status(400).json({ success: false, error: "没有符合条件的毛线订单" });
     // Accio Work (2026-11-06)：凭证只按 store 取（同店铺多账号），不再卡 user_id
