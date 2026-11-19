@@ -18,6 +18,8 @@
 //   pn                         -- posting_number
 
 // kind 排序优先级：数字越小越靠前
+// v2.2.9.228：cancelled 没在 KIND_ORDER 里 → rank=99，排到 mixed 之后，
+//   即整份拣货单的最后一段"取消订单"表（和 server.js 的 groupOrder 顺序保持一致）。
 const KIND_ORDER = { mohar: 0, alpaca: 1, mixed: 2 };
 const kindRank = (row) => {
   const k = String(row.kind || "");

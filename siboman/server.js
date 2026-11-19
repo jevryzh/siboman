@@ -17713,34 +17713,43 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     //   SQL 不再抽色号（旧 SQL 的 `[^-]+$` 对 "ALPACA-YARN-W023-2PCS" 会取到 "2PCS" → 错）。
     //   改成返回 offer_id + qty，色号识别/分类放到 JS 侧 `lib/yarn-kinds.js` 做，
     //   和拣货单/标签/区间统计三处共用同一套规则，未来加毛线种类只改 YARN_KINDS 配置。
+    // Accio Work (2026-11-19) v2.2.9.228：
+    //   不再过滤取消单，而是把 status 一起返回，JS 侧分桶：
+    //     - 非取消单 → 进入正常的 mohar/alpaca/mixed 分段
+    //     - 取消单   → 单独汇总到最后一张「取消订单」表
+    //   之所以用 status/display_status 双 COALESCE：和 yarn-range-export 保持口径一致，
+    //   任一列匹配 /^cancell?ed/i 都算取消。
     const skuRes = await db.query(
       `WITH unique_postings AS (
           SELECT DISTINCT ON (c.posting_number)
-                 c.posting_number, c.payload, c.synced_at
+                 c.posting_number, c.payload, c.status, c.display_status, c.synced_at
             FROM app_order_cache c
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
            ORDER BY c.posting_number, c.synced_at DESC NULLS LAST
         )
         SELECT u.posting_number AS pn,
+               COALESCE(u.display_status, u.status, '') AS status,
                COALESCE(p->>'offer_id','') AS offer_id,
                SUM(COALESCE((p->>'quantity')::int, 1))::int AS qty
           FROM unique_postings u
           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
          WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
            AND COALESCE(p->>'offer_id','') <> ''
-         GROUP BY 1, 2`,
+         GROUP BY 1, 2, 3`,
       [scopeIds, picked],
     );
 
     // JS 侧：抽色号 + 按 kind 分组，每单生成一组行（可能多个 kind → 归入 "mixed"）
-    // 结构：ordersByKind = Map<kindCode, Array<{ pn, colorQty, totalQty, colorKinds, firstColor }>>
-    //   kindCode = "mohar" / "alpaca" / "mixed"
-    const perOrder = new Map(); // pn -> { byKind: Map<kindCode, Map<color, qty>>, unknownQty }
+    // v2.2.9.228：同时按 status 分桶 —— 取消单不进 mohar/alpaca/mixed，单独汇总到 cancelled
+    //   结构：perOrder = Map<pn, { byKind, unknownQty, isCancelled }>
+    const isCancelledStatus = (s) => /^cancell?ed/i.test(String(s || ""));
+    const perOrder = new Map();
     for (const row of skuRes.rows) {
       const pn = String(row.pn);
       const { kind, color } = classifyYarnColor(extractYarnColor(row.offer_id));
-      const slot = perOrder.get(pn) || { byKind: new Map(), unknownQty: 0 };
+      const slot = perOrder.get(pn) || { byKind: new Map(), unknownQty: 0, isCancelled: false };
+      if (isCancelledStatus(row.status)) slot.isCancelled = true;
       if (!kind) {
         slot.unknownQty += Number(row.qty) || 0;
       } else {
@@ -17752,12 +17761,16 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     }
 
     // 把每单拍扁成一行。多种 kind → 单条 "mixed" 行；单种 → 对应 kind 行。
+    // v2.2.9.228：取消单统一归入 "cancelled" 段，不再按 kind 分段，和用户的
+    //   "格式和上面拣货单的格式一样" 诉求对齐（同样是 No./Shipment/Color×Qty/Qty/Label 五列）。
     const aggregated = []; // { pn, kind, colorQty, total_qty, color_kinds, first_color }
     for (const [pn, slot] of perOrder.entries()) {
       const kindCodes = [...slot.byKind.keys()];
       if (!kindCodes.length) continue; // 全 unknown 不进拣货单
       const isMixed = kindCodes.length > 1;
-      const rowKind = isMixed ? "mixed" : kindCodes[0];
+      const rowKind = slot.isCancelled
+        ? "cancelled"
+        : (isMixed ? "mixed" : kindCodes[0]);
       // 聚所有色号到一行；混种订单也显示两种毛线的 color×qty
       const colorEntries = [];
       let total = 0;
@@ -17791,6 +17804,8 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
     }
 
     // 用现有排序器：kind 分段 → 单/混色 → 件数 → 色号 → pn
+    // 排序器按 kindRank 映射，cancelled 不在 KIND_ORDER 里 → 自动落到最后一段（rank=99），
+    //   段内复用同样的 "单件优先 / 多件按色号分组 / 混色最后" 规则，无需特判。
     const sorted = sortYarnOrderRows(aggregated);
     // 客户号 = 订单号第一个 "-" 之后的那一段（保留前导 0）
     // v2.2.9.175 Label = 订单号第一个 "-" **前面**那一段的末 4 位
@@ -17801,17 +17816,20 @@ app.post("/api/seller/orders/yarn-picklist-export", requireAuth, async (req, res
       return head.slice(-4).padStart(4, "0");
     };
     // Accio Work (2026-11-17) v2.2.9.226：按毛线种类分组，每组独立出一张表、独立分页。
-    //   表顺序：mohar → alpaca → ...（按 YARN_KINDS 配置顺序）→ mixed
+    //   表顺序：mohar → alpaca → ...（按 YARN_KINDS 配置顺序）→ mixed → cancelled
     //   每种独立分页，不跨种类挤同一页；种类之间用一行空行视觉分隔。
+    // v2.2.9.228：追加 "取消订单" 表作为整份 Excel 的最后一段。
     const groupTitle = {
       mohar: "马海毛拣货单",
       alpaca: "羊驼毛拣货单",
       mixed: "混种订单拣货单",
+      cancelled: "取消订单",
     };
     for (const k of YARN_KINDS) {
       if (!(k.code in groupTitle)) groupTitle[k.code] = `${k.label}拣货单`;
     }
-    const groupOrder = [...YARN_KINDS.map((k) => k.code), "mixed"];
+    // v2.2.9.228 整份 Excel 末尾追加「取消订单」表（格式与上面一致，仅标题不同）
+    const groupOrder = [...YARN_KINDS.map((k) => k.code), "mixed", "cancelled"];
     const grouped = new Map(); // kindCode -> items[]
     for (const r of sorted) {
       const code = r.kind || "mixed";
@@ -17992,10 +18010,12 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
     //   连带把排序里的「按件数升序」整个带偏。
     // Accio Work (2026-11-17) v2.2.9.226：SQL 不抽色号，JS 侧用 yarn-kinds 分类，
     //   让排序器能按 kind（mohar/alpaca/mixed）分段。
+    // Accio Work (2026-11-19) v2.2.9.228：本接口仅给标签用，过滤 cancelled 订单，
+    //   保证标签 PDF 不会包含已取消的订单。
     const skuRows = await db.query(
       `WITH unique_postings AS (
           SELECT DISTINCT ON (c.posting_number)
-                 c.posting_number, c.payload, c.synced_at
+                 c.posting_number, c.payload, c.status, c.display_status, c.synced_at
             FROM app_order_cache c
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
@@ -18008,10 +18028,10 @@ app.post("/api/seller/orders/yarn-sorted-postings", requireAuth, async (req, res
           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
          WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
            AND COALESCE(p->>'offer_id','') <> ''
+           AND COALESCE(u.display_status, u.status, '') !~* '^cancell?ed'
          GROUP BY 1, 2`,
       [scopeIds, picked],
     );
-    // 聚合成排序器要的 { pn, kind, total_qty, color_kinds, first_color }
     const perOrder = new Map();
     for (const row of skuRows.rows) {
       const pn = String(row.pn);
@@ -18090,10 +18110,12 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
     //   再做颜色/件数聚合；避免多 store 同步导致数量翻倍、排序错乱。
     // Accio Work (2026-11-17) v2.2.9.226：SQL 不抽色号，JS 侧用 yarn-kinds 分类，
     //   让排序器能按 kind（mohar/alpaca/mixed）分段 → 标签 PDF 也按分段顺序合并。
+    // Accio Work (2026-11-19) v2.2.9.228：标签 PDF 不含取消单。前端排序接口已过滤 cancelled，
+    //   服务端再加一道保险 —— 即便插件直接传入 cancelled posting 也不会生成标签。
     const skuRows = await db.query(
       `WITH unique_postings AS (
           SELECT DISTINCT ON (c.posting_number)
-                 c.posting_number, c.payload, c.synced_at
+                 c.posting_number, c.payload, c.status, c.display_status, c.synced_at
             FROM app_order_cache c
            WHERE c.store_id = ANY($1::uuid[])
              AND c.posting_number = ANY($2::text[])
@@ -18106,6 +18128,7 @@ app.post("/api/seller/orders/yarn-labels", requireAuth, async (req, res, next) =
           CROSS JOIN LATERAL jsonb_array_elements(COALESCE(u.payload->'products','[]'::jsonb)) p
          WHERE COALESCE(p->>'name','') ILIKE '%пряж%'
            AND COALESCE(p->>'offer_id','') <> ''
+           AND COALESCE(u.display_status, u.status, '') !~* '^cancell?ed'
          GROUP BY 1, 2`,
       [scopeIds, picked],
     );
