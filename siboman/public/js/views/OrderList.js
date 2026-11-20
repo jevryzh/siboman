@@ -1244,6 +1244,75 @@ window.OrderListView = {
         yarnRangeDialog.loading = false;
       }
     };
+
+    // Accio Work (2026-11-20) v2.2.9.229 「拆单+分包发货」
+    //   勾选多单 → 调 preview 本地算出每单拆分方案 → 弹窗预览 → 用户确认 → execute 真实调 Ozon
+    //   非毛线 / 金额 ≤ 135 / 非待备货 的单会在弹窗里分类列出并说明跳过原因。
+    //   执行成功后触发一次「立即同步」刷新 ERP 本地缓存。
+    const yarnSplitDialog = Vue.reactive({
+      visible: false, loading: false, executing: false,
+      plan_id: '', threshold: 135,
+      splittable: [],  // [{posting_number, summary, packages}]
+      skipped: [],     // [{posting_number, reason}]
+      results: null,   // 执行后：[{posting_number, success, error?}]
+    });
+    const openYarnSplit = async () => {
+      const storeIds = selectedStoreIds();
+      if (!storeIds.length) return notify.warning('请先选择店铺');
+      const picked = [...new Set((selectedOrders.value || []).map((r) => String(r.posting_number || '')).filter(Boolean))];
+      if (!picked.length) return notify.warning('请先勾选订单');
+      yarnSplitDialog.visible = true;
+      yarnSplitDialog.loading = true;
+      yarnSplitDialog.executing = false;
+      yarnSplitDialog.results = null;
+      yarnSplitDialog.splittable = [];
+      yarnSplitDialog.skipped = [];
+      try {
+        const res = await axios.post('/api/seller/orders/yarn-split/preview',
+          { store_ids: storeIds, posting_numbers: picked });
+        const d = res.data || {};
+        yarnSplitDialog.plan_id = d.plan_id || '';
+        yarnSplitDialog.threshold = d.threshold || 135;
+        yarnSplitDialog.splittable = (d.items || []).filter((x) => !x.skipped);
+        yarnSplitDialog.skipped = (d.items || []).filter((x) => x.skipped);
+      } catch (e) {
+        notify.error('拆分预览失败：' + (e.response?.data?.error || e.message));
+        yarnSplitDialog.visible = false;
+      } finally {
+        yarnSplitDialog.loading = false;
+      }
+    };
+    const confirmYarnSplit = async () => {
+      if (!yarnSplitDialog.plan_id) return notify.warning('plan_id 丢失，请重新打开预览');
+      if (!yarnSplitDialog.splittable.length) return notify.warning('没有可拆分的订单');
+      // 二次确认（强调不可逆）
+      try {
+        await window.ElementPlus.ElMessageBox.confirm(
+          `将对 ${yarnSplitDialog.splittable.length} 单真实调用 Ozon 拆单+发货 API，`
+          + `完成后订单状态会从「等待备货」变为「已准备发运」，` + `该操作不可逆。确认继续？`,
+          '确认拆单+分包发货', { type: 'warning', confirmButtonText: '确认拆单', cancelButtonText: '取消' });
+      } catch { return; } // 用户取消
+      yarnSplitDialog.executing = true;
+      try {
+        const res = await axios.post('/api/seller/orders/yarn-split/execute',
+          { plan_id: yarnSplitDialog.plan_id }, { timeout: 180000 });
+        const d = res.data || {};
+        yarnSplitDialog.results = d.results || [];
+        if (d.fail === 0) notify.success(`拆分成功：${d.ok} 单已提交 Ozon`);
+        else if (d.ok === 0) notify.error(`拆分失败：${d.fail} 单全部失败`);
+        else notify.warning(`部分成功：${d.ok} 成功 / ${d.fail} 失败`);
+        // 成功后触发一次立即同步，让 ERP 本地看到新子单
+        if (d.ok > 0) {
+          try { await runManualSync(); } catch (_e) { /* 同步失败不阻塞拆单结果展示 */ }
+          try { await fetchOrders(); } catch (_e) {}
+        }
+      } catch (e) {
+        notify.error('拆分执行失败：' + (e.response?.data?.error || e.message));
+      } finally {
+        yarnSplitDialog.executing = false;
+      }
+    };
+
     // v2.2.9.157 生成拣货单：调卖家后台异步报告（assembly/list → report/status → report/download），
     //   接口会话绑定 IP，只能由插件在 seller.ozon.ru 里带着登录态调用。
     const pickListBusy = Vue.ref(false);
@@ -1789,6 +1858,7 @@ window.OrderListView = {
       labelsPrinting, printLabels,   // v2.2.9.156 打印面单
       yarnExporting, exportPendingSkus,   // v2.2.9.165 导出待备货毛线数量
       yarnRangeDialog, openYarnRangeDialog, exportYarnRange,   // v2.2.9.225 导出毛线订单区间统计
+      yarnSplitDialog, openYarnSplit, confirmYarnSplit,   // v2.2.9.229 拆单+分包发货
       pickListBusy, printPickList,   // v2.2.9.157 生成拣货单
       rowStatusSubtext, copyPostingNumber, copyText, orderDateText, orderTimeText, deadlineBadgeStyle, warehouseText, deliveryText,
       orderProfit, orderProfitRate, hasOrderProfit, orderOutboundCost, orderCommission, orderLastMile, orderOzonCost, orderTotalCost, orderDelivered, deadlineHourText, orderRowKey,
@@ -1942,6 +2012,7 @@ window.OrderListView = {
           <span style="font-weight:600">已选择 {{ selectedOrders.length }} 个订单</span>
           <div style="display:flex; gap:6px; flex-wrap:wrap">
             <el-button type="warning" size="small" :loading="batchLoading" @click="batchShip">批量发货</el-button>
+            <el-button type="danger" size="small" @click="openYarnSplit">拆单+分包发货</el-button>
             <el-button size="small" :loading="labelsPrinting" @click="printLabels">打印面单</el-button>
             <el-button size="small" :loading="pickListBusy" @click="printPickList">生成拣货单</el-button>
             <el-button size="small" @click="exportOrders">导出当前筛选</el-button>
@@ -2263,6 +2334,93 @@ window.OrderListView = {
         <template #footer>
           <el-button @click="yarnRangeDialog.visible = false">取消</el-button>
           <el-button type="primary" :loading="yarnRangeDialog.loading" @click="exportYarnRange">导出</el-button>
+        </template>
+      </el-dialog>
+
+      <!-- Accio Work (2026-11-20) v2.2.9.229 拆单+分包发货 -->
+      <el-dialog v-model="yarnSplitDialog.visible" title="拆单+分包发货（预览）" width="720px" append-to-body
+        :close-on-click-modal="false" :close-on-press-escape="!yarnSplitDialog.executing">
+        <div v-loading="yarnSplitDialog.loading" element-loading-text="分析中…">
+          <template v-if="!yarnSplitDialog.results">
+            <el-alert type="warning" show-icon :closable="false" style="margin-bottom:12px"
+              title="确认后将直接提交 Ozon 拆单+发货，订单状态会从「等待备货」变为「已准备发运」，该操作不可逆。" />
+            <div style="font-size:13px; color:#475569; margin-bottom:10px; line-height:1.7">
+              规则：仅拆<b>毛线订单</b>（商品名含 <code>пряж</code>）；订单金额 <b>&gt; {{ yarnSplitDialog.threshold }} CNY</b> 才拆；
+              按毛线类型分组，同色优先聚包、碎件混色凑数，每包金额 ≤ {{ yarnSplitDialog.threshold }}。
+            </div>
+            <template v-if="yarnSplitDialog.splittable.length">
+              <div style="font-weight:600; color:#047857; margin:12px 0 6px">
+                ✅ 可拆（{{ yarnSplitDialog.splittable.length }} 单，共 {{ yarnSplitDialog.splittable.reduce((s,x)=>s+x.summary.pack_count,0) }} 个子单）
+              </div>
+              <el-table :data="yarnSplitDialog.splittable" size="small" border stripe max-height="340">
+                <el-table-column prop="posting_number" label="订单号" width="170" />
+                <el-table-column label="金额" width="80" align="right">
+                  <template #default="{ row }">{{ row.summary.total_price }} CNY</template>
+                </el-table-column>
+                <el-table-column label="件数" width="60" align="right">
+                  <template #default="{ row }">{{ row.summary.total_qty }}</template>
+                </el-table-column>
+                <el-table-column label="子单" width="60" align="right">
+                  <template #default="{ row }">{{ row.summary.pack_count }}</template>
+                </el-table-column>
+                <el-table-column label="拆分方案">
+                  <template #default="{ row }">
+                    <div v-for="(pkg, pi) in row.packages" :key="pi" style="line-height:1.6; font-size:12px">
+                      <span style="color:#64748b">包{{ pi + 1 }}:</span>
+                      <template v-for="(p, i) in pkg.products" :key="i">
+                        <span v-if="i>0" style="color:#94a3b8">·</span>
+                        <span>{{ p.color || p.offer_id }}×{{ p.quantity }}</span>
+                      </template>
+                      <span style="color:#0f766e; margin-left:6px">({{ pkg.total_price }})</span>
+                      <el-tag v-if="pkg.is_mixed_color" size="small" type="info" style="margin-left:4px">混色</el-tag>
+                      <el-tag v-if="pkg.is_mixed_kind" size="small" type="warning" style="margin-left:4px">混种</el-tag>
+                    </div>
+                  </template>
+                </el-table-column>
+              </el-table>
+            </template>
+            <template v-else-if="!yarnSplitDialog.loading">
+              <el-empty description="所选订单中没有可拆的毛线订单" :image-size="80" />
+            </template>
+            <template v-if="yarnSplitDialog.skipped.length">
+              <div style="font-weight:600; color:#b45309; margin:16px 0 6px">
+                ⚠️ 跳过（{{ yarnSplitDialog.skipped.length }} 单）
+              </div>
+              <el-table :data="yarnSplitDialog.skipped" size="small" border max-height="200">
+                <el-table-column prop="posting_number" label="订单号" width="170" />
+                <el-table-column prop="reason" label="跳过原因" />
+              </el-table>
+            </template>
+          </template>
+          <!-- 执行结果 -->
+          <template v-else>
+            <el-table :data="yarnSplitDialog.results" size="small" border max-height="400">
+              <el-table-column prop="posting_number" label="订单号" width="170" />
+              <el-table-column label="结果" width="100">
+                <template #default="{ row }">
+                  <el-tag v-if="row.success" type="success" size="small">成功</el-tag>
+                  <el-tag v-else type="danger" size="small">失败</el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="详情">
+                <template #default="{ row }">
+                  <span v-if="row.success">已拆成 {{ row.pack_count }} 子单<span v-if="row.new_postings && row.new_postings.length">：{{ row.new_postings.join(', ') }}</span></span>
+                  <span v-else style="color:#dc2626">{{ row.error }}</span>
+                </template>
+              </el-table-column>
+            </el-table>
+          </template>
+        </div>
+        <template #footer>
+          <el-button @click="yarnSplitDialog.visible = false" :disabled="yarnSplitDialog.executing">
+            {{ yarnSplitDialog.results ? '关闭' : '取消' }}
+          </el-button>
+          <el-button v-if="!yarnSplitDialog.results" type="danger"
+            :loading="yarnSplitDialog.executing"
+            :disabled="!yarnSplitDialog.splittable.length"
+            @click="confirmYarnSplit">
+            确认拆单并发货（{{ yarnSplitDialog.splittable.length }} 单）
+          </el-button>
         </template>
       </el-dialog>
 

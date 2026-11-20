@@ -25,6 +25,7 @@ import { createOrderSync } from "./lib/order-sync.js";
 import { sortYarnOrderRows } from "./lib/yarn-order-sort.js";
 import { buildOrderedYarnLabels } from "./lib/yarn-label-export.js";
 import { buildYarnRangeXlsx } from "./lib/yarn-range-export.js";
+import { planOrderSplit, SPLIT_THRESHOLD as YARN_SPLIT_THRESHOLD } from "./lib/yarn-split-planner.js";
 import { YARN_KINDS, extractColor as extractYarnColor, classifyColor as classifyYarnColor } from "./lib/yarn-kinds.js";
 import {
   BUILTIN_CATEGORY_TREE,
@@ -2158,6 +2159,17 @@ async function initDatabase() {
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         UNIQUE(store_id, posting_number)
       );
+
+      -- Accio Work (2026-11-20) v2.2.9.229 「拆单+分包发货」临时 plan 存储
+      -- preview 阶段生成，execute 阶段消费；10 分钟过期；执行成功后删除
+      CREATE TABLE IF NOT EXISTS app_yarn_split_plans (
+        id TEXT PRIMARY KEY,
+        user_id UUID NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
+        plan JSONB NOT NULL DEFAULT '[]'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        expires_at TIMESTAMPTZ NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_yarn_split_plans_expires ON app_yarn_split_plans(expires_at);
 
       CREATE TABLE IF NOT EXISTS app_order_cancel_events (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -18412,6 +18424,198 @@ app.post("/api/seller/orders/yarn-range-export", requireAuth, async (req, res, n
     res.send(buf);
   } catch (error) { next(error); }
 });
+
+// Accio Work (2026-11-20) v2.2.9.229 「拆单+分包发货」
+// -----------------------------------------------------------------------------
+//   业务规则（用户确认版）：
+//     1. 只拆毛线订单（商品名含 'пряж'）
+//     2. 订单金额 > 135 CNY 才拆（≤ 135 跳过）
+//     3. 按毛线种类分组，同色优先聚包，碎件混色凑数，目标子单数最少
+//     4. 单件 > 135 的放行（1 件一包）
+//   两步接口：
+//     /yarn-split/preview  —— 本地计算，不动 Ozon，返回预览包清单
+//     /yarn-split/execute  —— 对确认过的 planId 逐单调 /v4/posting/fbs/ship
+//                              每单成功后记一行 app_order_ship_events
+//                              完成后前端自己调 refresh 刷新订单列表
+//   注意：Ozon 没有"只拆不发"的 API，拆分 = 立即把 posting 切成 N 个子 posting 并
+//   转到 awaiting_deliver 状态。这个操作不可逆，前端必须二次确认后再调 execute。
+app.post("/api/seller/orders/yarn-split/preview", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, error: "数据库不可用" });
+    const storeIds = (Array.isArray(req.body?.store_ids) ? req.body.store_ids
+      : req.body?.store_id ? [req.body.store_id] : []).map(String).filter(Boolean);
+    if (!storeIds.length) return res.status(400).json({ success: false, error: "请选择店铺" });
+    const picked = Array.isArray(req.body?.posting_numbers)
+      ? [...new Set(req.body.posting_numbers.map((x) => String(x).trim()).filter(Boolean))].slice(0, 500)
+      : [];
+    if (!picked.length) return res.status(400).json({ success: false, error: "请先勾选要拆分的订单" });
+
+    // 拉每张单最新 payload（和拣货单/标签接口同一口径：DISTINCT ON posting_number by synced_at DESC）
+    const rows = await db.query(
+      `SELECT DISTINCT ON (c.posting_number)
+              c.posting_number, c.store_id, c.status, c.display_status, c.payload
+         FROM app_order_cache c
+        WHERE c.store_id = ANY($1::uuid[])
+          AND c.posting_number = ANY($2::text[])
+        ORDER BY c.posting_number, c.synced_at DESC`,
+      [storeIds, picked],
+    );
+
+    const items = []; // 每条：{ posting_number, store_id, status, eligible, skipped, reason, summary, packages }
+    for (const pn of picked) {
+      const row = rows.rows.find((r) => r.posting_number === pn);
+      if (!row) {
+        items.push({ posting_number: pn, skipped: true, reason: "订单不在缓存中，请先同步" });
+        continue;
+      }
+      const curStatus = String(row.status || row.display_status || "").toLowerCase();
+      if (curStatus !== "awaiting_packaging") {
+        items.push({ posting_number: pn, store_id: row.store_id, status: curStatus, skipped: true,
+          reason: `订单状态 ${curStatus || "未知"}，不是待备货` });
+        continue;
+      }
+      const payload = row.payload || {};
+      const order = { posting_number: pn, products: payload.products || [] };
+      const plan = planOrderSplit(order);
+      if (plan.skipped) {
+        items.push({ posting_number: pn, store_id: row.store_id, status: curStatus, skipped: true,
+          reason: plan.reason, total_price: plan.total_price, total_qty: plan.total_qty });
+      } else {
+        items.push({ posting_number: pn, store_id: row.store_id, status: curStatus,
+          skipped: false, summary: plan.summary, packages: plan.packages });
+      }
+    }
+
+    // 生成 planId（10 分钟有效）供 execute 校验，避免前端篡改 packages
+    const crypto = await import("node:crypto");
+    const planId = crypto.randomBytes(12).toString("hex");
+    const planToExec = items.filter((x) => !x.skipped).map((x) => ({
+      posting_number: x.posting_number, store_id: x.store_id,
+      packages: x.packages.map((p) => ({
+        products: p.products.map((pp) => ({ product_id: pp.product_id, quantity: pp.quantity })),
+      })),
+    }));
+    // 把 plan 临时存库，execute 时查
+    await db.query(
+      `INSERT INTO app_yarn_split_plans (id, user_id, plan, created_at, expires_at)
+       VALUES ($1, $2, $3::jsonb, now(), now() + interval '10 minutes')`,
+      [planId, req.user.id, JSON.stringify(planToExec)],
+    );
+
+    const splittable = items.filter((x) => !x.skipped);
+    const skipped = items.filter((x) => x.skipped);
+    res.json({
+      success: true,
+      plan_id: planId,
+      threshold: YARN_SPLIT_THRESHOLD,
+      total_checked: picked.length,
+      splittable_count: splittable.length,
+      skipped_count: skipped.length,
+      total_packages: splittable.reduce((s, x) => s + x.summary.pack_count, 0),
+      items,
+    });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/seller/orders/yarn-split/execute", requireAuth, async (req, res, next) => {
+  try {
+    if (!db) return res.status(503).json({ success: false, error: "数据库不可用" });
+    const planId = String(req.body?.plan_id || "").trim();
+    if (!planId) return res.status(400).json({ success: false, error: "缺少 plan_id" });
+    const planRow = await db.query(
+      `SELECT plan, expires_at FROM app_yarn_split_plans WHERE id=$1 AND user_id=$2`,
+      [planId, req.user.id],
+    );
+    if (!planRow.rowCount) return res.status(404).json({ success: false, error: "plan 不存在或已过期" });
+    if (new Date(planRow.rows[0].expires_at) < new Date()) {
+      return res.status(410).json({ success: false, error: "plan 已过期，请重新预览" });
+    }
+    const plan = planRow.rows[0].plan || [];
+    if (!plan.length) return res.status(400).json({ success: false, error: "plan 为空" });
+
+    const results = []; // 每条：{ posting_number, success, error? }
+    const affectedStores = new Set();
+    for (const item of plan) {
+      affectedStores.add(String(item.store_id));
+      const pn = String(item.posting_number);
+      const pkgs = item.packages;
+      try {
+        // 复用 /api/seller/orders/ship 的幂等 claim 逻辑：先占坑再调 Ozon
+        let claim = await db.query(
+          `INSERT INTO app_order_ship_events (user_id, store_id, posting_number, packages, status)
+           VALUES ($1,$2,$3,$4::jsonb,'processing')
+           ON CONFLICT (store_id, posting_number) DO NOTHING
+           RETURNING id, status`,
+          [req.user.id, item.store_id, pn, JSON.stringify(pkgs)],
+        );
+        let eventId;
+        if (claim.rowCount) {
+          eventId = claim.rows[0].id;
+        } else {
+          // 已有记录：如果是 failed 可以重置；completed 则拒绝；processing 并发守护
+          const exist = await db.query(
+            `SELECT id, status FROM app_order_ship_events
+              WHERE user_id=$1 AND store_id=$2 AND posting_number=$3`,
+            [req.user.id, item.store_id, pn],
+          );
+          const row = exist.rows[0];
+          if (row.status === "completed") {
+            results.push({ posting_number: pn, success: false, error: "该订单已完成发货，请刷新" });
+            continue;
+          }
+          if (row.status === "processing") {
+            results.push({ posting_number: pn, success: false, error: "该订单正在处理，请勿重复提交" });
+            continue;
+          }
+          await db.query(
+            `UPDATE app_order_ship_events SET packages=$1::jsonb, status='processing', error='', updated_at=now()
+              WHERE id=$2`,
+            [JSON.stringify(pkgs), row.id],
+          );
+          eventId = row.id;
+        }
+        // 真实调 Ozon
+        const data = await callOzonSellerAPI("/v4/posting/fbs/ship", {
+          posting_number: pn, packages: pkgs, with: { additional_data: true },
+        }, { storeId: item.store_id, userId: req.user.id });
+        await db.query(
+          `UPDATE app_order_ship_events SET status='completed', ozon_response=$1::jsonb,
+             completed_at=now(), error='', updated_at=now() WHERE id=$2`,
+          [JSON.stringify(data || {}), eventId],
+        );
+        // Ozon 拆单成功返回的 result 通常是新子 posting 列表
+        const newPostings = Array.isArray(data?.result?.additional_data) ? data.result.additional_data
+          : Array.isArray(data?.result) ? data.result : [];
+        results.push({
+          posting_number: pn, success: true, pack_count: pkgs.length,
+          new_postings: newPostings.map((x) => typeof x === "string" ? x : x?.posting_number).filter(Boolean),
+        });
+      } catch (e) {
+        results.push({ posting_number: pn, success: false, error: String(e?.message || e) });
+        try {
+          await db.query(
+            `UPDATE app_order_ship_events SET status='failed', error=$1, updated_at=now()
+              WHERE user_id=$2 AND store_id=$3 AND posting_number=$4 AND status='processing'`,
+            [String(e?.message || e).slice(0, 500), req.user.id, item.store_id, pn],
+          );
+        } catch {}
+      }
+    }
+
+    // plan 用完就删，避免重复执行
+    await db.query(`DELETE FROM app_yarn_split_plans WHERE id=$1`, [planId]);
+
+    const ok = results.filter((r) => r.success).length;
+    const fail = results.filter((r) => !r.success).length;
+    res.json({
+      success: fail === 0,
+      total: results.length, ok, fail,
+      affected_stores: [...affectedStores],
+      results,
+    });
+  } catch (error) { next(error); }
+});
+
 
 app.post("/api/seller/orders/labels", requireAuth, async (req, res) => {
   try {
